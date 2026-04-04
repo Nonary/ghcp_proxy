@@ -167,6 +167,7 @@ class InitiatorPolicy:
         self._lock = Lock()
         self._active_requests: dict[str, dict[str, str | None]] = {}
         self._last_activity_at: datetime | None = None
+        self._seen_user_request: bool = False
 
     def seed_from_usage_events(self, events, *, now: datetime | None = None):
         del now
@@ -174,6 +175,7 @@ class InitiatorPolicy:
             self._events.clear()
             self._active_requests.clear()
             self._last_activity_at = None
+            self._seen_user_request = False
 
             if not isinstance(events, list):
                 return
@@ -299,7 +301,8 @@ class InitiatorPolicy:
         with self._lock:
             active = self._active_requests.pop(request_id, None)
             initiator = active.get("initiator") if isinstance(active, dict) else None
-            self._last_activity_at = event_time
+            if active is not None:
+                self._last_activity_at = event_time
             self._events.append(
                 {
                     "at": event_time.isoformat(),
@@ -328,14 +331,46 @@ class InitiatorPolicy:
         return initiator
 
     def _safeguard_active_locked(self, now: datetime) -> bool:
+        if not self._seen_user_request:
+            return False
         if self._active_requests:
             return True
         if self._last_activity_at is None:
+            self._seen_user_request = False
             return False
         elapsed_seconds = (now - self._last_activity_at).total_seconds()
-        return elapsed_seconds < self.request_finish_guard_seconds
+        if elapsed_seconds >= self.request_finish_guard_seconds:
+            self._seen_user_request = False
+            return False
+        return True
+
+    def _check_and_expire_safeguard_locked(self, now: datetime) -> bool:
+        if not self._seen_user_request:
+            return False
+        if self._active_requests:
+            return True
+        if self._last_activity_at is None:
+            self._seen_user_request = False
+            return False
+        elapsed_seconds = (now - self._last_activity_at).total_seconds()
+        if elapsed_seconds >= self.request_finish_guard_seconds:
+            self._seen_user_request = False
+            return False
+        return True
 
     def _record_request_started_locked(self, request_id: str, initiator: str, event_time: datetime):
+        if initiator == USER_INITIATOR:
+            self._seen_user_request = True
+        elif not self._check_and_expire_safeguard_locked(event_time):
+            self._events.append(
+                {
+                    "at": event_time.isoformat(),
+                    "initiator": initiator,
+                    "request_id": request_id,
+                    "type": "started",
+                }
+            )
+            return
         self._active_requests[request_id] = {
             "initiator": initiator,
             "started_at": event_time.isoformat(),
