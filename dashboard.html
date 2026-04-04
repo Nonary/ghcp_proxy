@@ -286,8 +286,13 @@
               <div :class="['status', codexProxyStatusClass('codex')]">{{ codexProxyStatusLabel('codex') }}</div>
               <div class="subtle">{{ clientProxyStatus.codex.path }}</div>
               <div class="toolbar">
-                <button class="primary" @click="installClientProxy('codex')" :disabled="savingProxyConfig">Install for Codex</button>
-                <button @click="disableClientProxy('codex')" :disabled="savingProxyConfig">Disable for Codex</button>
+                <button
+                  :class="clientProxyStatus.codex.configured ? '' : 'primary'"
+                  @click="toggleClientProxy('codex')"
+                  :disabled="savingProxyConfig || Boolean(clientProxyStatus.codex.error)"
+                >
+                  {{ clientProxyStatus.codex.configured ? 'Disable for Codex' : 'Enable for Codex' }}
+                </button>
               </div>
               <div v-if="clientProxyStatus.codex.error" class="status error">{{ clientProxyStatus.codex.error }}</div>
               <div v-else-if="clientProxyStatus.codex.backup_path" class="subtle">Latest backup: {{ clientProxyStatus.codex.backup_path }}</div>
@@ -297,16 +302,21 @@
               <div :class="['status', codexProxyStatusClass('claude')]">{{ codexProxyStatusLabel('claude') }}</div>
               <div class="subtle">{{ clientProxyStatus.claude.path }}</div>
               <div class="toolbar">
-                <button class="primary" @click="installClientProxy('claude')" :disabled="savingProxyConfig">Install for Claude</button>
-                <button @click="disableClientProxy('claude')" :disabled="savingProxyConfig">Disable for Claude</button>
+                <button
+                  :class="clientProxyStatus.claude.configured ? '' : 'primary'"
+                  @click="toggleClientProxy('claude')"
+                  :disabled="savingProxyConfig || Boolean(clientProxyStatus.claude.error)"
+                >
+                  {{ clientProxyStatus.claude.configured ? 'Disable for Claude' : 'Enable for Claude' }}
+                </button>
               </div>
               <div v-if="clientProxyStatus.claude.error" class="status error">{{ clientProxyStatus.claude.error }}</div>
               <div v-else-if="clientProxyStatus.claude.backup_path" class="subtle">Latest backup: {{ clientProxyStatus.claude.backup_path }}</div>
             </article>
           </div>
           <div class="toolbar" style="margin-top: 10px;">
-            <button class="primary" @click="installClientProxy('both')" :disabled="savingProxyConfig">Install for Both</button>
-            <button @click="disableClientProxy('both')" :disabled="savingProxyConfig">Disable for Both</button>
+            <button class="primary" @click="enableAllClientProxy" :disabled="savingProxyConfig || allClientProxyConfigured || anyClientProxyError">Enable All</button>
+            <button @click="disableAllClientProxy" :disabled="savingProxyConfig || noClientProxyConfigured || anyClientProxyError">Disable All</button>
           </div>
           <div v-if="proxyConfigError" class="status error">{{ proxyConfigError }}</div>
           <div v-else-if="proxyConfigStatusMessage" class="status good">{{ proxyConfigStatusMessage }}</div>
@@ -352,6 +362,7 @@
       data() {
         return {
           loading: false,
+          autoRefreshTimer: null,
           savingBillingToken: false,
           loadingClientProxyStatus: false,
           savingProxyConfig: false,
@@ -458,6 +469,15 @@
         },
         monthHistory() {
           return (this.data.month_history || []).slice(0, 8);
+        },
+        anyClientProxyError() {
+          return Boolean(this.clientProxyStatus.codex?.error || this.clientProxyStatus.claude?.error);
+        },
+        allClientProxyConfigured() {
+          return Boolean(this.clientProxyStatus.codex?.configured && this.clientProxyStatus.claude?.configured);
+        },
+        noClientProxyConfigured() {
+          return !this.clientProxyStatus.codex?.configured && !this.clientProxyStatus.claude?.configured;
         },
       },
       methods: {
@@ -583,7 +603,7 @@
             } else {
               const defaultMessage = action === 'disable'
                 ? `Proxy disabled for ${normalizedTargets.join(', ')}`
-                : `Wrote proxy settings for ${normalizedTargets.join(', ')}`;
+                : `Proxy enabled for ${normalizedTargets.join(', ')}`;
               this.proxyConfigStatusMessage = payload?.message || defaultMessage;
             }
           } catch (error) {
@@ -592,11 +612,16 @@
             this.savingProxyConfig = false;
           }
         },
-        async installClientProxy(target) {
-          return this.configureClientProxy(target, 'install');
+        async toggleClientProxy(target) {
+          const state = this.clientProxyStatus[target];
+          const action = state?.configured ? 'disable' : 'enable';
+          return this.configureClientProxy(target, action);
         },
-        async disableClientProxy(target) {
-          return this.configureClientProxy(target, 'disable');
+        async enableAllClientProxy() {
+          return this.configureClientProxy('both', 'enable');
+        },
+        async disableAllClientProxy() {
+          return this.configureClientProxy('both', 'disable');
         },
         async loadBillingTokenConfig() {
           try {
@@ -691,9 +716,16 @@
           return sorted.sort((a, b) => String(b[dateKey] || b.started_at || '').localeCompare(String(a[dateKey] || a.started_at || '')));
         },
         async load(forceRefresh = false) {
+          if (this.loading) return;
           this.loading = true;
           try {
-            const response = await fetch(`/api/dashboard${forceRefresh ? '?refresh=1' : ''}`);
+            const params = new URLSearchParams();
+            if (forceRefresh) {
+              params.set('refresh', '1');
+              params.set('_', String(Date.now()));
+            }
+            const query = params.toString();
+            const response = await fetch(`/api/dashboard${query ? `?${query}` : ''}`);
             if (!response.ok) throw new Error(`dashboard request failed: ${response.status}`);
             this.data = await response.json();
           } catch (error) {
@@ -704,10 +736,16 @@
         },
       },
       mounted() {
-        this.load();
+        this.load(true);
         this.loadBillingTokenConfig();
         this.loadClientProxyStatus();
-        window.setInterval(() => this.load(false), 15000);
+        this.autoRefreshTimer = window.setInterval(() => this.load(true), 60000);
+      },
+      beforeUnmount() {
+        if (this.autoRefreshTimer) {
+          window.clearInterval(this.autoRefreshTimer);
+          this.autoRefreshTimer = null;
+        }
       },
     }).mount('#app');
   </script>

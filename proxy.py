@@ -33,6 +33,7 @@ import httpx
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
+from initiator_policy import InitiatorPolicy
 
 app = FastAPI()
 
@@ -46,7 +47,6 @@ GITHUB_COPILOT_API_BASE = "https://api.githubcopilot.com"
 OPENCODE_VERSION = "1.3.13"
 OPENCODE_HEADER_VERSION = "OpenCode/1.0"
 OPENCODE_INTEGRATION_ID = "vscode-chat"
-USER_INITIATOR_PREFIX = "+"
 UPSTREAM_REQUESTS_PER_WINDOW = 5
 UPSTREAM_REQUEST_WINDOW_SECONDS = 1.0
 
@@ -183,6 +183,7 @@ _upstream_rate_limit_lock = asyncio.Lock()
 _upstream_request_timestamps = deque()
 _usage_log_lock = Lock()
 _recent_usage_events = deque(maxlen=MAX_STORED_USAGE_EVENTS)
+_initiator_policy = InitiatorPolicy()
 _ccusage_cache_lock = Lock()
 _sqlite_cache_lock = Lock()
 _sqlite_cache_enabled = True
@@ -836,9 +837,10 @@ def _start_usage_event(
     requested_model: str | None,
     resolved_model: str | None,
     initiator: str | None,
+    request_id: str | None = None,
 ) -> dict:
-    return {
-        "request_id": uuid4().hex,
+    event = {
+        "request_id": request_id or uuid4().hex,
         "started_at": _utc_now_iso(),
         "path": request.url.path,
         "method": request.method,
@@ -849,16 +851,23 @@ def _start_usage_event(
         "client_request_id": request.headers.get("x-client-request-id"),
         "subagent": request.headers.get("x-openai-subagent"),
     }
+    return event
 
 
 def _finish_usage_event(event: dict | None, status_code: int):
-    if not isinstance(event, dict) or status_code >= 400:
+    if not isinstance(event, dict):
+        return
+
+    finished_at = _utc_now()
+    _initiator_policy.note_request_finished(event.get("request_id"), finished_at=finished_at)
+
+    if status_code >= 400:
         return
 
     model_name = event.get("resolved_model") or event.get("requested_model")
     finished_event = {
         **event,
-        "finished_at": _utc_now_iso(),
+        "finished_at": finished_at.isoformat(),
         "status_code": status_code,
         "premium_requests": _premium_request_multiplier(model_name),
     }
@@ -1126,7 +1135,10 @@ def _seed_cached_payloads_from_sqlite():
 
 
 def _get_official_premium_payload(force_refresh: bool = False) -> dict:
-    _trigger_official_premium_refresh(force=force_refresh)
+    if force_refresh:
+        _refresh_official_premium_cache_sync()
+    else:
+        _trigger_official_premium_refresh(force=False)
     with _premium_cache_lock:
         payload = _premium_cache.get("payload") or _empty_official_premium_payload()
         age_seconds = None
@@ -1353,6 +1365,7 @@ def _build_dashboard_payload(force_refresh: bool = False) -> dict:
 
 
 _load_usage_history()
+_initiator_policy.seed_from_usage_events(_snapshot_usage_events())
 _seed_cached_payloads_from_sqlite()
 _trigger_ccusage_refresh()
 
@@ -1529,6 +1542,18 @@ def _codex_proxy_status() -> dict[str, bool | str | None]:
     return status
 
 
+def _empty_proxy_status(client: str, path: str) -> dict[str, bool | str | None]:
+    return {
+        "client": client,
+        "configured": False,
+        "exists": False,
+        "path": path,
+        "backup_path": None,
+        "error": "",
+        "status_message": "unknown",
+    }
+
+
 def _claude_proxy_status() -> dict[str, bool | str | None]:
     status = {
         "client": "claude",
@@ -1574,6 +1599,14 @@ def _claude_proxy_status() -> dict[str, bool | str | None]:
 
 
 def _write_codex_proxy_config() -> dict[str, bool | str | None]:
+    status = _codex_proxy_status()
+    if status.get("error"):
+        return status
+    if status.get("configured"):
+        status["backup_path"] = _latest_backup_path(CODEX_CONFIG_FILE)
+        status["status_message"] = "proxy already enabled"
+        return status
+
     backup_path = _backup_config_file(CODEX_CONFIG_FILE)
     os.makedirs(CODEX_CONFIG_DIR, exist_ok=True)
     with open(CODEX_CONFIG_FILE, "w", encoding="utf-8") as f:
@@ -1586,6 +1619,14 @@ def _write_codex_proxy_config() -> dict[str, bool | str | None]:
 
 
 def _write_claude_proxy_settings() -> dict[str, bool | str | None]:
+    status = _claude_proxy_status()
+    if status.get("error"):
+        return status
+    if status.get("configured"):
+        status["backup_path"] = _latest_backup_path(CLAUDE_SETTINGS_FILE)
+        status["status_message"] = "proxy already enabled"
+        return status
+
     backup_path = _backup_config_file(CLAUDE_SETTINGS_FILE)
     os.makedirs(CLAUDE_CONFIG_DIR, exist_ok=True)
     with open(CLAUDE_SETTINGS_FILE, "w", encoding="utf-8") as f:
@@ -1600,19 +1641,16 @@ def _write_claude_proxy_settings() -> dict[str, bool | str | None]:
 def _disable_client_proxy_config(config_path: str, status_fn) -> dict[str, bool | str | None]:
     status = status_fn()
     if not isinstance(status, dict):
-        status = {
-            "client": "unknown",
-            "configured": False,
-            "exists": False,
-            "path": config_path,
-            "backup_path": None,
-            "error": "",
-            "status_message": "unknown",
-        }
+        status = _empty_proxy_status("unknown", config_path)
     if status.get("error"):
         return status
     if not isinstance(config_path, str) or not config_path:
         status["error"] = "invalid config path"
+        return status
+    if not status.get("configured"):
+        status["backup_path"] = _latest_backup_path(config_path)
+        status["restored_from_backup"] = False
+        status["status_message"] = "proxy already disabled"
         return status
 
     backup_path = _latest_backup_path(config_path)
@@ -1841,19 +1879,6 @@ def build_copilot_headers(api_key: str) -> dict:
 
 # ─── Responses API helpers ────────────────────────────────────────────────────
 
-def _strip_user_initiator_prefix(text: str) -> tuple[str, str]:
-    if not isinstance(text, str):
-        return text, "agent"
-
-    stripped = text.lstrip()
-    if not stripped.startswith(USER_INITIATOR_PREFIX):
-        return text, "agent"
-
-    normalized = stripped[len(USER_INITIATOR_PREFIX) :]
-    if normalized.startswith(" "):
-        normalized = normalized[1:]
-    return normalized, "user"
-
 
 def _initiator_log_label(initiator: str | None) -> str:
     return "Agent" if initiator == "agent" else "User"
@@ -1931,59 +1956,6 @@ def _extract_item_text(item) -> str:
     if isinstance(item.get("input_text"), str):
         return item["input_text"]
     return ""
-
-
-def _strip_user_initiator_prefix_from_item(item) -> str:
-    if not isinstance(item, dict):
-        return "agent"
-
-    content = item.get("content")
-    if isinstance(content, str):
-        updated_text, initiator = _strip_user_initiator_prefix(content)
-        if initiator == "user":
-            item["content"] = updated_text
-        return initiator
-
-    if isinstance(content, list):
-        for entry in content:
-            if not isinstance(entry, dict):
-                continue
-            for key in ("text", "input_text"):
-                value = entry.get(key)
-                if not isinstance(value, str):
-                    continue
-                updated_text, initiator = _strip_user_initiator_prefix(value)
-                if initiator == "user":
-                    entry[key] = updated_text
-                    return initiator
-        return "agent"
-
-    for key in ("text", "input_text"):
-        value = item.get(key)
-        if not isinstance(value, str):
-            continue
-        updated_text, initiator = _strip_user_initiator_prefix(value)
-        if initiator == "user":
-            item[key] = updated_text
-            return initiator
-    return "agent"
-
-
-def determine_initiator(input_param) -> tuple[object, str]:
-    if isinstance(input_param, str):
-        normalized_input, initiator = _strip_user_initiator_prefix(input_param)
-        return normalized_input, initiator
-
-    if isinstance(input_param, list):
-        for item in reversed(input_param):
-            if not isinstance(item, dict):
-                continue
-            if str(item.get("role", "")).lower() == "user":
-                return input_param, _strip_user_initiator_prefix_from_item(item)
-
-    return input_param, "agent"
-
-
 def has_vision_input(value, depth=0, max_depth=10) -> bool:
     """Recursively find type='input_image' anywhere in the input tree."""
     if depth > max_depth or value is None:
@@ -2736,19 +2708,20 @@ async def proxy_anthropic_streaming_response(
     )
 
 
-def build_chat_headers_for_request(request: Request, messages, model_name: str, api_key: str) -> dict:
+def build_chat_headers_for_request(
+    request: Request,
+    messages,
+    model_name: str,
+    api_key: str,
+    request_id: str | None = None,
+) -> dict:
     headers = build_copilot_headers(api_key)
     for header_name in FORWARDED_REQUEST_HEADERS:
         header_value = request.headers.get(header_name)
         if header_value:
             headers[header_name] = header_value
 
-    initiator = "agent"
-    if isinstance(messages, list):
-        for msg in reversed(messages):
-            if isinstance(msg, dict) and str(msg.get("role", "")).lower() == "user":
-                initiator = _strip_user_initiator_prefix_from_item(msg)
-                break
+    initiator = _initiator_policy.resolve_chat_messages(messages, model_name, request_id=request_id)
     headers["X-Initiator"] = initiator
 
     if isinstance(messages, list):
@@ -2768,37 +2741,6 @@ def build_chat_headers_for_request(request: Request, messages, model_name: str, 
         headers["anthropic-beta"] = "interleaved-thinking-2025-05-14"
 
     return headers
-
-
-def _strip_user_initiator_prefix_from_anthropic_message(message) -> str:
-    if not isinstance(message, dict):
-        return "agent"
-
-    content = message.get("content")
-    if isinstance(content, str):
-        updated_text, initiator = _strip_user_initiator_prefix(content)
-        if initiator == "user":
-            message["content"] = updated_text
-        return initiator
-
-    if not isinstance(content, list):
-        return "agent"
-
-    for item in content:
-        if not isinstance(item, dict):
-            continue
-        if str(item.get("type", "")).lower() != "text":
-            continue
-        text = item.get("text")
-        if not isinstance(text, str):
-            continue
-        updated_text, initiator = _strip_user_initiator_prefix(text)
-        if initiator == "user":
-            item["text"] = updated_text
-            return initiator
-    return "agent"
-
-
 def _anthropic_messages_has_vision(messages) -> bool:
     if not isinstance(messages, list):
         return False
@@ -2821,7 +2763,12 @@ def _anthropic_messages_has_vision(messages) -> bool:
     return False
 
 
-def build_anthropic_headers_for_request(request: Request, body: dict, api_key: str) -> dict:
+def build_anthropic_headers_for_request(
+    request: Request,
+    body: dict,
+    api_key: str,
+    request_id: str | None = None,
+) -> dict:
     headers = build_copilot_headers(api_key)
     for header_name in FORWARDED_REQUEST_HEADERS:
         header_value = request.headers.get(header_name)
@@ -2829,12 +2776,7 @@ def build_anthropic_headers_for_request(request: Request, body: dict, api_key: s
             headers[header_name] = header_value
 
     messages = body.get("messages")
-    initiator = "agent"
-    if isinstance(messages, list):
-        for message in reversed(messages):
-            if isinstance(message, dict) and str(message.get("role", "")).lower() == "user":
-                initiator = _strip_user_initiator_prefix_from_anthropic_message(message)
-                break
+    initiator = _initiator_policy.resolve_anthropic_messages(messages, body.get("model"), request_id=request_id)
     headers["X-Initiator"] = initiator
 
     if _anthropic_messages_has_vision(messages):
@@ -2993,6 +2935,7 @@ def build_responses_headers_for_request(
     body: dict,
     api_key: str,
     force_initiator: str | None = None,
+    request_id: str | None = None,
 ) -> dict:
     headers = build_copilot_headers(api_key)
     for header_name in FORWARDED_REQUEST_HEADERS:
@@ -3001,11 +2944,14 @@ def build_responses_headers_for_request(
             headers[header_name] = header_value
 
     had_input = "input" in body
-    effective_input, initiator = determine_initiator(body.get("input"))
+    effective_input, initiator = _initiator_policy.resolve_responses_input(
+        body.get("input"),
+        body.get("model"),
+        force_initiator=force_initiator,
+        request_id=request_id,
+    )
     if had_input:
         body["input"] = effective_input
-    if force_initiator in {"user", "agent"}:
-        initiator = force_initiator
     headers["X-Initiator"] = initiator
 
     if has_vision_input(effective_input):
@@ -3171,13 +3117,15 @@ async def client_proxy_install_api(request: Request):
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="Request body must be an object")
     targets = _normalize_proxy_targets(payload)
-    action = payload.get("action", "install")
+    action = payload.get("action", "enable")
     if not isinstance(action, str):
-        raise HTTPException(status_code=400, detail='Action must be "install" or "disable".')
+        raise HTTPException(status_code=400, detail='Action must be "enable" or "disable".')
 
     action = action.strip().lower()
-    if action not in {"install", "disable"}:
-        raise HTTPException(status_code=400, detail='Unsupported action. Use "install" or "disable".')
+    if action == "install":
+        action = "enable"
+    if action not in {"enable", "disable"}:
+        raise HTTPException(status_code=400, detail='Unsupported action. Use "enable" or "disable".')
 
     clients = {}
 
@@ -3193,22 +3141,19 @@ async def client_proxy_install_api(request: Request):
             else:
                 clients[target] = _write_claude_proxy_settings()
         except Exception as exc:
-            clients[target] = {
-                "client": target,
-                "configured": False,
-                "exists": False,
-                "path": CODEX_CONFIG_FILE if target == "codex" else CLAUDE_SETTINGS_FILE,
-                "backup_path": None,
-                "error": str(exc),
-                "status_message": "failed to write config",
-            }
+            clients[target] = _empty_proxy_status(
+                target,
+                CODEX_CONFIG_FILE if target == "codex" else CLAUDE_SETTINGS_FILE,
+            )
+            clients[target]["error"] = str(exc)
+            clients[target]["status_message"] = "failed to write config"
 
     return JSONResponse(
         content={
             "clients": clients,
             "message": (
                 "Proxy enabled for: "
-                if action == "install"
+                if action == "enable"
                 else "Proxy disabled for: "
             )
             + (
@@ -3266,11 +3211,17 @@ async def proxy_streaming_response(
     """
     client = httpx.AsyncClient(timeout=timeout)
     request = client.build_request("POST", upstream_url, headers=headers, json=body)
-    upstream = await throttled_client_send(client, request, stream=True)
+    try:
+        upstream = await throttled_client_send(client, request, stream=True)
+    except Exception:
+        _finish_usage_event(usage_event, 599)
+        await client.aclose()
+        raise
 
     if upstream.status_code >= 400:
         try:
             await upstream.aread()
+            _finish_usage_event(usage_event, upstream.status_code)
             return proxy_non_streaming_response(upstream)
         finally:
             await upstream.aclose()
@@ -3281,13 +3232,12 @@ async def proxy_streaming_response(
     if content_type:
         response_headers["content-type"] = content_type
 
-    _finish_usage_event(usage_event, upstream.status_code)
-
     async def stream_upstream():
         try:
             async for chunk in upstream.aiter_bytes():
                 yield chunk
         finally:
+            _finish_usage_event(usage_event, upstream.status_code)
             await upstream.aclose()
             await client.aclose()
 
@@ -3303,6 +3253,7 @@ async def proxy_streaming_response(
 @app.post("/v1/responses")
 async def responses(request: Request):
     body = await parse_json_request(request)
+    request_id = uuid4().hex
 
     # Sanitize input (multi-turn encrypted_content passthrough)
     raw_input = body.get("input")
@@ -3320,24 +3271,36 @@ async def responses(request: Request):
         body,
         api_key,
         force_initiator="agent" if has_compaction_input else None,
+        request_id=request_id,
     )
     upstream_url = f"{_get_api_base().rstrip('/')}/responses"
     is_streaming = body.get("stream", False)
     log_proxy_request(request, body.get("model"), body.get("model"), headers.get("X-Initiator"))
-    usage_event = _start_usage_event(request, body.get("model"), body.get("model"), headers.get("X-Initiator"))
+    usage_event = _start_usage_event(
+        request,
+        body.get("model"),
+        body.get("model"),
+        headers.get("X-Initiator"),
+        request_id=request_id,
+    )
 
     if is_streaming:
         return await proxy_streaming_response(upstream_url, headers, body, timeout=300, usage_event=usage_event)
     else:
-        async with httpx.AsyncClient(timeout=120) as client:
-            upstream = await throttled_client_post(client, upstream_url, headers=headers, json=body)
-        _finish_usage_event(usage_event, upstream.status_code)
-        return proxy_non_streaming_response(upstream)
+        try:
+            async with httpx.AsyncClient(timeout=120) as client:
+                upstream = await throttled_client_post(client, upstream_url, headers=headers, json=body)
+            _finish_usage_event(usage_event, upstream.status_code)
+            return proxy_non_streaming_response(upstream)
+        except Exception:
+            _finish_usage_event(usage_event, 599)
+            raise
 
 
 @app.post("/v1/responses/compact")
 async def responses_compact(request: Request):
     body = await parse_json_request(request)
+    request_id = uuid4().hex
 
     try:
         api_key = get_api_key()
@@ -3345,15 +3308,30 @@ async def responses_compact(request: Request):
         raise HTTPException(status_code=401, detail=f"GHCP auth failed: {e}")
 
     summary_request = build_fake_compaction_request(body)
-    headers = build_responses_headers_for_request(request, summary_request, api_key, force_initiator="agent")
+    headers = build_responses_headers_for_request(
+        request,
+        summary_request,
+        api_key,
+        force_initiator="agent",
+        request_id=request_id,
+    )
     upstream_url = f"{_get_api_base().rstrip('/')}/responses"
     log_proxy_request(request, body.get("model"), summary_request.get("model"), headers.get("X-Initiator"))
-    usage_event = _start_usage_event(request, body.get("model"), summary_request.get("model"), headers.get("X-Initiator"))
+    usage_event = _start_usage_event(
+        request,
+        body.get("model"),
+        summary_request.get("model"),
+        headers.get("X-Initiator"),
+        request_id=request_id,
+    )
 
-    async with httpx.AsyncClient(timeout=120) as client:
-        upstream = await throttled_client_post(client, upstream_url, headers=headers, json=summary_request)
-
-    _finish_usage_event(usage_event, upstream.status_code)
+    try:
+        async with httpx.AsyncClient(timeout=120) as client:
+            upstream = await throttled_client_post(client, upstream_url, headers=headers, json=summary_request)
+        _finish_usage_event(usage_event, upstream.status_code)
+    except Exception:
+        _finish_usage_event(usage_event, 599)
+        raise
 
     if upstream.status_code >= 400:
         return proxy_non_streaming_response(upstream)
@@ -3382,6 +3360,7 @@ async def chat_completions(request: Request):
     Codex does NOT use this endpoint — it uses /v1/responses above.
     """
     body = await parse_json_request(request)
+    request_id = uuid4().hex
 
     messages = body.get("messages", [])
 
@@ -3390,20 +3369,30 @@ async def chat_completions(request: Request):
     except Exception as e:
         raise HTTPException(status_code=401, detail=f"GHCP auth failed: {e}")
 
-    headers = build_chat_headers_for_request(request, messages, body.get("model"), api_key)
+    headers = build_chat_headers_for_request(request, messages, body.get("model"), api_key, request_id=request_id)
 
     upstream_url = f"{_get_api_base().rstrip('/')}/chat/completions"
     is_streaming = body.get("stream", False)
     log_proxy_request(request, body.get("model"), body.get("model"), headers.get("X-Initiator"))
-    usage_event = _start_usage_event(request, body.get("model"), body.get("model"), headers.get("X-Initiator"))
+    usage_event = _start_usage_event(
+        request,
+        body.get("model"),
+        body.get("model"),
+        headers.get("X-Initiator"),
+        request_id=request_id,
+    )
 
     if is_streaming:
         return await proxy_streaming_response(upstream_url, headers, body, timeout=300, usage_event=usage_event)
     else:
-        async with httpx.AsyncClient(timeout=120) as client:
-            upstream = await throttled_client_post(client, upstream_url, headers=headers, json=body)
-        _finish_usage_event(usage_event, upstream.status_code)
-        return proxy_non_streaming_response(upstream)
+        try:
+            async with httpx.AsyncClient(timeout=120) as client:
+                upstream = await throttled_client_post(client, upstream_url, headers=headers, json=body)
+            _finish_usage_event(usage_event, upstream.status_code)
+            return proxy_non_streaming_response(upstream)
+        except Exception:
+            _finish_usage_event(usage_event, 599)
+            raise
 
 
 @app.post("/v1/messages")
@@ -3414,6 +3403,7 @@ async def anthropic_messages(request: Request):
     only adjusting headers and model fallback when necessary.
     """
     body = await parse_json_request(request)
+    request_id = uuid4().hex
 
     try:
         api_key = get_api_key()
@@ -3423,20 +3413,28 @@ async def anthropic_messages(request: Request):
     api_base = _get_api_base()
     resolved_model = resolve_copilot_model_name(body.get("model"))
     outbound_body = prepare_anthropic_outbound_body(body, resolved_model)
-    headers = build_anthropic_headers_for_request(request, outbound_body, api_key)
+    headers = build_anthropic_headers_for_request(request, outbound_body, api_key, request_id=request_id)
     upstream_url = f"{api_base.rstrip('/')}/v1/messages"
     log_proxy_request(request, body.get("model"), outbound_body.get("model"), headers.get("X-Initiator"))
-    usage_event = _start_usage_event(request, body.get("model"), outbound_body.get("model"), headers.get("X-Initiator"))
+    usage_event = _start_usage_event(
+        request,
+        body.get("model"),
+        outbound_body.get("model"),
+        headers.get("X-Initiator"),
+        request_id=request_id,
+    )
 
     if outbound_body.get("stream"):
         return await proxy_streaming_response(upstream_url, headers, outbound_body, timeout=300, usage_event=usage_event)
 
-    async with httpx.AsyncClient(timeout=120) as client:
-        upstream = await throttled_client_post(client, upstream_url, headers=headers, json=outbound_body)
-
-    _finish_usage_event(usage_event, upstream.status_code)
-
-    return proxy_non_streaming_response(upstream)
+    try:
+        async with httpx.AsyncClient(timeout=120) as client:
+            upstream = await throttled_client_post(client, upstream_url, headers=headers, json=outbound_body)
+        _finish_usage_event(usage_event, upstream.status_code)
+        return proxy_non_streaming_response(upstream)
+    except Exception:
+        _finish_usage_event(usage_event, 599)
+        raise
 
 
 # ─── Entrypoint ───────────────────────────────────────────────────────────────

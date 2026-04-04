@@ -14,6 +14,14 @@ Local reverse proxy for Codex and Claude Code using GitHub Copilot upstream.
 
 ## Run It
 
+For a quick macOS setup, assuming `python3`, `node`, and `npx` are already installed:
+
+```bash
+./install_macos.sh
+```
+
+That creates a local `.venv`, installs the Python dependencies, and leaves Codex/Claude activation to the dashboard so the backup-aware switch behavior is preserved.
+
 From `~/sources/codex-proxy`:
 
 ```bash
@@ -57,32 +65,11 @@ Important:
 - `wire_api` must be `"responses"`
 - `base_url` must point at the local proxy
 
-## Add Codex Instructions
-
-It is still useful to configure `~/.codex/AGENTS.md`.
-
-That file helps the terminal handle long-running work and follow-up turns more cleanly, even though the proxy now defaults requests to agent traffic unless you explicitly opt into a user request with `+`.
-
-From `~/sources/codex-proxy`:
-
-```bash
-cp AGENTS.md ~/.codex/AGENTS.md
-```
-
 ## Configure Claude Code
 
 Claude Code can use the same proxy, but the setup is different from Codex:
 
-- copy this repo's `AGENTS.md` to `~/.claude/CLAUDE.md`
 - create `~/.claude/settings.json` if it does not already exist
-
-It is still useful to configure `~/.claude/CLAUDE.md` for the same reason.
-
-From `~/sources/codex-proxy`:
-
-```bash
-cp AGENTS.md ~/.claude/CLAUDE.md
-```
 
 Recommended `~/.claude/settings.json`:
 
@@ -101,7 +88,6 @@ Important:
 
 - `ANTHROPIC_BASE_URL` should point at the proxy root, not `/v1`
 - `ANTHROPIC_AUTH_TOKEN` can be any placeholder string because the proxy handles upstream auth
-- Claude should use the same instruction file content, but the file must be named `CLAUDE.md`
 
 ## Billing Behavior
 
@@ -109,9 +95,11 @@ This repo is designed to bill like normal GitHub Copilot usage as closely as pos
 
 The basic idea is simple:
 
-- every request is sent as agent traffic by default
-- if you want a request treated as a user request, prefix the prompt with `+`
-- the proxy strips that leading `+` before forwarding the prompt upstream
+- normal requests are treated as user traffic
+- if you want a request treated as agent traffic, prefix the prompt with `_`
+- the proxy strips that leading `_` before forwarding the prompt upstream
+- Claude Haiku requests are always treated as agent traffic
+- the first unprefixed request is user traffic
 - tool calls themselves are free
 
 Examples:
@@ -120,30 +108,43 @@ Examples:
 refactor the parser and run tests
 ```
 
-This is sent as agent traffic.
+This is sent as user traffic.
 
 ```text
-+explain the parser architecture first
+_continue the tool-driven fix
 ```
 
-This is sent as a user request, and the upstream model receives `explain the parser architecture first`.
+This is sent as agent traffic, and the upstream model receives `continue the tool-driven fix`.
 
-## Practical Use Of `+`
+## Practical Use Of `_`
 
-Use `+` only when you explicitly want user initiator semantics for that request.
+Use `_` only when you explicitly want agent initiator semantics for that request.
 
 Example:
 
 ```text
-+finish the refactor and run the tests
+_finish the refactor and run the tests
 ```
 
 Use this sparingly.
 
-- use `+` when you want that specific request treated as user traffic
-- omit `+` when you want the request treated as agent traffic
-- remember that the leading `+` is removed before forwarding upstream
+- omit `_` when you want that specific request treated as user traffic
+- use `_` when you want the request treated as agent traffic
+- Claude Haiku requests are always treated as agent traffic
+- while any proxied request is still active, the next user-looking request is forced to agent traffic
+- after any proxied activity, the safeguard stays active for 15 more seconds and refreshes again on the next request start or finish
+- remember that the leading `_` is removed before forwarding upstream
 - be pragmatic
+
+## Proxy Activation
+
+The dashboard activation controls are meant to behave like a light switch.
+
+- enabling a client that is already enabled is a no-op
+- disabling a client that is already disabled is a no-op
+- an existing config is backed up only when the proxy first replaces it
+- disabling restores the latest backup when one exists
+- if no backup exists, disabling removes the proxy-managed config
 
 ## Dashboard Data Sources
 

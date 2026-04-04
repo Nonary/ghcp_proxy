@@ -1,13 +1,19 @@
 import unittest
+import tempfile
 from datetime import datetime, timezone
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+import initiator_policy
 import proxy
 
 
 class ProxyInitiatorTests(unittest.TestCase):
-    def test_responses_requests_default_to_agent(self):
+    def setUp(self):
+        proxy._initiator_policy = initiator_policy.InitiatorPolicy()
+
+    def test_responses_requests_default_to_user(self):
         request = SimpleNamespace(url=SimpleNamespace(path="/v1/responses"), headers={})
         body = {
             "model": "gpt-5",
@@ -16,27 +22,27 @@ class ProxyInitiatorTests(unittest.TestCase):
 
         headers = proxy.build_responses_headers_for_request(request, body, "test-key")
 
-        self.assertEqual(headers["X-Initiator"], "agent")
+        self.assertEqual(headers["X-Initiator"], "user")
         self.assertEqual(body["input"], "hello")
 
-    def test_plus_prefixed_responses_string_is_user_and_stripped(self):
+    def test_underscore_prefixed_responses_string_is_agent_and_stripped(self):
         request = SimpleNamespace(url=SimpleNamespace(path="/v1/responses"), headers={})
         body = {
             "model": "gpt-5",
-            "input": "+hello",
+            "input": "_hello",
         }
 
         headers = proxy.build_responses_headers_for_request(request, body, "test-key")
 
-        self.assertEqual(headers["X-Initiator"], "user")
+        self.assertEqual(headers["X-Initiator"], "agent")
         self.assertEqual(body["input"], "hello")
 
-    def test_only_latest_responses_user_item_can_opt_out_to_user(self):
+    def test_only_latest_responses_user_item_controls_agent_prefix(self):
         request = SimpleNamespace(url=SimpleNamespace(path="/v1/responses"), headers={})
         body = {
             "model": "gpt-5",
             "input": [
-                {"role": "user", "content": "+old request"},
+                {"role": "user", "content": "_old request"},
                 {"role": "assistant", "content": "done"},
                 {"role": "user", "content": "new request"},
             ],
@@ -44,36 +50,36 @@ class ProxyInitiatorTests(unittest.TestCase):
 
         headers = proxy.build_responses_headers_for_request(request, body, "test-key")
 
-        self.assertEqual(headers["X-Initiator"], "agent")
+        self.assertEqual(headers["X-Initiator"], "user")
         self.assertEqual(body["input"][-1]["content"], "new request")
 
-    def test_chat_plus_prefixed_user_message_is_user_and_stripped(self):
+    def test_chat_underscore_prefixed_user_message_is_agent_and_stripped(self):
         request = SimpleNamespace(url=SimpleNamespace(path="/v1/chat/completions"), headers={})
         messages = [
             {"role": "assistant", "content": "prior work"},
-            {"role": "user", "content": "+finish the task"},
+            {"role": "user", "content": "_finish the task"},
         ]
 
         headers = proxy.build_chat_headers_for_request(request, messages, "gpt-4.1", "test-key")
 
-        self.assertEqual(headers["X-Initiator"], "user")
+        self.assertEqual(headers["X-Initiator"], "agent")
         self.assertEqual(messages[-1]["content"], "finish the task")
 
-    def test_anthropic_plus_prefixed_user_message_is_user_and_stripped(self):
+    def test_anthropic_underscore_prefixed_user_message_is_agent_and_stripped(self):
         request = SimpleNamespace(url=SimpleNamespace(path="/v1/messages"), headers={})
         body = {
             "model": "claude-sonnet-4.6",
             "messages": [
                 {
                     "role": "user",
-                    "content": [{"type": "text", "text": "+hello"}],
+                    "content": [{"type": "text", "text": "_hello"}],
                 }
             ],
         }
 
         headers = proxy.build_anthropic_headers_for_request(request, body, "test-key")
 
-        self.assertEqual(headers["X-Initiator"], "user")
+        self.assertEqual(headers["X-Initiator"], "agent")
         self.assertEqual(body["messages"][0]["content"][0]["text"], "hello")
 
     def test_prepare_anthropic_outbound_body_strips_nested_cache_control(self):
@@ -110,7 +116,7 @@ class ProxyInitiatorTests(unittest.TestCase):
         request = SimpleNamespace(url=SimpleNamespace(path="/v1/responses"), headers={})
         body = {
             "model": "gpt-5",
-            "input": "+hello",
+            "input": "hello",
         }
 
         headers = proxy.build_responses_headers_for_request(
@@ -122,6 +128,135 @@ class ProxyInitiatorTests(unittest.TestCase):
 
         self.assertEqual(headers["X-Initiator"], "agent")
         self.assertEqual(body["input"], "hello")
+
+    def test_haiku_requests_are_always_agent(self):
+        request = SimpleNamespace(url=SimpleNamespace(path="/v1/responses"), headers={})
+        body = {
+            "model": "claude-haiku-4.5",
+            "input": "hello",
+        }
+
+        headers = proxy.build_responses_headers_for_request(request, body, "test-key")
+
+        self.assertEqual(headers["X-Initiator"], "agent")
+
+    def test_active_request_forces_following_user_request_to_agent(self):
+        policy = initiator_policy.InitiatorPolicy()
+        start = datetime(2026, 4, 4, 18, 0, tzinfo=timezone.utc)
+
+        policy.note_request_started("req-1", "user", started_at=start)
+
+        with mock.patch.object(initiator_policy, "_utc_now", return_value=start.replace(second=5)):
+            self.assertEqual(policy.resolve_initiator("user", "gpt-5"), "agent")
+
+    def test_request_resolution_with_request_id_marks_activity_for_other_requests(self):
+        policy = initiator_policy.InitiatorPolicy()
+        start = datetime(2026, 4, 4, 18, 5, tzinfo=timezone.utc)
+
+        with mock.patch.object(initiator_policy, "_utc_now", return_value=start):
+            self.assertEqual(policy.resolve_initiator("user", "gpt-5", request_id="req-1"), "user")
+
+        with mock.patch.object(initiator_policy, "_utc_now", return_value=start.replace(second=1)):
+            self.assertEqual(policy.resolve_initiator("user", "gpt-5", request_id="req-2"), "agent")
+
+    def test_recent_finished_request_forces_following_user_looking_request_to_agent(self):
+        policy = initiator_policy.InitiatorPolicy()
+        finished_at = datetime(2026, 4, 4, 18, 10, tzinfo=timezone.utc)
+
+        policy.note_request_started("req-1", "user", started_at=finished_at.replace(second=0))
+        policy.note_request_finished("req-1", finished_at=finished_at)
+
+        with mock.patch.object(initiator_policy, "_utc_now", return_value=finished_at.replace(second=10)):
+            self.assertEqual(policy.resolve_initiator("user", "gpt-5"), "agent")
+
+    def test_guard_expires_15_seconds_after_request_finishes(self):
+        policy = initiator_policy.InitiatorPolicy()
+        finished_at = datetime(2026, 4, 4, 18, 20, tzinfo=timezone.utc)
+
+        policy.note_request_started("req-1", "agent", started_at=finished_at.replace(second=0))
+        policy.note_request_finished("req-1", finished_at=finished_at)
+
+        with mock.patch.object(initiator_policy, "_utc_now", return_value=finished_at.replace(second=14)):
+            self.assertEqual(policy.resolve_initiator("user", "gpt-5"), "agent")
+
+        with mock.patch.object(initiator_policy, "_utc_now", return_value=finished_at.replace(second=16)):
+            self.assertEqual(policy.resolve_initiator("user", "gpt-5"), "user")
+
+    def test_any_request_activity_refreshes_the_15_second_timer(self):
+        policy = initiator_policy.InitiatorPolicy()
+        first_finish = datetime(2026, 4, 4, 18, 40, 5, tzinfo=timezone.utc)
+        second_start = datetime(2026, 4, 4, 18, 40, 14, tzinfo=timezone.utc)
+        second_finish = datetime(2026, 4, 4, 18, 40, 18, tzinfo=timezone.utc)
+
+        policy.note_request_started("req-1", "user", started_at=first_finish.replace(second=0))
+        policy.note_request_finished("req-1", finished_at=first_finish)
+
+        policy.note_request_started("req-2", "agent", started_at=second_start)
+        policy.note_request_finished("req-2", finished_at=second_finish)
+
+        with mock.patch.object(initiator_policy, "_utc_now", return_value=datetime(2026, 4, 4, 18, 40, 30, tzinfo=timezone.utc)):
+            self.assertEqual(policy.resolve_initiator("user", "gpt-5"), "agent")
+
+        with mock.patch.object(initiator_policy, "_utc_now", return_value=datetime(2026, 4, 4, 18, 40, 34, tzinfo=timezone.utc)):
+            self.assertEqual(policy.resolve_initiator("user", "gpt-5"), "user")
+
+    def test_stream_like_request_stays_active_until_finished(self):
+        policy = initiator_policy.InitiatorPolicy()
+        started_at = datetime(2026, 4, 4, 18, 30, tzinfo=timezone.utc)
+        finished_at = datetime(2026, 4, 4, 18, 31, tzinfo=timezone.utc)
+
+        policy.note_request_started("stream-1", "user", started_at=started_at)
+
+        with mock.patch.object(initiator_policy, "_utc_now", return_value=finished_at):
+            self.assertEqual(policy.resolve_initiator("user", "gpt-5"), "agent")
+
+        policy.note_request_finished("stream-1", finished_at=finished_at)
+
+        with mock.patch.object(initiator_policy, "_utc_now", return_value=finished_at.replace(second=10)):
+            self.assertEqual(policy.resolve_initiator("user", "gpt-5"), "agent")
+
+        with mock.patch.object(initiator_policy, "_utc_now", return_value=finished_at.replace(second=16)):
+            self.assertEqual(policy.resolve_initiator("user", "gpt-5"), "user")
+
+    def test_enabling_codex_proxy_is_idempotent_when_already_enabled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            config_path.write_text(proxy.CODEX_PROXY_CONFIG + "\n", encoding="utf-8")
+
+            with mock.patch.object(proxy, "CODEX_CONFIG_FILE", str(config_path)):
+                status = proxy._write_codex_proxy_config()
+
+            backups = list(Path(tmp).glob("config.toml.ghcp-proxy.bak.*"))
+            self.assertTrue(status["configured"])
+            self.assertEqual(status["status_message"], "proxy already enabled")
+            self.assertEqual(backups, [])
+
+    def test_disabling_codex_proxy_is_idempotent_when_already_disabled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+
+            with mock.patch.object(proxy, "CODEX_CONFIG_FILE", str(config_path)):
+                status = proxy._disable_codex_proxy_config()
+
+            self.assertFalse(status["configured"])
+            self.assertEqual(status["status_message"], "proxy already disabled")
+            self.assertIsNone(status["backup_path"])
+
+    def test_disabling_codex_proxy_restores_latest_backup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            backup_path = Path(f"{config_path}.ghcp-proxy.bak.20260404_180000")
+            config_path.write_text(proxy.CODEX_PROXY_CONFIG + "\n", encoding="utf-8")
+            backup_contents = 'model_provider = "openai"\n'
+            backup_path.write_text(backup_contents, encoding="utf-8")
+
+            with mock.patch.object(proxy, "CODEX_CONFIG_FILE", str(config_path)):
+                status = proxy._disable_codex_proxy_config()
+
+            self.assertFalse(status["configured"])
+            self.assertTrue(status["restored_from_backup"])
+            self.assertFalse(backup_path.exists())
+            self.assertEqual(config_path.read_text(encoding="utf-8"), backup_contents)
 
     def test_month_key_for_source_rows(self):
         self.assertEqual(proxy._month_key_for_source_row("claude", {"month": "2026-04"}), "2026-04")
