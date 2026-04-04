@@ -1,3 +1,5 @@
+import compression.zstd as pyzstd
+import gzip
 import unittest
 import tempfile
 from datetime import datetime, timezone
@@ -5,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+import httpx
 import initiator_policy
 import proxy
 
@@ -12,6 +15,30 @@ import proxy
 class ProxyInitiatorTests(unittest.TestCase):
     def setUp(self):
         proxy._initiator_policy = initiator_policy.InitiatorPolicy()
+
+    def test_parse_json_request_accepts_gzip_encoded_body(self):
+        raw = gzip.compress(b'{"model":"gpt-5","input":"hello"}')
+        request = SimpleNamespace(
+            headers={"content-encoding": "gzip"},
+            body=mock.AsyncMock(return_value=raw),
+        )
+
+        parsed = proxy.asyncio.run(proxy.parse_json_request(request))
+
+        self.assertEqual(parsed["model"], "gpt-5")
+        self.assertEqual(parsed["input"], "hello")
+
+    def test_parse_json_request_accepts_zstd_encoded_body(self):
+        raw = pyzstd.compress(b'{"model":"gpt-5","input":"hello"}')
+        request = SimpleNamespace(
+            headers={"content-encoding": "zstd"},
+            body=mock.AsyncMock(return_value=raw),
+        )
+
+        parsed = proxy.asyncio.run(proxy.parse_json_request(request))
+
+        self.assertEqual(parsed["model"], "gpt-5")
+        self.assertEqual(parsed["input"], "hello")
 
     def test_responses_requests_default_to_user(self):
         request = SimpleNamespace(url=SimpleNamespace(path="/v1/responses"), headers={})
@@ -82,7 +109,7 @@ class ProxyInitiatorTests(unittest.TestCase):
         self.assertEqual(headers["X-Initiator"], "agent")
         self.assertEqual(body["messages"][0]["content"][0]["text"], "hello")
 
-    def test_prepare_anthropic_outbound_body_strips_nested_cache_control(self):
+    def test_anthropic_request_to_chat_translates_cache_control_to_copilot_cache_control(self):
         body = {
             "model": "claude-sonnet-4.6",
             "system": [
@@ -93,6 +120,7 @@ class ProxyInitiatorTests(unittest.TestCase):
                     "cache_control": {"ephemeral": {"scope": "conversation"}},
                 },
             ],
+            "thinking": {"type": "enabled", "budget_tokens": 4096},
             "messages": [
                 {
                     "role": "user",
@@ -107,10 +135,231 @@ class ProxyInitiatorTests(unittest.TestCase):
             ],
         }
 
-        outbound = proxy.prepare_anthropic_outbound_body(body, "claude-sonnet-4.6")
+        outbound = proxy.asyncio.run(proxy.anthropic_request_to_chat(body, "https://example.invalid", "test-key"))
 
-        self.assertNotIn("cache_control", outbound["system"][1])
-        self.assertNotIn("cache_control", outbound["messages"][0]["content"][0])
+        self.assertEqual(outbound["model"], "claude-sonnet-4.6")
+        self.assertEqual(outbound["thinking_budget"], 4096)
+        self.assertEqual(outbound["messages"][0]["role"], "system")
+        self.assertIsInstance(outbound["messages"][0]["content"], list)
+        self.assertNotIn("stream_options", outbound)
+        self.assertEqual(
+            outbound["messages"][0]["content"][1]["copilot_cache_control"],
+            {"type": "ephemeral"},
+        )
+        self.assertEqual(
+            outbound["messages"][1]["content"][0]["copilot_cache_control"],
+            {"type": "ephemeral"},
+        )
+
+    def test_anthropic_request_to_chat_stream_requests_usage_chunks(self):
+        body = {
+            "model": "claude-sonnet-4.6",
+            "stream": True,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "hello"}],
+                }
+            ],
+        }
+
+        outbound = proxy.asyncio.run(proxy.anthropic_request_to_chat(body, "https://example.invalid", "test-key"))
+
+        self.assertEqual(outbound["stream_options"], {"include_usage": True})
+
+    def test_chat_completion_to_anthropic_maps_cached_usage_tokens(self):
+        payload = {
+            "id": "chatcmpl_123",
+            "model": "claude-sonnet-4.6",
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "hello",
+                    },
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 25,
+                "prompt_tokens_details": {
+                    "cached_tokens": 80,
+                    "cache_creation_input_tokens": 20,
+                },
+            },
+        }
+
+        translated = proxy.chat_completion_to_anthropic(payload)
+
+        self.assertEqual(translated["usage"]["input_tokens"], 0)
+        self.assertEqual(translated["usage"]["output_tokens"], 25)
+        self.assertEqual(translated["usage"]["cache_read_input_tokens"], 80)
+        self.assertEqual(translated["usage"]["cache_creation_input_tokens"], 20)
+
+    def test_chat_completion_to_anthropic_subtracts_cache_reads_from_input_tokens(self):
+        payload = {
+            "id": "chatcmpl_456",
+            "model": "claude-sonnet-4.6",
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "hello",
+                    },
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 135200,
+                "completion_tokens": 690,
+                "prompt_tokens_details": {
+                    "cached_tokens": 125000,
+                },
+            },
+        }
+
+        translated = proxy.chat_completion_to_anthropic(payload)
+
+        self.assertEqual(translated["usage"]["input_tokens"], 10200)
+        self.assertEqual(translated["usage"]["cache_read_input_tokens"], 125000)
+        self.assertEqual(translated["usage"]["cache_creation_input_tokens"], 0)
+
+    def test_anthropic_error_payload_from_openai_uses_anthropic_shape(self):
+        payload = {
+            "error": {
+                "message": "bad request",
+                "type": "invalid_request_error",
+            }
+        }
+
+        translated = proxy.anthropic_error_payload_from_openai(payload, 400)
+
+        self.assertEqual(
+            translated,
+            {
+                "type": "error",
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": "bad request",
+                },
+            },
+        )
+
+    def test_anthropic_error_response_from_upstream_translates_openai_error(self):
+        upstream = httpx.Response(
+            429,
+            json={
+                "error": {
+                    "message": "rate limited",
+                }
+            },
+            headers={"retry-after": "12"},
+        )
+
+        response = proxy.anthropic_error_response_from_upstream(upstream)
+
+        self.assertEqual(response.status_code, 429)
+        self.assertEqual(response.headers["retry-after"], "12")
+        self.assertEqual(
+            response.body,
+            b'{"type":"error","error":{"type":"rate_limit_error","message":"rate limited"}}',
+        )
+
+    def test_anthropic_messages_route_uses_anthropic_headers_and_error_shape(self):
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/messages"),
+            method="POST",
+            headers={"x-client-request-id": "req-123"},
+        )
+        body = {
+            "model": "claude-sonnet-4.6",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "hello"}],
+                }
+            ],
+        }
+        outbound = {
+            "model": "claude-sonnet-4.6",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": False,
+        }
+        upstream = httpx.Response(
+            400,
+            json={
+                "error": {
+                    "message": "unsupported field",
+                    "type": "invalid_request_error",
+                }
+            },
+            headers={"content-type": "application/json"},
+        )
+
+        with (
+            mock.patch.object(proxy, "parse_json_request", mock.AsyncMock(return_value=body)),
+            mock.patch.object(proxy, "get_api_key", return_value="test-key"),
+            mock.patch.object(proxy, "_get_api_base", return_value="https://example.invalid"),
+            mock.patch.object(proxy, "anthropic_request_to_chat", mock.AsyncMock(return_value=outbound)),
+            mock.patch.object(proxy, "log_proxy_request"),
+            mock.patch.object(proxy, "_start_usage_event", return_value=None),
+            mock.patch.object(proxy, "_finish_usage_event"),
+            mock.patch.object(proxy, "build_anthropic_headers_for_request", return_value={"X-Initiator": "user"}) as build_headers,
+            mock.patch.object(proxy, "build_chat_headers_for_request", side_effect=AssertionError("unexpected chat headers")),
+            mock.patch.object(proxy, "throttled_client_post", mock.AsyncMock(return_value=upstream)) as post,
+        ):
+            response = proxy.asyncio.run(proxy.anthropic_messages(request))
+
+        build_headers.assert_called_once_with(request, body, "test-key", request_id=mock.ANY)
+        self.assertEqual(post.await_args.args[1], "https://example.invalid/chat/completions")
+        self.assertEqual(post.await_args.kwargs["headers"], {"X-Initiator": "user"})
+        self.assertEqual(post.await_args.kwargs["json"], outbound)
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            response.body,
+            b'{"type":"error","error":{"type":"invalid_request_error","message":"unsupported field"}}',
+        )
+
+    def test_responses_route_invalid_json_returns_openai_error_shape(self):
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/responses"),
+            method="POST",
+            headers={},
+        )
+
+        with mock.patch.object(
+            proxy,
+            "parse_json_request",
+            mock.AsyncMock(side_effect=proxy.HTTPException(status_code=400, detail="Invalid JSON body")),
+        ):
+            response = proxy.asyncio.run(proxy.responses(request))
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            response.body,
+            b'{"error":{"message":"Invalid JSON body","type":"invalid_request_error","param":null,"code":null}}',
+        )
+
+    def test_anthropic_messages_invalid_json_returns_anthropic_error_shape(self):
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/messages"),
+            method="POST",
+            headers={},
+        )
+
+        with mock.patch.object(
+            proxy,
+            "parse_json_request",
+            mock.AsyncMock(side_effect=proxy.HTTPException(status_code=400, detail="Invalid JSON body")),
+        ):
+            response = proxy.asyncio.run(proxy.anthropic_messages(request))
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            response.body,
+            b'{"type":"error","error":{"type":"invalid_request_error","message":"Invalid JSON body"}}',
+        )
 
     def test_forced_agent_responses_requests_stay_agent(self):
         request = SimpleNamespace(url=SimpleNamespace(path="/v1/responses"), headers={})
@@ -139,6 +388,12 @@ class ProxyInitiatorTests(unittest.TestCase):
         headers = proxy.build_responses_headers_for_request(request, body, "test-key")
 
         self.assertEqual(headers["X-Initiator"], "agent")
+
+    def test_resolve_copilot_model_name_maps_dated_haiku_to_canonical_form(self):
+        self.assertEqual(
+            proxy.resolve_copilot_model_name("claude-haiku-4-5-20251001"),
+            "claude-haiku-4.5",
+        )
 
     def test_active_request_forces_following_user_request_to_agent(self):
         policy = initiator_policy.InitiatorPolicy()

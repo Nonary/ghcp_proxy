@@ -15,6 +15,8 @@ Configure Codex:
 
 import asyncio
 import base64
+import compression.zstd as pyzstd
+import gzip
 import json
 import glob
 import os
@@ -24,6 +26,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+import zlib
 from collections import deque
 from datetime import datetime, timezone
 from threading import Lock, Thread
@@ -34,6 +37,11 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 from initiator_policy import InitiatorPolicy
+
+try:
+    import brotli
+except ImportError:
+    brotli = None
 
 app = FastAPI()
 
@@ -55,6 +63,7 @@ ACCESS_TOKEN_FILE = os.path.join(TOKEN_DIR, "access-token")
 BILLING_TOKEN_FILE = os.path.join(TOKEN_DIR, "billing-token")
 API_KEY_FILE      = os.path.join(TOKEN_DIR, "api-key.json")
 USAGE_LOG_FILE    = os.path.join(TOKEN_DIR, "usage-log.jsonl")
+REQUEST_ERROR_LOG_FILE = os.path.join(TOKEN_DIR, "request-errors.log")
 PROXY_BASE_URL    = "http://localhost:8000"
 CODEX_PROXY_BASE_URL = f"{PROXY_BASE_URL}/v1"
 DASHBOARD_BASE_URL = "http://localhost:8000"
@@ -691,7 +700,7 @@ def _empty_official_premium_payload() -> dict:
     }
 
 
-def _collect_official_premium_payload(now: datetime | None = None) -> dict:
+def _collect_official_premium_payload(now: datetime | None = None, *, skip_cache: bool = False) -> dict:
     current = now or _utc_now()
     access_token = _load_billing_token() or _load_access_token()
     if not access_token:
@@ -721,9 +730,10 @@ def _collect_official_premium_payload(now: datetime | None = None) -> dict:
     last_error = None
     for attempt_scope, attempt_target in candidates:
         cache_key = _official_premium_cache_key(attempt_scope, attempt_target, current.year, current.month)
-        cached = _sqlite_cache_get(cache_key)
-        if isinstance(cached, dict):
-            return cached
+        if not skip_cache:
+            cached = _sqlite_cache_get(cache_key)
+            if isinstance(cached, dict):
+                return cached
 
         endpoint = _premium_usage_endpoint(attempt_scope, attempt_target)
         params = {"year": current.year, "month": current.month}
@@ -830,6 +840,17 @@ def _record_usage_event(event: dict):
             f.write(serialized)
             f.write("\n")
         _recent_usage_events.append(event)
+
+
+def _record_request_error(event: dict):
+    if not isinstance(event, dict):
+        return
+
+    os.makedirs(TOKEN_DIR, exist_ok=True)
+    serialized = json.dumps(event, separators=(",", ":"), default=_json_default)
+    with open(REQUEST_ERROR_LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(serialized)
+        f.write("\n")
 
 
 def _start_usage_event(
@@ -1052,7 +1073,7 @@ def _refresh_official_premium_cache_sync():
         _premium_cache["last_started_at"] = _utc_now_iso()
 
     try:
-        result = _collect_official_premium_payload()
+        result = _collect_official_premium_payload(skip_cache=True)
         _sqlite_cache_put("premium_usage:latest", result)
         with _premium_cache_lock:
             _premium_cache["loaded_at"] = time.monotonic()
@@ -1080,7 +1101,7 @@ def _trigger_official_premium_refresh(force: bool = False):
 
     def _runner():
         try:
-            result = _collect_official_premium_payload()
+            result = _collect_official_premium_payload(skip_cache=force)
             _sqlite_cache_put("premium_usage:latest", result)
             with _premium_cache_lock:
                 _premium_cache["loaded_at"] = time.monotonic()
@@ -1391,8 +1412,48 @@ async def parse_json_request(request: Request) -> dict:
     try:
         if not raw_body:
             return {}
+        content_encoding = str(request.headers.get("content-encoding", "")).strip().lower()
+
+        if content_encoding == "gzip":
+            raw_body = gzip.decompress(raw_body)
+        elif content_encoding == "deflate":
+            raw_body = zlib.decompress(raw_body)
+        elif content_encoding == "zstd":
+            raw_body = pyzstd.decompress(raw_body)
+        elif content_encoding == "br":
+            if brotli is None:
+                raise HTTPException(status_code=400, detail="Invalid JSON body: unsupported brotli request encoding")
+            raw_body = brotli.decompress(raw_body)
+        elif raw_body.startswith(b"\x1f\x8b"):
+            raw_body = gzip.decompress(raw_body)
+        elif raw_body.startswith(b"\x28\xb5\x2f\xfd"):
+            raw_body = pyzstd.decompress(raw_body)
+
         return json.loads(raw_body)
+    except HTTPException:
+        raise
     except Exception:
+        path = getattr(getattr(request, "url", None), "path", "?")
+        content_type = str(request.headers.get("content-type", "")).strip()
+        content_encoding = str(request.headers.get("content-encoding", "")).strip().lower()
+        preview_hex = raw_body[:24].hex()
+        preview_text = raw_body[:160].decode("utf-8", errors="replace")
+        _record_request_error(
+            {
+                "at": _utc_now_iso(),
+                "path": path,
+                "content_type": content_type,
+                "content_encoding": content_encoding,
+                "body_len": len(raw_body),
+                "preview_hex": preview_hex,
+                "preview_text": preview_text,
+            }
+        )
+        print(
+            f"WARN: Invalid JSON body path={path} content_type={content_type!r} "
+            f"content_encoding={content_encoding!r} body_len={len(raw_body)} preview_hex={preview_hex}",
+            flush=True,
+        )
         raise HTTPException(status_code=400, detail="Invalid JSON body")
 
 
@@ -1800,8 +1861,8 @@ def _device_flow() -> str:
             d = r.json()
 
             if "access_token" in d:
-                print("  ✓ Authorized successfully!", flush=True)
-                print("─" * 60, flush=True)
+                print("  Authorized successfully.", flush=True)
+                print("-" * 60, flush=True)
                 print("", flush=True)
                 _save_access_token(d["access_token"])
                 return d["access_token"]
@@ -1815,10 +1876,10 @@ def _device_flow() -> str:
                 interval += 5
                 continue
             elif error in ("expired_token", "access_denied"):
-                print(f"\n  ✗ Authorization failed: {error}", flush=True)
+                print(f"\n  Authorization failed: {error}", flush=True)
                 break
             else:
-                print(f"\n  ✗ Unexpected response: {d}", flush=True)
+                print(f"\n  Unexpected response: {d}", flush=True)
                 break
 
     raise RuntimeError("Device flow failed — could not obtain access token.")
@@ -1853,10 +1914,10 @@ def ensure_authenticated():
     print("Checking GitHub Copilot authentication...", flush=True)
     try:
         key = get_api_key()
-        print(f"✓ Authenticated. GHCP API key valid.", flush=True)
+        print("Authenticated. GHCP API key valid.", flush=True)
         return key
     except Exception as e:
-        print(f"\n✗ Authentication failed: {e}", file=sys.stderr, flush=True)
+        print(f"\nAuthentication failed: {e}", file=sys.stderr, flush=True)
         sys.exit(1)
 
 
@@ -1994,7 +2055,7 @@ def resolve_copilot_model_name(model_name: str | None) -> str | None:
     if not isinstance(normalized, str):
         return model_name
 
-    if normalized in ("claude-opus-4.6", "claude-sonnet-4.6", "claude-haiku-4-5"):
+    if normalized in ("claude-opus-4.6", "claude-sonnet-4.6", "claude-haiku-4.5"):
         return normalized
 
     if "opus" in normalized:
@@ -2002,7 +2063,7 @@ def resolve_copilot_model_name(model_name: str | None) -> str | None:
     if "sonnet" in normalized:
         return "claude-sonnet-4.6"
     if "haiku" in normalized:
-        return "claude-haiku-4-5"
+        return "claude-haiku-4.5"
     return normalized
 
 
@@ -2020,6 +2081,27 @@ def _extract_text_content(value) -> str:
     return ""
 
 
+def _normalize_anthropic_cache_control(value):
+    if not isinstance(value, dict):
+        return None
+
+    cache_type = value.get("type")
+    if isinstance(cache_type, str) and cache_type:
+        return {"type": cache_type}
+
+    if "ephemeral" in value:
+        return {"type": "ephemeral"}
+
+    return dict(value)
+
+
+def _attach_copilot_cache_control(target: dict, source: dict) -> dict:
+    cache_control = _normalize_anthropic_cache_control(source.get("cache_control"))
+    if cache_control is not None:
+        target["copilot_cache_control"] = cache_control
+    return target
+
+
 def _anthropic_image_block_to_chat(item: dict) -> dict:
     source = item.get("source")
     if not isinstance(source, dict):
@@ -2031,12 +2113,15 @@ def _anthropic_image_block_to_chat(item: dict) -> dict:
         data = source.get("data")
         if not isinstance(media_type, str) or not isinstance(data, str):
             raise ValueError("Anthropic base64 image source must include media_type and data strings")
-        return {"type": "image_url", "image_url": {"url": f"data:{media_type};base64,{data}"}}
+        return _attach_copilot_cache_control(
+            {"type": "image_url", "image_url": {"url": f"data:{media_type};base64,{data}"}},
+            item,
+        )
     if source_type == "url":
         image_url = source.get("url")
         if not isinstance(image_url, str):
             raise ValueError("Anthropic URL image source must include a url string")
-        return {"type": "image_url", "image_url": {"url": image_url}}
+        return _attach_copilot_cache_control({"type": "image_url", "image_url": {"url": image_url}}, item)
 
     raise ValueError(f"Unsupported Anthropic image source type: {source_type}")
 
@@ -2054,11 +2139,39 @@ def _anthropic_text_or_image_block_to_chat(item: dict) -> dict | None:
     if item_type == "text":
         text = item.get("text")
         if isinstance(text, str):
-            return {"type": "text", "text": text}
+            return _attach_copilot_cache_control({"type": "text", "text": text}, item)
         return None
     if item_type == "image":
         return _anthropic_image_block_to_chat(item)
     return None
+
+
+def _anthropic_system_to_chat_content(system):
+    if isinstance(system, str):
+        return system
+    if not isinstance(system, list):
+        return ""
+
+    converted = []
+    has_copilot_cache_control = False
+    for item in system:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("type", "")).lower() != "text":
+            raise ValueError("Anthropic system content currently supports text blocks only")
+        text = item.get("text")
+        if not isinstance(text, str):
+            continue
+        part = _attach_copilot_cache_control({"type": "text", "text": text}, item)
+        if "copilot_cache_control" in part:
+            has_copilot_cache_control = True
+        converted.append(part)
+
+    if not converted:
+        return ""
+    if not has_copilot_cache_control:
+        return "".join(part.get("text", "") for part in converted)
+    return converted
 
 
 def _anthropic_blocks_to_chat_content(blocks: list[dict]):
@@ -2075,7 +2188,11 @@ def _anthropic_blocks_to_chat_content(blocks: list[dict]):
 
     if not converted:
         return ""
-    if len(converted) == 1 and converted[0].get("type") == "text":
+    if (
+        len(converted) == 1
+        and converted[0].get("type") == "text"
+        and set(converted[0].keys()).issubset({"type", "text"})
+    ):
         return converted[0].get("text", "")
     return converted
 
@@ -2238,9 +2355,9 @@ async def anthropic_request_to_chat(body: dict, api_base: str, api_key: str) -> 
         raise ValueError("Anthropic request must include a messages array")
 
     chat_messages = []
-    system_text = _extract_text_content(body.get("system"))
-    if system_text:
-        chat_messages.append({"role": "system", "content": system_text})
+    system_content = _anthropic_system_to_chat_content(body.get("system"))
+    if system_content:
+        chat_messages.append({"role": "system", "content": system_content})
 
     for message in source_messages:
         if not isinstance(message, dict):
@@ -2248,10 +2365,13 @@ async def anthropic_request_to_chat(body: dict, api_base: str, api_key: str) -> 
         chat_messages.extend(anthropic_message_to_chat_messages(message))
 
     payload = {
-        "model": await resolve_copilot_model_name(body.get("model"), api_base, api_key),
+        "model": resolve_copilot_model_name(body.get("model")),
         "messages": chat_messages,
         "stream": bool(body.get("stream", False)),
     }
+
+    if payload["stream"]:
+        payload["stream_options"] = {"include_usage": True}
 
     for source_key, target_key in (
         ("max_tokens", "max_tokens"),
@@ -2263,6 +2383,12 @@ async def anthropic_request_to_chat(body: dict, api_base: str, api_key: str) -> 
         if value is not None:
             payload[target_key] = value
 
+    thinking = body.get("thinking")
+    if isinstance(thinking, dict):
+        budget_tokens = thinking.get("budget_tokens")
+        if isinstance(budget_tokens, int):
+            payload["thinking_budget"] = budget_tokens
+
     if body.get("tools") is not None:
         payload["tools"] = anthropic_tools_to_chat(body.get("tools"))
 
@@ -2271,6 +2397,30 @@ async def anthropic_request_to_chat(body: dict, api_base: str, api_key: str) -> 
         payload["tool_choice"] = mapped_tool_choice
 
     return payload
+
+
+def _chat_usage_to_anthropic(usage) -> dict:
+    if not isinstance(usage, dict):
+        return {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+        }
+
+    prompt_tokens = usage.get("prompt_tokens", 0) or 0
+    completion_tokens = usage.get("completion_tokens", 0) or 0
+    prompt_details = usage.get("prompt_tokens_details") if isinstance(usage.get("prompt_tokens_details"), dict) else {}
+    cache_creation_input_tokens = prompt_details.get("cache_creation_input_tokens", 0) or 0
+    cache_read_input_tokens = prompt_details.get("cached_tokens", 0) or 0
+    uncached_input_tokens = max(0, prompt_tokens - cache_creation_input_tokens - cache_read_input_tokens)
+
+    return {
+        "input_tokens": uncached_input_tokens,
+        "output_tokens": completion_tokens,
+        "cache_creation_input_tokens": cache_creation_input_tokens,
+        "cache_read_input_tokens": cache_read_input_tokens,
+    }
 
 
 def _chat_stop_reason_to_anthropic(value) -> str | None:
@@ -2342,13 +2492,7 @@ def chat_completion_to_anthropic(payload: dict, fallback_model=None) -> dict:
     choices = payload.get("choices") if isinstance(payload, dict) else None
     first_choice = choices[0] if isinstance(choices, list) and choices else {}
     message = first_choice.get("message") if isinstance(first_choice, dict) else {}
-    usage = payload.get("usage") if isinstance(payload, dict) else {}
-
-    input_tokens = 0
-    output_tokens = 0
-    if isinstance(usage, dict):
-        input_tokens = usage.get("prompt_tokens", 0) or 0
-        output_tokens = usage.get("completion_tokens", 0) or 0
+    usage = _chat_usage_to_anthropic(payload.get("usage") if isinstance(payload, dict) else {})
 
     return {
         "id": payload.get("id") if isinstance(payload, dict) else f"msg_{uuid4().hex}",
@@ -2358,11 +2502,130 @@ def chat_completion_to_anthropic(payload: dict, fallback_model=None) -> dict:
         "content": _chat_message_to_anthropic_content(message if isinstance(message, dict) else {}),
         "stop_reason": _chat_stop_reason_to_anthropic(first_choice.get("finish_reason") if isinstance(first_choice, dict) else None),
         "stop_sequence": None,
-        "usage": {
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens,
+        "usage": usage,
+    }
+
+
+def _anthropic_error_type_for_status(status_code: int) -> str:
+    if status_code == 400:
+        return "invalid_request_error"
+    if status_code == 401:
+        return "authentication_error"
+    if status_code == 403:
+        return "permission_error"
+    if status_code == 404:
+        return "not_found_error"
+    if status_code == 429:
+        return "rate_limit_error"
+    if status_code in {503, 529}:
+        return "overloaded_error"
+    return "api_error"
+
+
+def anthropic_error_payload_from_openai(payload, status_code: int, fallback_message: str | None = None) -> dict:
+    if isinstance(payload, dict):
+        if payload.get("type") == "error" and isinstance(payload.get("error"), dict):
+            error = payload["error"]
+            error_type = error.get("type")
+            message = error.get("message")
+            if isinstance(error_type, str) and isinstance(message, str) and message:
+                return payload
+
+        error = payload.get("error") if isinstance(payload.get("error"), dict) else {}
+        message = error.get("message") if isinstance(error.get("message"), str) else None
+        error_type = error.get("type") if isinstance(error.get("type"), str) else None
+        detail = payload.get("detail") if isinstance(payload.get("detail"), str) else None
+
+        return {
+            "type": "error",
+            "error": {
+                "type": error_type or _anthropic_error_type_for_status(status_code),
+                "message": message or detail or fallback_message or "Request failed",
+            },
+        }
+
+    return {
+        "type": "error",
+        "error": {
+            "type": _anthropic_error_type_for_status(status_code),
+            "message": fallback_message or "Request failed",
         },
     }
+
+
+def anthropic_error_response(status_code: int, message: str, error_type: str | None = None, headers: dict | None = None) -> JSONResponse:
+    payload = {
+        "type": "error",
+        "error": {
+            "type": error_type or _anthropic_error_type_for_status(status_code),
+            "message": message,
+        },
+    }
+    return JSONResponse(content=payload, status_code=status_code, headers=headers)
+
+
+def anthropic_error_response_from_upstream(upstream: httpx.Response) -> JSONResponse:
+    headers = {}
+    retry_after = upstream.headers.get("retry-after")
+    if retry_after:
+        headers["retry-after"] = retry_after
+
+    fallback_message = ""
+    try:
+        fallback_message = upstream.text.strip()
+    except Exception:
+        fallback_message = ""
+    if not fallback_message:
+        fallback_message = f"Upstream request failed with status {upstream.status_code}"
+
+    try:
+        payload = upstream.json()
+    except json.JSONDecodeError:
+        payload = None
+
+    translated = anthropic_error_payload_from_openai(payload, upstream.status_code, fallback_message)
+    return anthropic_error_response(
+        upstream.status_code,
+        translated["error"]["message"],
+        translated["error"]["type"],
+        headers=headers or None,
+    )
+
+
+def _openai_error_type_for_status(status_code: int) -> str:
+    if status_code == 400:
+        return "invalid_request_error"
+    if status_code == 401:
+        return "authentication_error"
+    if status_code == 403:
+        return "permission_error"
+    if status_code == 404:
+        return "not_found_error"
+    if status_code == 429:
+        return "rate_limit_error"
+    return "server_error"
+
+
+def openai_error_response(status_code: int, message: str, error_type: str | None = None, code=None, param=None, headers: dict | None = None) -> JSONResponse:
+    payload = {
+        "error": {
+            "message": message,
+            "type": error_type or _openai_error_type_for_status(status_code),
+            "param": param,
+            "code": code,
+        }
+    }
+    return JSONResponse(content=payload, status_code=status_code, headers=headers)
+
+
+def _http_exception_detail_to_message(detail) -> str:
+    if isinstance(detail, str) and detail:
+        return detail
+    if isinstance(detail, dict):
+        message = detail.get("message")
+        if isinstance(message, str) and message:
+            return message
+    return "Request failed"
 
 
 def _sse_encode(event_name: str, payload: dict) -> bytes:
@@ -2434,19 +2697,25 @@ def _extract_tool_call_deltas(delta) -> list[dict]:
 
 
 async def proxy_anthropic_streaming_response(
-    upstream_url: str, headers: dict, body: dict, fallback_model: str, timeout: int = 300
+    upstream_url: str, headers: dict, body: dict, fallback_model: str, timeout: int = 300, usage_event: dict | None = None
 ) -> Response:
     """
     Translate upstream chat-completions SSE into Anthropic Messages SSE.
     """
     client = httpx.AsyncClient(timeout=timeout)
     request = client.build_request("POST", upstream_url, headers=headers, json=body)
-    upstream = await throttled_client_send(client, request, stream=True)
+    try:
+        upstream = await throttled_client_send(client, request, stream=True)
+    except Exception:
+        _finish_usage_event(usage_event, 599)
+        await client.aclose()
+        raise
 
     if upstream.status_code >= 400:
         try:
             await upstream.aread()
-            return proxy_non_streaming_response(upstream)
+            _finish_usage_event(usage_event, upstream.status_code)
+            return anthropic_error_response_from_upstream(upstream)
         finally:
             await upstream.aclose()
             await client.aclose()
@@ -2462,6 +2731,8 @@ async def proxy_anthropic_streaming_response(
         model_name = fallback_model
         input_tokens = 0
         output_tokens = 0
+        cache_creation_input_tokens = 0
+        cache_read_input_tokens = 0
         stop_reason = None
         message_started = False
         next_block_index = 0
@@ -2501,6 +2772,8 @@ async def proxy_anthropic_streaming_response(
                         "usage": {
                             "input_tokens": input_tokens,
                             "output_tokens": 0,
+                            "cache_creation_input_tokens": cache_creation_input_tokens,
+                            "cache_read_input_tokens": cache_read_input_tokens,
                         },
                     },
                 },
@@ -2611,8 +2884,16 @@ async def proxy_anthropic_streaming_response(
 
                 usage = payload.get("usage")
                 if isinstance(usage, dict):
-                    input_tokens = usage.get("prompt_tokens", input_tokens) or input_tokens
-                    output_tokens = usage.get("completion_tokens", output_tokens) or output_tokens
+                    anthropic_usage = _chat_usage_to_anthropic(usage)
+                    input_tokens = anthropic_usage.get("input_tokens", input_tokens) or input_tokens
+                    output_tokens = anthropic_usage.get("output_tokens", output_tokens) or output_tokens
+                    cache_creation_input_tokens = (
+                        anthropic_usage.get("cache_creation_input_tokens", cache_creation_input_tokens)
+                        or cache_creation_input_tokens
+                    )
+                    cache_read_input_tokens = (
+                        anthropic_usage.get("cache_read_input_tokens", cache_read_input_tokens) or cache_read_input_tokens
+                    )
 
                 async for event in ensure_message_started():
                     yield event
@@ -2689,12 +2970,18 @@ async def proxy_anthropic_streaming_response(
                         "stop_reason": stop_reason or "end_turn",
                         "stop_sequence": None,
                     },
-                    "usage": {"output_tokens": output_tokens},
+                    "usage": {
+                        "input_tokens": input_tokens,
+                        "output_tokens": output_tokens,
+                        "cache_creation_input_tokens": cache_creation_input_tokens,
+                        "cache_read_input_tokens": cache_read_input_tokens,
+                    },
                 },
             )
             yield _sse_encode("message_stop", {"type": "message_stop"})
             stream_closed = True
         finally:
+            _finish_usage_event(usage_event, upstream.status_code)
             await upstream.aclose()
             await client.aclose()
 
@@ -3252,7 +3539,10 @@ async def proxy_streaming_response(
 
 @app.post("/v1/responses")
 async def responses(request: Request):
-    body = await parse_json_request(request)
+    try:
+        body = await parse_json_request(request)
+    except HTTPException as exc:
+        return openai_error_response(exc.status_code, _http_exception_detail_to_message(exc.detail))
     request_id = uuid4().hex
 
     # Sanitize input (multi-turn encrypted_content passthrough)
@@ -3264,7 +3554,7 @@ async def responses(request: Request):
     try:
         api_key = get_api_key()
     except Exception as e:
-        raise HTTPException(status_code=401, detail=f"GHCP auth failed: {e}")
+        return openai_error_response(401, f"GHCP auth failed: {e}")
 
     headers = build_responses_headers_for_request(
         request,
@@ -3299,13 +3589,16 @@ async def responses(request: Request):
 
 @app.post("/v1/responses/compact")
 async def responses_compact(request: Request):
-    body = await parse_json_request(request)
+    try:
+        body = await parse_json_request(request)
+    except HTTPException as exc:
+        return openai_error_response(exc.status_code, _http_exception_detail_to_message(exc.detail))
     request_id = uuid4().hex
 
     try:
         api_key = get_api_key()
     except Exception as e:
-        raise HTTPException(status_code=401, detail=f"GHCP auth failed: {e}")
+        return openai_error_response(401, f"GHCP auth failed: {e}")
 
     summary_request = build_fake_compaction_request(body)
     headers = build_responses_headers_for_request(
@@ -3339,11 +3632,11 @@ async def responses_compact(request: Request):
     try:
         upstream_payload = upstream.json()
     except json.JSONDecodeError as e:
-        raise HTTPException(status_code=502, detail=f"Invalid JSON from upstream summarization response: {e}")
+        return openai_error_response(502, f"Invalid JSON from upstream summarization response: {e}")
 
     summary_text = extract_response_output_text(upstream_payload)
     if not summary_text:
-        raise HTTPException(status_code=502, detail="Upstream summarization response did not include assistant text output")
+        return openai_error_response(502, "Upstream summarization response did not include assistant text output")
 
     return JSONResponse(
         content=build_fake_compaction_response(body, summary_text, upstream_payload.get("usage")),
@@ -3359,7 +3652,10 @@ async def chat_completions(request: Request):
     For models that still use the Chat API.
     Codex does NOT use this endpoint — it uses /v1/responses above.
     """
-    body = await parse_json_request(request)
+    try:
+        body = await parse_json_request(request)
+    except HTTPException as exc:
+        return openai_error_response(exc.status_code, _http_exception_detail_to_message(exc.detail))
     request_id = uuid4().hex
 
     messages = body.get("messages", [])
@@ -3367,7 +3663,7 @@ async def chat_completions(request: Request):
     try:
         api_key = get_api_key()
     except Exception as e:
-        raise HTTPException(status_code=401, detail=f"GHCP auth failed: {e}")
+        return openai_error_response(401, f"GHCP auth failed: {e}")
 
     headers = build_chat_headers_for_request(request, messages, body.get("model"), api_key, request_id=request_id)
 
@@ -3399,22 +3695,28 @@ async def chat_completions(request: Request):
 async def anthropic_messages(request: Request):
     """
     Anthropic-compatible route.
-    Forward Anthropic Messages payloads directly to GHCP's Anthropic endpoint,
-    only adjusting headers and model fallback when necessary.
+    Translate Anthropic Messages payloads onto GHCP's OpenAI-compatible chat
+    endpoint so Claude Code can reuse Copilot's cache semantics.
     """
-    body = await parse_json_request(request)
+    try:
+        body = await parse_json_request(request)
+    except HTTPException as exc:
+        return anthropic_error_response(exc.status_code, _http_exception_detail_to_message(exc.detail))
     request_id = uuid4().hex
 
     try:
         api_key = get_api_key()
     except Exception as e:
-        raise HTTPException(status_code=401, detail=f"GHCP auth failed: {e}")
+        return anthropic_error_response(401, f"GHCP auth failed: {e}")
 
     api_base = _get_api_base()
-    resolved_model = resolve_copilot_model_name(body.get("model"))
-    outbound_body = prepare_anthropic_outbound_body(body, resolved_model)
-    headers = build_anthropic_headers_for_request(request, outbound_body, api_key, request_id=request_id)
-    upstream_url = f"{api_base.rstrip('/')}/v1/messages"
+    try:
+        outbound_body = await anthropic_request_to_chat(body, api_base, api_key)
+    except ValueError as e:
+        return anthropic_error_response(400, str(e))
+
+    headers = build_anthropic_headers_for_request(request, body, api_key, request_id=request_id)
+    upstream_url = f"{api_base.rstrip('/')}/chat/completions"
     log_proxy_request(request, body.get("model"), outbound_body.get("model"), headers.get("X-Initiator"))
     usage_event = _start_usage_event(
         request,
@@ -3425,13 +3727,23 @@ async def anthropic_messages(request: Request):
     )
 
     if outbound_body.get("stream"):
-        return await proxy_streaming_response(upstream_url, headers, outbound_body, timeout=300, usage_event=usage_event)
+        return await proxy_anthropic_streaming_response(
+            upstream_url,
+            headers,
+            outbound_body,
+            outbound_body.get("model"),
+            timeout=300,
+            usage_event=usage_event,
+        )
 
     try:
         async with httpx.AsyncClient(timeout=120) as client:
             upstream = await throttled_client_post(client, upstream_url, headers=headers, json=outbound_body)
         _finish_usage_event(usage_event, upstream.status_code)
-        return proxy_non_streaming_response(upstream)
+        if upstream.status_code >= 400:
+            return anthropic_error_response_from_upstream(upstream)
+        translated = chat_completion_to_anthropic(upstream.json(), fallback_model=outbound_body.get("model"))
+        return JSONResponse(content=translated, status_code=upstream.status_code)
     except Exception:
         _finish_usage_event(usage_event, 599)
         raise
