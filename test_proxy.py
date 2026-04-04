@@ -220,11 +220,27 @@ class ProxyInitiatorTests(unittest.TestCase):
             mock.patch.object(proxy, "_snapshot_usage_events", return_value=usage_events),
             mock.patch.object(proxy, "_load_api_key_payload", return_value={"sku": "plus_monthly_subscriber_quota"}),
             mock.patch.object(proxy, "_get_ccusage_payload", return_value=ccusage_payload),
+            mock.patch.object(
+                proxy,
+                "_get_official_premium_payload",
+                return_value={
+                    "available": True,
+                    "remaining": 1420,
+                    "used": 80,
+                    "included": 1500,
+                    "reset_date": None,
+                    "source": "github-rest-billing-api",
+                    "raw": {},
+                    "refreshing": False,
+                    "error": None,
+                },
+            ),
         ):
             payload = proxy._build_dashboard_payload()
 
         self.assertEqual(payload["premium"]["included"], 1500)
-        self.assertEqual(payload["premium"]["used"], 1.33)
+        self.assertEqual(payload["premium"]["used"], 80)
+        self.assertEqual(payload["premium"]["official_remaining"], 1420)
         self.assertEqual(payload["current_month"]["ccusage"]["cost_usd"], 4.0)
         self.assertEqual(payload["current_month"]["ccusage"]["total_tokens"], 400)
         self.assertEqual(payload["recent_sessions"][0]["source"], "codex")

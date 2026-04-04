@@ -166,3 +166,24 @@ export GHCP_CODEX_CCUSAGE_COMMAND="npx --yes @ccusage/codex@latest"
 
 If GitHub does not expose an official remaining premium-request count in the Copilot token payload, the dashboard shows a tracked remaining value based on successful proxied requests for the current month.
 
+You can force official Copilot billing lookups with a token in one of two ways:
+
+```bash
+export GHCP_GITHUB_BILLING_TOKEN="gho_xxx"
+```
+
+You can also configure it from the dashboard at `http://localhost:8000/ui` under **GitHub Billing Token**.
+
+If you are billed through an organization or enterprise account, set:
+
+```bash
+export GHCP_GITHUB_BILLING_SCOPE=org
+export GHCP_GITHUB_BILLING_TARGET=my-org-slug
+```
+
+The dashboard cache is also persisted in SQLite for fast startup/refreshes:
+
+```bash
+export GHCP_CACHE_DB_PATH="~/.config/ghcp_proxy/ghcp-dashboard-cache.sqlite3"
+```
+
