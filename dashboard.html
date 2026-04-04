@@ -1,0 +1,715 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>GHCP Proxy Dashboard</title>
+  <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+  <style>
+    :root {
+      --bg: #0b1218;
+      --panel: rgba(20, 29, 37, 0.9);
+      --panel-soft: rgba(28, 39, 50, 0.8);
+      --line: rgba(200, 220, 235, 0.12);
+      --text: #edf4f8;
+      --muted: #97a8b8;
+      --accent: #ff8752;
+      --accent-2: #6ee7c8;
+      --danger: #ff8f87;
+      --shadow: 0 24px 80px rgba(0, 0, 0, 0.28);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      color: var(--text);
+      background:
+        radial-gradient(circle at top left, rgba(255,135,82,.20), transparent 26%),
+        radial-gradient(circle at top right, rgba(110,231,200,.14), transparent 24%),
+        linear-gradient(180deg, #081015 0%, #0b1218 45%, #101922 100%);
+      font-family: "Aptos", "Segoe UI Variable Display", sans-serif;
+    }
+    .app { max-width: 1440px; margin: 0 auto; padding: 28px 18px 42px; }
+    .content, .metrics { display: grid; gap: 16px; }
+    .metrics { grid-template-columns: repeat(3, minmax(0, 1fr)); margin-bottom: 18px; }
+    .content { grid-template-columns: 1.35fr .65fr; }
+    .panel {
+      border: 1px solid var(--line);
+      border-radius: 24px;
+      background: var(--panel);
+      backdrop-filter: blur(18px);
+      box-shadow: var(--shadow);
+      padding: 18px;
+    }
+    .eyebrow {
+      font-size: .76rem;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: .14em;
+      margin-bottom: 10px;
+    }
+    h1 { margin: 0 0 12px; font-size: clamp(2rem, 5vw, 4rem); line-height: .92; letter-spacing: -.05em; }
+    h2, h3 { margin: 0; }
+    p { margin: 0; color: var(--muted); }
+    .chips, .toolbar, .tabs { display: flex; gap: 10px; flex-wrap: wrap; }
+    .chip, .badge {
+      display: inline-flex;
+      align-items: center;
+      padding: 7px 11px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      background: rgba(255,255,255,.04);
+      font-size: .86rem;
+    }
+    .badge { color: var(--accent-2); border-color: rgba(110,231,200,.16); background: rgba(110,231,200,.08); text-transform: uppercase; letter-spacing: .08em; }
+    .metric .value { font-size: clamp(1.7rem, 3.4vw, 2.8rem); font-weight: 700; letter-spacing: -.06em; margin: 6px 0; }
+    .subtle { color: var(--muted); font-size: .92rem; }
+    .panel-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: center;
+      margin-bottom: 14px;
+    }
+    .tabs { padding: 6px; border: 1px solid var(--line); border-radius: 999px; background: rgba(255,255,255,.03); }
+    .tabs button, .toolbar button, .toolbar input, .toolbar select {
+      font: inherit;
+      border-radius: 12px;
+      border: 1px solid var(--line);
+      background: rgba(255,255,255,.04);
+      color: var(--text);
+      padding: 10px 12px;
+    }
+    .toolbar .spacer {
+      flex: 1;
+      min-width: 0;
+    }
+    .tabs button {
+      border: 0;
+      background: transparent;
+      color: var(--muted);
+      border-radius: 999px;
+      padding: 8px 12px;
+      cursor: pointer;
+    }
+    .tabs button.active { background: linear-gradient(135deg, var(--accent), #f6ac68); color: #21150f; font-weight: 700; }
+    .toolbar button.primary { border: 0; background: linear-gradient(135deg, var(--accent), #f6ac68); color: #21150f; font-weight: 700; cursor: pointer; }
+    .toolbar { margin-bottom: 14px; }
+    table { width: 100%; border-collapse: collapse; font-size: .92rem; }
+    th, td { padding: 11px 8px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+    th { color: var(--muted); font-size: .75rem; text-transform: uppercase; letter-spacing: .12em; }
+    th:last-child, td:last-child { text-align: right; }
+    .mono { font-family: "Cascadia Code", Consolas, monospace; font-size: .84rem; }
+    .list, .history { display: grid; gap: 12px; }
+    .mini-card {
+      border-radius: 18px;
+      border: 1px solid var(--line);
+      background: var(--panel-soft);
+      padding: 14px;
+    }
+    .mini-card strong { display: block; font-size: 1.25rem; letter-spacing: -.04em; margin: 8px 0 6px; }
+    .bar { height: 10px; background: rgba(255,255,255,.06); border-radius: 999px; overflow: hidden; margin: 8px 0; }
+    .bar > span { display: block; height: 100%; background: linear-gradient(90deg, var(--accent), var(--accent-2)); }
+    .empty { color: var(--muted); padding: 18px 0; }
+    .status.error { color: var(--danger); }
+    .status.good { color: var(--accent-2); }
+    .status.warn { color: #ffd27f; }
+    .proxy-grid { display: grid; gap: 12px; grid-template-columns: 1fr 1fr; }
+    @media (max-width: 1080px) {
+      .content, .metrics { grid-template-columns: 1fr; }
+      .proxy-grid { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div id="app" class="app">
+      <div class="chips" style="margin-bottom: 16px;">
+        <span class="chip">{{ updatedLabel }}</span>
+        <span class="chip">{{ cacheLabel }}</span>
+        <span class="chip">{{ refreshLabel }}</span>
+      </div>
+
+    <section class="metrics">
+      <article class="panel metric">
+        <div class="eyebrow">Premium Remaining</div>
+        <div class="value">{{ premiumRemainingLabel }}</div>
+        <div class="subtle">{{ premiumRemainingMetaLabel }}</div>
+      </article>
+      <article class="panel metric">
+        <div class="eyebrow">This Month Saved</div>
+        <div class="value">{{ money(currentMonth.cost_usd) }}</div>
+        <div class="subtle">Estimated direct API spend avoided</div>
+      </article>
+      <article class="panel metric">
+        <div class="eyebrow">This Month Tokens</div>
+        <div class="value">{{ compact(currentMonth.total_tokens) }}</div>
+        <div class="subtle">{{ compact(currentMonth.input_tokens) }} in · {{ compact(currentMonth.output_tokens) }} out</div>
+      </article>
+    </section>
+
+    <section class="content">
+      <article class="panel">
+        <div class="panel-head">
+          <div>
+            <h3>Usage Explorer</h3>
+            <div class="subtle">Client-side tabs, filtering, and sorting.</div>
+          </div>
+          <div class="tabs">
+            <button v-for="tab in tabs" :key="tab" :class="{ active: activeTab === tab }" @click="activeTab = tab">{{ tab }}</button>
+          </div>
+        </div>
+
+        <div class="toolbar">
+          <input v-model.trim="search" type="search" placeholder="Filter by model, source, path, or session">
+          <select v-model="sourceFilter">
+            <option value="all">All sources</option>
+            <option value="claude">Claude</option>
+            <option value="codex">Codex</option>
+            <option value="proxy">Proxy</option>
+          </select>
+          <select v-model="sortMode">
+            <option value="recent">Newest first</option>
+            <option value="cost">Highest cost</option>
+            <option value="tokens">Most tokens</option>
+          </select>
+          <button class="primary" @click="load(true)" :disabled="loading">Refresh</button>
+        </div>
+
+        <div v-if="activeTab === 'sessions'">
+          <table>
+            <thead>
+              <tr>
+                <th>Source</th>
+                <th>Session</th>
+                <th>Model</th>
+                <th>Last Activity</th>
+                <th>Tokens</th>
+                <th>Cost</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="row in filteredSessions" :key="row.source + row.session_id">
+                <td><span class="badge">{{ row.source }}</span></td>
+                <td class="mono">{{ shortId(row.session_id) }}</td>
+                <td>{{ modelLabel(row.models) }}</td>
+                <td>{{ stamp(row.last_activity) }}</td>
+                <td>{{ compact(row.total_tokens) }}</td>
+                <td>{{ money(row.cost_usd) }}</td>
+              </tr>
+              <tr v-if="!filteredSessions.length"><td colspan="6" class="empty">No sessions match the current filter.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div v-else-if="activeTab === 'requests'">
+          <table>
+            <thead>
+              <tr>
+                <th>When</th>
+                <th>Path</th>
+                <th>Model</th>
+                <th>Initiator</th>
+                <th>Session</th>
+                <th>Premium</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="row in filteredRequests" :key="row.request_id || row.started_at">
+                <td>{{ stamp(row.finished_at || row.started_at) }}</td>
+                <td class="mono">{{ row.path || '-' }}</td>
+                <td>{{ row.resolved_model || row.requested_model || '-' }}</td>
+                <td>{{ row.initiator || '-' }}</td>
+                <td class="mono">{{ shortId(row.session_id || row.client_request_id) }}</td>
+                <td>{{ row.premium_requests ?? '-' }}</td>
+              </tr>
+              <tr v-if="!filteredRequests.length"><td colspan="6" class="empty">No requests match the current filter.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div v-else class="history">
+          <article v-for="row in monthHistory" :key="row.month_key" class="mini-card">
+            <div class="eyebrow">{{ row.month_key }}</div>
+            <strong>{{ money(row.cost_usd) }} · {{ compact(row.total_tokens) }}</strong>
+            <div class="subtle">{{ Object.keys(row.sources || {}).join(' + ') || 'No sources' }}</div>
+            <div class="bar"><span :style="{ width: historyWidth(row) + '%' }"></span></div>
+          </article>
+          <div v-if="!monthHistory.length" class="empty">No monthly history available.</div>
+        </div>
+      </article>
+
+      <div class="list">
+        <article class="panel">
+          <div class="panel-head">
+            <div>
+              <h3>Current Source Split</h3>
+              <div class="subtle">{{ filteredSessions.length }} visible rows</div>
+            </div>
+          </div>
+          <div class="list">
+            <article v-for="(row, source) in sourceCards" :key="source" class="mini-card">
+              <span class="badge">{{ source }}</span>
+              <strong>{{ money(row.cost_usd) }}</strong>
+              <div class="subtle">{{ compact(row.total_tokens) }} total tokens</div>
+              <div class="subtle">{{ compact(row.input_tokens) }} in · {{ compact(row.output_tokens) }} out</div>
+            </article>
+            <div v-if="!Object.keys(sourceCards).length" class="empty">No current month source data.</div>
+          </div>
+        </article>
+
+        <article class="panel">
+          <div class="panel-head">
+            <div>
+              <h3>Backend Status</h3>
+              <div class="subtle">Cache-first API and background refresh state.</div>
+            </div>
+          </div>
+          <div v-if="premium.official?.error" class="status error">github-billing: {{ premium.official.error }}</div>
+          <div v-if="ccusage.errors?.length">
+            <div v-for="item in ccusage.errors" :key="item.source" class="status error">{{ item.source }}: {{ item.error }}</div>
+          </div>
+          <div v-else :class="['status', ccusage.refreshing ? 'warn' : 'good']">
+            {{ ccusage.refreshing ? 'Refresh in progress. Showing cached data.' : 'Cache healthy. No source errors.' }}
+          </div>
+        </article>
+
+        <article class="panel">
+          <div class="panel-head">
+            <div>
+              <h3>Client Proxy Configuration</h3>
+              <div class="subtle">Install or verify local proxy settings for Codex and Claude Code.</div>
+            </div>
+          </div>
+          <div class="proxy-grid">
+            <article class="mini-card">
+              <div class="eyebrow">Codex</div>
+              <div :class="['status', codexProxyStatusClass('codex')]">{{ codexProxyStatusLabel('codex') }}</div>
+              <div class="subtle">{{ clientProxyStatus.codex.path }}</div>
+              <div class="toolbar">
+                <button class="primary" @click="installClientProxy('codex')" :disabled="savingProxyConfig">Install for Codex</button>
+                <button @click="disableClientProxy('codex')" :disabled="savingProxyConfig">Disable for Codex</button>
+              </div>
+              <div v-if="clientProxyStatus.codex.error" class="status error">{{ clientProxyStatus.codex.error }}</div>
+              <div v-else-if="clientProxyStatus.codex.backup_path" class="subtle">Latest backup: {{ clientProxyStatus.codex.backup_path }}</div>
+            </article>
+            <article class="mini-card">
+              <div class="eyebrow">Claude</div>
+              <div :class="['status', codexProxyStatusClass('claude')]">{{ codexProxyStatusLabel('claude') }}</div>
+              <div class="subtle">{{ clientProxyStatus.claude.path }}</div>
+              <div class="toolbar">
+                <button class="primary" @click="installClientProxy('claude')" :disabled="savingProxyConfig">Install for Claude</button>
+                <button @click="disableClientProxy('claude')" :disabled="savingProxyConfig">Disable for Claude</button>
+              </div>
+              <div v-if="clientProxyStatus.claude.error" class="status error">{{ clientProxyStatus.claude.error }}</div>
+              <div v-else-if="clientProxyStatus.claude.backup_path" class="subtle">Latest backup: {{ clientProxyStatus.claude.backup_path }}</div>
+            </article>
+          </div>
+          <div class="toolbar" style="margin-top: 10px;">
+            <button class="primary" @click="installClientProxy('both')" :disabled="savingProxyConfig">Install for Both</button>
+            <button @click="disableClientProxy('both')" :disabled="savingProxyConfig">Disable for Both</button>
+          </div>
+          <div v-if="proxyConfigError" class="status error">{{ proxyConfigError }}</div>
+          <div v-else-if="proxyConfigStatusMessage" class="status good">{{ proxyConfigStatusMessage }}</div>
+        </article>
+
+        <article class="panel">
+          <div class="panel-head">
+            <div>
+              <h3>GitHub Billing Token</h3>
+              <div class="subtle">{{ billingTokenStatusLabel }}</div>
+            </div>
+            <span v-if="billingToken.readonly" class="badge">readonly</span>
+          </div>
+          <div class="toolbar">
+            <input
+              v-model="billingToken.tokenInput"
+              type="password"
+              placeholder="Personal access token for premium billing lookups"
+              :disabled="billingToken.readonly"
+            />
+            <button class="primary" @click="saveBillingToken" :disabled="billingToken.readonly || savingBillingToken || !billingToken.tokenInput">
+              Save
+            </button>
+            <button
+              @click="clearBillingToken"
+              :disabled="billingToken.readonly || savingBillingToken || !billingToken.configured"
+            >
+              Clear
+            </button>
+          </div>
+          <div v-if="billingToken.error" class="status error">{{ billingToken.error }}</div>
+          <div v-else-if="billingToken.statusMessage" class="status good">{{ billingToken.statusMessage }}</div>
+          <p class="subtle">This token is used only for official GitHub premium billing lookups and is stored locally.</p>
+        </article>
+      </div>
+    </section>
+  </div>
+
+  <script>
+    const { createApp } = Vue;
+
+    createApp({
+      data() {
+        return {
+          loading: false,
+          savingBillingToken: false,
+          loadingClientProxyStatus: false,
+          savingProxyConfig: false,
+          proxyConfigError: '',
+          proxyConfigStatusMessage: '',
+          clientProxyStatus: {
+            codex: {
+              client: 'codex',
+              configured: false,
+              exists: false,
+              path: '',
+              backup_path: null,
+              error: '',
+              status_message: 'loading status...',
+            },
+            claude: {
+              client: 'claude',
+              configured: false,
+              exists: false,
+              path: '',
+              backup_path: null,
+              error: '',
+              status_message: 'loading status...',
+            },
+          },
+          activeTab: 'sessions',
+          tabs: ['sessions', 'requests', 'history'],
+          search: '',
+          sourceFilter: 'all',
+          sortMode: 'recent',
+          data: {
+            premium: {},
+            current_month: { ccusage: { sources: {} } },
+            recent_sessions: [],
+            recent_requests: [],
+            month_history: [],
+            ccusage: { errors: [] },
+          },
+          billingToken: {
+            configured: false,
+            source: 'none',
+            readonly: false,
+            tokenInput: '',
+            error: '',
+            statusMessage: '',
+          },
+        };
+      },
+      computed: {
+        premium() { return this.data.premium || {}; },
+        ccusage() { return this.data.ccusage || {}; },
+        currentMonth() { return this.data.current_month?.ccusage || {}; },
+        sourceCards() { return this.currentMonth.sources || {}; },
+        premiumRemainingLabel() {
+          const remaining = this.premium.official_remaining ?? this.premium.tracked_remaining;
+          return this._formatPremiumValue(remaining);
+        },
+        premiumRemainingMetaLabel() {
+          const used = this._asPremiumNumber(this.premium.used);
+          const included = this._asPremiumNumber(this.premium.included);
+          const remaining = this._asPremiumNumber(this.premium.official_remaining ?? this.premium.tracked_remaining);
+          const percentLeft = this._premiumPercentLeft(included, remaining);
+
+          if (percentLeft == null && !Number.isFinite(used)) {
+            return 'No premium quota usage available yet';
+          }
+
+          const parts = [];
+          if (percentLeft != null) {
+            parts.push(`${this._formatPercent(percentLeft)}% left`);
+          }
+          if (Number.isFinite(used)) {
+            parts.push(`${this._formatPremiumValue(used)} used this month`);
+          }
+          if (Number.isFinite(included)) {
+            parts.push(`quota ${this._formatPremiumValue(included)}`);
+          }
+          return parts.join(' · ') || 'No premium quota data yet';
+        },
+        updatedLabel() { return `Updated ${this.stamp(this.data.generated_at)}`; },
+        cacheLabel() {
+          const age = this.ccusage.age_seconds;
+          if (!Number.isFinite(age)) return 'Cache warming';
+          if (age < 5) return 'Fresh cache';
+          if (age < 60) return `Cache ${Math.round(age)}s old`;
+          return `Cache ${Math.round(age / 60)}m old`;
+        },
+        refreshLabel() { return this.ccusage.refreshing ? 'Refresh in progress' : 'Serving from cache'; },
+        billingTokenStatusLabel() {
+          if (!this.billingToken.configured) {
+            return 'No billing token configured';
+          }
+          return this.billingToken.source === 'environment'
+            ? 'Using GHCP_GITHUB_BILLING_TOKEN (environment)'
+            : 'Using saved local PAT';
+        },
+        filteredSessions() {
+          const rows = (this.data.recent_sessions || []).filter((row) => this.allowSource(row.source) && this.matches(row));
+          return this.sortRows(rows, 'last_activity');
+        },
+        filteredRequests() {
+          const rows = (this.data.recent_requests || []).map((row) => ({ ...row, source: 'proxy' })).filter((row) => this.allowSource(row.source) && this.matches(row));
+          return this.sortRows(rows, 'finished_at');
+        },
+        monthHistory() {
+          return (this.data.month_history || []).slice(0, 8);
+        },
+      },
+      methods: {
+        integer(value) { return new Intl.NumberFormat('en-US').format(Number(value || 0)); },
+        compact(value) { return Number.isFinite(value) ? new Intl.NumberFormat('en-US', { notation: 'compact', maximumFractionDigits: 1 }).format(value) : '-'; },
+        money(value) { return Number.isFinite(value) ? new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 2 }).format(value) : '-'; },
+        _asPremiumNumber(value) {
+          const numeric = Number(value);
+          return Number.isFinite(numeric) ? numeric : NaN;
+        },
+        _formatPremiumValue(value) {
+          const numeric = Number(value);
+          if (!Number.isFinite(numeric)) return 'Unknown';
+          return new Intl.NumberFormat('en-US', { maximumFractionDigits: 3 }).format(numeric);
+        },
+        _formatPercent(value) {
+          const numeric = Number(value);
+          if (!Number.isFinite(numeric)) return 'Unknown';
+          return new Intl.NumberFormat('en-US', { maximumFractionDigits: 3 }).format(numeric);
+        },
+        _premiumPercentLeft(included, remaining) {
+          if (!Number.isFinite(included) || included <= 0 || !Number.isFinite(remaining)) {
+            return null;
+          }
+          const value = (remaining / included) * 100;
+          if (!Number.isFinite(value)) return null;
+          return Math.min(100, Math.max(0, value));
+        },
+        stamp(value) {
+          if (!value) return '-';
+          const date = new Date(value);
+          return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
+        },
+        shortId(value) { return !value ? '-' : (value.length > 36 ? value.slice(-36) : value); },
+        modelLabel(models) { return Array.isArray(models) && models.length ? models.join(', ') : '-'; },
+        historyWidth(row) {
+          const max = Math.max(...this.monthHistory.map((item) => Number(item.cost_usd || 0)), 1);
+          return (Number(row.cost_usd || 0) / max) * 100;
+        },
+        codexProxyStatusClass(client) {
+          const state = this.clientProxyStatus[client] || {};
+          if (state.error) return 'error';
+          if (!state.exists) return 'warn';
+          return state.configured ? 'good' : 'warn';
+        },
+        codexProxyStatusLabel(client) {
+          const state = this.clientProxyStatus[client];
+          if (!state) return 'Unknown';
+          if (state.error) return `Configuration error: ${state.error}`;
+          if (!state.exists) return 'Not configured';
+          if (state.configured) return `Activated (${state.status_message})`;
+          return `Not activated (${state.status_message})`;
+        },
+        async loadClientProxyStatus() {
+          this.loadingClientProxyStatus = true;
+          this.proxyConfigError = '';
+          try {
+            const response = await fetch('/api/config/client-proxy');
+            if (!response.ok) {
+              throw new Error(`client proxy status request failed: ${response.status}`);
+            }
+            const payload = await response.json();
+            if (payload?.clients?.codex) {
+              this.clientProxyStatus.codex = { ...this.clientProxyStatus.codex, ...payload.clients.codex };
+            }
+            if (payload?.clients?.claude) {
+              this.clientProxyStatus.claude = { ...this.clientProxyStatus.claude, ...payload.clients.claude };
+            }
+          } catch (error) {
+            this.proxyConfigError = error.message;
+          } finally {
+            this.loadingClientProxyStatus = false;
+          }
+        },
+        async configureClientProxy(target, action) {
+          if (this.savingProxyConfig) return;
+
+          const normalizedTargets = Array.isArray(target) ? target : [target];
+          this.savingProxyConfig = true;
+          this.proxyConfigStatusMessage = '';
+          this.proxyConfigError = '';
+
+          try {
+            const response = await fetch('/api/config/client-proxy', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                action,
+                targets: normalizedTargets,
+              }),
+            });
+            if (!response.ok) {
+              let message = `client proxy ${action} request failed: ${response.status}`;
+              try {
+                const data = await response.json();
+                if (data?.detail) {
+                  message = data.detail;
+                } else if (data?.error) {
+                  message = data.error;
+                }
+              } catch (_error) {}
+              throw new Error(message);
+            }
+
+            const payload = await response.json();
+            if (payload?.clients?.codex) {
+              this.clientProxyStatus.codex = { ...this.clientProxyStatus.codex, ...payload.clients.codex };
+            }
+            if (payload?.clients?.claude) {
+              this.clientProxyStatus.claude = { ...this.clientProxyStatus.claude, ...payload.clients.claude };
+            }
+
+            await this.loadClientProxyStatus();
+            const clientErrors = [];
+            if (payload?.clients?.codex?.error) {
+              clientErrors.push(`codex: ${payload.clients.codex.error}`);
+            }
+            if (payload?.clients?.claude?.error) {
+              clientErrors.push(`claude: ${payload.clients.claude.error}`);
+            }
+            if (clientErrors.length) {
+              this.proxyConfigError = clientErrors.join(' | ');
+            } else {
+              const defaultMessage = action === 'disable'
+                ? `Proxy disabled for ${normalizedTargets.join(', ')}`
+                : `Wrote proxy settings for ${normalizedTargets.join(', ')}`;
+              this.proxyConfigStatusMessage = payload?.message || defaultMessage;
+            }
+          } catch (error) {
+            this.proxyConfigError = error.message;
+          } finally {
+            this.savingProxyConfig = false;
+          }
+        },
+        async installClientProxy(target) {
+          return this.configureClientProxy(target, 'install');
+        },
+        async disableClientProxy(target) {
+          return this.configureClientProxy(target, 'disable');
+        },
+        async loadBillingTokenConfig() {
+          try {
+            const response = await fetch('/api/config/billing-token');
+            if (!response.ok) throw new Error(`billing token status request failed: ${response.status}`);
+            const payload = await response.json();
+            this.billingToken.configured = Boolean(payload.configured);
+            this.billingToken.source = payload.source || 'none';
+            this.billingToken.readonly = Boolean(payload.readonly);
+            this.billingToken.error = '';
+          } catch (error) {
+            this.billingToken.error = error.message;
+          }
+        },
+        async saveBillingToken() {
+          if (this.savingBillingToken) return;
+          this.savingBillingToken = true;
+          this.billingToken.statusMessage = '';
+          this.billingToken.error = '';
+          try {
+            const response = await fetch('/api/config/billing-token', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ token: this.billingToken.tokenInput }),
+            });
+            if (!response.ok) {
+              let message = `save request failed: ${response.status}`;
+              try {
+                const data = await response.json();
+                if (data?.detail) {
+                  message = data.detail;
+                } else if (data?.error) {
+                  message = data.error;
+                }
+              } catch (_error) {}
+              throw new Error(message);
+            }
+            const payload = await response.json();
+            this.billingToken.configured = Boolean(payload.configured);
+            this.billingToken.source = payload.source || 'none';
+            this.billingToken.readonly = Boolean(payload.readonly);
+            this.billingToken.tokenInput = '';
+            this.billingToken.statusMessage = 'Billing token saved.';
+            await this.load(true);
+          } catch (error) {
+            this.billingToken.error = error.message;
+          } finally {
+            this.savingBillingToken = false;
+          }
+        },
+        async clearBillingToken() {
+          this.savingBillingToken = true;
+          this.billingToken.statusMessage = '';
+          this.billingToken.error = '';
+          try {
+            const response = await fetch('/api/config/billing-token', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ clear: true }),
+            });
+            if (!response.ok) {
+              let message = `clear request failed: ${response.status}`;
+              try {
+                const data = await response.json();
+                if (data?.detail) {
+                  message = data.detail;
+                } else if (data?.error) {
+                  message = data.error;
+                }
+              } catch (_error) {}
+              throw new Error(message);
+            }
+            const payload = await response.json();
+            this.billingToken.configured = Boolean(payload.configured);
+            this.billingToken.source = payload.source || 'none';
+            this.billingToken.readonly = Boolean(payload.readonly);
+            this.billingToken.tokenInput = '';
+            this.billingToken.statusMessage = 'Billing token cleared.';
+            await this.load(true);
+          } catch (error) {
+            this.billingToken.error = error.message;
+          } finally {
+            this.savingBillingToken = false;
+          }
+        },
+        allowSource(source) { return this.sourceFilter === 'all' || this.sourceFilter === source; },
+        matches(row) { return !this.search || JSON.stringify(row).toLowerCase().includes(this.search.toLowerCase()); },
+        sortRows(rows, dateKey) {
+          const sorted = [...rows];
+          if (this.sortMode === 'cost') return sorted.sort((a, b) => Number(b.cost_usd || 0) - Number(a.cost_usd || 0));
+          if (this.sortMode === 'tokens') return sorted.sort((a, b) => Number(b.total_tokens || 0) - Number(a.total_tokens || 0));
+          return sorted.sort((a, b) => String(b[dateKey] || b.started_at || '').localeCompare(String(a[dateKey] || a.started_at || '')));
+        },
+        async load(forceRefresh = false) {
+          this.loading = true;
+          try {
+            const response = await fetch(`/api/dashboard${forceRefresh ? '?refresh=1' : ''}`);
+            if (!response.ok) throw new Error(`dashboard request failed: ${response.status}`);
+            this.data = await response.json();
+          } catch (error) {
+            this.data.ccusage = { ...(this.data.ccusage || {}), errors: [{ source: 'dashboard', error: error.message }] };
+          } finally {
+            this.loading = false;
+          }
+        },
+      },
+      mounted() {
+        this.load();
+        this.loadBillingTokenConfig();
+        this.loadClientProxyStatus();
+        window.setInterval(() => this.load(false), 15000);
+      },
+    }).mount('#app');
+  </script>
+</body>
+</html>
