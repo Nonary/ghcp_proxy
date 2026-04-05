@@ -437,6 +437,28 @@ class ProxyInitiatorTests(unittest.TestCase):
             "proxy-chain-123",
         )
 
+    def test_finish_usage_event_records_cost_from_model_pricing(self):
+        event = {
+            "request_id": "req-999",
+            "resolved_model": "gpt-5.4",
+            "_started_monotonic": 10.0,
+        }
+        usage = {
+            "input_tokens": 1_000_000,
+            "output_tokens": 1_000_000,
+            "cached_input_tokens": 1_000_000,
+        }
+
+        with (
+            mock.patch.object(proxy, "_record_usage_event") as record_usage,
+            mock.patch.object(proxy._initiator_policy, "note_request_finished"),
+        ):
+            proxy._finish_usage_event(event, 200, usage=usage)
+
+        record_usage.assert_called_once()
+        finished = record_usage.call_args.args[0]
+        self.assertAlmostEqual(finished["cost_usd"], 17.75)
+
     def test_sse_usage_capture_extracts_token_usage(self):
         capture = proxy._SSEUsageCapture("responses")
 
@@ -661,6 +683,55 @@ class ProxyInitiatorTests(unittest.TestCase):
             body,
         )
 
+    def test_proxy_streaming_response_connect_error_returns_openai_error(self):
+        request = httpx.Request("POST", "https://example.invalid/responses")
+
+        class FakeClient:
+            def __init__(self):
+                self.aclose = mock.AsyncMock()
+
+            def build_request(self, *args, **kwargs):
+                return request
+
+        fake_client = FakeClient()
+        usage_event = {"request_id": "req-123"}
+        connect_error = httpx.ConnectError("All connection attempts failed", request=request)
+
+        with (
+            mock.patch.object(proxy.httpx, "AsyncClient", return_value=fake_client),
+            mock.patch.object(proxy, "throttled_client_send", mock.AsyncMock(side_effect=connect_error)),
+            mock.patch.object(proxy, "_finish_usage_event") as finish_usage,
+        ):
+            response = proxy.asyncio.run(
+                proxy.proxy_streaming_response(
+                    "https://example.invalid/responses",
+                    {"Authorization": "Bearer test"},
+                    {"model": "gpt-5.4-mini", "stream": True},
+                    usage_event=usage_event,
+                )
+            )
+
+        finish_usage.assert_called_once_with(
+            usage_event,
+            502,
+            response_text="Upstream connection failed: All connection attempts failed",
+        )
+        fake_client.aclose.assert_awaited_once()
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(
+            response.body,
+            b'{"error":{"message":"Upstream connection failed: All connection attempts failed","type":"server_error","param":null,"code":null}}',
+        )
+
+    def test_upstream_request_error_status_and_message_maps_timeout_to_504(self):
+        request = httpx.Request("POST", "https://example.invalid/responses")
+        timeout_error = httpx.ReadTimeout("Timed out", request=request)
+
+        self.assertEqual(
+            proxy._upstream_request_error_status_and_message(timeout_error),
+            (504, "Upstream request timed out: Timed out"),
+        )
+
     def test_anthropic_error_payload_from_openai_uses_anthropic_shape(self):
         payload = {
             "error": {
@@ -777,6 +848,45 @@ class ProxyInitiatorTests(unittest.TestCase):
             b'{"error":{"message":"Invalid JSON body","type":"invalid_request_error","param":null,"code":null}}',
         )
 
+    def test_responses_route_upstream_connect_error_returns_openai_error_shape(self):
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/responses"),
+            method="POST",
+            headers={},
+        )
+        body = {
+            "model": "gpt-5.4-mini",
+            "input": "hello",
+            "stream": False,
+        }
+        connect_error = httpx.ConnectError(
+            "All connection attempts failed",
+            request=httpx.Request("POST", "https://example.invalid/responses"),
+        )
+
+        with (
+            mock.patch.object(proxy, "parse_json_request", mock.AsyncMock(return_value=body)),
+            mock.patch.object(proxy, "get_api_key", return_value="test-key"),
+            mock.patch.object(proxy, "_get_api_base", return_value="https://example.invalid"),
+            mock.patch.object(proxy, "build_responses_headers_for_request", return_value={"X-Initiator": "agent"}),
+            mock.patch.object(proxy, "log_proxy_request"),
+            mock.patch.object(proxy, "_start_usage_event", return_value=None),
+            mock.patch.object(proxy, "_finish_usage_event") as finish_usage,
+            mock.patch.object(proxy, "throttled_client_post", mock.AsyncMock(side_effect=connect_error)),
+        ):
+            response = proxy.asyncio.run(proxy.responses(request))
+
+        finish_usage.assert_called_once_with(
+            None,
+            502,
+            response_text="Upstream connection failed: All connection attempts failed",
+        )
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(
+            response.body,
+            b'{"error":{"message":"Upstream connection failed: All connection attempts failed","type":"server_error","param":null,"code":null}}',
+        )
+
     def test_anthropic_messages_invalid_json_returns_anthropic_error_shape(self):
         request = SimpleNamespace(
             url=SimpleNamespace(path="/v1/messages"),
@@ -795,6 +905,55 @@ class ProxyInitiatorTests(unittest.TestCase):
         self.assertEqual(
             response.body,
             b'{"type":"error","error":{"type":"invalid_request_error","message":"Invalid JSON body"}}',
+        )
+
+    def test_anthropic_messages_upstream_connect_error_returns_anthropic_error_shape(self):
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/messages"),
+            method="POST",
+            headers={},
+        )
+        body = {
+            "model": "claude-sonnet-4.6",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "hello"}],
+                }
+            ],
+        }
+        outbound = {
+            "model": "claude-sonnet-4.6",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": False,
+        }
+        connect_error = httpx.ConnectError(
+            "All connection attempts failed",
+            request=httpx.Request("POST", "https://example.invalid/chat/completions"),
+        )
+
+        with (
+            mock.patch.object(proxy, "parse_json_request", mock.AsyncMock(return_value=body)),
+            mock.patch.object(proxy, "get_api_key", return_value="test-key"),
+            mock.patch.object(proxy, "_get_api_base", return_value="https://example.invalid"),
+            mock.patch.object(proxy, "anthropic_request_to_chat", mock.AsyncMock(return_value=outbound)),
+            mock.patch.object(proxy, "build_anthropic_headers_for_request", return_value={"X-Initiator": "agent"}),
+            mock.patch.object(proxy, "log_proxy_request"),
+            mock.patch.object(proxy, "_start_usage_event", return_value=None),
+            mock.patch.object(proxy, "_finish_usage_event") as finish_usage,
+            mock.patch.object(proxy, "throttled_client_post", mock.AsyncMock(side_effect=connect_error)),
+        ):
+            response = proxy.asyncio.run(proxy.anthropic_messages(request))
+
+        finish_usage.assert_called_once_with(
+            None,
+            502,
+            response_text="Upstream connection failed: All connection attempts failed",
+        )
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(
+            response.body,
+            b'{"type":"error","error":{"type":"api_error","message":"Upstream connection failed: All connection attempts failed"}}',
         )
 
     def test_forced_agent_responses_requests_stay_agent(self):
@@ -1079,10 +1238,57 @@ class ProxyInitiatorTests(unittest.TestCase):
         self.assertEqual(proxy._month_key_for_source_row("claude", {"month": "2026-04"}), "2026-04")
         self.assertEqual(proxy._month_key_for_source_row("codex", {"month": "Apr 2026"}), "2026-04")
 
+    def test_collect_ccusage_payload_aggregates_local_usage_costs(self):
+        events = [
+            {
+                "request_id": "claude-req",
+                "session_id": "claude-session",
+                "server_request_id": "claude-chain",
+                "started_at": "2026-04-04T17:50:00+00:00",
+                "finished_at": "2026-04-04T17:51:00+00:00",
+                "resolved_model": "claude-opus-4.1",
+                "usage": {
+                    "input_tokens": 1_000_000,
+                    "output_tokens": 1_000_000,
+                    "cached_input_tokens": 1_000_000,
+                    "cache_creation_input_tokens": 1_000_000,
+                    "total_tokens": 2_000_000,
+                },
+            },
+            {
+                "request_id": "gpt-req",
+                "session_id": "codex-session",
+                "server_request_id": "codex-chain",
+                "started_at": "2026-04-04T18:00:00+00:00",
+                "finished_at": "2026-04-04T18:01:00+00:00",
+                "resolved_model": "gpt-5.4",
+                "usage": {
+                    "input_tokens": 1_000_000,
+                    "output_tokens": 1_000_000,
+                    "cached_input_tokens": 1_000_000,
+                    "total_tokens": 2_000_000,
+                },
+            },
+        ]
+
+        with mock.patch.object(proxy, "_snapshot_usage_events", return_value=events):
+            payload = proxy._collect_ccusage_payload()
+
+        self.assertEqual(payload["generated_by"], "local-request-log")
+        self.assertEqual(set(payload["sources"].keys()), {"claude", "codex"})
+
+        claude_month = payload["sources"]["claude"]["monthly"]["monthly"][0]
+        codex_month = payload["sources"]["codex"]["monthly"]["monthly"][0]
+        self.assertAlmostEqual(claude_month["totalCost"], 110.25)
+        self.assertAlmostEqual(codex_month["costUSD"], 17.75)
+        self.assertEqual(payload["sources"]["claude"]["sessions"]["sessions"][0]["modelsUsed"], ["claude-opus-4.1"])
+        self.assertEqual(set(payload["sources"]["codex"]["sessions"]["sessions"][0]["models"].keys()), {"gpt-5.4"})
+
     def test_build_dashboard_payload_combines_claude_and_codex(self):
         fixed_now = datetime(2026, 4, 4, 18, 0, tzinfo=timezone.utc)
         ccusage_payload = {
             "available": True,
+            "generated_by": "local-request-log",
             "sources": {
                 "claude": {
                     "available": True,

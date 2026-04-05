@@ -20,10 +20,8 @@ import gzip
 import json
 import glob
 import os
-import shlex
 import shutil
 import sqlite3
-import subprocess
 import sys
 import time
 import zlib
@@ -227,32 +225,194 @@ CCUSAGE_CACHE_TTL_SECONDS = 300.0
 PREMIUM_CACHE_TTL_SECONDS = 300.0
 
 MODEL_PRICING = {
-    "claude-haiku-4-5": {"provider": "Anthropic", "input_per_million": 1.00, "output_per_million": 5.00},
-    "claude-opus-4.6": {"provider": "Anthropic", "input_per_million": 5.00, "output_per_million": 25.00},
-    "claude-sonnet-4.6": {"provider": "Anthropic", "input_per_million": 3.00, "output_per_million": 15.00},
-    "gpt-4.1": {"provider": "OpenAI", "input_per_million": 2.00, "output_per_million": 8.00},
-    "gpt-4.1-mini": {"provider": "OpenAI", "input_per_million": 0.40, "output_per_million": 1.60},
-    "gpt-4.1-nano": {"provider": "OpenAI", "input_per_million": 0.10, "output_per_million": 0.40},
-    "gpt-4o": {"provider": "OpenAI", "input_per_million": 2.50, "output_per_million": 10.00},
-    "gpt-4o-mini": {"provider": "OpenAI", "input_per_million": 0.15, "output_per_million": 0.60},
-    "gpt-5": {"provider": "OpenAI", "input_per_million": 1.25, "output_per_million": 10.00},
-    "gpt-5-mini": {"provider": "OpenAI", "input_per_million": 0.25, "output_per_million": 2.00},
-    "gpt-5-nano": {"provider": "OpenAI", "input_per_million": 0.05, "output_per_million": 0.40},
-    "gpt-5.1": {"provider": "OpenAI", "input_per_million": 1.25, "output_per_million": 10.00},
-    "gpt-5.1-codex": {"provider": "OpenAI", "input_per_million": 1.25, "output_per_million": 10.00},
-    "gpt-5.1-codex-max": {"provider": "OpenAI", "input_per_million": 1.25, "output_per_million": 10.00},
-    "gpt-5.1-codex-mini": {"provider": "OpenAI", "input_per_million": 0.25, "output_per_million": 2.00},
-    "gpt-5.2": {"provider": "OpenAI", "input_per_million": 1.75, "output_per_million": 14.00},
-    "gpt-5.2-codex": {"provider": "OpenAI", "input_per_million": 1.75, "output_per_million": 14.00},
-    "gpt-5.4": {"provider": "OpenAI", "input_per_million": 2.50, "output_per_million": 15.00},
-    "gpt-5.4-mini": {"provider": "OpenAI", "input_per_million": 0.75, "output_per_million": 4.50},
-    "gpt-5.4-nano": {"provider": "OpenAI", "input_per_million": 0.20, "output_per_million": 1.25},
+    "claude-haiku-3": {
+        "provider": "Anthropic",
+        "input_per_million": 0.25,
+        "cached_input_per_million": 0.025,
+        "output_per_million": 1.25,
+    },
+    "claude-haiku-3-5": {
+        "provider": "Anthropic",
+        "input_per_million": 0.80,
+        "cached_input_per_million": 0.08,
+        "output_per_million": 4.00,
+    },
+    "claude-haiku-4-5": {
+        "provider": "Anthropic",
+        "input_per_million": 1.00,
+        "cached_input_per_million": 0.10,
+        "output_per_million": 5.00,
+    },
+    "claude-sonnet-3-5": {
+        "provider": "Anthropic",
+        "input_per_million": 3.00,
+        "cached_input_per_million": 0.30,
+        "output_per_million": 15.00,
+    },
+    "claude-sonnet-3-7": {
+        "provider": "Anthropic",
+        "input_per_million": 3.00,
+        "cached_input_per_million": 0.30,
+        "output_per_million": 15.00,
+    },
+    "claude-sonnet-4.6": {
+        "provider": "Anthropic",
+        "input_per_million": 3.00,
+        "cached_input_per_million": 0.30,
+        "output_per_million": 15.00,
+    },
+    "claude-opus-3": {
+        "provider": "Anthropic",
+        "input_per_million": 15.00,
+        "cached_input_per_million": 1.50,
+        "output_per_million": 75.00,
+    },
+    "claude-opus-4.1": {
+        "provider": "Anthropic",
+        "input_per_million": 15.00,
+        "cached_input_per_million": 1.50,
+        "output_per_million": 75.00,
+    },
+    "claude-opus-4.6": {
+        "provider": "Anthropic",
+        "input_per_million": 5.00,
+        "cached_input_per_million": 0.50,
+        "output_per_million": 25.00,
+    },
+    "gpt-4.1": {
+        "provider": "OpenAI",
+        "input_per_million": 2.00,
+        "cached_input_per_million": 0.50,
+        "output_per_million": 8.00,
+    },
+    "gpt-4.1-mini": {
+        "provider": "OpenAI",
+        "input_per_million": 0.40,
+        "cached_input_per_million": 0.10,
+        "output_per_million": 1.60,
+    },
+    "gpt-4.1-nano": {
+        "provider": "OpenAI",
+        "input_per_million": 0.10,
+        "cached_input_per_million": 0.025,
+        "output_per_million": 0.40,
+    },
+    "gpt-4o": {
+        "provider": "OpenAI",
+        "input_per_million": 2.50,
+        "cached_input_per_million": 1.25,
+        "output_per_million": 10.00,
+    },
+    "gpt-4o-mini": {
+        "provider": "OpenAI",
+        "input_per_million": 0.15,
+        "cached_input_per_million": 0.075,
+        "output_per_million": 0.60,
+    },
+    "gpt-5": {
+        "provider": "OpenAI",
+        "input_per_million": 1.25,
+        "cached_input_per_million": 0.125,
+        "output_per_million": 10.00,
+    },
+    "gpt-5-mini": {
+        "provider": "OpenAI",
+        "input_per_million": 0.25,
+        "cached_input_per_million": 0.025,
+        "output_per_million": 2.00,
+    },
+    "gpt-5-nano": {
+        "provider": "OpenAI",
+        "input_per_million": 0.05,
+        "cached_input_per_million": 0.005,
+        "output_per_million": 0.40,
+    },
+    "gpt-5.1": {
+        "provider": "OpenAI",
+        "input_per_million": 1.25,
+        "cached_input_per_million": 0.125,
+        "output_per_million": 10.00,
+    },
+    "gpt-5.1-codex": {
+        "provider": "OpenAI",
+        "input_per_million": 1.25,
+        "cached_input_per_million": 0.125,
+        "output_per_million": 10.00,
+    },
+    "gpt-5.1-codex-max": {
+        "provider": "OpenAI",
+        "input_per_million": 1.25,
+        "cached_input_per_million": 0.125,
+        "output_per_million": 10.00,
+    },
+    "gpt-5.1-codex-mini": {
+        "provider": "OpenAI",
+        "input_per_million": 0.25,
+        "cached_input_per_million": 0.025,
+        "output_per_million": 2.00,
+    },
+    "gpt-5.2": {
+        "provider": "OpenAI",
+        "input_per_million": 1.75,
+        "cached_input_per_million": 0.175,
+        "output_per_million": 14.00,
+    },
+    "gpt-5.2-codex": {
+        "provider": "OpenAI",
+        "input_per_million": 1.75,
+        "cached_input_per_million": 0.175,
+        "output_per_million": 14.00,
+    },
+    "gpt-5.3-codex": {
+        "provider": "OpenAI",
+        "input_per_million": 1.75,
+        "cached_input_per_million": 0.175,
+        "output_per_million": 14.00,
+    },
+    "gpt-5.4": {
+        "provider": "OpenAI",
+        "input_per_million": 2.50,
+        "cached_input_per_million": 0.25,
+        "output_per_million": 15.00,
+    },
+    "gpt-5.4-mini": {
+        "provider": "OpenAI",
+        "input_per_million": 0.75,
+        "cached_input_per_million": 0.075,
+        "output_per_million": 4.50,
+    },
+    "gpt-5.4-nano": {
+        "provider": "OpenAI",
+        "input_per_million": 0.20,
+        "cached_input_per_million": 0.02,
+        "output_per_million": 1.25,
+    },
 }
 
 MODEL_PRICING_ALIASES = {
+    "anthropic/claude-haiku-3": "claude-haiku-3",
+    "anthropic/claude-haiku-3.5": "claude-haiku-3-5",
+    "anthropic/claude-haiku-4.5": "claude-haiku-4-5",
+    "anthropic/claude-opus-3": "claude-opus-3",
+    "anthropic/claude-opus-4": "claude-opus-4.1",
+    "anthropic/claude-opus-4.0": "claude-opus-4.1",
+    "anthropic/claude-opus-4.1": "claude-opus-4.1",
+    "anthropic/claude-opus-4.5": "claude-opus-4.6",
+    "anthropic/claude-sonnet-3.5": "claude-sonnet-3-5",
+    "anthropic/claude-sonnet-3.7": "claude-sonnet-3-7",
+    "anthropic/claude-sonnet-4": "claude-sonnet-4.6",
+    "anthropic/claude-sonnet-4.5": "claude-sonnet-4.6",
     "claude-haiku-4.5": "claude-haiku-4-5",
+    "claude-haiku-3.5": "claude-haiku-3-5",
+    "claude-haiku-3": "claude-haiku-3",
+    "claude-opus-4": "claude-opus-4.1",
+    "claude-opus-4.0": "claude-opus-4.1",
+    "claude-opus-4.1": "claude-opus-4.1",
     "claude-opus-4.5": "claude-opus-4.6",
     "claude-opus-4-6": "claude-opus-4.6",
+    "claude-opus-3": "claude-opus-3",
+    "claude-sonnet-3.5": "claude-sonnet-3-5",
+    "claude-sonnet-3.7": "claude-sonnet-3-7",
     "claude-sonnet-4": "claude-sonnet-4.6",
     "claude-sonnet-4.5": "claude-sonnet-4.6",
     "claude-sonnet-4-6": "claude-sonnet-4.6",
@@ -536,8 +696,110 @@ def _normalize_model_name(model_name: str | None) -> str | None:
     normalized = model_name.strip().lower().replace("_", "-")
     if normalized.startswith("anthropic/"):
         normalized = normalized.split("/", 1)[1]
+    if normalized.startswith("openai/"):
+        normalized = normalized.split("/", 1)[1]
     normalized = MODEL_PRICING_ALIASES.get(normalized, normalized)
     return normalized
+
+
+def _usage_event_model_name(event: dict | None) -> str | None:
+    if not isinstance(event, dict):
+        return None
+
+    for key in ("response_model", "resolved_model", "requested_model"):
+        model_name = event.get(key)
+        normalized = _normalize_model_name(model_name)
+        if normalized:
+            return normalized
+    return None
+
+
+def _usage_event_source(event: dict | None) -> str:
+    if not isinstance(event, dict):
+        return "codex"
+
+    model_name = _usage_event_model_name(event)
+    if isinstance(model_name, str):
+        if model_name.startswith("claude-"):
+            return "claude"
+        if model_name.startswith("gpt-"):
+            return "codex"
+
+    path = str(event.get("path") or "")
+    if path.endswith("/messages"):
+        return "claude"
+    if path.endswith("/responses") or path.endswith("/responses/compact") or path.endswith("/chat/completions"):
+        return "codex"
+    return "codex"
+
+
+def _usage_event_group_key(event: dict | None) -> tuple[str, str]:
+    if not isinstance(event, dict):
+        return ("codex", "unknown")
+
+    source = _usage_event_source(event)
+    group_id = None
+    for key in ("session_id", "client_request_id", "server_request_id", "request_id"):
+        value = event.get(key)
+        if isinstance(value, str) and value:
+            group_id = value
+            break
+
+    if not isinstance(group_id, str) or not group_id:
+        group_id = "unknown"
+    return (source, group_id)
+
+
+def _pricing_entry_for_model(model_name: str | None) -> dict | None:
+    normalized = _normalize_model_name(model_name)
+    if not normalized:
+        return None
+    return MODEL_PRICING.get(normalized)
+
+
+def _anthropic_cache_creation_rate_per_million(entry: dict) -> float:
+    input_rate = _coerce_float(entry.get("input_per_million"))
+    cache_write_rate = _coerce_float(entry.get("cache_write_5m_per_million"))
+    if cache_write_rate > 0:
+        return cache_write_rate
+    # The proxy does not record cache TTL separately, so default to the 5m write rate.
+    return round(input_rate * 1.25, 6)
+
+
+def _usage_event_cost(model_name: str | None, usage: dict | None) -> float:
+    if not isinstance(usage, dict):
+        return 0.0
+
+    entry = _pricing_entry_for_model(model_name)
+    if not isinstance(entry, dict):
+        return 0.0
+
+    input_tokens = _coerce_int(usage.get("input_tokens"))
+    output_tokens = _coerce_int(usage.get("output_tokens"))
+    cached_input_tokens = _coerce_int(usage.get("cached_input_tokens"))
+    if cached_input_tokens == 0 and usage.get("cache_read_input_tokens") is not None:
+        cached_input_tokens = _coerce_int(usage.get("cache_read_input_tokens"))
+    cache_creation_input_tokens = _coerce_int(usage.get("cache_creation_input_tokens"))
+    reasoning_output_tokens = _coerce_int(usage.get("reasoning_output_tokens"))
+
+    input_rate = _coerce_float(entry.get("input_per_million"))
+    output_rate = _coerce_float(entry.get("output_per_million"))
+    cached_rate = entry.get("cached_input_per_million")
+    if cached_rate is None and str(entry.get("provider") or "").lower() == "anthropic":
+        cached_rate = round(input_rate * 0.1, 6)
+    cached_rate = _coerce_float(cached_rate, default=input_rate)
+
+    cache_creation_rate = input_rate
+    if str(entry.get("provider") or "").lower() == "anthropic":
+        cache_creation_rate = _anthropic_cache_creation_rate_per_million(entry)
+
+    billable_output_tokens = output_tokens + reasoning_output_tokens
+    return (
+        (input_tokens * input_rate)
+        + (cached_input_tokens * cached_rate)
+        + (cache_creation_input_tokens * cache_creation_rate)
+        + (billable_output_tokens * output_rate)
+    ) / 1_000_000.0
 
 
 def _premium_request_multiplier(model_name: str | None) -> float:
@@ -1038,6 +1300,8 @@ def _load_usage_history():
                     normalized_usage = _normalize_usage_payload(payload.get("usage"))
                     if isinstance(normalized_usage, dict):
                         payload["usage"] = normalized_usage
+                        if payload.get("cost_usd") is None:
+                            payload["cost_usd"] = _usage_event_cost(_usage_event_model_name(payload), normalized_usage)
                     _recent_usage_events.append(payload)
                     _remember_server_request_id(payload)
     except OSError:
@@ -1281,6 +1545,7 @@ def _finish_usage_event(
         or finished_event.get("resolved_model")
         or finished_event.get("requested_model")
     )
+    finished_event["cost_usd"] = _usage_event_cost(model_name, derived_usage)
     finished_event["premium_requests"] = _premium_request_multiplier(model_name) if status_code < 400 else 0.0
     _remember_server_request_id(finished_event)
     _record_usage_event(finished_event)
@@ -1291,98 +1556,164 @@ def _snapshot_usage_events() -> list[dict]:
         return list(_recent_usage_events)
 
 
-def _find_command(*names: str) -> str | None:
-    for name in names:
-        resolved = shutil.which(name)
-        if resolved:
-            return resolved
-    return None
-
-
-def _resolve_ccusage_command(source: str) -> list[str] | None:
-    if source == "claude":
-        override = os.environ.get("GHCP_CLAUDE_CCUSAGE_COMMAND")
-        if override:
-            return shlex.split(override)
-        ccusage_cmd = _find_command("ccusage.cmd", "ccusage", "ccusage.ps1")
-        if ccusage_cmd:
-            return [ccusage_cmd]
-        npx_cmd = _find_command("npx.cmd", "npx", "npx.ps1")
-        if npx_cmd:
-            return [npx_cmd, "--yes", "ccusage"]
-        return None
-
-    if source == "codex":
-        override = os.environ.get("GHCP_CODEX_CCUSAGE_COMMAND")
-        if override:
-            return shlex.split(override)
-        npx_cmd = _find_command("npx.cmd", "npx", "npx.ps1")
-        if npx_cmd:
-            return [npx_cmd, "--yes", "@ccusage/codex@latest"]
-        return None
-
-    return None
-
-
-def _run_ccusage_report(source: str, subcommand: str) -> dict:
-    base_command = _resolve_ccusage_command(source)
-    if not base_command:
-        raise RuntimeError(f"{source} ccusage command is unavailable")
-
-    command = [*base_command, subcommand, "--json", "--offline"]
-    completed = subprocess.run(
-        command,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=120,
-        check=False,
-    )
-    if completed.returncode != 0:
-        stderr = (completed.stderr or completed.stdout or "").strip()
-        raise RuntimeError(stderr or f"{source} ccusage command failed with exit code {completed.returncode}")
-
-    try:
-        payload = json.loads(completed.stdout)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"{source} ccusage returned invalid JSON for '{subcommand}': {exc}") from exc
-    if not isinstance(payload, dict):
-        raise RuntimeError(f"{source} ccusage returned unexpected payload type for '{subcommand}'")
-    return payload
-
-
 def _empty_ccusage_payload() -> dict:
     return {
-        "available": False,
+        "available": True,
+        "generated_by": "local-request-log",
         "loaded_at": None,
         "sources": {},
         "errors": [],
     }
 
 
+def _new_usage_aggregate_bucket() -> dict:
+    return {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "cached_input_tokens": 0,
+        "cache_creation_tokens": 0,
+        "reasoning_output_tokens": 0,
+        "cost_usd": 0.0,
+        "_model_order": [],
+        "_models": {},
+        "_last_activity_dt": None,
+        "project_path": None,
+        "request_count": 0,
+    }
+
+
+def _ingest_usage_event(bucket: dict, event: dict):
+    if not isinstance(bucket, dict) or not isinstance(event, dict):
+        return
+
+    usage = _normalize_usage_payload(event.get("usage")) or {}
+    event_cost = event.get("cost_usd")
+    if not isinstance(event_cost, (int, float)):
+        event_cost = _usage_event_cost(_usage_event_model_name(event), usage)
+
+    event_time = _parse_iso_datetime(event.get("finished_at") or event.get("started_at"))
+    if event_time is not None:
+        current_last = bucket.get("_last_activity_dt")
+        if not isinstance(current_last, datetime) or event_time > current_last:
+            bucket["_last_activity_dt"] = event_time
+
+    project_path = event.get("project_path")
+    if bucket.get("project_path") is None and isinstance(project_path, str) and project_path:
+        bucket["project_path"] = project_path
+
+    input_tokens = _coerce_int(usage.get("input_tokens"))
+    output_tokens = _coerce_int(usage.get("output_tokens"))
+    total_tokens = _coerce_int(usage.get("total_tokens"))
+    cached_input_tokens = _coerce_int(usage.get("cached_input_tokens"))
+    cache_creation_tokens = _coerce_int(usage.get("cache_creation_input_tokens"))
+    reasoning_output_tokens = _coerce_int(usage.get("reasoning_output_tokens"))
+    model_name = _usage_event_model_name(event) or "unknown"
+
+    bucket["input_tokens"] += input_tokens
+    bucket["output_tokens"] += output_tokens
+    bucket["total_tokens"] += total_tokens
+    bucket["cached_input_tokens"] += cached_input_tokens
+    bucket["cache_creation_tokens"] += cache_creation_tokens
+    bucket["reasoning_output_tokens"] += reasoning_output_tokens
+    bucket["cost_usd"] += _coerce_float(event_cost)
+    bucket["request_count"] += 1
+
+    model_bucket = bucket["_models"].setdefault(model_name, {"inputTokens": 0})
+    model_bucket["inputTokens"] += input_tokens
+    if model_name not in bucket["_model_order"]:
+        bucket["_model_order"].append(model_name)
+
+
+def _finalize_usage_bucket(bucket: dict, source: str, *, session_id: str | None = None, month: str | None = None) -> dict:
+    if not isinstance(bucket, dict):
+        return {}
+
+    last_activity_dt = bucket.get("_last_activity_dt")
+    last_activity = last_activity_dt.isoformat() if isinstance(last_activity_dt, datetime) else None
+    models = bucket.get("_models") if isinstance(bucket.get("_models"), dict) else {}
+    model_order = bucket.get("_model_order") if isinstance(bucket.get("_model_order"), list) else []
+    result = {
+        "sessionId": session_id,
+        "lastActivity": last_activity,
+        "projectPath": bucket.get("project_path"),
+        "inputTokens": bucket.get("input_tokens", 0),
+        "outputTokens": bucket.get("output_tokens", 0),
+        "totalTokens": bucket.get("total_tokens", 0),
+        "requestCount": bucket.get("request_count", 0),
+    }
+
+    if month is not None:
+        result["month"] = month
+
+    if source == "claude":
+        result["cacheReadTokens"] = bucket.get("cached_input_tokens", 0)
+        result["cacheCreationTokens"] = bucket.get("cache_creation_tokens", 0)
+        result["totalCost"] = bucket.get("cost_usd", 0.0)
+        result["modelsUsed"] = list(model_order)
+    else:
+        result["cachedInputTokens"] = bucket.get("cached_input_tokens", 0)
+        result["reasoningOutputTokens"] = bucket.get("reasoning_output_tokens", 0)
+        result["costUSD"] = bucket.get("cost_usd", 0.0)
+        result["models"] = {name: value for name, value in models.items()}
+
+    return result
+
+
 def _collect_ccusage_payload() -> dict:
+    usage_events = _snapshot_usage_events()
+    source_month_buckets: dict[str, dict[str, dict]] = {}
+    source_session_buckets: dict[str, dict[str, dict]] = {}
+
+    for event in usage_events:
+        event_time = _parse_iso_datetime(event.get("finished_at") or event.get("started_at"))
+        if event_time is None:
+            continue
+
+        source = _usage_event_source(event)
+        month_key = _month_key(event_time)
+        group_source, group_id = _usage_event_group_key(event)
+        session_key = group_id
+        if not isinstance(session_key, str) or not session_key:
+            session_key = event.get("server_request_id") or event.get("request_id") or "unknown"
+        if group_source != source:
+            source = group_source
+
+        source_month_bucket = source_month_buckets.setdefault(source, {})
+        month_bucket = source_month_bucket.setdefault(month_key, _new_usage_aggregate_bucket())
+        _ingest_usage_event(month_bucket, event)
+
+        source_session_bucket = source_session_buckets.setdefault(source, {})
+        session_bucket = source_session_bucket.setdefault(session_key, _new_usage_aggregate_bucket())
+        _ingest_usage_event(session_bucket, event)
+
     result = {
         "available": True,
+        "generated_by": "local-request-log",
         "loaded_at": _utc_now_iso(),
         "sources": {},
         "errors": [],
     }
 
-    for source in ("claude", "codex"):
+    for source in sorted(set(source_month_buckets) | set(source_session_buckets)):
+        month_buckets = source_month_buckets.get(source, {})
+        session_buckets = source_session_buckets.get(source, {})
+        monthly_rows = []
+        for month_key, bucket in month_buckets.items():
+            monthly_rows.append(_finalize_usage_bucket(bucket, source, month=month_key))
+        monthly_rows.sort(key=lambda row: row.get("month") or "", reverse=True)
+
+        session_rows = []
+        for session_id, bucket in session_buckets.items():
+            session_rows.append(_finalize_usage_bucket(bucket, source, session_id=session_id))
+        session_rows.sort(key=lambda row: row.get("lastActivity") or "", reverse=True)
+
         source_payload = {
-            "available": True,
-            "monthly": None,
-            "sessions": None,
+            "available": bool(monthly_rows or session_rows),
+            "monthly": {"monthly": monthly_rows},
+            "sessions": {"sessions": session_rows},
             "error": None,
         }
-        try:
-            source_payload["monthly"] = _run_ccusage_report(source, "monthly")
-            source_payload["sessions"] = _run_ccusage_report(source, "session")
-        except Exception as exc:
-            source_payload["available"] = False
-            source_payload["error"] = str(exc)
-            result["errors"].append({"source": source, "error": str(exc)})
         result["sources"][source] = source_payload
 
     result["available"] = any(item.get("available") for item in result["sources"].values())
@@ -1535,6 +1866,8 @@ def _seed_cached_payloads_from_sqlite():
             _ccusage_cache["last_error"] = ccusage_payload.get("error") or None
             _ccusage_cache["refreshing"] = False
             _ccusage_cache["last_started_at"] = None
+            if ccusage_payload.get("generated_by") != "local-request-log":
+                _ccusage_cache["loaded_at"] = 0.0
 
     premium_payload = _sqlite_cache_get_latest("premium_usage:")
     if isinstance(premium_payload, dict):
@@ -1575,14 +1908,12 @@ def _month_key_for_source_row(source: str, row: dict) -> str | None:
     raw_value = row.get("month")
     if not isinstance(raw_value, str):
         return None
-    if source == "claude":
-        return raw_value
-    if source == "codex":
+    for fmt in ("%Y-%m", "%b %Y"):
         try:
-            return datetime.strptime(raw_value, "%b %Y").strftime("%Y-%m")
+            return datetime.strptime(raw_value, fmt).strftime("%Y-%m")
         except ValueError:
-            return None
-    return None
+            continue
+    return raw_value if source == "claude" else None
 
 
 def _normalize_session(source: str, session: dict) -> dict:
@@ -3034,6 +3365,21 @@ def openai_error_response(status_code: int, message: str, error_type: str | None
     return JSONResponse(content=payload, status_code=status_code, headers=headers)
 
 
+def _upstream_request_error_status_and_message(exc: httpx.RequestError) -> tuple[int, str]:
+    if isinstance(exc, httpx.TimeoutException):
+        prefix = "Upstream request timed out"
+        status_code = 504
+    elif isinstance(exc, httpx.ConnectError):
+        prefix = "Upstream connection failed"
+        status_code = 502
+    else:
+        prefix = "Upstream request failed"
+        status_code = 502
+
+    detail = str(exc).strip()
+    return status_code, f"{prefix}: {detail}" if detail else prefix
+
+
 def _http_exception_detail_to_message(detail) -> str:
     if isinstance(detail, str) and detail:
         return detail
@@ -3127,6 +3473,11 @@ async def proxy_anthropic_streaming_response(
     request = client.build_request("POST", upstream_url, headers=headers, json=body)
     try:
         upstream = await throttled_client_send(client, request, stream=True)
+    except httpx.RequestError as exc:
+        status_code, message = _upstream_request_error_status_and_message(exc)
+        _finish_usage_event(usage_event, status_code, response_text=message)
+        await client.aclose()
+        return anthropic_error_response(status_code, message)
     except Exception:
         _finish_usage_event(usage_event, 599)
         await client.aclose()
@@ -3842,7 +4193,8 @@ async def dashboard():
 @app.get("/api/dashboard")
 async def dashboard_api(request: Request):
     refresh = request.query_params.get("refresh", "").lower() in {"1", "true", "yes"}
-    return JSONResponse(content=_build_dashboard_payload(force_refresh=refresh))
+    payload = await asyncio.to_thread(_build_dashboard_payload, refresh)
+    return JSONResponse(content=payload)
 
 
 @app.get("/api/dashboard/stream")
@@ -3854,7 +4206,8 @@ async def dashboard_stream(request: Request):
     async def stream():
         nonlocal last_version
         try:
-            yield _sse_encode("dashboard", _build_dashboard_payload(force_refresh=False))
+            initial_payload = await asyncio.to_thread(_build_dashboard_payload, False)
+            yield _sse_encode("dashboard", initial_payload)
             while True:
                 if await request.is_disconnected():
                     break
@@ -3868,7 +4221,8 @@ async def dashboard_stream(request: Request):
                 if version == last_version:
                     continue
                 last_version = version
-                yield _sse_encode("dashboard", _build_dashboard_payload(force_refresh=False))
+                payload = await asyncio.to_thread(_build_dashboard_payload, False)
+                yield _sse_encode("dashboard", payload)
         finally:
             _unregister_dashboard_stream_listener(queue)
 
@@ -4053,6 +4407,11 @@ async def proxy_streaming_response(
     request = client.build_request("POST", upstream_url, headers=headers, json=body)
     try:
         upstream = await throttled_client_send(client, request, stream=True)
+    except httpx.RequestError as exc:
+        status_code, message = _upstream_request_error_status_and_message(exc)
+        _finish_usage_event(usage_event, status_code, response_text=message)
+        await client.aclose()
+        return openai_error_response(status_code, message)
     except Exception:
         _finish_usage_event(usage_event, 599)
         await client.aclose()
@@ -4165,6 +4524,10 @@ async def responses(request: Request):
                 response_text=_extract_upstream_text(upstream),
             )
             return proxy_non_streaming_response(upstream)
+        except httpx.RequestError as exc:
+            status_code, message = _upstream_request_error_status_and_message(exc)
+            _finish_usage_event(usage_event, status_code, response_text=message)
+            return openai_error_response(status_code, message)
         except Exception:
             _finish_usage_event(usage_event, 599)
             raise
@@ -4207,6 +4570,10 @@ async def responses_compact(request: Request):
     try:
         async with httpx.AsyncClient(timeout=120) as client:
             upstream = await throttled_client_post(client, upstream_url, headers=headers, json=summary_request)
+    except httpx.RequestError as exc:
+        status_code, message = _upstream_request_error_status_and_message(exc)
+        _finish_usage_event(usage_event, status_code, response_text=message)
+        return openai_error_response(status_code, message)
     except Exception:
         _finish_usage_event(usage_event, 599)
         raise
@@ -4311,6 +4678,10 @@ async def chat_completions(request: Request):
                 response_text=_extract_upstream_text(upstream),
             )
             return proxy_non_streaming_response(upstream)
+        except httpx.RequestError as exc:
+            status_code, message = _upstream_request_error_status_and_message(exc)
+            _finish_usage_event(usage_event, status_code, response_text=message)
+            return openai_error_response(status_code, message)
         except Exception:
             _finish_usage_event(usage_event, 599)
             raise
@@ -4391,6 +4762,10 @@ async def anthropic_messages(request: Request):
             response_payload=translated,
         )
         return JSONResponse(content=translated, status_code=upstream.status_code)
+    except httpx.RequestError as exc:
+        status_code, message = _upstream_request_error_status_and_message(exc)
+        _finish_usage_event(usage_event, status_code, response_text=message)
+        return anthropic_error_response(status_code, message)
     except Exception:
         _finish_usage_event(usage_event, 599)
         raise

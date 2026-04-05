@@ -167,8 +167,8 @@
   <div id="app" class="app">
       <div class="chips" style="margin-bottom: 16px;">
         <span class="chip">{{ updatedLabel }}</span>
-        <span class="chip">{{ cacheLabel }}</span>
-        <span class="chip">{{ refreshLabel }}</span>
+        <span class="chip">{{ liveStatusLabel }}</span>
+        <span class="chip">Costs from proxy request history</span>
       </div>
 
     <section class="metrics">
@@ -214,7 +214,6 @@
             <option value="cost">Highest cost</option>
             <option value="tokens">Most tokens</option>
           </select>
-          <button class="primary" @click="load(true)" :disabled="loading">Refresh</button>
         </div>
 
         <div v-if="activeTab === 'sessions'">
@@ -415,15 +414,17 @@
           <div class="panel-head">
             <div>
               <h3>Backend Status</h3>
-              <div class="subtle">Cache-first API and background refresh state.</div>
+              <div class="subtle">Live dashboard stream, billing lookups, and source errors.</div>
             </div>
           </div>
+          <div :class="['status', dashboardStreamConnected ? 'good' : 'warn']">{{ liveStatusLabel }}</div>
+          <div v-if="dashboardStreamError" class="status error">{{ dashboardStreamError }}</div>
           <div v-if="premium.official?.error" class="status error">github-billing: {{ premium.official.error }}</div>
           <div v-if="ccusage.errors?.length">
             <div v-for="item in ccusage.errors" :key="item.source" class="status error">{{ item.source }}: {{ item.error }}</div>
           </div>
-          <div v-else :class="['status', ccusage.refreshing ? 'warn' : 'good']">
-            {{ ccusage.refreshing ? 'Refresh in progress. Showing cached data.' : 'Cache healthy. No source errors.' }}
+          <div v-else-if="!premium.official?.error" class="status good">
+            No source errors.
           </div>
         </article>
 
@@ -515,7 +516,6 @@
     createApp({
       data() {
         return {
-          loading: false,
           autoRefreshTimer: null,
           savingBillingToken: false,
           loadingClientProxyStatus: false,
@@ -603,14 +603,11 @@
           return parts.join(' · ') || 'No premium quota data yet';
         },
         updatedLabel() { return `Updated ${this.stamp(this.data.generated_at)}`; },
-        cacheLabel() {
-          const age = this.ccusage.age_seconds;
-          if (!Number.isFinite(age)) return 'Cache warming';
-          if (age < 5) return 'Fresh cache';
-          if (age < 60) return `Cache ${Math.round(age)}s old`;
-          return `Cache ${Math.round(age / 60)}m old`;
+        liveStatusLabel() {
+          if (this.dashboardStreamConnected) return 'Live updates connected';
+          if (this.dashboardStreamError) return 'Polling fallback active';
+          return 'Loading live updates';
         },
-        refreshLabel() { return this.ccusage.refreshing ? 'Refresh in progress' : 'Serving from cache'; },
         billingTokenStatusLabel() {
           if (!this.billingToken.configured) {
             return 'No billing token configured';
@@ -911,7 +908,7 @@
             this.billingToken.readonly = Boolean(payload.readonly);
             this.billingToken.tokenInput = '';
             this.billingToken.statusMessage = 'Billing token saved.';
-            await this.load(true);
+            await this.load();
           } catch (error) {
             this.billingToken.error = error.message;
           } finally {
@@ -946,7 +943,7 @@
             this.billingToken.readonly = Boolean(payload.readonly);
             this.billingToken.tokenInput = '';
             this.billingToken.statusMessage = 'Billing token cleared.';
-            await this.load(true);
+            await this.load();
           } catch (error) {
             this.billingToken.error = error.message;
           } finally {
@@ -1047,35 +1044,25 @@
             this.dashboardStreamReconnectTimer = null;
           }
         },
-        async load(forceRefresh = false) {
-          if (this.loading) return;
-          this.loading = true;
+        async load() {
           try {
-            const params = new URLSearchParams();
-            if (forceRefresh) {
-              params.set('refresh', '1');
-              params.set('_', String(Date.now()));
-            }
-            const query = params.toString();
-            const response = await fetch(`/api/dashboard${query ? `?${query}` : ''}`);
+            const response = await fetch('/api/dashboard');
             if (!response.ok) throw new Error(`dashboard request failed: ${response.status}`);
             const payload = await response.json();
             this._applyDashboardPayload(payload);
           } catch (error) {
             this.data.ccusage = { ...(this.data.ccusage || {}), errors: [{ source: 'dashboard', error: error.message }] };
-          } finally {
-            this.loading = false;
           }
         },
       },
       mounted() {
-        this.load(true);
+        this.load();
         this.loadBillingTokenConfig();
         this.loadClientProxyStatus();
         this.startDashboardStream();
         this.autoRefreshTimer = window.setInterval(() => {
           if (!this.dashboardStreamConnected) {
-            this.load(true);
+            this.load();
           }
         }, 60000);
       },
