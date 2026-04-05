@@ -229,9 +229,12 @@
               </tr>
             </thead>
             <tbody>
-              <tr v-for="row in filteredSessions" :key="row.source + row.session_id">
+              <tr v-for="row in filteredSessions" :key="row.source + (row.session_display_id || row.session_id || row.last_activity)">
                 <td><span class="badge">{{ row.source }}</span></td>
-                <td class="mono">{{ shortId(row.session_id) }}</td>
+                <td>
+                  <div class="mono">{{ shortId(row.session_display_id || row.session_id) }}</div>
+                  <div v-if="row.session_kind && row.session_kind !== 'session'" class="subtle">{{ sessionKindLabel(row.session_kind) }}</div>
+                </td>
                 <td>{{ modelLabel(row.models) }}</td>
                 <td>{{ stamp(row.last_activity) }}</td>
                 <td>{{ compact(row.total_tokens) }}</td>
@@ -678,6 +681,12 @@
           return row?.request_id || row?.client_request_id || row?.started_at || '';
         },
         shortId(value) { return !value ? '-' : (value.length > 36 ? value.slice(-36) : value); },
+        sessionKindLabel(kind) {
+          if (kind === 'synthetic_chain') return 'chain fallback';
+          if (kind === 'client_request') return 'client fallback';
+          if (kind === 'request') return 'request fallback';
+          return kind || '';
+        },
         modelLabel(models) { return Array.isArray(models) && models.length ? models.join(', ') : '-'; },
         tokenSummary(row) {
           const usage = row?.usage || {};
@@ -1044,9 +1053,10 @@
             this.dashboardStreamReconnectTimer = null;
           }
         },
-        async load() {
+        async load(forceRefresh = false) {
           try {
-            const response = await fetch('/api/dashboard');
+            const suffix = forceRefresh ? '?refresh=1' : '';
+            const response = await fetch(`/api/dashboard${suffix}`, { cache: 'no-store' });
             if (!response.ok) throw new Error(`dashboard request failed: ${response.status}`);
             const payload = await response.json();
             this._applyDashboardPayload(payload);
@@ -1056,14 +1066,12 @@
         },
       },
       mounted() {
-        this.load();
+        this.load(true);
         this.loadBillingTokenConfig();
         this.loadClientProxyStatus();
         this.startDashboardStream();
         this.autoRefreshTimer = window.setInterval(() => {
-          if (!this.dashboardStreamConnected) {
-            this.load();
-          }
+          this.load(true);
         }, 60000);
       },
       beforeUnmount() {

@@ -73,6 +73,7 @@ CODEX_CONFIG_DIR    = os.path.expanduser("~/.codex")
 CODEX_CONFIG_FILE   = os.path.join(CODEX_CONFIG_DIR, "config.toml")
 CLAUDE_CONFIG_DIR   = os.path.expanduser("~/.claude")
 CLAUDE_SETTINGS_FILE = os.path.join(CLAUDE_CONFIG_DIR, "settings.json")
+CLAUDE_HISTORY_FILE = os.path.join(CLAUDE_CONFIG_DIR, "history.jsonl")
 CODEX_PROXY_CONFIG = """\
 model_provider = "custom"
 model = "gpt-5.4"
@@ -197,6 +198,7 @@ _recent_usage_events = deque(maxlen=MAX_STORED_USAGE_EVENTS)
 _session_request_id_lock = Lock()
 _latest_server_request_ids_by_chain: dict[tuple[str, str], str] = {}
 _active_server_request_ids_by_request: dict[str, dict[str, str | None]] = {}
+_latest_session_contexts_by_fallback_chain: dict[tuple[str, str], dict[str, str | None]] = {}
 _initiator_policy = InitiatorPolicy()
 _ccusage_cache_lock = Lock()
 _sqlite_cache_lock = Lock()
@@ -220,8 +222,17 @@ _premium_cache = {
     "last_error": None,
     "last_started_at": None,
 }
+_claude_history_cache_lock = Lock()
+_claude_history_cache = {
+    "mtime": None,
+    "size": None,
+    "entries": [],
+}
 CCUSAGE_CACHE_TTL_SECONDS = 300.0
-PREMIUM_CACHE_TTL_SECONDS = 300.0
+PREMIUM_CACHE_TTL_SECONDS = 60.0
+CLAUDE_HISTORY_CACHE_MAX_ENTRIES = 400
+CLAUDE_HISTORY_MATCH_MAX_AGE_SECONDS = 300.0
+CLAUDE_HISTORY_FUTURE_SLOP_SECONDS = 15.0
 
 MODEL_PRICING = {
     "claude-haiku-3": {
@@ -594,6 +605,147 @@ def _request_session_id(request: Request, request_body: dict | None = None) -> s
     return None
 
 
+def _fallback_session_chain_key(client_request_id: str | None, subagent: str | None) -> tuple[str, str]:
+    return _server_request_chain_key(None, client_request_id, subagent)
+
+
+def _remember_fallback_session_context(event: dict | None):
+    if not isinstance(event, dict):
+        return
+    session_id = event.get("session_id")
+    if not isinstance(session_id, str) or not session_id:
+        return
+    fallback_key = _fallback_session_chain_key(
+        event.get("client_request_id"),
+        event.get("subagent"),
+    )
+    with _session_request_id_lock:
+        _latest_session_contexts_by_fallback_chain[fallback_key] = {
+            "session_id": session_id,
+            "project_path": event.get("project_path"),
+            "server_request_id": event.get("server_request_id"),
+        }
+
+
+def _get_fallback_session_context(
+    client_request_id: str | None,
+    subagent: str | None,
+) -> dict[str, str | None] | None:
+    fallback_key = _fallback_session_chain_key(client_request_id, subagent)
+    with _session_request_id_lock:
+        context = _latest_session_contexts_by_fallback_chain.get(fallback_key)
+        return dict(context) if isinstance(context, dict) else None
+
+
+def _load_recent_claude_history_entries() -> list[dict]:
+    try:
+        stat = os.stat(CLAUDE_HISTORY_FILE)
+    except OSError:
+        with _claude_history_cache_lock:
+            _claude_history_cache.update({"mtime": None, "size": None, "entries": []})
+        return []
+
+    with _claude_history_cache_lock:
+        cached_mtime = _claude_history_cache.get("mtime")
+        cached_size = _claude_history_cache.get("size")
+        if cached_mtime == stat.st_mtime and cached_size == stat.st_size:
+            cached_entries = _claude_history_cache.get("entries")
+            return list(cached_entries) if isinstance(cached_entries, list) else []
+
+    entries = []
+    try:
+        with open(CLAUDE_HISTORY_FILE, encoding="utf-8") as f:
+            tail_lines = deque(f, maxlen=CLAUDE_HISTORY_CACHE_MAX_ENTRIES)
+    except OSError:
+        return []
+
+    for raw_line in tail_lines:
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        session_id = payload.get("sessionId") or payload.get("session_id")
+        timestamp_ms = payload.get("timestamp")
+        project_path = payload.get("project")
+        if not isinstance(session_id, str) or not session_id:
+            continue
+        if not isinstance(project_path, str) or not project_path:
+            project_path = None
+        try:
+            timestamp = datetime.fromtimestamp(float(timestamp_ms) / 1000.0, tz=timezone.utc)
+        except (TypeError, ValueError, OSError):
+            continue
+        entries.append(
+            {
+                "session_id": session_id,
+                "project_path": project_path,
+                "timestamp": timestamp,
+                "display": payload.get("display"),
+            }
+        )
+
+    with _claude_history_cache_lock:
+        _claude_history_cache.update(
+            {
+                "mtime": stat.st_mtime,
+                "size": stat.st_size,
+                "entries": list(entries),
+            }
+        )
+    return entries
+
+
+def _infer_claude_session_context(now: datetime | None = None) -> dict[str, str | None] | None:
+    current = now or _utc_now()
+    entries = _load_recent_claude_history_entries()
+    if not entries:
+        return None
+
+    best = None
+    best_delta = None
+    for entry in reversed(entries):
+        timestamp = entry.get("timestamp")
+        if not isinstance(timestamp, datetime):
+            continue
+        delta_seconds = (current - timestamp).total_seconds()
+        if delta_seconds < -CLAUDE_HISTORY_FUTURE_SLOP_SECONDS:
+            continue
+        if delta_seconds > CLAUDE_HISTORY_MATCH_MAX_AGE_SECONDS:
+            break
+        if best is None or delta_seconds < best_delta:
+            best = entry
+            best_delta = delta_seconds
+
+    if best is None:
+        return None
+
+    return {
+        "session_id": best.get("session_id"),
+        "project_path": best.get("project_path"),
+        "session_id_origin": "claude_history",
+    }
+
+
+def _request_looks_like_claude(
+    request: Request,
+    requested_model: str | None,
+    resolved_model: str | None,
+) -> bool:
+    path = str(getattr(getattr(request, "url", None), "path", "") or "")
+    if path.endswith("/messages"):
+        return True
+    for candidate in (resolved_model, requested_model):
+        normalized = _normalize_model_name(candidate)
+        if isinstance(normalized, str) and normalized.startswith("claude-"):
+            return True
+    return False
+
+
 def _remember_server_request_id(event: dict | None):
     if not isinstance(event, dict):
         return
@@ -674,6 +826,10 @@ def _resolve_server_request_id(
     request: Request,
     initiator: str | None,
     request_body: dict | None = None,
+    *,
+    session_id: str | None = None,
+    client_request_id: str | None = None,
+    subagent: str | None = None,
 ) -> tuple[str, str | None]:
     explicit_server_request_id = (
         request.headers.get("x-request-id")
@@ -683,9 +839,12 @@ def _resolve_server_request_id(
     if explicit_server_request_id:
         return explicit_server_request_id, explicit_server_request_id
 
-    session_id = _request_session_id(request, request_body)
-    client_request_id = request.headers.get("x-client-request-id")
-    subagent = request.headers.get("x-openai-subagent")
+    if session_id is None:
+        session_id = _request_session_id(request, request_body)
+    if client_request_id is None:
+        client_request_id = request.headers.get("x-client-request-id")
+    if subagent is None:
+        subagent = request.headers.get("x-openai-subagent")
 
     if initiator == "agent":
         active_server_request_id = _get_active_server_request_id_for_request(
@@ -752,6 +911,47 @@ def _usage_event_source(event: dict | None) -> str:
     return "codex"
 
 
+def _apply_missing_claude_session_context(event: dict | None) -> dict | None:
+    if not isinstance(event, dict):
+        return event
+    existing_session_id = event.get("session_id")
+    if isinstance(existing_session_id, str) and existing_session_id:
+        return event
+    if _usage_event_source(event) != "claude":
+        return event
+
+    fallback_context = _get_fallback_session_context(
+        event.get("client_request_id"),
+        event.get("subagent"),
+    )
+    if isinstance(fallback_context, dict):
+        fallback_session_id = fallback_context.get("session_id")
+        fallback_project_path = fallback_context.get("project_path")
+        if isinstance(fallback_session_id, str) and fallback_session_id:
+            event["session_id"] = fallback_session_id
+            event.setdefault("session_id_origin", "fallback_chain")
+        if isinstance(fallback_project_path, str) and fallback_project_path and not event.get("project_path"):
+            event["project_path"] = fallback_project_path
+
+    existing_session_id = event.get("session_id")
+    if isinstance(existing_session_id, str) and existing_session_id:
+        return event
+
+    event_time = _parse_iso_datetime(event.get("started_at") or event.get("finished_at"))
+    inferred_context = _infer_claude_session_context(now=event_time) if event_time is not None else None
+    if not isinstance(inferred_context, dict):
+        return event
+
+    inferred_session_id = inferred_context.get("session_id")
+    inferred_project_path = inferred_context.get("project_path")
+    if isinstance(inferred_session_id, str) and inferred_session_id:
+        event["session_id"] = inferred_session_id
+        event.setdefault("session_id_origin", str(inferred_context.get("session_id_origin") or "claude_history"))
+    if isinstance(inferred_project_path, str) and inferred_project_path and not event.get("project_path"):
+        event["project_path"] = inferred_project_path
+    return event
+
+
 def _usage_event_group_key(event: dict | None) -> tuple[str, str]:
     if not isinstance(event, dict):
         return ("codex", "unknown")
@@ -767,6 +967,58 @@ def _usage_event_group_key(event: dict | None) -> tuple[str, str]:
     if not isinstance(group_id, str) or not group_id:
         group_id = "unknown"
     return (source, group_id)
+
+
+def _usage_event_session_descriptor(event: dict | None) -> dict[str, str]:
+    source, group_id = _usage_event_group_key(event)
+
+    actual_session_id = event.get("session_id") if isinstance(event, dict) else None
+    if isinstance(actual_session_id, str) and actual_session_id:
+        return {
+            "source": source,
+            "group_id": group_id,
+            "session_id": actual_session_id,
+            "session_kind": "session",
+            "session_display_id": actual_session_id,
+        }
+
+    client_request_id = event.get("client_request_id") if isinstance(event, dict) else None
+    if isinstance(client_request_id, str) and client_request_id:
+        return {
+            "source": source,
+            "group_id": group_id,
+            "session_id": "",
+            "session_kind": "client_request",
+            "session_display_id": f"client:{client_request_id}",
+        }
+
+    server_request_id = event.get("server_request_id") if isinstance(event, dict) else None
+    if isinstance(server_request_id, str) and server_request_id:
+        return {
+            "source": source,
+            "group_id": group_id,
+            "session_id": "",
+            "session_kind": "synthetic_chain",
+            "session_display_id": f"chain:{server_request_id}",
+        }
+
+    request_id = event.get("request_id") if isinstance(event, dict) else None
+    if isinstance(request_id, str) and request_id:
+        return {
+            "source": source,
+            "group_id": group_id,
+            "session_id": "",
+            "session_kind": "request",
+            "session_display_id": f"request:{request_id}",
+        }
+
+    return {
+        "source": source,
+        "group_id": group_id,
+        "session_id": "",
+        "session_kind": "unknown",
+        "session_display_id": "unknown",
+    }
 
 
 def _pricing_entry_for_model(model_name: str | None) -> dict | None:
@@ -1321,8 +1573,10 @@ def _load_usage_history():
                         payload["usage"] = normalized_usage
                         if payload.get("cost_usd") is None:
                             payload["cost_usd"] = _usage_event_cost(_usage_event_model_name(payload), normalized_usage)
+                    _apply_missing_claude_session_context(payload)
                     _recent_usage_events.append(payload)
                     _remember_server_request_id(payload)
+                    _remember_fallback_session_context(payload)
     except OSError:
         pass
 
@@ -1339,6 +1593,7 @@ def _record_usage_event(event: dict):
             f.write("\n")
         _recent_usage_events.append(event)
     _remember_server_request_id(event)
+    _remember_fallback_session_context(event)
     _notify_dashboard_stream_listeners()
 
 
@@ -1471,16 +1726,51 @@ def _start_usage_event(
     upstream_path: str | None = None,
     outbound_headers: dict | None = None,
 ) -> dict:
+    client_request_id = request.headers.get("x-client-request-id")
+    subagent = request.headers.get("x-openai-subagent")
     session_id = _request_session_id(request, request_body)
-    server_request_id, prior_server_request_id = _resolve_server_request_id(request, initiator, request_body)
+    project_path = None
+    session_id_origin = "request" if session_id else None
+
+    if not session_id:
+        fallback_context = _get_fallback_session_context(client_request_id, subagent)
+        if isinstance(fallback_context, dict):
+            inherited_session_id = fallback_context.get("session_id")
+            inherited_project_path = fallback_context.get("project_path")
+            if isinstance(inherited_session_id, str) and inherited_session_id:
+                session_id = inherited_session_id
+                session_id_origin = "fallback_chain"
+            if isinstance(inherited_project_path, str) and inherited_project_path:
+                project_path = inherited_project_path
+
+    if not session_id and _request_looks_like_claude(request, requested_model, resolved_model):
+        inferred_context = _infer_claude_session_context()
+        if isinstance(inferred_context, dict):
+            inferred_session_id = inferred_context.get("session_id")
+            inferred_project_path = inferred_context.get("project_path")
+            if isinstance(inferred_session_id, str) and inferred_session_id:
+                session_id = inferred_session_id
+                session_id_origin = str(inferred_context.get("session_id_origin") or "claude_history")
+            if isinstance(inferred_project_path, str) and inferred_project_path:
+                project_path = inferred_project_path
+
+    server_request_id, prior_server_request_id = _resolve_server_request_id(
+        request,
+        initiator,
+        request_body,
+        session_id=session_id,
+        client_request_id=client_request_id,
+        subagent=subagent,
+    )
     if isinstance(outbound_headers, dict):
         if session_id:
             outbound_headers["session_id"] = session_id
         outbound_headers["x-request-id"] = server_request_id
         outbound_headers["x-github-request-id"] = server_request_id
+    started_at = _utc_now_iso()
     event = {
         "request_id": request_id or uuid4().hex,
-        "started_at": _utc_now_iso(),
+        "started_at": started_at,
         "path": request.url.path,
         "method": request.method,
         "upstream_path": upstream_path,
@@ -1488,13 +1778,16 @@ def _start_usage_event(
         "resolved_model": resolved_model or requested_model,
         "initiator": initiator,
         "session_id": session_id,
-        "client_request_id": request.headers.get("x-client-request-id"),
-        "subagent": request.headers.get("x-openai-subagent"),
+        "session_id_origin": session_id_origin,
+        "project_path": project_path,
+        "client_request_id": client_request_id,
+        "subagent": subagent,
         "server_request_id": server_request_id,
         "prior_server_request_id": prior_server_request_id,
         "_started_monotonic": time.perf_counter(),
     }
     _remember_server_request_id(event)
+    _remember_fallback_session_context(event)
     _remember_active_server_request_id(event)
     return event
 
@@ -1602,6 +1895,9 @@ def _new_usage_aggregate_bucket() -> dict:
         "_last_activity_dt": None,
         "project_path": None,
         "request_count": 0,
+        "session_id": None,
+        "session_kind": "unknown",
+        "session_display_id": None,
     }
 
 
@@ -1655,8 +1951,16 @@ def _finalize_usage_bucket(bucket: dict, source: str, *, session_id: str | None 
     last_activity = last_activity_dt.isoformat() if isinstance(last_activity_dt, datetime) else None
     models = bucket.get("_models") if isinstance(bucket.get("_models"), dict) else {}
     model_order = bucket.get("_model_order") if isinstance(bucket.get("_model_order"), list) else []
+    effective_session_id = session_id if session_id is not None else bucket.get("session_id")
+    if not isinstance(effective_session_id, str):
+        effective_session_id = None
+    effective_display_id = bucket.get("session_display_id")
+    if not isinstance(effective_display_id, str) or not effective_display_id:
+        effective_display_id = effective_session_id
     result = {
-        "sessionId": session_id,
+        "sessionId": effective_session_id,
+        "sessionKind": bucket.get("session_kind") or "unknown",
+        "sessionDisplayId": effective_display_id,
         "lastActivity": last_activity,
         "projectPath": bucket.get("project_path"),
         "inputTokens": bucket.get("input_tokens", 0),
@@ -1704,7 +2008,7 @@ def _collect_ccusage_payload() -> dict:
  
         session_rows = []
         for session_id, bucket in session_buckets.items():
-            session_rows.append(_finalize_usage_bucket(bucket, source, session_id=session_id))
+            session_rows.append(_finalize_usage_bucket(bucket, source, session_id=bucket.get("session_id")))
         session_rows.sort(key=lambda row: row.get("lastActivity") or "", reverse=True)
  
         source_payload = {
@@ -1729,9 +2033,11 @@ def _aggregate_usage_event_buckets(usage_events: list[dict] | None = None) -> tu
         if event_time is None:
             continue
 
+        descriptor = _usage_event_session_descriptor(event)
         source = _usage_event_source(event)
         month_key = _month_key(event_time)
-        group_source, group_id = _usage_event_group_key(event)
+        group_source = descriptor.get("source") or source
+        group_id = descriptor.get("group_id")
         session_key = group_id
         if not isinstance(session_key, str) or not session_key:
             session_key = event.get("server_request_id") or event.get("request_id") or "unknown"
@@ -1744,6 +2050,12 @@ def _aggregate_usage_event_buckets(usage_events: list[dict] | None = None) -> tu
 
         source_session_bucket = source_session_buckets.setdefault(source, {})
         session_bucket = source_session_bucket.setdefault(session_key, _new_usage_aggregate_bucket())
+        if session_bucket.get("session_display_id") is None and descriptor.get("session_display_id"):
+            session_bucket["session_display_id"] = descriptor.get("session_display_id")
+        if not session_bucket.get("session_id") and descriptor.get("session_id"):
+            session_bucket["session_id"] = descriptor.get("session_id")
+        if session_bucket.get("session_kind") in {None, "", "unknown"} and descriptor.get("session_kind"):
+            session_bucket["session_kind"] = descriptor.get("session_kind")
         _ingest_usage_event(session_bucket, event)
 
     return source_month_buckets, source_session_buckets
@@ -1763,7 +2075,7 @@ def _collect_local_dashboard_usage(usage_events: list[dict] | None = None) -> di
             )
         for session_id, bucket in session_buckets.items():
             normalized_sessions.append(
-                _normalize_session(source, _finalize_usage_bucket(bucket, source, session_id=session_id))
+                _normalize_session(source, _finalize_usage_bucket(bucket, source, session_id=bucket.get("session_id")))
             )
 
     normalized_sessions.sort(key=lambda item: item.get("last_activity") or "", reverse=True)
@@ -1857,6 +2169,7 @@ def _refresh_official_premium_cache_sync():
             _premium_cache["loaded_at"] = time.monotonic()
             _premium_cache["payload"] = result
             _premium_cache["last_error"] = None
+        _notify_dashboard_stream_listeners()
     except Exception as exc:
         with _premium_cache_lock:
             _premium_cache["last_error"] = str(exc)
@@ -1885,6 +2198,7 @@ def _trigger_official_premium_refresh(force: bool = False):
                 _premium_cache["loaded_at"] = time.monotonic()
                 _premium_cache["payload"] = result
                 _premium_cache["last_error"] = None
+            _notify_dashboard_stream_listeners()
         except Exception as exc:
             with _premium_cache_lock:
                 _premium_cache["last_error"] = str(exc)
@@ -1995,6 +2309,8 @@ def _normalize_session(source: str, session: dict) -> dict:
     return {
         "source": source,
         "session_id": session.get("sessionId"),
+        "session_kind": session.get("sessionKind") or "unknown",
+        "session_display_id": session.get("sessionDisplayId") or session.get("sessionId"),
         "last_activity": session.get("lastActivity"),
         "project_path": session.get("projectPath"),
         "input_tokens": _coerce_int(session.get("inputTokens")),
@@ -4238,7 +4554,7 @@ async def dashboard():
 async def dashboard_api(request: Request):
     refresh = request.query_params.get("refresh", "").lower() in {"1", "true", "yes"}
     payload = await asyncio.to_thread(_build_dashboard_payload, refresh)
-    return JSONResponse(content=payload)
+    return JSONResponse(content=payload, headers={"Cache-Control": "no-store"})
 
 
 @app.get("/api/dashboard/stream")
