@@ -71,6 +71,16 @@ _initiator_policy = InitiatorPolicy()
 usage_event_bus = EventBus()
 
 
+class GracefulStreamingResponse(StreamingResponse):
+    """Suppress shutdown/disconnect cancellation noise for long-lived streams."""
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        except asyncio.CancelledError:
+            return
+
+
 def get_initiator_policy() -> InitiatorPolicy:
     return _initiator_policy
 
@@ -402,7 +412,7 @@ async def proxy_streaming_response(
             await upstream.aclose()
             await client.aclose()
 
-    return StreamingResponse(
+    return GracefulStreamingResponse(
         stream_upstream(),
         status_code=upstream.status_code,
         headers=response_headers,
@@ -482,7 +492,7 @@ async def proxy_anthropic_streaming_response(
             await upstream.aclose()
             await client.aclose()
 
-    return StreamingResponse(
+    return GracefulStreamingResponse(
         stream_translated(),
         status_code=upstream.status_code,
         headers=response_headers,
@@ -546,7 +556,7 @@ async def dashboard_stream(request: Request):
         finally:
             dashboard_module._unregister_dashboard_stream_listener(queue)
 
-    return StreamingResponse(
+    return GracefulStreamingResponse(
         stream(),
         media_type="text/event-stream",
         headers={
@@ -967,6 +977,4 @@ if __name__ == "__main__":
     print("    export OPENAI_API_KEY=anything", flush=True)
     print("", flush=True)
 
-    if sys.platform == "win32":
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     uvicorn.run(app, host="0.0.0.0", port=8000, access_log=False, timeout_graceful_shutdown=2)

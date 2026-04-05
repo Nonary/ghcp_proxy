@@ -1,3 +1,4 @@
+import asyncio
 import compression.zstd as pyzstd
 import auth
 import dashboard
@@ -284,7 +285,7 @@ class ProxyInitiatorTests(unittest.TestCase):
         tool_msg = [m for m in outbound["messages"] if m["role"] == "tool"][0]
         self.assertNotIn("copilot_cache_control", tool_msg)
 
-    def test_build_fake_compaction_request_clamps_openai_xhigh_reasoning_to_high(self):
+    def test_build_fake_compaction_request_preserves_openai_xhigh_reasoning(self):
         body = {
             "model": "openai/gpt-5.4",
             "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hello"}]}],
@@ -293,10 +294,10 @@ class ProxyInitiatorTests(unittest.TestCase):
 
         compact_request = format_translation.build_fake_compaction_request(body)
 
-        self.assertEqual(compact_request["reasoning"], {"effort": "high", "summary": "auto"})
+        self.assertEqual(compact_request["reasoning"], {"effort": "xhigh", "summary": "auto"})
         self.assertEqual(body["reasoning"], {"effort": "xhigh", "summary": "auto"})
 
-    def test_build_fake_compaction_request_clamps_anthropic_max_reasoning_to_high(self):
+    def test_build_fake_compaction_request_preserves_anthropic_max_reasoning(self):
         body = {
             "model": "anthropic/claude-sonnet-4.6",
             "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hello"}]}],
@@ -305,7 +306,7 @@ class ProxyInitiatorTests(unittest.TestCase):
 
         compact_request = format_translation.build_fake_compaction_request(body)
 
-        self.assertEqual(compact_request["reasoning"], {"effort": "high"})
+        self.assertEqual(compact_request["reasoning"], {"effort": "max"})
 
     def test_anthropic_request_to_chat_stream_requests_usage_chunks(self):
         body = {
@@ -1141,6 +1142,20 @@ class ProxyInitiatorTests(unittest.TestCase):
             response.body,
             b'{"error":{"message":"Upstream connection failed: All connection attempts failed","type":"server_error","param":null,"code":null}}',
         )
+
+    def test_graceful_streaming_response_swallows_cancelled_error(self):
+        response = proxy.GracefulStreamingResponse(iter(()))
+        receive = mock.AsyncMock()
+        send = mock.AsyncMock()
+
+        with mock.patch.object(
+            proxy.StreamingResponse,
+            "__call__",
+            mock.AsyncMock(side_effect=asyncio.CancelledError()),
+        ) as parent_call:
+            proxy.asyncio.run(response({}, receive, send))
+
+        parent_call.assert_awaited_once_with({}, receive, send)
 
     def test_upstream_request_error_status_and_message_maps_timeout_to_504(self):
         request = httpx.Request("POST", "https://example.invalid/responses")
