@@ -18,6 +18,7 @@ from uuid import uuid4
 import httpx
 import initiator_policy
 import proxy
+from proxy_client_config import ProxyClientConfig, ProxyClientConfigService
 import util
 import usage_tracking
 
@@ -58,6 +59,38 @@ class ProxyInitiatorTests(unittest.TestCase):
                 pass
         self.addCleanup(_cleanup)
         return path
+
+    def _make_temp_file_path(self, prefix: str, suffix: str) -> Path:
+        path = Path.cwd() / f"{prefix}{uuid4().hex}{suffix}"
+        def _cleanup():
+            try:
+                path.unlink(missing_ok=True)
+            except PermissionError:
+                pass
+            for backup_path in path.parent.glob(f"{path.name}.ghcp-proxy.bak.*"):
+                try:
+                    backup_path.unlink(missing_ok=True)
+                except PermissionError:
+                    pass
+        self.addCleanup(_cleanup)
+        return path
+
+    def _make_client_proxy_service(
+        self,
+        *,
+        codex_config_file: str | None = None,
+        claude_settings_file: str | None = None,
+    ) -> ProxyClientConfigService:
+        return ProxyClientConfigService(
+            ProxyClientConfig(
+                codex_config_file=codex_config_file or proxy.CODEX_CONFIG_FILE,
+                codex_proxy_config=proxy.CODEX_PROXY_CONFIG,
+                claude_settings_file=claude_settings_file or proxy.CLAUDE_SETTINGS_FILE,
+                claude_proxy_settings=proxy.CLAUDE_PROXY_SETTINGS,
+                claude_max_context_tokens=proxy.CLAUDE_MAX_CONTEXT_TOKENS,
+                claude_max_output_tokens=proxy.CLAUDE_MAX_OUTPUT_TOKENS,
+            )
+        )
 
     def test_parse_json_request_accepts_gzip_encoded_body(self):
         raw = gzip.compress(b'{"model":"gpt-5","input":"hello"}')
@@ -1620,129 +1653,94 @@ class ProxyInitiatorTests(unittest.TestCase):
             )
 
     def test_enabling_codex_proxy_is_idempotent_when_already_enabled(self):
-        fd, raw_path = tempfile.mkstemp(prefix="codex-config-", suffix=".toml", dir=str(Path.cwd()))
-        os.close(fd)
-        config_path = Path(raw_path)
-        try:
-            config_path.write_text(proxy.CODEX_PROXY_CONFIG + "\n", encoding="utf-8")
+        config_path = self._make_temp_file_path("codex-config-", ".toml")
+        config_path.write_text(proxy.CODEX_PROXY_CONFIG + "\n", encoding="utf-8")
+        service = self._make_client_proxy_service(codex_config_file=str(config_path))
 
-            with mock.patch.object(proxy, "CODEX_CONFIG_FILE", str(config_path)):
-                status = proxy.write_codex_proxy_config()
+        status = service.write_codex_proxy_config()
 
-            backups = list(config_path.parent.glob(f"{config_path.name}.ghcp-proxy.bak.*"))
-            self.assertTrue(status["configured"])
-            self.assertEqual(status["status_message"], "proxy already enabled")
-            self.assertEqual(backups, [])
-        finally:
-            config_path.unlink(missing_ok=True)
-            for backup_path in config_path.parent.glob(f"{config_path.name}.ghcp-proxy.bak.*"):
-                backup_path.unlink(missing_ok=True)
+        backups = list(config_path.parent.glob(f"{config_path.name}.ghcp-proxy.bak.*"))
+        self.assertTrue(status["configured"])
+        self.assertEqual(status["status_message"], "proxy already enabled")
+        self.assertEqual(backups, [])
 
     def test_disabling_codex_proxy_is_idempotent_when_already_disabled(self):
-        fd, raw_path = tempfile.mkstemp(prefix="codex-config-", suffix=".toml", dir=str(Path.cwd()))
-        os.close(fd)
-        config_path = Path(raw_path)
-        config_path.unlink(missing_ok=True)
-        try:
+        config_path = self._make_temp_file_path("codex-config-", ".toml")
+        service = self._make_client_proxy_service(codex_config_file=str(config_path))
+        status = service.disable_codex_proxy_config()
 
-            with mock.patch.object(proxy, "CODEX_CONFIG_FILE", str(config_path)):
-                status = proxy.disable_codex_proxy_config()
-
-            self.assertFalse(status["configured"])
-            self.assertEqual(status["status_message"], "proxy already disabled")
-            self.assertIsNone(status["backup_path"])
-        finally:
-            config_path.unlink(missing_ok=True)
+        self.assertFalse(status["configured"])
+        self.assertEqual(status["status_message"], "proxy already disabled")
+        self.assertIsNone(status["backup_path"])
 
     def test_disabling_codex_proxy_restores_latest_backup(self):
-        fd, raw_path = tempfile.mkstemp(prefix="codex-config-", suffix=".toml", dir=str(Path.cwd()))
-        os.close(fd)
-        config_path = Path(raw_path)
-        try:
-            backup_path = Path(f"{config_path}.ghcp-proxy.bak.20260404_180000")
-            config_path.write_text(proxy.CODEX_PROXY_CONFIG + "\n", encoding="utf-8")
-            backup_contents = 'model_provider = "openai"\n'
-            backup_path.write_text(backup_contents, encoding="utf-8")
+        config_path = self._make_temp_file_path("codex-config-", ".toml")
+        backup_path = Path(f"{config_path}.ghcp-proxy.bak.20260404_180000")
+        config_path.write_text(proxy.CODEX_PROXY_CONFIG + "\n", encoding="utf-8")
+        backup_contents = 'model_provider = "openai"\n'
+        backup_path.write_text(backup_contents, encoding="utf-8")
+        service = self._make_client_proxy_service(codex_config_file=str(config_path))
 
-            with mock.patch.object(proxy, "CODEX_CONFIG_FILE", str(config_path)):
-                status = proxy.disable_codex_proxy_config()
+        status = service.disable_codex_proxy_config()
 
-            self.assertFalse(status["configured"])
-            self.assertTrue(status["restored_from_backup"])
-            self.assertFalse(backup_path.exists())
-            self.assertEqual(config_path.read_text(encoding="utf-8"), backup_contents)
-        finally:
-            config_path.unlink(missing_ok=True)
-            Path(f"{config_path}.ghcp-proxy.bak.20260404_180000").unlink(missing_ok=True)
+        self.assertFalse(status["configured"])
+        self.assertTrue(status["restored_from_backup"])
+        self.assertEqual(config_path.read_text(encoding="utf-8"), backup_contents)
 
     def test_claude_proxy_status_requires_token_caps(self):
-        fd, raw_path = tempfile.mkstemp(prefix="claude-settings-", suffix=".json", dir=str(Path.cwd()))
-        os.close(fd)
-        settings_path = Path(raw_path)
-        try:
-            settings_path.write_text(
-                (
-                    '{\n'
-                    '  "env": {\n'
-                    '    "ANTHROPIC_BASE_URL": "http://localhost:8000",\n'
-                    '    "ANTHROPIC_AUTH_TOKEN": "sk-dummy",\n'
-                    '    "CLAUDE_CODE_DISABLE_1M_CONTEXT": "1"\n'
-                    '  }\n'
-                    '}\n'
-                ),
-                encoding="utf-8",
-            )
+        settings_path = self._make_temp_file_path("claude-settings-", ".json")
+        settings_path.write_text(
+            (
+                '{\n'
+                '  "env": {\n'
+                '    "ANTHROPIC_BASE_URL": "http://localhost:8000",\n'
+                '    "ANTHROPIC_AUTH_TOKEN": "sk-dummy",\n'
+                '    "CLAUDE_CODE_DISABLE_1M_CONTEXT": "1"\n'
+                '  }\n'
+                '}\n'
+            ),
+            encoding="utf-8",
+        )
+        service = self._make_client_proxy_service(claude_settings_file=str(settings_path))
 
-            with mock.patch.object(proxy, "CLAUDE_SETTINGS_FILE", str(settings_path)):
-                status = proxy.claude_proxy_status()
+        status = service.claude_proxy_status()
 
-            self.assertFalse(status["configured"])
-            self.assertEqual(status["status_message"], "proxy configured, missing context cap and output cap")
-        finally:
-            settings_path.unlink(missing_ok=True)
-            for backup_path in settings_path.parent.glob(f"{settings_path.name}.ghcp-proxy.bak.*"):
-                backup_path.unlink(missing_ok=True)
+        self.assertFalse(status["configured"])
+        self.assertEqual(status["status_message"], "proxy configured, missing context cap and output cap")
 
     def test_write_claude_proxy_settings_preserves_existing_keys_and_adds_context_cap(self):
-        fd, raw_path = tempfile.mkstemp(prefix="claude-settings-", suffix=".json", dir=str(Path.cwd()))
-        os.close(fd)
-        settings_path = Path(raw_path)
-        try:
-            settings_path.write_text(
-                (
-                    '{\n'
-                    '  "env": {\n'
-                    '    "ANTHROPIC_BASE_URL": "http://localhost:8000",\n'
-                    '    "ANTHROPIC_AUTH_TOKEN": "sk-dummy",\n'
-                    '    "CLAUDE_CODE_DISABLE_1M_CONTEXT": "1"\n'
-                    '  },\n'
-                    '  "skipDangerousModePermissionPrompt": true,\n'
-                    '  "model": "opus"\n'
-                    '}\n'
-                ),
-                encoding="utf-8",
-            )
+        settings_path = self._make_temp_file_path("claude-settings-", ".json")
+        settings_path.write_text(
+            (
+                '{\n'
+                '  "env": {\n'
+                '    "ANTHROPIC_BASE_URL": "http://localhost:8000",\n'
+                '    "ANTHROPIC_AUTH_TOKEN": "sk-dummy",\n'
+                '    "CLAUDE_CODE_DISABLE_1M_CONTEXT": "1"\n'
+                '  },\n'
+                '  "skipDangerousModePermissionPrompt": true,\n'
+                '  "model": "opus"\n'
+                '}\n'
+            ),
+            encoding="utf-8",
+        )
+        service = self._make_client_proxy_service(claude_settings_file=str(settings_path))
 
-            with mock.patch.object(proxy, "CLAUDE_SETTINGS_FILE", str(settings_path)):
-                status = proxy.write_claude_proxy_settings()
+        status = service.write_claude_proxy_settings()
 
-            written = proxy.json.loads(settings_path.read_text(encoding="utf-8"))
-            self.assertTrue(status["configured"])
-            self.assertEqual(
-                written["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"],
-                proxy.CLAUDE_MAX_CONTEXT_TOKENS,
-            )
-            self.assertEqual(
-                written["env"]["CLAUDE_CODE_MAX_OUTPUT_TOKENS"],
-                proxy.CLAUDE_MAX_OUTPUT_TOKENS,
-            )
-            self.assertTrue(written["skipDangerousModePermissionPrompt"])
-            self.assertEqual(written["model"], "opus")
-            self.assertEqual(written["effortLevel"], "medium")
-        finally:
-            settings_path.unlink(missing_ok=True)
-            for backup_path in settings_path.parent.glob(f"{settings_path.name}.ghcp-proxy.bak.*"):
-                backup_path.unlink(missing_ok=True)
+        written = proxy.json.loads(settings_path.read_text(encoding="utf-8"))
+        self.assertTrue(status["configured"])
+        self.assertEqual(
+            written["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"],
+            proxy.CLAUDE_MAX_CONTEXT_TOKENS,
+        )
+        self.assertEqual(
+            written["env"]["CLAUDE_CODE_MAX_OUTPUT_TOKENS"],
+            proxy.CLAUDE_MAX_OUTPUT_TOKENS,
+        )
+        self.assertTrue(written["skipDangerousModePermissionPrompt"])
+        self.assertEqual(written["model"], "opus")
+        self.assertEqual(written["effortLevel"], "medium")
 
     def test_month_key_for_source_rows(self):
         self.assertEqual(util.month_key_for_source_row("claude", {"month": "2026-04"}), "2026-04")

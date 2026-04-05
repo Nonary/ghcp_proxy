@@ -35,10 +35,10 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Redirect
 from anthropic_stream import AnthropicStreamTranslator
 from initiator_policy import InitiatorPolicy
 from event_bus import EventBus
-from proxy_runtime import (
-    AuthRuntimeBindings,
-    ProxyRuntime,
-    ProxySettings,
+from proxy_client_config import (
+    ProxyClientConfig,
+    ProxyClientConfigService,
+    normalize_proxy_targets,
 )
 
 # ─── Import from new modules ─────────────────────────────────────────────────
@@ -105,9 +105,8 @@ usage_tracking.configure_usage_tracking(
     event_bus=usage_event_bus,
 )
 
-
-def _current_proxy_settings() -> ProxySettings:
-    return ProxySettings(
+client_proxy_config_service = ProxyClientConfigService(
+    ProxyClientConfig(
         codex_config_file=CODEX_CONFIG_FILE,
         codex_proxy_config=CODEX_PROXY_CONFIG,
         claude_settings_file=CLAUDE_SETTINGS_FILE,
@@ -115,13 +114,6 @@ def _current_proxy_settings() -> ProxySettings:
         claude_max_context_tokens=CLAUDE_MAX_CONTEXT_TOKENS,
         claude_max_output_tokens=CLAUDE_MAX_OUTPUT_TOKENS,
     )
-
-
-_runtime = ProxyRuntime(
-    settings_provider=_current_proxy_settings,
-    auth_runtime=AuthRuntimeBindings(
-        load_api_key_payload=auth.load_api_key_payload,
-    ),
 )
 
 dashboard_service = dashboard_module.DashboardService(
@@ -153,13 +145,13 @@ async def parse_json_request(request: Request) -> dict:
     return await util.parse_json_request(request, error_callback=usage_tracker.record_request_error)
 
 
-codex_proxy_status = _runtime.codex_proxy_status
-claude_proxy_status = _runtime.claude_proxy_status
-write_codex_proxy_config = _runtime.write_codex_proxy_config
-write_claude_proxy_settings = _runtime.write_claude_proxy_settings
-disable_codex_proxy_config = _runtime.disable_codex_proxy_config
-disable_claude_proxy_settings = _runtime.disable_claude_proxy_settings
-proxy_client_status_payload = _runtime.proxy_client_status_payload
+codex_proxy_status = client_proxy_config_service.codex_proxy_status
+claude_proxy_status = client_proxy_config_service.claude_proxy_status
+write_codex_proxy_config = client_proxy_config_service.write_codex_proxy_config
+write_claude_proxy_settings = client_proxy_config_service.write_claude_proxy_settings
+disable_codex_proxy_config = client_proxy_config_service.disable_codex_proxy_config
+disable_claude_proxy_settings = client_proxy_config_service.disable_claude_proxy_settings
+proxy_client_status_payload = client_proxy_config_service.proxy_client_status_payload
 
 
 def configured_upstream_timeout_seconds() -> int:
@@ -600,7 +592,7 @@ async def client_proxy_install_api(request: Request):
     payload = await parse_json_request(request)
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="Request body must be an object")
-    targets = auth.normalize_proxy_targets(payload)
+    targets = normalize_proxy_targets(payload)
     action = payload.get("action", "enable")
     if not isinstance(action, str):
         raise HTTPException(status_code=400, detail='Action must be "enable" or "disable".')
@@ -616,19 +608,11 @@ async def client_proxy_install_api(request: Request):
     for target in targets:
         try:
             if action == "disable":
-                if target == "codex":
-                    clients[target] = disable_codex_proxy_config()
-                else:
-                    clients[target] = disable_claude_proxy_settings()
-            elif target == "codex":
-                clients[target] = write_codex_proxy_config()
+                clients[target] = client_proxy_config_service.disable_target(target)
             else:
-                clients[target] = write_claude_proxy_settings()
+                clients[target] = client_proxy_config_service.enable_target(target)
         except Exception as exc:
-            clients[target] = auth.empty_proxy_status(
-                target,
-                CODEX_CONFIG_FILE if target == "codex" else CLAUDE_SETTINGS_FILE,
-            )
+            clients[target] = client_proxy_config_service.empty_proxy_status(target)
             clients[target]["error"] = str(exc)
             clients[target]["status_message"] = "failed to write config"
 
