@@ -29,7 +29,14 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 from anthropic_stream import AnthropicStreamTranslator
 from initiator_policy import InitiatorPolicy
-from proxy_runtime import ProxyRuntime, ProxySettings
+from event_bus import EventBus
+from proxy_runtime import (
+    AuthRuntimeBindings,
+    DashboardRuntimeBindings,
+    ProxyRuntime,
+    ProxySettings,
+    UsageTrackingRuntimeBindings,
+)
 
 # ─── Import from new modules ─────────────────────────────────────────────────
 
@@ -141,6 +148,12 @@ from auth import (
 )
 
 from usage_tracking import (
+    REQUEST_FINISHED_EVENT,
+    USAGE_EVENT_RECORDED_EVENT,
+    UsageArchiveStore,
+    UsageTracker,
+    UsageTrackingState,
+    configure_usage_tracking,
     _usage_log_lock,
     _recent_usage_events,
     _archived_usage_events,
@@ -174,10 +187,12 @@ from usage_tracking import (
 
 from dashboard import (
     _init_sqlite_cache,
+    _sqlite_cache_lock,
     _sqlite_cache_enabled,
     _sqlite_cache_error,
     _sqlite_connect,
     _sqlite_cache_put,
+    _set_sqlite_cache_unavailable,
     _infer_premium_allowance,
     _extract_quota_summary,
     _github_rest_headers,
@@ -215,6 +230,48 @@ from dashboard import (
 app = FastAPI()
 
 _initiator_policy = InitiatorPolicy()
+usage_event_bus = EventBus()
+
+
+def _current_usage_tracking_state() -> UsageTrackingState:
+    return UsageTrackingState(
+        usage_log_lock=_usage_log_lock,
+        recent_usage_events=_recent_usage_events,
+        archived_usage_events=_archived_usage_events,
+        session_request_id_lock=_session_request_id_lock,
+        latest_server_request_ids_by_chain=_latest_server_request_ids_by_chain,
+        active_server_request_ids_by_request=_active_server_request_ids_by_request,
+        latest_claude_user_session_contexts=_latest_claude_user_session_contexts,
+    )
+
+
+usage_event_bus.subscribe(
+    REQUEST_FINISHED_EVENT,
+    lambda request_id, finished_at=None: _initiator_policy.note_request_finished(
+        request_id,
+        finished_at=finished_at,
+    ),
+)
+usage_event_bus.subscribe(
+    USAGE_EVENT_RECORDED_EVENT,
+    lambda _event: _notify_dashboard_stream_listeners(),
+)
+
+usage_tracker = UsageTracker(
+    state=_current_usage_tracking_state(),
+    archive_store=UsageArchiveStore(
+        init_storage=lambda: _init_sqlite_cache(),
+        lock=_sqlite_cache_lock,
+        connect=lambda: _sqlite_connect(),
+        mark_unavailable=lambda error: _set_sqlite_cache_unavailable(error),
+    ),
+    event_bus=usage_event_bus,
+)
+configure_usage_tracking(
+    state=usage_tracker.state,
+    archive_store=usage_tracker.archive_store,
+    event_bus=usage_event_bus,
+)
 
 
 def _current_proxy_settings() -> ProxySettings:
@@ -230,28 +287,24 @@ def _current_proxy_settings() -> ProxySettings:
 
 _runtime = ProxyRuntime(
     settings_provider=_current_proxy_settings,
-    load_api_key_payload=lambda: _load_api_key_payload(),
-    sqlite_cache_enabled=lambda: _sqlite_cache_enabled,
-    sqlite_cache_error=lambda: _sqlite_cache_error,
-    sqlite_connect=lambda: _sqlite_connect(),
-    sqlite_cache_put=lambda cache_key, payload: _sqlite_cache_put(cache_key, payload),
-    collect_official_premium_payload=lambda *args, **kwargs: _collect_official_premium_payload(*args, **kwargs),
-    get_official_premium_payload=lambda *args, **kwargs: _get_official_premium_payload(*args, **kwargs),
-    notify_dashboard_stream_listeners=lambda: _notify_dashboard_stream_listeners(),
-    utc_now=lambda: _utc_now(),
-    utc_now_iso=lambda: _utc_now_iso(),
-    record_usage_event=lambda event: _record_usage_event(event),
-    rewrite_usage_log_locked=lambda events: _rewrite_usage_log_locked(events),
-    snapshot_usage_events=lambda: _snapshot_usage_events(),
-    snapshot_all_usage_events=lambda: _snapshot_all_usage_events(),
-    usage_log_lock=lambda: _usage_log_lock,
-    recent_usage_events=lambda: _recent_usage_events,
-    archived_usage_events=lambda: _archived_usage_events,
-    session_request_id_lock=lambda: _session_request_id_lock,
-    latest_server_request_ids_by_chain=lambda: _latest_server_request_ids_by_chain,
-    active_server_request_ids_by_request=lambda: _active_server_request_ids_by_request,
-    latest_claude_user_session_contexts=lambda: _latest_claude_user_session_contexts,
-    thread_class=lambda: Thread,
+    auth_runtime=AuthRuntimeBindings(
+        load_api_key_payload=lambda: _load_api_key_payload(),
+    ),
+    dashboard_runtime=DashboardRuntimeBindings(
+        sqlite_cache_enabled=lambda: _sqlite_cache_enabled,
+        sqlite_cache_error=lambda: _sqlite_cache_error,
+        sqlite_connect=lambda: _sqlite_connect(),
+        sqlite_cache_put=lambda cache_key, payload: _sqlite_cache_put(cache_key, payload),
+        collect_official_premium_payload=lambda *args, **kwargs: _collect_official_premium_payload(*args, **kwargs),
+        get_official_premium_payload=lambda *args, **kwargs: _get_official_premium_payload(*args, **kwargs),
+        notify_dashboard_stream_listeners=lambda: _notify_dashboard_stream_listeners(),
+        utc_now=lambda: _utc_now(),
+        utc_now_iso=lambda: _utc_now_iso(),
+        thread_class=lambda: Thread,
+    ),
+    usage_tracking_runtime=UsageTrackingRuntimeBindings(
+        state_provider=_current_usage_tracking_state,
+    ),
 )
 
 
