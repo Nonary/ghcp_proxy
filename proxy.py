@@ -94,7 +94,6 @@ CLAUDE_PROXY_SETTINGS = {
 }
 MAX_STORED_USAGE_EVENTS = 400
 FORWARDED_REQUEST_HEADERS = (
-    "session_id",
     "x-client-request-id",
     "x-openai-subagent",
 )
@@ -576,6 +575,25 @@ def _server_request_chain_key(
     return (scope, normalized_subagent)
 
 
+def _request_session_id(request: Request, request_body: dict | None = None) -> str | None:
+    for header_name in ("session_id", "session-id"):
+        header_value = request.headers.get(header_name)
+        if isinstance(header_value, str):
+            normalized = header_value.strip()
+            if normalized:
+                return normalized
+
+    if isinstance(request_body, dict):
+        for key in ("session_id", "sessionId"):
+            value = request_body.get(key)
+            if isinstance(value, str):
+                normalized = value.strip()
+                if normalized:
+                    return normalized
+
+    return None
+
+
 def _remember_server_request_id(event: dict | None):
     if not isinstance(event, dict):
         return
@@ -655,6 +673,7 @@ def _get_latest_server_request_id_for_request(
 def _resolve_server_request_id(
     request: Request,
     initiator: str | None,
+    request_body: dict | None = None,
 ) -> tuple[str, str | None]:
     explicit_server_request_id = (
         request.headers.get("x-request-id")
@@ -664,7 +683,7 @@ def _resolve_server_request_id(
     if explicit_server_request_id:
         return explicit_server_request_id, explicit_server_request_id
 
-    session_id = request.headers.get("session_id")
+    session_id = _request_session_id(request, request_body)
     client_request_id = request.headers.get("x-client-request-id")
     subagent = request.headers.get("x-openai-subagent")
 
@@ -1452,8 +1471,11 @@ def _start_usage_event(
     upstream_path: str | None = None,
     outbound_headers: dict | None = None,
 ) -> dict:
-    server_request_id, prior_server_request_id = _resolve_server_request_id(request, initiator)
+    session_id = _request_session_id(request, request_body)
+    server_request_id, prior_server_request_id = _resolve_server_request_id(request, initiator, request_body)
     if isinstance(outbound_headers, dict):
+        if session_id:
+            outbound_headers["session_id"] = session_id
         outbound_headers["x-request-id"] = server_request_id
         outbound_headers["x-github-request-id"] = server_request_id
     event = {
@@ -1465,7 +1487,7 @@ def _start_usage_event(
         "requested_model": requested_model,
         "resolved_model": resolved_model or requested_model,
         "initiator": initiator,
-        "session_id": request.headers.get("session_id"),
+        "session_id": session_id,
         "client_request_id": request.headers.get("x-client-request-id"),
         "subagent": request.headers.get("x-openai-subagent"),
         "server_request_id": server_request_id,
@@ -1662,6 +1684,43 @@ def _finalize_usage_bucket(bucket: dict, source: str, *, session_id: str | None 
 
 def _collect_ccusage_payload() -> dict:
     usage_events = _snapshot_usage_events()
+    source_month_buckets, source_session_buckets = _aggregate_usage_event_buckets(usage_events)
+ 
+    result = {
+        "available": True,
+        "generated_by": "local-request-log",
+        "loaded_at": _utc_now_iso(),
+        "sources": {},
+        "errors": [],
+    }
+ 
+    for source in sorted(set(source_month_buckets) | set(source_session_buckets)):
+        month_buckets = source_month_buckets.get(source, {})
+        session_buckets = source_session_buckets.get(source, {})
+        monthly_rows = []
+        for month_key, bucket in month_buckets.items():
+            monthly_rows.append(_finalize_usage_bucket(bucket, source, month=month_key))
+        monthly_rows.sort(key=lambda row: row.get("month") or "", reverse=True)
+ 
+        session_rows = []
+        for session_id, bucket in session_buckets.items():
+            session_rows.append(_finalize_usage_bucket(bucket, source, session_id=session_id))
+        session_rows.sort(key=lambda row: row.get("lastActivity") or "", reverse=True)
+ 
+        source_payload = {
+            "available": bool(monthly_rows or session_rows),
+            "monthly": {"monthly": monthly_rows},
+            "sessions": {"sessions": session_rows},
+            "error": None,
+        }
+        result["sources"][source] = source_payload
+ 
+    result["available"] = any(item.get("available") for item in result["sources"].values())
+    return result
+
+
+def _aggregate_usage_event_buckets(usage_events: list[dict] | None = None) -> tuple[dict[str, dict[str, dict]], dict[str, dict[str, dict]]]:
+    usage_events = list(usage_events) if isinstance(usage_events, list) else _snapshot_usage_events()
     source_month_buckets: dict[str, dict[str, dict]] = {}
     source_session_buckets: dict[str, dict[str, dict]] = {}
 
@@ -1687,37 +1746,34 @@ def _collect_ccusage_payload() -> dict:
         session_bucket = source_session_bucket.setdefault(session_key, _new_usage_aggregate_bucket())
         _ingest_usage_event(session_bucket, event)
 
-    result = {
-        "available": True,
-        "generated_by": "local-request-log",
-        "loaded_at": _utc_now_iso(),
-        "sources": {},
-        "errors": [],
-    }
+    return source_month_buckets, source_session_buckets
+
+
+def _collect_local_dashboard_usage(usage_events: list[dict] | None = None) -> dict:
+    source_month_buckets, source_session_buckets = _aggregate_usage_event_buckets(usage_events)
+    normalized_months = []
+    normalized_sessions = []
 
     for source in sorted(set(source_month_buckets) | set(source_session_buckets)):
         month_buckets = source_month_buckets.get(source, {})
         session_buckets = source_session_buckets.get(source, {})
-        monthly_rows = []
         for month_key, bucket in month_buckets.items():
-            monthly_rows.append(_finalize_usage_bucket(bucket, source, month=month_key))
-        monthly_rows.sort(key=lambda row: row.get("month") or "", reverse=True)
-
-        session_rows = []
+            normalized_months.append(
+                _normalize_month_row(source, _finalize_usage_bucket(bucket, source, month=month_key))
+            )
         for session_id, bucket in session_buckets.items():
-            session_rows.append(_finalize_usage_bucket(bucket, source, session_id=session_id))
-        session_rows.sort(key=lambda row: row.get("lastActivity") or "", reverse=True)
+            normalized_sessions.append(
+                _normalize_session(source, _finalize_usage_bucket(bucket, source, session_id=session_id))
+            )
 
-        source_payload = {
-            "available": bool(monthly_rows or session_rows),
-            "monthly": {"monthly": monthly_rows},
-            "sessions": {"sessions": session_rows},
-            "error": None,
-        }
-        result["sources"][source] = source_payload
-
-    result["available"] = any(item.get("available") for item in result["sources"].values())
-    return result
+    normalized_sessions.sort(key=lambda item: item.get("last_activity") or "", reverse=True)
+    return {
+        "month_rows": normalized_months,
+        "session_count": len(normalized_sessions),
+        "recent_sessions": normalized_sessions[:20],
+        "month_history": _combine_month_rows(normalized_months),
+        "errors": [],
+    }
 
 
 def _refresh_ccusage_cache_sync():
@@ -2040,33 +2096,13 @@ def _build_dashboard_payload(force_refresh: bool = False) -> dict:
     official_reset_date = official_premium.get("reset_date")
     official_available = bool(official_premium.get("available"))
 
-    ccusage_payload = _get_ccusage_payload(force_refresh=force_refresh)
-    normalized_months = []
-    normalized_sessions = []
+    local_usage = _collect_local_dashboard_usage(usage_events)
     per_source_month = {}
-    for source, source_payload in (ccusage_payload.get("sources") or {}).items():
-        if not isinstance(source_payload, dict) or not source_payload.get("available"):
-            continue
+    for row in local_usage.get("month_rows") or []:
+        source = row.get("source")
+        if row.get("month_key") == current_month_key and isinstance(source, str) and source:
+            per_source_month[source] = row
 
-        monthly_payload = source_payload.get("monthly")
-        monthly_rows = monthly_payload.get("monthly") if isinstance(monthly_payload, dict) else []
-        if isinstance(monthly_rows, list):
-            for row in monthly_rows:
-                if isinstance(row, dict):
-                    normalized = _normalize_month_row(source, row)
-                    normalized_months.append(normalized)
-                    if normalized.get("month_key") == current_month_key:
-                        per_source_month[source] = normalized
-
-        sessions_payload = source_payload.get("sessions")
-        session_rows = sessions_payload.get("sessions") if isinstance(sessions_payload, dict) else []
-        if isinstance(session_rows, list):
-            for session in session_rows:
-                if isinstance(session, dict):
-                    normalized_sessions.append(_normalize_session(source, session))
-
-    normalized_sessions.sort(key=lambda item: item.get("last_activity") or "", reverse=True)
-    month_history = _combine_month_rows(normalized_months)
     current_month_usage = {
         "month_key": current_month_key,
         "input_tokens": sum(item.get("input_tokens", 0) for item in per_source_month.values()),
@@ -2103,13 +2139,17 @@ def _build_dashboard_payload(force_refresh: bool = False) -> dict:
             "start_at": month_start.isoformat(),
             "end_at": month_end.isoformat(),
             "proxy_requests": len(current_month_events),
-            "sessions": len(normalized_sessions),
-            "ccusage": current_month_usage,
+            "sessions": local_usage.get("session_count", 0),
+            "usage": current_month_usage,
         },
-        "recent_sessions": normalized_sessions[:20],
+        "recent_sessions": local_usage.get("recent_sessions") or [],
         "recent_requests": recent_requests,
-        "month_history": month_history[:12],
-        "ccusage": ccusage_payload,
+        "month_history": (local_usage.get("month_history") or [])[:12],
+        "ccusage": {
+            "available": True,
+            "generated_by": "local-request-log",
+            "errors": local_usage.get("errors") or [],
+        },
     }
 
 
@@ -2669,7 +2709,11 @@ def build_copilot_headers(api_key: str) -> dict:
 # ─── Responses API helpers ────────────────────────────────────────────────────
 
 
-def _apply_forwarded_request_headers(headers: dict, request: Request):
+def _apply_forwarded_request_headers(headers: dict, request: Request, request_body: dict | None = None):
+    session_id = _request_session_id(request, request_body)
+    if session_id:
+        headers["session_id"] = session_id
+
     for header_name in FORWARDED_REQUEST_HEADERS:
         header_value = request.headers.get(header_name)
         if header_value:
@@ -3901,7 +3945,7 @@ def build_anthropic_headers_for_request(
     request_id: str | None = None,
 ) -> dict:
     headers = build_copilot_headers(api_key)
-    _apply_forwarded_request_headers(headers, request)
+    _apply_forwarded_request_headers(headers, request, body)
 
     messages = body.get("messages")
     initiator = _initiator_policy.resolve_anthropic_messages(messages, body.get("model"), request_id=request_id)
@@ -4066,7 +4110,7 @@ def build_responses_headers_for_request(
     request_id: str | None = None,
 ) -> dict:
     headers = build_copilot_headers(api_key)
-    _apply_forwarded_request_headers(headers, request)
+    _apply_forwarded_request_headers(headers, request, body)
 
     had_input = "input" in body
     effective_input, initiator = _initiator_policy.resolve_responses_input(

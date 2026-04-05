@@ -550,7 +550,7 @@
           selectedRequestKey: '',
           data: {
             premium: {},
-            current_month: { ccusage: { sources: {} } },
+            current_month: { usage: { sources: {} } },
             recent_sessions: [],
             recent_requests: [],
             month_history: [],
@@ -574,7 +574,7 @@
       computed: {
         premium() { return this.data.premium || {}; },
         ccusage() { return this.data.ccusage || {}; },
-        currentMonth() { return this.data.current_month?.ccusage || {}; },
+        currentMonth() { return this.data.current_month?.usage || this.data.current_month?.ccusage || {}; },
         sourceCards() { return this.currentMonth.sources || {}; },
         premiumRemainingLabel() {
           const remaining = this.premium.official_remaining ?? this.premium.tracked_remaining;

@@ -114,6 +114,23 @@ class ProxyInitiatorTests(unittest.TestCase):
         self.assertEqual(headers["X-Initiator"], "agent")
         self.assertEqual(body["messages"][0]["content"][0]["text"], "hello")
 
+    def test_build_anthropic_headers_for_request_uses_body_session_id(self):
+        request = SimpleNamespace(url=SimpleNamespace(path="/v1/messages"), headers={})
+        body = {
+            "model": "claude-sonnet-4.6",
+            "sessionId": "claude-session",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "hello"}],
+                }
+            ],
+        }
+
+        headers = proxy.build_anthropic_headers_for_request(request, body, "test-key")
+
+        self.assertEqual(headers["session_id"], "claude-session")
+
     def test_anthropic_request_to_chat_translates_cache_control_to_copilot_cache_control(self):
         body = {
             "model": "claude-sonnet-4.6",
@@ -279,6 +296,45 @@ class ProxyInitiatorTests(unittest.TestCase):
         self.assertNotIn("request_options", event)
         self.assertNotIn("request_payload", event)
 
+    def test_start_usage_event_uses_hyphenated_session_header(self):
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/messages"),
+            method="POST",
+            headers={"session-id": "session-123"},
+        )
+        outbound_headers = {}
+
+        event = proxy._start_usage_event(
+            request,
+            requested_model="claude-haiku-4.5",
+            resolved_model="claude-haiku-4.5",
+            initiator="agent",
+            outbound_headers=outbound_headers,
+        )
+
+        self.assertEqual(event["session_id"], "session-123")
+        self.assertEqual(outbound_headers["session_id"], "session-123")
+
+    def test_start_usage_event_uses_request_body_session_id(self):
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/responses"),
+            method="POST",
+            headers={},
+        )
+        outbound_headers = {}
+
+        event = proxy._start_usage_event(
+            request,
+            requested_model="gpt-5.4",
+            resolved_model="gpt-5.4",
+            initiator="agent",
+            request_body={"sessionId": "session-123"},
+            outbound_headers=outbound_headers,
+        )
+
+        self.assertEqual(event["session_id"], "session-123")
+        self.assertEqual(outbound_headers["session_id"], "session-123")
+
     def test_start_usage_event_agent_inherits_latest_session_server_request_id(self):
         with proxy._session_request_id_lock:
             proxy._latest_server_request_ids_by_chain[("session:session-123", "__root__")] = "server-prev"
@@ -294,6 +350,27 @@ class ProxyInitiatorTests(unittest.TestCase):
             requested_model="gpt-5.4",
             resolved_model="gpt-5.4",
             initiator="agent",
+        )
+
+        self.assertEqual(event["prior_server_request_id"], "server-prev")
+        self.assertEqual(event["server_request_id"], "server-prev")
+
+    def test_start_usage_event_agent_inherits_latest_body_session_server_request_id(self):
+        with proxy._session_request_id_lock:
+            proxy._latest_server_request_ids_by_chain[("session:session-123", "__root__")] = "server-prev"
+
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/responses"),
+            method="POST",
+            headers={},
+        )
+
+        event = proxy._start_usage_event(
+            request,
+            requested_model="gpt-5.4",
+            resolved_model="gpt-5.4",
+            initiator="agent",
+            request_body={"sessionId": "session-123"},
         )
 
         self.assertEqual(event["prior_server_request_id"], "server-prev")
@@ -501,6 +578,28 @@ class ProxyInitiatorTests(unittest.TestCase):
 
         self.assertNotIn("x-request-id", headers)
         self.assertNotIn("x-github-request-id", headers)
+
+    def test_build_responses_headers_for_request_uses_hyphenated_session_header(self):
+        request = SimpleNamespace(
+            headers={"session-id": "session-123"},
+            url=SimpleNamespace(path="/v1/responses"),
+        )
+        body = {"model": "gpt-5.4", "input": "hello"}
+
+        headers = proxy.build_responses_headers_for_request(request, body, "test-key")
+
+        self.assertEqual(headers["session_id"], "session-123")
+
+    def test_build_responses_headers_for_request_uses_body_session_id(self):
+        request = SimpleNamespace(
+            headers={},
+            url=SimpleNamespace(path="/v1/responses"),
+        )
+        body = {"model": "gpt-5.4", "input": "hello", "sessionId": "session-123"}
+
+        headers = proxy.build_responses_headers_for_request(request, body, "test-key")
+
+        self.assertEqual(headers["session_id"], "session-123")
 
     def test_build_responses_headers_for_request_preserves_incoming_server_request_id(self):
         request = SimpleNamespace(
@@ -1286,90 +1385,42 @@ class ProxyInitiatorTests(unittest.TestCase):
 
     def test_build_dashboard_payload_combines_claude_and_codex(self):
         fixed_now = datetime(2026, 4, 4, 18, 0, tzinfo=timezone.utc)
-        ccusage_payload = {
-            "available": True,
-            "generated_by": "local-request-log",
-            "sources": {
-                "claude": {
-                    "available": True,
-                    "monthly": {
-                        "monthly": [
-                            {
-                                "month": "2026-04",
-                                "inputTokens": 100,
-                                "outputTokens": 20,
-                                "cacheCreationTokens": 10,
-                                "cacheReadTokens": 30,
-                                "totalTokens": 160,
-                                "totalCost": 1.25,
-                                "modelsUsed": ["claude-sonnet-4-6"],
-                            }
-                        ]
-                    },
-                    "sessions": {
-                        "sessions": [
-                            {
-                                "sessionId": "claude-session",
-                                "lastActivity": "2026-04-04T17:00:00Z",
-                                "inputTokens": 100,
-                                "outputTokens": 20,
-                                "cacheCreationTokens": 10,
-                                "cacheReadTokens": 30,
-                                "totalTokens": 160,
-                                "totalCost": 1.25,
-                                "modelsUsed": ["claude-sonnet-4-6"],
-                            }
-                        ]
-                    },
-                },
-                "codex": {
-                    "available": True,
-                    "monthly": {
-                        "monthly": [
-                            {
-                                "month": "Apr 2026",
-                                "inputTokens": 200,
-                                "outputTokens": 40,
-                                "cachedInputTokens": 50,
-                                "reasoningOutputTokens": 12,
-                                "totalTokens": 240,
-                                "costUSD": 2.75,
-                                "models": {"gpt-5.4": {"inputTokens": 200}},
-                            }
-                        ]
-                    },
-                    "sessions": {
-                        "sessions": [
-                            {
-                                "sessionId": "codex-session",
-                                "lastActivity": "2026-04-04T18:30:00Z",
-                                "inputTokens": 200,
-                                "outputTokens": 40,
-                                "cachedInputTokens": 50,
-                                "reasoningOutputTokens": 12,
-                                "totalTokens": 240,
-                                "costUSD": 2.75,
-                                "models": {"gpt-5.4": {"inputTokens": 200}},
-                            }
-                        ]
-                    },
-                },
-            },
-            "errors": [],
-        }
-
         usage_events = [
             {
+                "request_id": "claude-req",
+                "session_id": "claude-session",
+                "server_request_id": "claude-chain",
                 "started_at": "2026-04-04T17:50:00+00:00",
                 "finished_at": "2026-04-04T17:51:00+00:00",
+                "resolved_model": "claude-sonnet-4.6",
                 "premium_requests": 1.0,
                 "path": "/v1/responses",
+                "usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 20,
+                    "cached_input_tokens": 30,
+                    "cache_creation_input_tokens": 10,
+                    "total_tokens": 160,
+                },
+                "cost_usd": 1.25,
             },
             {
+                "request_id": "codex-req",
+                "session_id": "codex-session",
+                "server_request_id": "codex-chain",
                 "started_at": "2026-04-04T17:55:00+00:00",
                 "finished_at": "2026-04-04T17:56:00+00:00",
+                "resolved_model": "gpt-5.4",
                 "premium_requests": 0.33,
-                "path": "/v1/messages",
+                "path": "/v1/responses",
+                "usage": {
+                    "input_tokens": 200,
+                    "output_tokens": 40,
+                    "cached_input_tokens": 50,
+                    "reasoning_output_tokens": 12,
+                    "total_tokens": 240,
+                },
+                "cost_usd": 2.75,
             },
         ]
 
@@ -1377,7 +1428,7 @@ class ProxyInitiatorTests(unittest.TestCase):
             mock.patch.object(proxy, "_utc_now", return_value=fixed_now),
             mock.patch.object(proxy, "_snapshot_usage_events", return_value=usage_events),
             mock.patch.object(proxy, "_load_api_key_payload", return_value={"sku": "plus_monthly_subscriber_quota"}),
-            mock.patch.object(proxy, "_get_ccusage_payload", return_value=ccusage_payload),
+            mock.patch.object(proxy, "_get_ccusage_payload", side_effect=AssertionError("dashboard should not use ccusage")),
             mock.patch.object(
                 proxy,
                 "_get_official_premium_payload",
@@ -1399,8 +1450,8 @@ class ProxyInitiatorTests(unittest.TestCase):
         self.assertEqual(payload["premium"]["included"], 1500)
         self.assertEqual(payload["premium"]["used"], 80)
         self.assertEqual(payload["premium"]["official_remaining"], 1420)
-        self.assertEqual(payload["current_month"]["ccusage"]["cost_usd"], 4.0)
-        self.assertEqual(payload["current_month"]["ccusage"]["total_tokens"], 400)
+        self.assertEqual(payload["current_month"]["usage"]["cost_usd"], 4.0)
+        self.assertEqual(payload["current_month"]["usage"]["total_tokens"], 400)
         self.assertEqual(payload["recent_sessions"][0]["source"], "codex")
         self.assertEqual(payload["recent_sessions"][1]["source"], "claude")
 
