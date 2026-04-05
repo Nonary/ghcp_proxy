@@ -2276,13 +2276,15 @@ def anthropic_message_to_chat_messages(message: dict) -> list[dict]:
             tool_text = _anthropic_tool_result_content_to_text(item.get("content", ""))
             if item.get("is_error") is True:
                 tool_text = f"[tool_error]\n{tool_text}"
-            chat_messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": tool_use_id,
-                    "content": tool_text,
-                }
-            )
+            tool_message = {
+                "role": "tool",
+                "tool_call_id": tool_use_id,
+                "content": tool_text,
+            }
+            cache_control = _normalize_anthropic_cache_control(item.get("cache_control"))
+            if cache_control is not None:
+                tool_message["copilot_cache_control"] = cache_control
+            chat_messages.append(tool_message)
             continue
         content_item = _anthropic_text_or_image_block_to_chat(item)
         if content_item is None:
@@ -2411,14 +2413,12 @@ def _chat_usage_to_anthropic(usage) -> dict:
     prompt_tokens = usage.get("prompt_tokens", 0) or 0
     completion_tokens = usage.get("completion_tokens", 0) or 0
     prompt_details = usage.get("prompt_tokens_details") if isinstance(usage.get("prompt_tokens_details"), dict) else {}
-    cache_creation_input_tokens = prompt_details.get("cache_creation_input_tokens", 0) or 0
     cache_read_input_tokens = prompt_details.get("cached_tokens", 0) or 0
-    uncached_input_tokens = max(0, prompt_tokens - cache_creation_input_tokens - cache_read_input_tokens)
 
     return {
-        "input_tokens": uncached_input_tokens,
+        "input_tokens": max(0, prompt_tokens - cache_read_input_tokens),
         "output_tokens": completion_tokens,
-        "cache_creation_input_tokens": cache_creation_input_tokens,
+        "cache_creation_input_tokens": 0,
         "cache_read_input_tokens": cache_read_input_tokens,
     }
 
@@ -2697,7 +2697,12 @@ def _extract_tool_call_deltas(delta) -> list[dict]:
 
 
 async def proxy_anthropic_streaming_response(
-    upstream_url: str, headers: dict, body: dict, fallback_model: str, timeout: int = 300, usage_event: dict | None = None
+    upstream_url: str,
+    headers: dict,
+    body: dict,
+    fallback_model: str,
+    timeout: int = 300,
+    usage_event: dict | None = None,
 ) -> Response:
     """
     Translate upstream chat-completions SSE into Anthropic Messages SSE.
@@ -2735,6 +2740,7 @@ async def proxy_anthropic_streaming_response(
         cache_read_input_tokens = 0
         stop_reason = None
         message_started = False
+        last_message_start_usage = None
         next_block_index = 0
         text_block = None
         tool_blocks = {}
@@ -2754,9 +2760,15 @@ async def proxy_anthropic_streaming_response(
             )
 
         async def ensure_message_started():
-            nonlocal message_started
+            nonlocal message_started, last_message_start_usage
             if message_started:
                 return
+            usage_payload = {
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "cache_creation_input_tokens": cache_creation_input_tokens,
+                "cache_read_input_tokens": cache_read_input_tokens,
+            }
             yield _sse_encode(
                 "message_start",
                 {
@@ -2769,16 +2781,48 @@ async def proxy_anthropic_streaming_response(
                         "model": model_name,
                         "stop_reason": None,
                         "stop_sequence": None,
-                        "usage": {
-                            "input_tokens": input_tokens,
-                            "output_tokens": 0,
-                            "cache_creation_input_tokens": cache_creation_input_tokens,
-                            "cache_read_input_tokens": cache_read_input_tokens,
-                        },
+                        "usage": usage_payload,
                     },
                 },
             )
+            last_message_start_usage = usage_payload
             message_started = True
+
+        async def refresh_message_started_usage():
+            nonlocal last_message_start_usage
+            if not message_started:
+                return
+
+            usage_payload = {
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "cache_creation_input_tokens": cache_creation_input_tokens,
+                "cache_read_input_tokens": cache_read_input_tokens,
+            }
+            if usage_payload == last_message_start_usage:
+                return
+
+            # Claude Code copies usage from message_start into the assistant
+            # message yielded at content_block_stop. OpenAI chat streams usually
+            # surface usage only on the final chunk, so we refresh message_start
+            # with the late-arriving totals before the block closes.
+            yield _sse_encode(
+                "message_start",
+                {
+                    "type": "message_start",
+                    "message": {
+                        "id": message_id,
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [],
+                        "model": model_name,
+                        "stop_reason": None,
+                        "stop_sequence": None,
+                        "usage": usage_payload,
+                    },
+                },
+            )
+            last_message_start_usage = usage_payload
 
         async def ensure_text_block():
             nonlocal next_block_index, text_block, active_block
@@ -2897,6 +2941,8 @@ async def proxy_anthropic_streaming_response(
 
                 async for event in ensure_message_started():
                     yield event
+                async for event in refresh_message_started_usage():
+                    yield event
 
                 choices = payload.get("choices")
                 first_choice = choices[0] if isinstance(choices, list) and choices else {}
@@ -2936,6 +2982,8 @@ async def proxy_anthropic_streaming_response(
                     stop_reason = mapped_stop_reason
 
             async for event in ensure_message_started():
+                yield event
+            async for event in refresh_message_started_usage():
                 yield event
 
             if active_block is not None:
@@ -3488,7 +3536,11 @@ def proxy_non_streaming_response(upstream: httpx.Response) -> Response:
 
 
 async def proxy_streaming_response(
-    upstream_url: str, headers: dict, body: dict, timeout: int = 300, usage_event: dict | None = None
+    upstream_url: str,
+    headers: dict,
+    body: dict,
+    timeout: int = 300,
+    usage_event: dict | None = None,
 ) -> Response:
     """
     Relay an upstream SSE response while preserving upstream error statuses.
@@ -3768,4 +3820,6 @@ if __name__ == "__main__":
     print("    export OPENAI_API_KEY=anything", flush=True)
     print("", flush=True)
 
+    if sys.platform == "win32":
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     uvicorn.run(app, host="0.0.0.0", port=8000, access_log=False)

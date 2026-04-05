@@ -151,6 +151,74 @@ class ProxyInitiatorTests(unittest.TestCase):
             {"type": "ephemeral"},
         )
 
+    def test_anthropic_request_to_chat_preserves_cache_control_on_tool_results(self):
+        body = {
+            "model": "claude-sonnet-4.6",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "hello"}],
+                },
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "tool_use", "id": "tool_1", "name": "Read", "input": {"file": "test.py"}},
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "tool_1",
+                            "content": "file contents",
+                            "cache_control": {"type": "ephemeral"},
+                        }
+                    ],
+                },
+            ],
+        }
+
+        outbound = proxy.asyncio.run(proxy.anthropic_request_to_chat(body, "https://example.invalid", "test-key"))
+
+        tool_msg = [m for m in outbound["messages"] if m["role"] == "tool"][0]
+        self.assertEqual(
+            tool_msg["copilot_cache_control"],
+            {"type": "ephemeral"},
+        )
+
+    def test_anthropic_request_to_chat_no_cache_control_on_tool_result_without_it(self):
+        body = {
+            "model": "claude-sonnet-4.6",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "hello"}],
+                },
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "tool_use", "id": "tool_1", "name": "Read", "input": {"file": "test.py"}},
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "tool_1",
+                            "content": "file contents",
+                        }
+                    ],
+                },
+            ],
+        }
+
+        outbound = proxy.asyncio.run(proxy.anthropic_request_to_chat(body, "https://example.invalid", "test-key"))
+
+        tool_msg = [m for m in outbound["messages"] if m["role"] == "tool"][0]
+        self.assertNotIn("copilot_cache_control", tool_msg)
+
     def test_anthropic_request_to_chat_stream_requests_usage_chunks(self):
         body = {
             "model": "claude-sonnet-4.6",
@@ -192,10 +260,10 @@ class ProxyInitiatorTests(unittest.TestCase):
 
         translated = proxy.chat_completion_to_anthropic(payload)
 
-        self.assertEqual(translated["usage"]["input_tokens"], 0)
+        self.assertEqual(translated["usage"]["input_tokens"], 20)
         self.assertEqual(translated["usage"]["output_tokens"], 25)
         self.assertEqual(translated["usage"]["cache_read_input_tokens"], 80)
-        self.assertEqual(translated["usage"]["cache_creation_input_tokens"], 20)
+        self.assertEqual(translated["usage"]["cache_creation_input_tokens"], 0)
 
     def test_chat_completion_to_anthropic_subtracts_cache_reads_from_input_tokens(self):
         payload = {
@@ -224,6 +292,63 @@ class ProxyInitiatorTests(unittest.TestCase):
         self.assertEqual(translated["usage"]["input_tokens"], 10200)
         self.assertEqual(translated["usage"]["cache_read_input_tokens"], 125000)
         self.assertEqual(translated["usage"]["cache_creation_input_tokens"], 0)
+
+    def test_anthropic_stream_refreshes_message_start_usage_when_openai_usage_arrives_late(self):
+        chunks = [
+            (
+                'event: message\n'
+                'data: {"id":"chatcmpl_123","model":"claude-haiku-4.5","choices":[{"delta":{"content":"hello"},"finish_reason":null}]}\n\n'
+            ).encode("utf-8"),
+            (
+                'event: message\n'
+                'data: {"id":"chatcmpl_123","model":"claude-haiku-4.5","choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":30,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":10}}}\n\n'
+            ).encode("utf-8"),
+            b"data: [DONE]\n\n",
+        ]
+
+        class FakeUpstream:
+            status_code = 200
+
+            async def aiter_bytes(self):
+                for chunk in chunks:
+                    yield chunk
+
+            async def aread(self):
+                return b""
+
+            async def aclose(self):
+                return None
+
+        class FakeClient:
+            def build_request(self, *args, **kwargs):
+                return object()
+
+            async def aclose(self):
+                return None
+
+        async def collect_stream_body():
+            response = await proxy.proxy_anthropic_streaming_response(
+                "https://example.invalid/chat/completions",
+                {"Authorization": "Bearer test"},
+                {"stream": True},
+                "claude-haiku-4.5",
+            )
+            body = b""
+            async for chunk in response.body_iterator:
+                body += chunk if isinstance(chunk, bytes) else chunk.encode("utf-8")
+            return body.decode("utf-8")
+
+        with (
+            mock.patch.object(proxy.httpx, "AsyncClient", return_value=FakeClient()),
+            mock.patch.object(proxy, "throttled_client_send", mock.AsyncMock(return_value=FakeUpstream())),
+        ):
+            body = proxy.asyncio.run(collect_stream_body())
+
+        self.assertEqual(body.count("event: message_start"), 2)
+        self.assertIn(
+            '"usage":{"input_tokens":20,"output_tokens":5,"cache_creation_input_tokens":0,"cache_read_input_tokens":10}',
+            body,
+        )
 
     def test_anthropic_error_payload_from_openai_uses_anthropic_shape(self):
         payload = {

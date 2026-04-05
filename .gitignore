@@ -2,3 +2,5 @@ __pycache__/
 *.pyc
 .ghcp_proxy-cache.sqlite3
 .ghcp_proxy-cache*
+.tmp/
+.live-proxy*
