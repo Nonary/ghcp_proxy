@@ -80,29 +80,17 @@ class GracefulStreamingResponse(StreamingResponse):
             return
 
 
-def get_initiator_policy() -> InitiatorPolicy:
-    return _initiator_policy
-
-
 def set_initiator_policy(policy: InitiatorPolicy):
     global _initiator_policy
     _initiator_policy = policy
 
 
-usage_event_bus.subscribe(
-    usage_tracking.REQUEST_FINISHED_EVENT,
-    _initiator_policy.note_request_finished,
-)
-
 usage_tracker = usage_tracking.UsageTracker(
-    state=usage_tracking.current_usage_tracking_state(),
-    archive_store=dashboard_module.dashboard_cache_store.usage_archive_store(),
+    state=usage_tracking.UsageTrackingState(),
+    archive_store=dashboard_module.create_usage_archive_store(),
     event_bus=usage_event_bus,
-)
-usage_tracking.configure_usage_tracking(
-    state=usage_tracker.state,
-    archive_store=usage_tracker.archive_store,
-    event_bus=usage_event_bus,
+    on_request_finished=_initiator_policy.note_request_finished,
+    on_usage_event_recorded=lambda _event: dashboard_service.notify_dashboard_stream_listeners(),
 )
 
 client_proxy_config_service = ProxyClientConfigService(
@@ -116,7 +104,7 @@ client_proxy_config_service = ProxyClientConfigService(
     )
 )
 
-dashboard_service = dashboard_module.DashboardService(
+dashboard_service = dashboard_module.create_dashboard_service(
     dependencies=dashboard_module.DashboardDependencies(
         load_billing_token=auth.load_billing_token,
         load_access_token=auth.load_access_token,
@@ -126,15 +114,10 @@ dashboard_service = dashboard_module.DashboardService(
     ),
     utc_now=util.utc_now,
     utc_now_iso=util.utc_now_iso,
-    sqlite_cache_put=dashboard_module.dashboard_cache_store.put,
-    notify_dashboard_stream_listeners=dashboard_module.dashboard_stream_broker.notify_listeners,
     thread_class=Thread,
 )
 
-usage_event_bus.subscribe(
-    usage_tracking.USAGE_EVENT_RECORDED_EVENT,
-    lambda _event: dashboard_module.dashboard_stream_broker.notify_listeners(),
-)
+
 
 
 # ─── Module-level parse_json_request wrapper ──────────────────────────────────
@@ -144,14 +127,6 @@ usage_event_bus.subscribe(
 async def parse_json_request(request: Request) -> dict:
     return await util.parse_json_request(request, error_callback=usage_tracker.record_request_error)
 
-
-codex_proxy_status = client_proxy_config_service.codex_proxy_status
-claude_proxy_status = client_proxy_config_service.claude_proxy_status
-write_codex_proxy_config = client_proxy_config_service.write_codex_proxy_config
-write_claude_proxy_settings = client_proxy_config_service.write_claude_proxy_settings
-disable_codex_proxy_config = client_proxy_config_service.disable_codex_proxy_config
-disable_claude_proxy_settings = client_proxy_config_service.disable_claude_proxy_settings
-proxy_client_status_payload = client_proxy_config_service.proxy_client_status_payload
 
 
 def configured_upstream_timeout_seconds() -> int:
@@ -182,7 +157,7 @@ def configured_upstream_timeout_seconds() -> int:
 usage_tracker.load_archived_history()
 usage_tracker.load_history()
 _initiator_policy.seed_from_usage_events(usage_tracker.snapshot_usage_events())
-dashboard_module.seed_cached_payloads_from_sqlite()
+dashboard_module.initialize()
 
 
 # ─── Upstream response helpers ────────────────────────────────────────────────
@@ -243,7 +218,6 @@ def _prepare_upstream_request(
             return None, error_response(401, f"GHCP auth failed: {exc}")
 
     headers = header_builder(effective_api_key, request_id)
-    usage_tracking.log_proxy_request(request, requested_model, resolved_model, headers.get("X-Initiator"))
     usage_event = usage_tracker.start_event(
         request,
         requested_model,
@@ -504,9 +478,8 @@ async def dashboard_api(request: Request):
 async def dashboard_stream(request: Request):
     heartbeat_seconds = 20
     poll_seconds = 1.0
-    stream_broker = dashboard_module.dashboard_stream_broker
-    queue = stream_broker.register_listener()
-    last_version = stream_broker.current_version()
+    queue = dashboard_service.register_stream_listener()
+    last_version = dashboard_service.current_stream_version()
 
     async def stream():
         nonlocal last_version
@@ -533,7 +506,7 @@ async def dashboard_stream(request: Request):
                 payload = await asyncio.to_thread(dashboard_service.build_payload, False)
                 yield format_translation.sse_encode("dashboard", payload)
         finally:
-            stream_broker.unregister_listener(queue)
+            dashboard_service.unregister_stream_listener(queue)
 
     return GracefulStreamingResponse(
         stream(),
@@ -584,7 +557,7 @@ async def billing_token_config_api(request: Request):
 
 @app.get("/api/config/client-proxy")
 async def client_proxy_status_api():
-    return JSONResponse(content=proxy_client_status_payload())
+    return JSONResponse(content=client_proxy_config_service.proxy_client_status_payload())
 
 
 @app.post("/api/config/client-proxy")
@@ -668,6 +641,8 @@ async def responses(request: Request):
             api_key,
             force_initiator="agent" if has_compaction_input else None,
             request_id=request_id,
+            initiator_policy=_initiator_policy,
+            session_id_resolver=usage_tracking.request_session_id,
         ),
         error_response=format_translation.openai_error_response,
     )
@@ -711,6 +686,8 @@ async def responses_compact(request: Request):
             api_key,
             force_initiator="agent",
             request_id=request_id,
+            initiator_policy=_initiator_policy,
+            session_id_resolver=usage_tracking.request_session_id,
         ),
         error_response=format_translation.openai_error_response,
     )
@@ -807,6 +784,8 @@ async def chat_completions(request: Request):
             body.get("model"),
             api_key,
             request_id=request_id,
+            initiator_policy=_initiator_policy,
+            session_id_resolver=usage_tracking.request_session_id,
         ),
         error_response=format_translation.openai_error_response,
     )
@@ -864,6 +843,8 @@ async def anthropic_messages(request: Request):
             body,
             resolved_api_key,
             request_id=request_id,
+            initiator_policy=_initiator_policy,
+            session_id_resolver=usage_tracking.request_session_id,
         ),
         error_response=format_translation.anthropic_error_response,
         api_key=api_key,

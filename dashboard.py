@@ -988,6 +988,7 @@ class DashboardService:
         utc_now_iso: Callable[[], str] = utc_now_iso,
         sqlite_cache_put: Callable[[str, dict], None] = dashboard_cache_store.put,
         notify_dashboard_stream_listeners: Callable[[], None] = dashboard_stream_broker.notify_listeners,
+        stream_broker: "DashboardStreamBroker | None" = None,
         thread_class: Callable[[], type] | type = Thread,
     ):
         self.dependencies = dependencies or DashboardDependencies()
@@ -995,6 +996,7 @@ class DashboardService:
         self.utc_now_iso = utc_now_iso
         self.sqlite_cache_put = sqlite_cache_put
         self.notify_dashboard_stream_listeners = notify_dashboard_stream_listeners
+        self._stream_broker = stream_broker or dashboard_stream_broker
         self.thread_class = thread_class
 
     def _resolved_thread_class(self):
@@ -1269,3 +1271,41 @@ class DashboardService:
             "recent_requests": recent_requests,
             "month_history": (local_usage.get("month_history") or [])[:12],
         }
+
+    # ─── Stream broker delegation ─────────────────────────────────────────────
+
+    def register_stream_listener(self) -> asyncio.Queue:
+        return self._stream_broker.register_listener()
+
+    def unregister_stream_listener(self, queue: asyncio.Queue):
+        self._stream_broker.unregister_listener(queue)
+
+    def current_stream_version(self) -> int:
+        return self._stream_broker.current_version()
+
+
+# ─── Public factory API ───────────────────────────────────────────────────────
+
+
+def create_dashboard_service(
+    dependencies: DashboardDependencies,
+    **kwargs,
+) -> DashboardService:
+    """Create a fully-wired DashboardService. Encapsulates cache/broker setup."""
+    return DashboardService(
+        dependencies=dependencies,
+        sqlite_cache_put=dashboard_cache_store.put,
+        notify_dashboard_stream_listeners=dashboard_stream_broker.notify_listeners,
+        stream_broker=dashboard_stream_broker,
+        **kwargs,
+    )
+
+
+def create_usage_archive_store():
+    """Create a usage archive store backed by the dashboard cache."""
+    return dashboard_cache_store.usage_archive_store()
+
+
+def initialize():
+    """Seed cached payloads from SQLite. Call once at startup."""
+    seed_cached_payloads_from_sqlite()

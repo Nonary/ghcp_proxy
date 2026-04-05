@@ -1,0 +1,731 @@
+import json
+import sqlite3
+import unittest
+from pathlib import Path
+from threading import Lock
+from types import SimpleNamespace
+from unittest import mock
+from uuid import uuid4
+
+import proxy
+import usage_tracking
+
+
+class UsageTrackingTests(unittest.TestCase):
+    def setUp(self):
+        proxy.usage_tracker.clear_state()
+
+    def _make_usage_tracker(
+        self,
+        *,
+        archive_store: usage_tracking.UsageArchiveStore | None = None,
+        event_bus=None,
+    ) -> usage_tracking.UsageTracker:
+        return usage_tracking.UsageTracker(
+            state=usage_tracking.UsageTrackingState(),
+            archive_store=archive_store,
+            event_bus=event_bus,
+        )
+
+    def _make_usage_log_path(self, prefix: str = "usage-log-") -> Path:
+        path = Path.cwd() / f"{prefix}{uuid4().hex}.jsonl"
+        def _cleanup():
+            try:
+                path.unlink(missing_ok=True)
+            except PermissionError:
+                pass
+        self.addCleanup(_cleanup)
+        return path
+
+    def test_start_usage_event_tracks_metadata_only(self):
+        tracker = self._make_usage_tracker()
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/messages"),
+            method="POST",
+            headers={
+                "session_id": "session-123",
+                "x-client-request-id": "client-456",
+            },
+        )
+        outbound_body = {
+            "model": "claude-haiku-4.5",
+            "messages": [
+                {"role": "system", "content": "stay concise"},
+                {"role": "user", "content": [{"type": "text", "text": "inspect file.py"}]},
+            ],
+            "max_tokens": 1024,
+            "requestType": "ChatMessages",
+            "otherOptions": {"intent": "debug"},
+        }
+
+        event = tracker.start_event(
+            request,
+            requested_model="claude-haiku-4-5-20251001",
+            resolved_model="claude-haiku-4.5",
+            initiator="agent",
+            request_id="req-123",
+            request_body=outbound_body,
+            upstream_path="/chat/completions",
+        )
+
+        self.assertEqual(event["request_id"], "req-123")
+        self.assertEqual(event["upstream_path"], "/chat/completions")
+        self.assertEqual(event["session_id"], "session-123")
+        self.assertEqual(event["client_request_id"], "client-456")
+        self.assertIsInstance(event["server_request_id"], str)
+        self.assertNotIn("request_text", event)
+        self.assertNotIn("request_options", event)
+        self.assertNotIn("request_payload", event)
+
+    def test_start_usage_event_uses_hyphenated_session_header(self):
+        tracker = self._make_usage_tracker()
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/messages"),
+            method="POST",
+            headers={"session-id": "session-123"},
+        )
+        outbound_headers = {}
+
+        event = tracker.start_event(
+            request,
+            requested_model="claude-haiku-4.5",
+            resolved_model="claude-haiku-4.5",
+            initiator="agent",
+            outbound_headers=outbound_headers,
+        )
+
+        self.assertEqual(event["session_id"], "session-123")
+        self.assertEqual(outbound_headers["session_id"], "session-123")
+
+    def test_start_usage_event_uses_request_body_session_id(self):
+        tracker = self._make_usage_tracker()
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/responses"),
+            method="POST",
+            headers={},
+        )
+        outbound_headers = {}
+
+        event = tracker.start_event(
+            request,
+            requested_model="gpt-5.4",
+            resolved_model="gpt-5.4",
+            initiator="agent",
+            request_body={"sessionId": "session-123"},
+            outbound_headers=outbound_headers,
+        )
+
+        self.assertEqual(event["session_id"], "session-123")
+        self.assertEqual(outbound_headers["session_id"], "session-123")
+
+    def test_start_usage_event_uses_claude_code_session_header(self):
+        tracker = self._make_usage_tracker()
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/messages"),
+            method="POST",
+            headers={"x-claude-code-session-id": "claude-session"},
+        )
+        outbound_headers = {}
+
+        event = tracker.start_event(
+            request,
+            requested_model="claude-sonnet-4.6",
+            resolved_model="claude-sonnet-4.6",
+            initiator="user",
+            outbound_headers=outbound_headers,
+        )
+
+        self.assertEqual(event["session_id"], "claude-session")
+        self.assertEqual(event["session_id_origin"], "request")
+        self.assertEqual(outbound_headers["session_id"], "claude-session")
+
+    def test_start_usage_event_uses_opencode_session_affinity_header(self):
+        tracker = self._make_usage_tracker()
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/messages"),
+            method="POST",
+            headers={"x-session-affinity": "opencode-session"},
+        )
+        outbound_headers = {}
+
+        event = tracker.start_event(
+            request,
+            requested_model="claude-sonnet-4.6",
+            resolved_model="claude-sonnet-4.6",
+            initiator="user",
+            outbound_headers=outbound_headers,
+        )
+
+        self.assertEqual(event["session_id"], "opencode-session")
+        self.assertEqual(event["session_id_origin"], "request")
+        self.assertEqual(outbound_headers["session_id"], "opencode-session")
+
+    def test_start_usage_event_uses_claude_metadata_user_id_session_id(self):
+        tracker = self._make_usage_tracker()
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/messages"),
+            method="POST",
+            headers={},
+        )
+        outbound_headers = {}
+
+        event = tracker.start_event(
+            request,
+            requested_model="claude-sonnet-4.6",
+            resolved_model="claude-sonnet-4.6",
+            initiator="user",
+            request_body={
+                "metadata": {
+                    "user_id": '{"device_id":"device-123","session_id":"claude-session"}'
+                }
+            },
+            outbound_headers=outbound_headers,
+        )
+
+        self.assertEqual(event["session_id"], "claude-session")
+        self.assertEqual(event["session_id_origin"], "request")
+        self.assertEqual(outbound_headers["session_id"], "claude-session")
+
+    def test_start_usage_event_user_uses_request_id_session_when_session_missing(self):
+        tracker = self._make_usage_tracker()
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/messages"),
+            method="POST",
+            headers={},
+        )
+        outbound_headers = {}
+        request_id = "user-request-123"
+
+        event = tracker.start_event(
+            request,
+            requested_model="gpt-5.4",
+            resolved_model="gpt-5.4",
+            initiator="user",
+            request_id=request_id,
+            outbound_headers=outbound_headers,
+        )
+
+        self.assertEqual(event["request_id"], request_id)
+        self.assertEqual(event["session_id"], request_id)
+        self.assertEqual(event["session_id_origin"], "request_id")
+        self.assertEqual(outbound_headers["session_id"], request_id)
+        self.assertEqual(outbound_headers["x-request-id"], event["server_request_id"])
+        self.assertEqual(outbound_headers["x-github-request-id"], event["server_request_id"])
+
+    def test_start_usage_event_user_follow_up_attaches_to_active_claude_session(self):
+        tracker = self._make_usage_tracker()
+        first_request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/messages"),
+            method="POST",
+            headers={"x-client-request-id": "client-123"},
+        )
+        first_event = tracker.start_event(
+            first_request,
+            requested_model="claude-sonnet-4.6",
+            resolved_model="claude-sonnet-4.6",
+            initiator="user",
+        )
+
+        follow_up_request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/messages"),
+            method="POST",
+            headers={"x-client-request-id": "client-123"},
+        )
+        follow_up_event = tracker.start_event(
+            follow_up_request,
+            requested_model="claude-haiku-4.5",
+            resolved_model="claude-haiku-4.5",
+            initiator="user",
+        )
+
+        self.assertEqual(follow_up_event["session_id"], first_event["session_id"])
+        self.assertEqual(follow_up_event["session_id_origin"], "request_id")
+        self.assertEqual(follow_up_event["prior_server_request_id"], first_event["server_request_id"])
+        self.assertEqual(follow_up_event["server_request_id"], first_event["server_request_id"])
+
+    def test_start_usage_event_agent_follow_up_attaches_to_active_claude_session(self):
+        tracker = self._make_usage_tracker()
+        user_request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/messages"),
+            method="POST",
+            headers={},
+        )
+        user_event = tracker.start_event(
+            user_request,
+            requested_model="claude-sonnet-4.6",
+            resolved_model="claude-sonnet-4.6",
+            initiator="user",
+        )
+
+        agent_request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/messages"),
+            method="POST",
+            headers={},
+        )
+        agent_event = tracker.start_event(
+            agent_request,
+            requested_model="claude-haiku-4.5",
+            resolved_model="claude-haiku-4.5",
+            initiator="agent",
+        )
+
+        self.assertEqual(agent_event["session_id"], user_event["session_id"])
+        self.assertEqual(agent_event["session_id_origin"], "request_id")
+        self.assertEqual(agent_event["prior_server_request_id"], user_event["server_request_id"])
+        self.assertEqual(agent_event["server_request_id"], user_event["server_request_id"])
+
+    def test_start_usage_event_agent_follow_up_after_user_finish_attaches_to_latest_claude_session(self):
+        tracker = self._make_usage_tracker()
+        log_path = self._make_usage_log_path()
+        user_request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/messages"),
+            method="POST",
+            headers={},
+        )
+        user_event = tracker.start_event(
+            user_request,
+            requested_model="claude-sonnet-4.6",
+            resolved_model="claude-sonnet-4.6",
+            initiator="user",
+        )
+
+        tracker.usage_log_file = str(log_path)
+        tracker.finish_event(user_event, 200)
+
+        agent_request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/messages"),
+            method="POST",
+            headers={},
+        )
+        agent_event = tracker.start_event(
+            agent_request,
+            requested_model="claude-haiku-4.5",
+            resolved_model="claude-haiku-4.5",
+            initiator="agent",
+        )
+
+        self.assertEqual(agent_event["session_id"], user_event["session_id"])
+        self.assertEqual(agent_event["session_id_origin"], "request_id")
+        self.assertEqual(agent_event["prior_server_request_id"], user_event["server_request_id"])
+        self.assertEqual(agent_event["server_request_id"], user_event["server_request_id"])
+
+    def test_start_usage_event_user_non_claude_request_does_not_generate_implicit_session(self):
+        tracker = self._make_usage_tracker()
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/responses"),
+            method="POST",
+            headers={},
+        )
+
+        event = tracker.start_event(
+            request,
+            requested_model="gpt-5.4",
+            resolved_model="gpt-5.4",
+            initiator="user",
+            outbound_headers={},
+        )
+
+        self.assertIsNone(event["session_id"])
+        self.assertIsNone(event["session_id_origin"])
+        self.assertIsNone(event["prior_server_request_id"])
+
+    def test_start_usage_event_user_without_chain_context_does_not_reuse_unrelated_active_request_id(self):
+        tracker = self._make_usage_tracker()
+        first_request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/messages"),
+            method="POST",
+            headers={},
+        )
+        first_event = tracker.start_event(
+            first_request,
+            requested_model="claude-sonnet-4.6",
+            resolved_model="claude-sonnet-4.6",
+            initiator="user",
+            request_id="first-user-request",
+        )
+
+        second_request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/messages"),
+            method="POST",
+            headers={},
+        )
+        second_event = tracker.start_event(
+            second_request,
+            requested_model="claude-haiku-4.5",
+            resolved_model="claude-haiku-4.5",
+            initiator="user",
+            request_id="second-user-request",
+        )
+
+        self.assertEqual(first_event["session_id"], "first-user-request")
+        self.assertEqual(second_event["session_id"], "second-user-request")
+        self.assertNotEqual(second_event["server_request_id"], first_event["server_request_id"])
+        self.assertIsNone(second_event["prior_server_request_id"])
+
+    def test_start_usage_event_agent_inherits_latest_session_server_request_id(self):
+        tracker = self._make_usage_tracker()
+        tracker.remember_latest_server_request_id("session-123", None, None, "server-prev")
+
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/responses"),
+            method="POST",
+            headers={"session_id": "session-123"},
+        )
+
+        event = tracker.start_event(
+            request,
+            requested_model="gpt-5.4",
+            resolved_model="gpt-5.4",
+            initiator="agent",
+        )
+
+        self.assertEqual(event["prior_server_request_id"], "server-prev")
+        self.assertEqual(event["server_request_id"], "server-prev")
+
+    def test_start_usage_event_agent_inherits_latest_body_session_server_request_id(self):
+        tracker = self._make_usage_tracker()
+        tracker.remember_latest_server_request_id("session-123", None, None, "server-prev")
+
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/responses"),
+            method="POST",
+            headers={},
+        )
+
+        event = tracker.start_event(
+            request,
+            requested_model="gpt-5.4",
+            resolved_model="gpt-5.4",
+            initiator="agent",
+            request_body={"sessionId": "session-123"},
+        )
+
+        self.assertEqual(event["prior_server_request_id"], "server-prev")
+        self.assertEqual(event["server_request_id"], "server-prev")
+
+    def test_start_usage_event_user_request_starts_new_server_request_id(self):
+        tracker = self._make_usage_tracker()
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/responses"),
+            method="POST",
+            headers={},
+        )
+
+        event = tracker.start_event(
+            request,
+            requested_model="gpt-5.4",
+            resolved_model="gpt-5.4",
+            initiator="user",
+        )
+
+        self.assertIsInstance(event["server_request_id"], str)
+        self.assertIsNone(event["prior_server_request_id"])
+
+    def test_start_usage_event_agent_inherits_active_user_server_request_id(self):
+        tracker = self._make_usage_tracker()
+        user_request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/messages"),
+            method="POST",
+            headers={},
+        )
+        user_event = tracker.start_event(
+            user_request,
+            requested_model="claude-sonnet-4.6",
+            resolved_model="claude-sonnet-4.6",
+            initiator="user",
+        )
+
+        agent_request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/messages"),
+            method="POST",
+            headers={},
+        )
+        agent_event = tracker.start_event(
+            agent_request,
+            requested_model="claude-haiku-4.5",
+            resolved_model="claude-haiku-4.5",
+            initiator="agent",
+        )
+
+        self.assertEqual(agent_event["prior_server_request_id"], user_event["server_request_id"])
+        self.assertEqual(agent_event["server_request_id"], user_event["server_request_id"])
+
+    def test_start_usage_event_subagent_request_starts_its_own_server_request_id(self):
+        tracker = self._make_usage_tracker()
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/messages"),
+            method="POST",
+            headers={"x-openai-subagent": "worker-1"},
+        )
+
+        event = tracker.start_event(
+            request,
+            requested_model="claude-haiku-4.5",
+            resolved_model="claude-haiku-4.5",
+            initiator="agent",
+        )
+
+        self.assertIsInstance(event["server_request_id"], str)
+        self.assertIsNone(event["prior_server_request_id"])
+
+    def test_start_usage_event_applies_server_request_id_to_outbound_headers(self):
+        tracker = self._make_usage_tracker()
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/messages"),
+            method="POST",
+            headers={},
+        )
+        outbound_headers = {}
+
+        event = tracker.start_event(
+            request,
+            requested_model="claude-haiku-4.5",
+            resolved_model="claude-haiku-4.5",
+            initiator="user",
+            outbound_headers=outbound_headers,
+        )
+
+        self.assertEqual(outbound_headers["x-request-id"], event["server_request_id"])
+        self.assertEqual(outbound_headers["x-github-request-id"], event["server_request_id"])
+
+    def test_finish_usage_event_tracks_usage_and_timing(self):
+        tracker = self._make_usage_tracker()
+        log_path = self._make_usage_log_path()
+        event = {
+            "request_id": "req-999",
+            "resolved_model": "gpt-5.4",
+            "_started_monotonic": 10.0,
+            "_first_output_monotonic": 10.45,
+        }
+        response_payload = {
+            "id": "resp_123",
+            "model": "gpt-5.4",
+            "output_text": "done",
+            "usage": {"input_tokens": 11, "output_tokens": 7},
+        }
+        upstream = SimpleNamespace(headers={"x-request-id": "server-abc", "content-type": "application/json"})
+
+        tracker.usage_log_file = str(log_path)
+        with mock.patch.object(usage_tracking.time, "perf_counter", return_value=12.0):
+            tracker.finish_event(
+                event,
+                200,
+                upstream=upstream,
+                response_payload=response_payload,
+            )
+
+        finished = tracker.snapshot_usage_events()[0]
+        self.assertEqual(finished["response_id"], "resp_123")
+        self.assertEqual(finished["upstream_request_id"], "server-abc")
+        self.assertEqual(finished["usage"]["input_tokens"], 11)
+        self.assertEqual(finished["duration_ms"], 2000)
+        self.assertEqual(finished["time_to_first_token_ms"], 450)
+        self.assertEqual(finished["premium_requests"], 1.0)
+        self.assertTrue(finished["success"])
+
+    def test_finish_usage_event_remembers_session_server_request_id(self):
+        tracker = self._make_usage_tracker()
+        log_path = self._make_usage_log_path()
+        event = {
+            "request_id": "req-999",
+            "resolved_model": "gpt-5.4",
+            "session_id": "session-123",
+            "server_request_id": "proxy-chain-123",
+        }
+        upstream = SimpleNamespace(headers={"x-request-id": "server-abc"})
+
+        tracker.usage_log_file = str(log_path)
+        tracker.finish_event(event, 200, upstream=upstream)
+
+        self.assertEqual(
+            tracker.latest_server_request_id("session-123", None, None),
+            "proxy-chain-123",
+        )
+
+    def test_finish_usage_event_records_cost_from_model_pricing(self):
+        tracker = self._make_usage_tracker()
+        log_path = self._make_usage_log_path()
+        event = {
+            "request_id": "req-999",
+            "resolved_model": "gpt-5.4",
+            "_started_monotonic": 10.0,
+        }
+        usage = {
+            "input_tokens": 1_000_000,
+            "output_tokens": 1_000_000,
+            "cached_input_tokens": 1_000_000,
+        }
+
+        tracker.usage_log_file = str(log_path)
+        tracker.finish_event(event, 200, usage=usage)
+
+        finished = tracker.snapshot_usage_events()[0]
+        self.assertAlmostEqual(finished["cost_usd"], 17.75)
+
+    def test_sse_usage_capture_extracts_token_usage(self):
+        tracker = self._make_usage_tracker()
+        capture = tracker.create_sse_capture("responses")
+
+        saw_output = capture.feed(
+            b'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"Hello"}\n\n'
+        )
+        capture.feed(
+            b'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_1","model":"gpt-5.4","usage":{"input_tokens":5,"output_tokens":2,"input_tokens_details":{"cached_tokens":3},"output_tokens_details":{"reasoning_tokens":1}},"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hello"}]}]}}\n\n'
+        )
+
+        self.assertTrue(saw_output)
+        self.assertEqual(capture.usage["input_tokens"], 2)
+        self.assertEqual(capture.usage["output_tokens"], 2)
+        self.assertEqual(capture.usage["total_tokens"], 4)
+        self.assertEqual(capture.usage["cached_input_tokens"], 3)
+        self.assertEqual(capture.usage["reasoning_output_tokens"], 1)
+
+    def test_sse_usage_capture_normalizes_cached_prompt_tokens(self):
+        tracker = self._make_usage_tracker()
+        capture = tracker.create_sse_capture("chat")
+        capture.feed(
+            b'event: message\ndata: {"id":"chatcmpl_1","choices":[{"delta":{"content":"Hi"}}],"usage":{"prompt_tokens":20,"completion_tokens":4,"prompt_tokens_details":{"cached_tokens":7}}}\n\n'
+        )
+
+        self.assertEqual(capture.usage["input_tokens"], 13)
+        self.assertEqual(capture.usage["output_tokens"], 4)
+        self.assertEqual(capture.usage["total_tokens"], 17)
+        self.assertEqual(capture.usage["cached_input_tokens"], 7)
+
+    def test_load_usage_history_normalizes_cached_tokens(self):
+        tracker = self._make_usage_tracker()
+        log_path = self._make_usage_log_path()
+        log_path.write_text(
+            '{"session_id":"session-123","server_request_id":"server-abc","usage":{"prompt_tokens":20,"completion_tokens":4,"prompt_tokens_details":{"cached_tokens":7}}}\n',
+            encoding="utf-8",
+        )
+
+        tracker.usage_log_file = str(log_path)
+        tracker.load_history()
+        events = tracker.snapshot_usage_events()
+
+        self.assertEqual(events[0]["usage"]["input_tokens"], 13)
+        self.assertEqual(events[0]["usage"]["total_tokens"], 17)
+        self.assertEqual(events[0]["usage"]["cached_input_tokens"], 7)
+        self.assertEqual(
+            tracker.latest_server_request_id("session-123", None, None),
+            "server-abc",
+        )
+
+    def test_load_usage_history_normalizes_responses_usage_details(self):
+        tracker = self._make_usage_tracker()
+        log_path = self._make_usage_log_path()
+        log_path.write_text(
+            '{"session_id":"session-123","server_request_id":"server-def","usage":{"input_tokens":20,"output_tokens":4,"input_tokens_details":{"cached_tokens":7},"output_tokens_details":{"reasoning_tokens":2}}}\n',
+            encoding="utf-8",
+        )
+
+        tracker.usage_log_file = str(log_path)
+        tracker.load_history()
+        events = tracker.snapshot_usage_events()
+
+        self.assertEqual(events[0]["usage"]["input_tokens"], 13)
+        self.assertEqual(events[0]["usage"]["total_tokens"], 17)
+        self.assertEqual(events[0]["usage"]["cached_input_tokens"], 7)
+        self.assertEqual(events[0]["usage"]["reasoning_output_tokens"], 2)
+        self.assertEqual(
+            tracker.latest_server_request_id("session-123", None, None),
+            "server-def",
+        )
+
+    def test_normalize_usage_payload_preserves_explicit_cached_input_shape(self):
+        import util
+        normalized = util.normalize_usage_payload(
+            {
+                "input_tokens": 20,
+                "output_tokens": 4,
+                "total_tokens": 24,
+                "cached_input_tokens": 7,
+            }
+        )
+
+        self.assertEqual(normalized["input_tokens"], 20)
+        self.assertEqual(normalized["output_tokens"], 4)
+        self.assertEqual(normalized["total_tokens"], 24)
+        self.assertEqual(normalized["cached_input_tokens"], 7)
+
+    def test_load_usage_history_compacts_old_requests_into_archive(self):
+        from constants import DETAILED_REQUEST_HISTORY_LIMIT
+
+        events = []
+        for idx in range(DETAILED_REQUEST_HISTORY_LIMIT + 2):
+            minute = idx % 60
+            events.append({
+                "request_id": f"req-{idx:04d}",
+                "session_id": f"session-{idx:04d}",
+                "server_request_id": f"chain-{idx:04d}",
+                "started_at": f"2026-04-04T18:{minute:02d}:00+00:00",
+                "finished_at": f"2026-04-04T18:{minute:02d}:30+00:00",
+                "resolved_model": "gpt-5.4",
+                "path": "/v1/responses",
+                "premium_requests": 0.33,
+                "usage": {
+                    "input_tokens": 100 + idx,
+                    "output_tokens": 25,
+                    "cached_input_tokens": 10,
+                    "total_tokens": 125 + idx,
+                },
+                "cost_usd": round(0.01 * (idx + 1), 4),
+            })
+
+        log_path = self._make_usage_log_path(prefix="usage-history-")
+        log_path.write_text(
+            "".join(
+                f"{json.dumps(event, separators=(',', ':'))}\n"
+                for event in events
+            ),
+            encoding="utf-8",
+        )
+        db_uri = "file:usage-archive-test?mode=memory&cache=shared"
+        keeper = sqlite3.connect(db_uri, uri=True)
+        keeper.row_factory = sqlite3.Row
+        keeper.execute(
+            """
+            CREATE TABLE archived_usage_events (
+                archive_key TEXT PRIMARY KEY,
+                recorded_at TEXT NOT NULL,
+                payload_json TEXT NOT NULL
+            )
+            """
+        )
+        keeper.commit()
+
+        def connect_shared():
+            connection = sqlite3.connect(db_uri, uri=True)
+            connection.row_factory = sqlite3.Row
+            return connection
+
+        tracker = self._make_usage_tracker(
+            archive_store=usage_tracking.UsageArchiveStore(
+                init_storage=lambda: True,
+                lock=Lock(),
+                connect=lambda: connect_shared(),
+                mark_unavailable=lambda error: None,
+            ),
+        )
+
+        tracker.usage_log_file = str(log_path)
+        with mock.patch.object(tracker, "_rewrite_usage_log") as rewrite_usage_log:
+            tracker.load_history()
+
+        recent_events = tracker.snapshot_usage_events()
+        archived_events = tracker.snapshot_archived_usage_events()
+        self.assertEqual(len(recent_events), DETAILED_REQUEST_HISTORY_LIMIT)
+        self.assertEqual(len(archived_events), 2)
+        self.assertEqual(archived_events[0]["request_id"], "req-0000")
+        self.assertEqual(archived_events[1]["request_id"], "req-0001")
+        self.assertEqual(recent_events[0]["request_id"], "req-0002")
+        rewrite_usage_log.assert_called_once()
+        self.assertEqual(len(rewrite_usage_log.call_args.args[0]), DETAILED_REQUEST_HISTORY_LIMIT)
+        archived_count = keeper.execute("SELECT COUNT(*) FROM archived_usage_events").fetchone()[0]
+        self.assertEqual(archived_count, 2)
+        keeper.close()
+
+
+if __name__ == "__main__":
+    unittest.main()
