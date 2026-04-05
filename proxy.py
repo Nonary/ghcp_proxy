@@ -19,17 +19,17 @@ import os
 import sqlite3
 import sys
 import time
+from dataclasses import dataclass
 from threading import Thread
 from uuid import uuid4
 
-import auth as _auth_module
-import dashboard as _dashboard_module
-import usage_tracking as _usage_tracking_module
 import httpx
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
+from anthropic_stream import AnthropicStreamTranslator
 from initiator_policy import InitiatorPolicy
+from proxy_runtime import ProxyRuntime, ProxySettings
 
 # ─── Import from new modules ─────────────────────────────────────────────────
 
@@ -46,25 +46,13 @@ from constants import (
 
 from util import (
     _json_default,
-    _coerce_float,
-    _coerce_int,
     _utc_now,
     _utc_now_iso,
     _normalize_usage_payload,
-    _normalize_model_name,
-    _usage_event_model_name,
-    _usage_event_source,
     _extract_payload_usage,
-    _pricing_entry_for_model,
     _usage_event_cost,
     _premium_request_multiplier,
-    _server_request_chain_key,
-    _is_claude_request,
-    _month_key,
     _month_key_for_source_row,
-    _extract_item_text,
-    _extract_text_content,
-    _parse_iso_datetime,
     parse_json_request as _parse_json_request_impl,
 )
 
@@ -140,15 +128,8 @@ from auth import (
     _backup_config_file,
     _latest_backup_path,
     _parse_toml_values,
-    _codex_proxy_status,
     _empty_proxy_status,
-    _claude_proxy_status,
-    _write_codex_proxy_config,
-    _write_claude_proxy_settings,
     _disable_client_proxy_config,
-    _disable_codex_proxy_config,
-    _disable_claude_proxy_settings,
-    _proxy_client_status_payload,
     _normalize_proxy_targets,
     _load_api_key,
     _load_api_key_payload,
@@ -179,30 +160,23 @@ from usage_tracking import (
     _normalize_recorded_usage_event,
     _start_usage_event,
     _mark_usage_event_first_output,
-    _finish_usage_event,
     _snapshot_usage_events,
     _snapshot_all_usage_events,
     _record_usage_event,
     _record_request_error,
     _rewrite_usage_log_locked,
-    _load_usage_history,
-    _compact_usage_history_if_needed,
     _usage_event_archive_summary,
     _usage_event_archive_key,
-    _load_archived_usage_history,
-    _delete_archived_usage_events,
     _SSEUsageCapture,
     _initiator_log_label,
     log_proxy_request,
 )
 
 from dashboard import (
-    _sqlite_cache_lock,
-    _sqlite_cache_enabled,
     _init_sqlite_cache,
+    _sqlite_cache_enabled,
+    _sqlite_cache_error,
     _sqlite_connect,
-    _sqlite_cache_get,
-    _sqlite_cache_get_latest,
     _sqlite_cache_put,
     _infer_premium_allowance,
     _extract_quota_summary,
@@ -214,18 +188,13 @@ from dashboard import (
     _collect_official_premium_payload,
     _empty_official_premium_payload,
     _current_billing_month_bounds,
-    _premium_cache_lock,
-    _premium_cache,
     _refresh_official_premium_cache_sync,
-    _trigger_official_premium_refresh,
     _get_official_premium_payload,
-    _seed_cached_payloads_from_sqlite,
     _register_dashboard_stream_listener,
     _unregister_dashboard_stream_listener,
     _notify_dashboard_stream_listeners,
-    _dashboard_stream_subscribers,
-    _dashboard_stream_lock,
-    _dashboard_stream_version,
+    _premium_cache_lock,
+    _premium_cache,
     _new_usage_aggregate_bucket,
     _ingest_usage_event,
     _finalize_usage_bucket,
@@ -246,7 +215,44 @@ from dashboard import (
 app = FastAPI()
 
 _initiator_policy = InitiatorPolicy()
-_sqlite_cache_error = getattr(_dashboard_module, "_sqlite_cache_error", None)
+
+
+def _current_proxy_settings() -> ProxySettings:
+    return ProxySettings(
+        codex_config_file=CODEX_CONFIG_FILE,
+        codex_proxy_config=CODEX_PROXY_CONFIG,
+        claude_settings_file=CLAUDE_SETTINGS_FILE,
+        claude_proxy_settings=CLAUDE_PROXY_SETTINGS,
+        claude_max_context_tokens=CLAUDE_MAX_CONTEXT_TOKENS,
+        claude_max_output_tokens=CLAUDE_MAX_OUTPUT_TOKENS,
+    )
+
+
+_runtime = ProxyRuntime(
+    settings_provider=_current_proxy_settings,
+    load_api_key_payload=lambda: _load_api_key_payload(),
+    sqlite_cache_enabled=lambda: _sqlite_cache_enabled,
+    sqlite_cache_error=lambda: _sqlite_cache_error,
+    sqlite_connect=lambda: _sqlite_connect(),
+    sqlite_cache_put=lambda cache_key, payload: _sqlite_cache_put(cache_key, payload),
+    collect_official_premium_payload=lambda *args, **kwargs: _collect_official_premium_payload(*args, **kwargs),
+    get_official_premium_payload=lambda *args, **kwargs: _get_official_premium_payload(*args, **kwargs),
+    notify_dashboard_stream_listeners=lambda: _notify_dashboard_stream_listeners(),
+    utc_now=lambda: _utc_now(),
+    utc_now_iso=lambda: _utc_now_iso(),
+    record_usage_event=lambda event: _record_usage_event(event),
+    rewrite_usage_log_locked=lambda events: _rewrite_usage_log_locked(events),
+    snapshot_usage_events=lambda: _snapshot_usage_events(),
+    snapshot_all_usage_events=lambda: _snapshot_all_usage_events(),
+    usage_log_lock=lambda: _usage_log_lock,
+    recent_usage_events=lambda: _recent_usage_events,
+    archived_usage_events=lambda: _archived_usage_events,
+    session_request_id_lock=lambda: _session_request_id_lock,
+    latest_server_request_ids_by_chain=lambda: _latest_server_request_ids_by_chain,
+    active_server_request_ids_by_request=lambda: _active_server_request_ids_by_request,
+    latest_claude_user_session_contexts=lambda: _latest_claude_user_session_contexts,
+    thread_class=lambda: Thread,
+)
 
 
 # ─── Module-level parse_json_request wrapper ──────────────────────────────────
@@ -257,159 +263,26 @@ async def parse_json_request(request: Request) -> dict:
     return await _parse_json_request_impl(request, error_callback=_record_request_error)
 
 
-# ─── Compatibility wrappers for extracted modules ────────────────────────────
-
-def _sync_auth_module():
-    _auth_module.CODEX_CONFIG_FILE = CODEX_CONFIG_FILE
-    _auth_module.CODEX_CONFIG_DIR = os.path.dirname(CODEX_CONFIG_FILE) or _auth_module.CODEX_CONFIG_DIR
-    _auth_module.CODEX_PROXY_CONFIG = CODEX_PROXY_CONFIG
-    _auth_module.CLAUDE_SETTINGS_FILE = CLAUDE_SETTINGS_FILE
-    _auth_module.CLAUDE_CONFIG_DIR = os.path.dirname(CLAUDE_SETTINGS_FILE) or _auth_module.CLAUDE_CONFIG_DIR
-    _auth_module.CLAUDE_PROXY_SETTINGS = CLAUDE_PROXY_SETTINGS
-    _auth_module.CLAUDE_MAX_CONTEXT_TOKENS = CLAUDE_MAX_CONTEXT_TOKENS
-    _auth_module.CLAUDE_MAX_OUTPUT_TOKENS = CLAUDE_MAX_OUTPUT_TOKENS
-
-
-def _sync_dashboard_module():
-    _dashboard_module._sqlite_cache_lock = _sqlite_cache_lock
-    _dashboard_module._sqlite_cache_enabled = _sqlite_cache_enabled
-    _dashboard_module._sqlite_cache_error = _sqlite_cache_error
-    _dashboard_module._sqlite_connect = _sqlite_connect
-    _dashboard_module._sqlite_cache_get = _sqlite_cache_get
-    _dashboard_module._sqlite_cache_get_latest = _sqlite_cache_get_latest
-    _dashboard_module._sqlite_cache_put = _sqlite_cache_put
-    _dashboard_module._premium_cache_lock = _premium_cache_lock
-    _dashboard_module._premium_cache = _premium_cache
-    _dashboard_module._collect_official_premium_payload = _collect_official_premium_payload
-    _dashboard_module._get_official_premium_payload = _get_official_premium_payload
-    _dashboard_module._notify_dashboard_stream_listeners = _notify_dashboard_stream_listeners
-    _dashboard_module._utc_now = _utc_now
-    _dashboard_module._utc_now_iso = _utc_now_iso
-    _dashboard_module.Thread = Thread
-
-
-def _sync_usage_tracking_module():
-    _usage_tracking_module._usage_log_lock = _usage_log_lock
-    _usage_tracking_module._recent_usage_events = _recent_usage_events
-    _usage_tracking_module._archived_usage_events = _archived_usage_events
-    _usage_tracking_module._session_request_id_lock = _session_request_id_lock
-    _usage_tracking_module._latest_server_request_ids_by_chain = _latest_server_request_ids_by_chain
-    _usage_tracking_module._active_server_request_ids_by_request = _active_server_request_ids_by_request
-    _usage_tracking_module._latest_claude_user_session_contexts = _latest_claude_user_session_contexts
-    _usage_tracking_module._record_usage_event = _record_usage_event
-    _usage_tracking_module._rewrite_usage_log_locked = _rewrite_usage_log_locked
-    _usage_tracking_module._snapshot_usage_events = _snapshot_usage_events
-    _usage_tracking_module._snapshot_all_usage_events = _snapshot_all_usage_events
-    _usage_tracking_module._utc_now = _utc_now
-    _usage_tracking_module._utc_now_iso = _utc_now_iso
-    _usage_tracking_module._extract_payload_usage = _extract_payload_usage
-    _usage_tracking_module._normalize_usage_payload = _normalize_usage_payload
-    _usage_tracking_module._usage_event_cost = _usage_event_cost
-    _usage_tracking_module._premium_request_multiplier = _premium_request_multiplier
-    _usage_tracking_module.DETAILED_REQUEST_HISTORY_LIMIT = DETAILED_REQUEST_HISTORY_LIMIT
-
-
-def _refresh_dashboard_aliases():
-    global _sqlite_cache_enabled, _sqlite_cache_error
-    _sqlite_cache_enabled = _dashboard_module._sqlite_cache_enabled
-    _sqlite_cache_error = getattr(_dashboard_module, "_sqlite_cache_error", None)
-
-
-def _codex_proxy_status():
-    _sync_auth_module()
-    return _auth_module._codex_proxy_status()
-
-
-def _claude_proxy_status():
-    _sync_auth_module()
-    return _auth_module._claude_proxy_status()
-
-
-def _write_codex_proxy_config():
-    _sync_auth_module()
-    return _auth_module._write_codex_proxy_config()
-
-
-def _write_claude_proxy_settings():
-    _sync_auth_module()
-    return _auth_module._write_claude_proxy_settings()
-
-
-def _disable_codex_proxy_config():
-    _sync_auth_module()
-    return _auth_module._disable_codex_proxy_config()
-
-
-def _disable_claude_proxy_settings():
-    _sync_auth_module()
-    return _auth_module._disable_claude_proxy_settings()
-
-
-def _proxy_client_status_payload():
-    _sync_auth_module()
-    return _auth_module._proxy_client_status_payload()
-
-
-def _load_archived_usage_history():
-    _sync_dashboard_module()
-    _sync_usage_tracking_module()
-    result = _usage_tracking_module._load_archived_usage_history()
-    _refresh_dashboard_aliases()
-    return result
-
-
-def _load_usage_history():
-    _sync_dashboard_module()
-    _sync_usage_tracking_module()
-    result = _usage_tracking_module._load_usage_history()
-    _refresh_dashboard_aliases()
-    return result
-
-
-def _compact_usage_history_if_needed():
-    _sync_dashboard_module()
-    _sync_usage_tracking_module()
-    result = _usage_tracking_module._compact_usage_history_if_needed()
-    _refresh_dashboard_aliases()
-    return result
-
-
-def _finish_usage_event(*args, **kwargs):
-    _sync_usage_tracking_module()
-    result = _usage_tracking_module._finish_usage_event(*args, **kwargs)
-    _refresh_dashboard_aliases()
-    return result
-
-
-def _seed_cached_payloads_from_sqlite():
-    _sync_dashboard_module()
-    result = _dashboard_module._seed_cached_payloads_from_sqlite()
-    _refresh_dashboard_aliases()
-    return result
-
-
-def _trigger_official_premium_refresh(force: bool = False):
-    _sync_dashboard_module()
-    result = _dashboard_module._trigger_official_premium_refresh(force=force)
-    _refresh_dashboard_aliases()
-    return result
-
-
-def _build_dashboard_payload(force_refresh: bool = False) -> dict:
-    _sync_auth_module()
-    _sync_dashboard_module()
-    _sync_usage_tracking_module()
-    result = _dashboard_module._build_dashboard_payload(force_refresh=force_refresh)
-    _refresh_dashboard_aliases()
-    return result
+# Runtime-backed compatibility surface for tests and route handlers.
+_codex_proxy_status = _runtime.codex_proxy_status
+_claude_proxy_status = _runtime.claude_proxy_status
+_write_codex_proxy_config = _runtime.write_codex_proxy_config
+_write_claude_proxy_settings = _runtime.write_claude_proxy_settings
+_disable_codex_proxy_config = _runtime.disable_codex_proxy_config
+_disable_claude_proxy_settings = _runtime.disable_claude_proxy_settings
+_proxy_client_status_payload = _runtime.proxy_client_status_payload
+_load_archived_usage_history = _runtime.load_archived_usage_history
+_load_usage_history = _runtime.load_usage_history
+_compact_usage_history_if_needed = _runtime.compact_usage_history_if_needed
+_finish_usage_event = _runtime.finish_usage_event
+_seed_cached_payloads_from_sqlite = _runtime.seed_cached_payloads_from_sqlite
+_trigger_official_premium_refresh = _runtime.trigger_official_premium_refresh
+_build_dashboard_payload = _runtime.build_dashboard_payload
 
 
 # ─── Initialization ──────────────────────────────────────────────────────────
 
-_load_archived_usage_history()
-_load_usage_history()
-_initiator_policy.seed_from_usage_events(_snapshot_usage_events())
-_seed_cached_payloads_from_sqlite()
+_runtime.initialize(_initiator_policy)
 
 
 # ─── Upstream response helpers ────────────────────────────────────────────────
@@ -436,6 +309,88 @@ def _extract_upstream_text(upstream: httpx.Response) -> str | None:
     if not text:
         return None
     return text[:4096]
+
+
+@dataclass
+class UpstreamRequestPlan:
+    upstream_url: str
+    headers: dict
+    body: dict
+    usage_event: dict | None
+    requested_model: str | None
+    resolved_model: str | None
+
+
+def _prepare_upstream_request(
+    request: Request,
+    *,
+    body: dict,
+    requested_model: str | None,
+    resolved_model: str | None,
+    upstream_path: str,
+    upstream_url: str,
+    header_builder,
+    error_response,
+    api_key: str | None = None,
+) -> tuple[UpstreamRequestPlan | None, Response | None]:
+    request_id = uuid4().hex
+
+    effective_api_key = api_key
+    if effective_api_key is None:
+        try:
+            effective_api_key = get_api_key()
+        except Exception as exc:
+            return None, error_response(401, f"GHCP auth failed: {exc}")
+
+    headers = header_builder(effective_api_key, request_id)
+    log_proxy_request(request, requested_model, resolved_model, headers.get("X-Initiator"))
+    usage_event = _start_usage_event(
+        request,
+        requested_model,
+        resolved_model,
+        headers.get("X-Initiator"),
+        request_id=request_id,
+        request_body=body,
+        upstream_path=upstream_path,
+        outbound_headers=headers,
+    )
+    return (
+        UpstreamRequestPlan(
+            upstream_url=upstream_url,
+            headers=headers,
+            body=body,
+            usage_event=usage_event,
+            requested_model=requested_model,
+            resolved_model=resolved_model,
+        ),
+        None,
+    )
+
+
+async def _post_non_streaming_request(plan: UpstreamRequestPlan, *, error_response) -> Response:
+    try:
+        async with httpx.AsyncClient(timeout=120) as client:
+            upstream = await throttled_client_post(
+                client,
+                plan.upstream_url,
+                headers=plan.headers,
+                json=plan.body,
+            )
+        _finish_usage_event(
+            plan.usage_event,
+            upstream.status_code,
+            upstream=upstream,
+            response_payload=_extract_upstream_json_payload(upstream),
+            response_text=_extract_upstream_text(upstream),
+        )
+        return proxy_non_streaming_response(upstream)
+    except httpx.RequestError as exc:
+        status_code, message = _upstream_request_error_status_and_message(exc)
+        _finish_usage_event(plan.usage_event, status_code, response_text=message)
+        return error_response(status_code, message)
+    except Exception:
+        _finish_usage_event(plan.usage_event, 599)
+        raise
 
 
 def proxy_non_streaming_response(upstream: httpx.Response) -> Response:
@@ -591,329 +546,25 @@ async def proxy_anthropic_streaming_response(
     }
 
     async def stream_translated():
-        message_id = f"msg_{uuid4().hex}"
-        model_name = fallback_model
-        input_tokens = 0
-        output_tokens = 0
-        cache_creation_input_tokens = 0
-        cache_read_input_tokens = 0
-        stop_reason = None
-        message_started = False
-        last_message_start_usage = None
-        next_block_index = 0
-        text_block = None
-        tool_blocks = {}
-        active_block = None
-        stream_closed = False
-        response_text_parts: list[str] = []
-
-        async def emit_block_stop(block):
-            if not isinstance(block, dict) or block.get("closed") is True:
-                return
-            block["closed"] = True
-            yield _sse_encode(
-                "content_block_stop",
-                {
-                    "type": "content_block_stop",
-                    "index": block["anthropic_index"],
-                },
-            )
-
-        async def ensure_message_started():
-            nonlocal message_started, last_message_start_usage
-            if message_started:
-                return
-            usage_payload = {
-                "input_tokens": input_tokens,
-                "output_tokens": output_tokens,
-                "cache_creation_input_tokens": cache_creation_input_tokens,
-                "cache_read_input_tokens": cache_read_input_tokens,
-            }
-            yield _sse_encode(
-                "message_start",
-                {
-                    "type": "message_start",
-                    "message": {
-                        "id": message_id,
-                        "type": "message",
-                        "role": "assistant",
-                        "content": [],
-                        "model": model_name,
-                        "stop_reason": None,
-                        "stop_sequence": None,
-                        "usage": usage_payload,
-                    },
-                },
-            )
-            last_message_start_usage = usage_payload
-            message_started = True
-
-        async def refresh_message_started_usage():
-            nonlocal last_message_start_usage
-            if not message_started:
-                return
-
-            usage_payload = {
-                "input_tokens": input_tokens,
-                "output_tokens": output_tokens,
-                "cache_creation_input_tokens": cache_creation_input_tokens,
-                "cache_read_input_tokens": cache_read_input_tokens,
-            }
-            if usage_payload == last_message_start_usage:
-                return
-
-            yield _sse_encode(
-                "message_start",
-                {
-                    "type": "message_start",
-                    "message": {
-                        "id": message_id,
-                        "type": "message",
-                        "role": "assistant",
-                        "content": [],
-                        "model": model_name,
-                        "stop_reason": None,
-                        "stop_sequence": None,
-                        "usage": usage_payload,
-                    },
-                },
-            )
-            last_message_start_usage = usage_payload
-
-        async def ensure_text_block():
-            nonlocal next_block_index, text_block, active_block
-
-            if text_block is not None and text_block.get("closed") is not True:
-                active_block = ("text", text_block["anthropic_index"])
-                return
-
-            if active_block is not None:
-                block_type, block_key = active_block
-                active = text_block if block_type == "text" else tool_blocks.get(block_key)
-                if active is not None:
-                    async for event in emit_block_stop(active):
-                        yield event
-                active_block = None
-
-            text_block = {
-                "anthropic_index": next_block_index,
-                "closed": False,
-            }
-            next_block_index += 1
-            active_block = ("text", text_block["anthropic_index"])
-            yield _sse_encode(
-                "content_block_start",
-                {
-                    "type": "content_block_start",
-                    "index": text_block["anthropic_index"],
-                    "content_block": {"type": "text", "text": ""},
-                },
-            )
-
-        async def ensure_tool_block(tool_delta: dict):
-            nonlocal next_block_index, active_block
-
-            openai_index = tool_delta.get("index", 0)
-            state = tool_blocks.get(openai_index)
-            if state is None:
-                state = {
-                    "anthropic_index": next_block_index,
-                    "id": tool_delta.get("id") if isinstance(tool_delta.get("id"), str) else f"toolu_{uuid4().hex}",
-                    "name": "",
-                    "arguments": "",
-                    "closed": False,
-                    "started": False,
-                }
-                tool_blocks[openai_index] = state
-                next_block_index += 1
-
-            function = tool_delta.get("function") if isinstance(tool_delta.get("function"), dict) else {}
-            if isinstance(tool_delta.get("id"), str):
-                state["id"] = tool_delta["id"]
-            if isinstance(function.get("name"), str) and function.get("name"):
-                if not state["name"]:
-                    state["name"] = function["name"]
-                elif function["name"] not in state["name"]:
-                    state["name"] += function["name"]
-            if isinstance(function.get("arguments"), str) and function.get("arguments"):
-                state["arguments"] += function["arguments"]
-
-            if state["started"] and state["closed"] is not True:
-                active_block = ("tool", openai_index)
-                return
-
-            if active_block is not None:
-                block_type, block_key = active_block
-                active = text_block if block_type == "text" else tool_blocks.get(block_key)
-                if active is not None:
-                    async for event in emit_block_stop(active):
-                        yield event
-                active_block = None
-
-            state["started"] = True
-            state["closed"] = False
-            active_block = ("tool", openai_index)
-            yield _sse_encode(
-                "content_block_start",
-                {
-                    "type": "content_block_start",
-                    "index": state["anthropic_index"],
-                    "content_block": {
-                        "type": "tool_use",
-                        "id": state["id"],
-                        "name": state["name"],
-                        "input": {},
-                    },
-                },
-            )
-
+        translator = AnthropicStreamTranslator(
+            fallback_model,
+            mark_first_output=lambda: _mark_usage_event_first_output(usage_event),
+        )
         try:
-            async for _event_name, data in _iter_sse_messages(upstream.aiter_bytes()):
-                if data == "[DONE]":
-                    break
-
-                try:
-                    payload = json.loads(data)
-                except json.JSONDecodeError:
-                    continue
-
-                if isinstance(payload.get("id"), str):
-                    message_id = payload["id"]
-                if isinstance(payload.get("model"), str):
-                    model_name = payload["model"]
-
-                usage = payload.get("usage")
-                if isinstance(usage, dict):
-                    anthropic_usage = _chat_usage_to_anthropic(usage)
-                    input_tokens = anthropic_usage.get("input_tokens", input_tokens) or input_tokens
-                    output_tokens = anthropic_usage.get("output_tokens", output_tokens) or output_tokens
-                    cache_creation_input_tokens = (
-                        anthropic_usage.get("cache_creation_input_tokens", cache_creation_input_tokens)
-                        or cache_creation_input_tokens
-                    )
-                    cache_read_input_tokens = (
-                        anthropic_usage.get("cache_read_input_tokens", cache_read_input_tokens) or cache_read_input_tokens
-                    )
-
-                async for event in ensure_message_started():
-                    yield event
-                async for event in refresh_message_started_usage():
-                    yield event
-
-                choices = payload.get("choices")
-                first_choice = choices[0] if isinstance(choices, list) and choices else {}
-                delta = first_choice.get("delta") if isinstance(first_choice, dict) else {}
-                text_delta = _extract_text_from_chat_delta(delta)
-                if text_delta:
-                    response_text_parts.append(text_delta)
-                    _mark_usage_event_first_output(usage_event)
-                    async for event in ensure_text_block():
-                        yield event
-                    yield _sse_encode(
-                        "content_block_delta",
-                        {
-                            "type": "content_block_delta",
-                            "index": text_block["anthropic_index"],
-                            "delta": {"type": "text_delta", "text": text_delta},
-                        },
-                    )
-
-                for tool_delta in _extract_tool_call_deltas(delta):
-                    async for event in ensure_tool_block(tool_delta):
-                        yield event
-                    tool_state = tool_blocks.get(tool_delta.get("index", 0))
-                    function = tool_delta.get("function") if isinstance(tool_delta.get("function"), dict) else {}
-                    arguments_chunk = function.get("arguments")
-                    if isinstance(arguments_chunk, str) and arguments_chunk:
-                        yield _sse_encode(
-                            "content_block_delta",
-                            {
-                                "type": "content_block_delta",
-                                "index": tool_state["anthropic_index"],
-                                "delta": {"type": "input_json_delta", "partial_json": arguments_chunk},
-                            },
-                        )
-
-                finish_reason = first_choice.get("finish_reason") if isinstance(first_choice, dict) else None
-                mapped_stop_reason = _chat_stop_reason_to_anthropic(finish_reason)
-                if mapped_stop_reason is not None:
-                    stop_reason = mapped_stop_reason
-
-            async for event in ensure_message_started():
+            async for event in translator.translate(upstream.aiter_bytes()):
                 yield event
-            async for event in refresh_message_started_usage():
-                yield event
-
-            if active_block is not None:
-                block_type, block_key = active_block
-                active = text_block if block_type == "text" else tool_blocks.get(block_key)
-                if active is not None:
-                    async for event in emit_block_stop(active):
-                        yield event
-                active_block = None
-
-            if text_block is None and not tool_blocks:
-                empty_text_block = {
-                    "anthropic_index": next_block_index,
-                    "closed": False,
-                }
-                yield _sse_encode(
-                    "content_block_start",
-                    {
-                        "type": "content_block_start",
-                        "index": empty_text_block["anthropic_index"],
-                        "content_block": {"type": "text", "text": ""},
-                    },
-                )
-                async for event in emit_block_stop(empty_text_block):
-                    yield event
-
-            yield _sse_encode(
-                "message_delta",
-                {
-                    "type": "message_delta",
-                    "delta": {
-                        "stop_reason": stop_reason or "end_turn",
-                        "stop_sequence": None,
-                    },
-                    "usage": {
-                        "input_tokens": input_tokens,
-                        "output_tokens": output_tokens,
-                        "cache_creation_input_tokens": cache_creation_input_tokens,
-                        "cache_read_input_tokens": cache_read_input_tokens,
-                    },
-                },
-            )
-            yield _sse_encode("message_stop", {"type": "message_stop"})
-            stream_closed = True
         finally:
-            response_payload = {
-                "id": message_id,
-                "type": "message",
-                "role": "assistant",
-                "model": model_name,
-                "stop_reason": stop_reason or "end_turn",
-                "content": [{"type": "text", "text": "".join(response_text_parts)}] if response_text_parts else [],
-                "usage": {
-                    "input_tokens": input_tokens,
-                    "output_tokens": output_tokens,
-                    "cache_creation_input_tokens": cache_creation_input_tokens,
-                    "cache_read_input_tokens": cache_read_input_tokens,
-                },
-            }
+            response_payload = translator.build_response_payload()
             _finish_usage_event(
                 usage_event,
                 upstream.status_code,
                 upstream=upstream,
                 response_payload=response_payload,
-                response_text="".join(response_text_parts) if response_text_parts else None,
+                response_text=translator.response_text,
                 usage=response_payload["usage"],
             )
             await upstream.aclose()
             await client.aclose()
-
-        if not stream_closed:
-            yield _sse_encode("message_stop", {"type": "message_stop"})
 
     return StreamingResponse(
         stream_translated(),
@@ -926,10 +577,6 @@ _trigger_official_premium_refresh()
 
 
 # ─── Dashboard routes ─────────────────────────────────────────────────────────
-
-def _render_dashboard_html() -> str:
-    with open(DASHBOARD_FILE, encoding="utf-8") as f:
-        return f.read()
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -954,7 +601,7 @@ async def dashboard_stream(request: Request):
     heartbeat_seconds = 20
     poll_seconds = 1.0
     queue = _register_dashboard_stream_listener()
-    last_version = _dashboard_stream_version
+    last_version = _runtime.dashboard_stream_version
 
     async def stream():
         nonlocal last_version
@@ -1100,7 +747,6 @@ async def responses(request: Request):
         body = await parse_json_request(request)
     except HTTPException as exc:
         return openai_error_response(exc.status_code, _http_exception_detail_to_message(exc.detail))
-    request_id = uuid4().hex
 
     # Sanitize input (multi-turn encrypted_content passthrough)
     raw_input = body.get("input")
@@ -1108,60 +754,36 @@ async def responses(request: Request):
     if raw_input is not None:
         body["input"] = sanitize_input(raw_input)
 
-    try:
-        api_key = get_api_key()
-    except Exception as e:
-        return openai_error_response(401, f"GHCP auth failed: {e}")
-
-    headers = build_responses_headers_for_request(
-        request,
-        body,
-        api_key,
-        force_initiator="agent" if has_compaction_input else None,
-        request_id=request_id,
-    )
     upstream_url = f"{_get_api_base().rstrip('/')}/responses"
-    is_streaming = body.get("stream", False)
-    log_proxy_request(request, body.get("model"), body.get("model"), headers.get("X-Initiator"))
-    usage_event = _start_usage_event(
+    plan, error_response = _prepare_upstream_request(
         request,
-        body.get("model"),
-        body.get("model"),
-        headers.get("X-Initiator"),
-        request_id=request_id,
-        request_body=body,
+        body=body,
+        requested_model=body.get("model"),
+        resolved_model=body.get("model"),
         upstream_path="/responses",
-        outbound_headers=headers,
-    )
-
-    if is_streaming:
-        return await proxy_streaming_response(
-            upstream_url,
-            headers,
+        upstream_url=upstream_url,
+        header_builder=lambda api_key, request_id: build_responses_headers_for_request(
+            request,
             body,
+            api_key,
+            force_initiator="agent" if has_compaction_input else None,
+            request_id=request_id,
+        ),
+        error_response=openai_error_response,
+    )
+    if error_response is not None:
+        return error_response
+
+    if body.get("stream", False):
+        return await proxy_streaming_response(
+            plan.upstream_url,
+            plan.headers,
+            plan.body,
             timeout=300,
-            usage_event=usage_event,
+            usage_event=plan.usage_event,
             stream_type="responses",
         )
-    else:
-        try:
-            async with httpx.AsyncClient(timeout=120) as client:
-                upstream = await throttled_client_post(client, upstream_url, headers=headers, json=body)
-            _finish_usage_event(
-                usage_event,
-                upstream.status_code,
-                upstream=upstream,
-                response_payload=_extract_upstream_json_payload(upstream),
-                response_text=_extract_upstream_text(upstream),
-            )
-            return proxy_non_streaming_response(upstream)
-        except httpx.RequestError as exc:
-            status_code, message = _upstream_request_error_status_and_message(exc)
-            _finish_usage_event(usage_event, status_code, response_text=message)
-            return openai_error_response(status_code, message)
-        except Exception:
-            _finish_usage_event(usage_event, 599)
-            raise
+    return await _post_non_streaming_request(plan, error_response=openai_error_response)
 
 
 @app.post("/v1/responses/compact")
@@ -1170,48 +792,47 @@ async def responses_compact(request: Request):
         body = await parse_json_request(request)
     except HTTPException as exc:
         return openai_error_response(exc.status_code, _http_exception_detail_to_message(exc.detail))
-    request_id = uuid4().hex
-
-    try:
-        api_key = get_api_key()
-    except Exception as e:
-        return openai_error_response(401, f"GHCP auth failed: {e}")
 
     summary_request = build_fake_compaction_request(body)
-    headers = build_responses_headers_for_request(
-        request,
-        summary_request,
-        api_key,
-        force_initiator="agent",
-        request_id=request_id,
-    )
     upstream_url = f"{_get_api_base().rstrip('/')}/responses"
-    log_proxy_request(request, body.get("model"), summary_request.get("model"), headers.get("X-Initiator"))
-    usage_event = _start_usage_event(
+    plan, error_response = _prepare_upstream_request(
         request,
-        body.get("model"),
-        summary_request.get("model"),
-        headers.get("X-Initiator"),
-        request_id=request_id,
-        request_body=summary_request,
+        body=summary_request,
+        requested_model=body.get("model"),
+        resolved_model=summary_request.get("model"),
         upstream_path="/responses",
-        outbound_headers=headers,
+        upstream_url=upstream_url,
+        header_builder=lambda api_key, request_id: build_responses_headers_for_request(
+            request,
+            summary_request,
+            api_key,
+            force_initiator="agent",
+            request_id=request_id,
+        ),
+        error_response=openai_error_response,
     )
+    if error_response is not None:
+        return error_response
 
     try:
         async with httpx.AsyncClient(timeout=120) as client:
-            upstream = await throttled_client_post(client, upstream_url, headers=headers, json=summary_request)
+            upstream = await throttled_client_post(
+                client,
+                plan.upstream_url,
+                headers=plan.headers,
+                json=plan.body,
+            )
     except httpx.RequestError as exc:
         status_code, message = _upstream_request_error_status_and_message(exc)
-        _finish_usage_event(usage_event, status_code, response_text=message)
+        _finish_usage_event(plan.usage_event, status_code, response_text=message)
         return openai_error_response(status_code, message)
     except Exception:
-        _finish_usage_event(usage_event, 599)
+        _finish_usage_event(plan.usage_event, 599)
         raise
 
     if upstream.status_code >= 400:
         _finish_usage_event(
-            usage_event,
+            plan.usage_event,
             upstream.status_code,
             upstream=upstream,
             response_payload=_extract_upstream_json_payload(upstream),
@@ -1223,7 +844,7 @@ async def responses_compact(request: Request):
         upstream_payload = upstream.json()
     except json.JSONDecodeError as e:
         _finish_usage_event(
-            usage_event,
+            plan.usage_event,
             502,
             upstream=upstream,
             response_text=f"Invalid JSON from upstream summarization response: {e}",
@@ -1233,7 +854,7 @@ async def responses_compact(request: Request):
     summary_text = extract_response_output_text(upstream_payload)
     if not summary_text:
         _finish_usage_event(
-            usage_event,
+            plan.usage_event,
             502,
             upstream=upstream,
             response_payload=upstream_payload,
@@ -1243,7 +864,7 @@ async def responses_compact(request: Request):
 
     compacted_response = build_fake_compaction_response(body, summary_text, upstream_payload.get("usage"))
     _finish_usage_event(
-        usage_event,
+        plan.usage_event,
         upstream.status_code,
         upstream=upstream,
         response_payload=compacted_response,
@@ -1263,59 +884,39 @@ async def chat_completions(request: Request):
         body = await parse_json_request(request)
     except HTTPException as exc:
         return openai_error_response(exc.status_code, _http_exception_detail_to_message(exc.detail))
-    request_id = uuid4().hex
 
     messages = body.get("messages", [])
 
-    try:
-        api_key = get_api_key()
-    except Exception as e:
-        return openai_error_response(401, f"GHCP auth failed: {e}")
-
-    headers = build_chat_headers_for_request(request, messages, body.get("model"), api_key, request_id=request_id)
-
     upstream_url = f"{_get_api_base().rstrip('/')}/chat/completions"
-    is_streaming = body.get("stream", False)
-    log_proxy_request(request, body.get("model"), body.get("model"), headers.get("X-Initiator"))
-    usage_event = _start_usage_event(
+    plan, error_response = _prepare_upstream_request(
         request,
-        body.get("model"),
-        body.get("model"),
-        headers.get("X-Initiator"),
-        request_id=request_id,
-        request_body=body,
+        body=body,
+        requested_model=body.get("model"),
+        resolved_model=body.get("model"),
         upstream_path="/chat/completions",
-        outbound_headers=headers,
+        upstream_url=upstream_url,
+        header_builder=lambda api_key, request_id: build_chat_headers_for_request(
+            request,
+            messages,
+            body.get("model"),
+            api_key,
+            request_id=request_id,
+        ),
+        error_response=openai_error_response,
     )
+    if error_response is not None:
+        return error_response
 
-    if is_streaming:
+    if body.get("stream", False):
         return await proxy_streaming_response(
-            upstream_url,
-            headers,
-            body,
+            plan.upstream_url,
+            plan.headers,
+            plan.body,
             timeout=300,
-            usage_event=usage_event,
+            usage_event=plan.usage_event,
             stream_type="chat",
         )
-    else:
-        try:
-            async with httpx.AsyncClient(timeout=120) as client:
-                upstream = await throttled_client_post(client, upstream_url, headers=headers, json=body)
-            _finish_usage_event(
-                usage_event,
-                upstream.status_code,
-                upstream=upstream,
-                response_payload=_extract_upstream_json_payload(upstream),
-                response_text=_extract_upstream_text(upstream),
-            )
-            return proxy_non_streaming_response(upstream)
-        except httpx.RequestError as exc:
-            status_code, message = _upstream_request_error_status_and_message(exc)
-            _finish_usage_event(usage_event, status_code, response_text=message)
-            return openai_error_response(status_code, message)
-        except Exception:
-            _finish_usage_event(usage_event, 599)
-            raise
+    return await _post_non_streaming_request(plan, error_response=openai_error_response)
 
 
 @app.post("/v1/messages")
@@ -1329,51 +930,61 @@ async def anthropic_messages(request: Request):
         body = await parse_json_request(request)
     except HTTPException as exc:
         return anthropic_error_response(exc.status_code, _http_exception_detail_to_message(exc.detail))
-    request_id = uuid4().hex
 
     try:
         api_key = get_api_key()
-    except Exception as e:
-        return anthropic_error_response(401, f"GHCP auth failed: {e}")
+    except Exception as exc:
+        return anthropic_error_response(401, f"GHCP auth failed: {exc}")
 
     api_base = _get_api_base()
     try:
         outbound_body = await anthropic_request_to_chat(body, api_base, api_key)
-    except ValueError as e:
-        return anthropic_error_response(400, str(e))
+    except ValueError as exc:
+        return anthropic_error_response(400, str(exc))
 
-    headers = build_anthropic_headers_for_request(request, body, api_key, request_id=request_id)
     upstream_url = f"{api_base.rstrip('/')}/chat/completions"
-    log_proxy_request(request, body.get("model"), outbound_body.get("model"), headers.get("X-Initiator"))
-    usage_event = _start_usage_event(
+    plan, error_response = _prepare_upstream_request(
         request,
-        body.get("model"),
-        outbound_body.get("model"),
-        headers.get("X-Initiator"),
-        request_id=request_id,
-        request_body=outbound_body,
+        body=outbound_body,
+        requested_model=body.get("model"),
+        resolved_model=outbound_body.get("model"),
         upstream_path="/chat/completions",
-        outbound_headers=headers,
+        upstream_url=upstream_url,
+        header_builder=lambda resolved_api_key, request_id: build_anthropic_headers_for_request(
+            request,
+            body,
+            resolved_api_key,
+            request_id=request_id,
+        ),
+        error_response=anthropic_error_response,
+        api_key=api_key,
     )
+    if error_response is not None:
+        return error_response
 
     if outbound_body.get("stream"):
         return await proxy_anthropic_streaming_response(
-            upstream_url,
-            headers,
-            outbound_body,
+            plan.upstream_url,
+            plan.headers,
+            plan.body,
             outbound_body.get("model"),
             timeout=300,
-            usage_event=usage_event,
+            usage_event=plan.usage_event,
         )
 
     try:
         async with httpx.AsyncClient(timeout=120) as client:
-            upstream = await throttled_client_post(client, upstream_url, headers=headers, json=outbound_body)
+            upstream = await throttled_client_post(
+                client,
+                plan.upstream_url,
+                headers=plan.headers,
+                json=plan.body,
+            )
         if upstream.status_code >= 400:
             fallback_message = _extract_upstream_text(upstream) or f"Upstream request failed with status {upstream.status_code}"
             error_payload = anthropic_error_payload_from_openai(_extract_upstream_json_payload(upstream), upstream.status_code, fallback_message)
             _finish_usage_event(
-                usage_event,
+                plan.usage_event,
                 upstream.status_code,
                 upstream=upstream,
                 response_payload=error_payload,
@@ -1387,7 +998,7 @@ async def anthropic_messages(request: Request):
             )
         translated = chat_completion_to_anthropic(upstream.json(), fallback_model=outbound_body.get("model"))
         _finish_usage_event(
-            usage_event,
+            plan.usage_event,
             upstream.status_code,
             upstream=upstream,
             response_payload=translated,
@@ -1395,10 +1006,10 @@ async def anthropic_messages(request: Request):
         return JSONResponse(content=translated, status_code=upstream.status_code)
     except httpx.RequestError as exc:
         status_code, message = _upstream_request_error_status_and_message(exc)
-        _finish_usage_event(usage_event, status_code, response_text=message)
+        _finish_usage_event(plan.usage_event, status_code, response_text=message)
         return anthropic_error_response(status_code, message)
     except Exception:
-        _finish_usage_event(usage_event, 599)
+        _finish_usage_event(plan.usage_event, 599)
         raise
 
 
