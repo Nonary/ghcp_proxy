@@ -10,7 +10,7 @@ Local reverse proxy for Codex and Claude Code using GitHub Copilot upstream.
 - Handles GitHub Copilot auth automatically on startup
 - Exposes a local dashboard at `http://localhost:8000/`
 - Shows tracked GitHub premium request usage for traffic that passes through the proxy
-- Pulls recent session, token, and savings data from both Claude Code and Codex via `ccusage`
+- Tracks session, token, and estimated cost data from the proxy's own request log
 
 ## Run It
 
@@ -151,19 +151,9 @@ The dashboard activation controls are meant to behave like a light switch.
 The dashboard combines two local data sources:
 
 - proxy request logs in `~/.config/ghcp_proxy/usage-log.jsonl` for tracked GitHub premium request usage
-- `ccusage` reports for Claude Code and Codex session/token/cost history
+- built-in token tracking and model pricing for Claude and GPT requests that pass through the proxy
 
-By default the proxy will try:
-
-- `ccusage` for Claude Code
-- `npx --yes @ccusage/codex@latest` for Codex
-
-You can override either command if you already have a preferred local install:
-
-```bash
-export GHCP_CLAUDE_CCUSAGE_COMMAND="ccusage"
-export GHCP_CODEX_CCUSAGE_COMMAND="npx --yes @ccusage/codex@latest"
-```
+The local cost estimates use the common model rates configured in `proxy.py`, including cached-input pricing where the provider publishes it.
 
 If GitHub does not expose an official remaining premium-request count in the Copilot token payload, the dashboard shows a tracked remaining value based on successful proxied requests for the current month.
 
