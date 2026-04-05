@@ -1357,7 +1357,7 @@ class ProxyInitiatorTests(unittest.TestCase):
         with mock.patch.object(initiator_policy, "_utc_now", return_value=start.replace(second=7)):
             self.assertEqual(policy.resolve_initiator("user", "gpt-5"), "agent")
 
-    def test_safeguard_resets_after_expiry_so_haiku_cannot_reactivate(self):
+    def test_any_copilot_activity_reactivates_safeguard_after_first_user_request(self):
         policy = initiator_policy.InitiatorPolicy()
         start = datetime(2026, 4, 4, 18, 0, tzinfo=timezone.utc)
 
@@ -1380,7 +1380,7 @@ class ProxyInitiatorTests(unittest.TestCase):
         with mock.patch.object(initiator_policy, "_utc_now", return_value=start.replace(second=27)):
             self.assertEqual(
                 policy.resolve_initiator("user", "claude-opus-4.6", request_id="opus-1"),
-                "user",
+                "agent",
             )
 
     def test_seeded_user_history_does_not_pre_activate_safeguard(self):
