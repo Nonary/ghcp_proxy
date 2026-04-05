@@ -8,8 +8,10 @@ import sqlite3
 import time
 from collections import deque
 from contextlib import closing
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from threading import Lock, Thread
+from typing import Callable
 
 import httpx
 
@@ -51,6 +53,17 @@ _premium_cache = {
     "last_error": None,
     "last_started_at": None,
 }
+
+
+# ─── Runtime dependencies ─────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class DashboardDependencies:
+    load_billing_token: Callable[[], str | None] = lambda: None
+    load_access_token: Callable[[], str | None] = lambda: None
+    load_api_key_payload: Callable[[], dict] = lambda: {}
+    snapshot_all_usage_events: Callable[[], list[dict]] = lambda: []
+    snapshot_usage_events: Callable[[], list[dict]] = lambda: []
 
 
 # ─── SQLite cache functions ──────────────────────────────────────────────────
@@ -428,97 +441,6 @@ def _empty_official_premium_payload() -> dict:
     }
 
 
-def _collect_official_premium_payload(now: datetime | None = None, *, skip_cache: bool = False) -> dict:
-    from auth import _load_billing_token, _load_access_token, _load_api_key_payload
-
-    current = now or _utc_now()
-    access_token = _load_billing_token() or _load_access_token()
-    if not access_token:
-        raise RuntimeError(
-            "No GitHub OAuth token is available for billing API requests. "
-            "Set GHCP_GITHUB_BILLING_TOKEN, set a billing token via /api/config/billing-token (UI), or run proxy auth."
-        )
-
-    identity = _fetch_github_identity(access_token)
-    scope, target = _billing_target_from_env_or_identity(identity)
-    quota_summary = _extract_quota_summary(_load_api_key_payload())
-    included = quota_summary.get("included")
-    explicit_scope = os.environ.get("GHCP_GITHUB_BILLING_SCOPE")
-    candidates: list[tuple[str, str]] = []
-    seen_candidates = set()
-    candidates.append((scope, target))
-    seen_candidates.add(f"{scope}:{target}")
-    if not explicit_scope:
-        for org_login in _load_billing_org_candidates(access_token):
-            candidate_key = f"org:{org_login}"
-            if candidate_key in seen_candidates:
-                continue
-            seen_candidates.add(candidate_key)
-            candidates.append(("org", org_login))
-
-    payload = None
-    last_error = None
-    for attempt_scope, attempt_target in candidates:
-        cache_key = _official_premium_cache_key(attempt_scope, attempt_target, current.year, current.month)
-        if not skip_cache:
-            cached = _sqlite_cache_get(cache_key)
-            if isinstance(cached, dict):
-                return cached
-
-        endpoint = _premium_usage_endpoint(attempt_scope, attempt_target)
-        params = {"year": current.year, "month": current.month}
-        fetch_attempts = (
-            (params, "with month filter"),
-            ({}, "without month filter"),
-        )
-        for attempt_params, attempt_label in fetch_attempts:
-            try:
-                payload, _ = _github_rest_get_json(access_token, endpoint, params=attempt_params)
-                scope, target = attempt_scope, attempt_target
-                break
-            except Exception as exc:
-                last_error = str(exc)
-                if "without month filter" in attempt_label:
-                    print(f"Billing API fallback attempt failed for {attempt_scope}:{attempt_target} ({attempt_label}): {exc}", flush=True)
-                    continue
-                print(f"Billing API month-filtered call failed ({attempt_label}): {exc}", flush=True)
-        if payload is not None:
-            break
-
-    if payload is None:
-        raise RuntimeError(f"GitHub billing API failed after probing identities: {last_error}")
-
-    endpoint_included = _extract_included_from_billing_payload(payload if isinstance(payload, dict) else {})
-    effective_included = _coerce_int(endpoint_included, default=None)
-    if effective_included is None:
-        effective_included = _coerce_int(included, default=None)
-
-    explicit_remaining = _extract_explicit_remaining_from_billing_payload(payload if isinstance(payload, dict) else {})
-    inferred_remaining, total_used = _infer_remaining_from_billing_payload(
-        payload if isinstance(payload, dict) else {}, effective_included
-    )
-    reset_date = quota_summary.get("reset_date")
-    if isinstance(payload, dict):
-        reset_date = payload.get("resetDate") or payload.get("reset_date") or reset_date
-    result = {
-        "available": True,
-        "loaded_at": _utc_now_iso(),
-        "scope": scope,
-        "target": target,
-        "remaining": explicit_remaining if explicit_remaining is not None else inferred_remaining,
-        "used": total_used,
-        "included": effective_included,
-        "reset_date": reset_date,
-        "source": "github-rest-billing-api",
-        "raw": payload if isinstance(payload, dict) else None,
-        "error": None,
-        "inference": "explicit" if explicit_remaining is not None else "usageItems",
-    }
-    _sqlite_cache_put(cache_key, result)
-    _sqlite_cache_put("premium_usage:latest", result)
-    return result
-
-
 def _current_billing_month_bounds(now: datetime | None = None) -> tuple[datetime, datetime]:
     current = now or _utc_now()
     start = datetime(current.year, current.month, 1, tzinfo=timezone.utc)
@@ -636,60 +558,6 @@ def _usage_event_session_descriptor(event: dict | None) -> dict[str, str]:
     }
 
 
-# ─── Premium cache ───────────────────────────────────────────────────────────
-
-def _refresh_official_premium_cache_sync():
-    with _premium_cache_lock:
-        _premium_cache["refreshing"] = True
-        _premium_cache["last_started_at"] = _utc_now_iso()
-
-    try:
-        result = _collect_official_premium_payload(skip_cache=True)
-        _sqlite_cache_put("premium_usage:latest", result)
-        with _premium_cache_lock:
-            _premium_cache["loaded_at"] = time.monotonic()
-            _premium_cache["payload"] = result
-            _premium_cache["last_error"] = None
-        _notify_dashboard_stream_listeners()
-    except Exception as exc:
-        with _premium_cache_lock:
-            _premium_cache["last_error"] = str(exc)
-    finally:
-        with _premium_cache_lock:
-            _premium_cache["refreshing"] = False
-
-
-def _trigger_official_premium_refresh(force: bool = False):
-    with _premium_cache_lock:
-        payload = _premium_cache.get("payload")
-        loaded_at = _premium_cache.get("loaded_at", 0.0)
-        refreshing = _premium_cache.get("refreshing", False)
-        is_stale = payload is None or (time.monotonic() - loaded_at) >= PREMIUM_CACHE_TTL_SECONDS
-        should_refresh = force or is_stale
-        if refreshing or not should_refresh:
-            return
-        _premium_cache["refreshing"] = True
-        _premium_cache["last_started_at"] = _utc_now_iso()
-
-    def _runner():
-        try:
-            result = _collect_official_premium_payload(skip_cache=force)
-            _sqlite_cache_put("premium_usage:latest", result)
-            with _premium_cache_lock:
-                _premium_cache["loaded_at"] = time.monotonic()
-                _premium_cache["payload"] = result
-                _premium_cache["last_error"] = None
-            _notify_dashboard_stream_listeners()
-        except Exception as exc:
-            with _premium_cache_lock:
-                _premium_cache["last_error"] = str(exc)
-        finally:
-            with _premium_cache_lock:
-                _premium_cache["refreshing"] = False
-
-    Thread(target=_runner, daemon=True).start()
-
-
 def _monotonic_loaded_at_from_payload(payload: dict | None) -> float:
     if not isinstance(payload, dict):
         return time.monotonic()
@@ -708,7 +576,7 @@ def _monotonic_loaded_at_from_payload(payload: dict | None) -> float:
     return time.monotonic()
 
 
-def _seed_cached_payloads_from_sqlite():
+def seed_cached_payloads_from_sqlite():
     premium_payload = _sqlite_cache_get_latest("premium_usage:")
     if isinstance(premium_payload, dict):
         with _premium_cache_lock:
@@ -717,27 +585,6 @@ def _seed_cached_payloads_from_sqlite():
             _premium_cache["last_error"] = premium_payload.get("error")
             _premium_cache["refreshing"] = False
             _premium_cache["last_started_at"] = None
-
-
-def _get_official_premium_payload(force_refresh: bool = False) -> dict:
-    if force_refresh:
-        _refresh_official_premium_cache_sync()
-    else:
-        _trigger_official_premium_refresh(force=False)
-    with _premium_cache_lock:
-        payload = _premium_cache.get("payload") or _empty_official_premium_payload()
-        age_seconds = None
-        loaded_at = _premium_cache.get("loaded_at", 0.0)
-        if loaded_at:
-            age_seconds = max(0.0, time.monotonic() - loaded_at)
-        annotated = {
-            **payload,
-            "refreshing": bool(_premium_cache.get("refreshing")),
-            "age_seconds": age_seconds,
-            "last_error": _premium_cache.get("last_error"),
-            "last_started_at": _premium_cache.get("last_started_at"),
-        }
-    return annotated
 
 
 # ─── Usage aggregation and dashboard building ────────────────────────────────
@@ -847,10 +694,13 @@ def _finalize_usage_bucket(bucket: dict, source: str, *, session_id: str | None 
     return result
 
 
-def _aggregate_usage_event_buckets(usage_events: list[dict] | None = None) -> tuple[dict[str, dict[str, dict]], dict[str, dict[str, dict]]]:
+def _aggregate_usage_event_buckets(
+    usage_events: list[dict] | None = None,
+    *,
+    snapshot_usage_events: Callable[[], list[dict]] | None = None,
+) -> tuple[dict[str, dict[str, dict]], dict[str, dict[str, dict]]]:
     if usage_events is None:
-        from usage_tracking import _snapshot_usage_events
-        usage_events = _snapshot_usage_events()
+        usage_events = snapshot_usage_events() if snapshot_usage_events is not None else []
     else:
         usage_events = list(usage_events)
     source_month_buckets: dict[str, dict[str, dict]] = {}
@@ -889,8 +739,15 @@ def _aggregate_usage_event_buckets(usage_events: list[dict] | None = None) -> tu
     return source_month_buckets, source_session_buckets
 
 
-def _collect_local_dashboard_usage(usage_events: list[dict] | None = None) -> dict:
-    source_month_buckets, source_session_buckets = _aggregate_usage_event_buckets(usage_events)
+def collect_local_dashboard_usage(
+    usage_events: list[dict] | None = None,
+    *,
+    snapshot_usage_events: Callable[[], list[dict]] | None = None,
+) -> dict:
+    source_month_buckets, source_session_buckets = _aggregate_usage_event_buckets(
+        usage_events,
+        snapshot_usage_events=snapshot_usage_events,
+    )
     normalized_months = []
     normalized_sessions = []
 
@@ -903,7 +760,7 @@ def _collect_local_dashboard_usage(usage_events: list[dict] | None = None) -> di
             )
         for session_id, bucket in session_buckets.items():
             normalized_sessions.append(
-                _normalize_session(source, _finalize_usage_bucket(bucket, source, session_id=bucket.get("session_id")))
+                normalize_session(source, _finalize_usage_bucket(bucket, source, session_id=bucket.get("session_id")))
             )
 
     normalized_sessions.sort(key=lambda item: item.get("last_activity") or "", reverse=True)
@@ -916,7 +773,7 @@ def _collect_local_dashboard_usage(usage_events: list[dict] | None = None) -> di
     }
 
 
-def _normalize_session(source: str, session: dict) -> dict:
+def normalize_session(source: str, session: dict) -> dict:
     if source == "claude":
         models = session.get("modelsUsed") or list((session.get("models") or {}).keys())
         cost_usd = _coerce_float(session.get("totalCost"))
@@ -1062,81 +919,279 @@ def _combine_usage_rows(rows: list[dict], *, month_key: str | None = None) -> di
     return combined
 
 
-def _build_dashboard_payload(force_refresh: bool = False) -> dict:
-    from auth import _load_api_key_payload
-    from usage_tracking import _snapshot_all_usage_events, _snapshot_usage_events
+class DashboardService:
+    """Owns dashboard aggregation with explicit auth/usage callbacks and runtime hooks."""
 
-    now = _utc_now()
-    month_start, month_end = _current_billing_month_bounds(now)
-    current_month_key = _month_key(now)
-    usage_events = _snapshot_all_usage_events()
-    detailed_usage_events = _snapshot_usage_events()
-    current_month_events = []
-    for event in usage_events:
-        recorded_at = _parse_iso_datetime(event.get("finished_at") or event.get("started_at"))
-        if recorded_at is None:
-            continue
-        if month_start <= recorded_at < month_end:
-            current_month_events.append(event)
+    def __init__(
+        self,
+        *,
+        dependencies: DashboardDependencies | None = None,
+        utc_now: Callable[[], datetime] = _utc_now,
+        utc_now_iso: Callable[[], str] = _utc_now_iso,
+        sqlite_cache_put: Callable[[str, dict], None] = _sqlite_cache_put,
+        notify_dashboard_stream_listeners: Callable[[], None] = _notify_dashboard_stream_listeners,
+        thread_class: Callable[[], type] | type = Thread,
+    ):
+        self.dependencies = dependencies or DashboardDependencies()
+        self.utc_now = utc_now
+        self.utc_now_iso = utc_now_iso
+        self.sqlite_cache_put = sqlite_cache_put
+        self.notify_dashboard_stream_listeners = notify_dashboard_stream_listeners
+        self.thread_class = thread_class
 
-    premium_used = round(sum(_coerce_float(event.get("premium_requests")) for event in current_month_events), 2)
-    quota_summary = _extract_quota_summary(_load_api_key_payload())
-    included = quota_summary.get("included")
-    has_tracked_premium_data = bool(current_month_events)
-    tracked_remaining = None
-    if included is not None and has_tracked_premium_data:
-        tracked_remaining = round(max(included - premium_used, 0.0), 2)
-    official_premium = _get_official_premium_payload(force_refresh=force_refresh)
-    official_included = official_premium.get("included")
-    official_used = official_premium.get("used")
-    official_remaining = official_premium.get("remaining")
-    official_reset_date = official_premium.get("reset_date")
-    official_available = bool(official_premium.get("available"))
+    def _resolved_thread_class(self):
+        resolved_thread_class = self.thread_class
+        if callable(resolved_thread_class) and not isinstance(resolved_thread_class, type):
+            resolved_thread_class = resolved_thread_class()
+        return resolved_thread_class
 
-    local_usage = _collect_local_dashboard_usage(usage_events)
-    month_rows = list(local_usage.get("month_rows") or [])
-    current_month_usage = _combine_usage_rows(
-        [row for row in month_rows if row.get("month_key") == current_month_key],
-        month_key=current_month_key,
-    )
-    all_time_usage = _combine_usage_rows(month_rows)
-    all_time_usage["months_tracked"] = len(local_usage.get("month_history") or [])
+    def collect_official_premium_payload(
+        self,
+        now: datetime | None = None,
+        *,
+        skip_cache: bool = False,
+    ) -> dict:
+        current = now or self.utc_now()
+        access_token = self.dependencies.load_billing_token() or self.dependencies.load_access_token()
+        if not access_token:
+            raise RuntimeError(
+                "No GitHub OAuth token is available for billing API requests. "
+                "Set GHCP_GITHUB_BILLING_TOKEN, set a billing token via /api/config/billing-token (UI), or run proxy auth."
+            )
 
-    recent_requests = sorted(
-        detailed_usage_events,
-        key=lambda item: item.get("finished_at") or item.get("started_at") or "",
-        reverse=True,
-    )[:DETAILED_REQUEST_HISTORY_LIMIT]
+        identity = _fetch_github_identity(access_token)
+        scope, target = _billing_target_from_env_or_identity(identity)
+        api_key_payload = self.dependencies.load_api_key_payload()
+        if not isinstance(api_key_payload, dict):
+            api_key_payload = {}
+        quota_summary = _extract_quota_summary(api_key_payload)
+        included = quota_summary.get("included")
+        explicit_scope = os.environ.get("GHCP_GITHUB_BILLING_SCOPE")
+        candidates: list[tuple[str, str]] = [(scope, target)]
+        seen_candidates = {f"{scope}:{target}"}
+        if not explicit_scope:
+            for org_login in _load_billing_org_candidates(access_token):
+                candidate_key = f"org:{org_login}"
+                if candidate_key in seen_candidates:
+                    continue
+                seen_candidates.add(candidate_key)
+                candidates.append(("org", org_login))
 
-    return {
-        "generated_at": now.isoformat(),
-        "premium": {
-            "sku": quota_summary.get("sku") or official_premium.get("raw", {}).get("sku"),
-            "included": official_included if official_included is not None else included,
-            "used": official_used if official_available and official_used is not None else premium_used,
-            "tracked_remaining": tracked_remaining,
-            "has_tracked_data": has_tracked_premium_data,
-            "official_remaining": official_remaining if official_available else quota_summary.get("official_remaining"),
-            "reset_date": official_reset_date if official_reset_date is not None else quota_summary.get("reset_date"),
-            "source": official_premium.get("source") if official_available else "proxy-request-log",
-            "official": official_premium,
-        },
-        "current_month": {
-            "label": current_month_key,
-            "start_at": month_start.isoformat(),
-            "end_at": month_end.isoformat(),
-            "proxy_requests": len(current_month_events),
-            "sessions": local_usage.get("session_count", 0),
-            "usage": current_month_usage,
-        },
-        "all_time": {
-            "proxy_requests": len(usage_events),
-            "archived_requests": max(len(usage_events) - len(detailed_usage_events), 0),
-            "detailed_requests": len(detailed_usage_events),
-            "sessions": local_usage.get("session_count", 0),
-            "usage": all_time_usage,
-        },
-        "recent_sessions": local_usage.get("recent_sessions") or [],
-        "recent_requests": recent_requests,
-        "month_history": (local_usage.get("month_history") or [])[:12],
-    }
+        payload = None
+        cache_key = None
+        last_error = None
+        for attempt_scope, attempt_target in candidates:
+            cache_key = _official_premium_cache_key(attempt_scope, attempt_target, current.year, current.month)
+            if not skip_cache:
+                cached = _sqlite_cache_get(cache_key)
+                if isinstance(cached, dict):
+                    return cached
+
+            endpoint = _premium_usage_endpoint(attempt_scope, attempt_target)
+            fetch_attempts = (
+                ({"year": current.year, "month": current.month}, "with month filter"),
+                ({}, "without month filter"),
+            )
+            for attempt_params, attempt_label in fetch_attempts:
+                try:
+                    payload, _ = _github_rest_get_json(access_token, endpoint, params=attempt_params)
+                    scope, target = attempt_scope, attempt_target
+                    break
+                except Exception as exc:
+                    last_error = str(exc)
+                    if "without month filter" in attempt_label:
+                        print(
+                            f"Billing API fallback attempt failed for {attempt_scope}:{attempt_target} "
+                            f"({attempt_label}): {exc}",
+                            flush=True,
+                        )
+                        continue
+                    print(f"Billing API month-filtered call failed ({attempt_label}): {exc}", flush=True)
+            if payload is not None:
+                break
+
+        if payload is None or cache_key is None:
+            raise RuntimeError(f"GitHub billing API failed after probing identities: {last_error}")
+
+        endpoint_included = _extract_included_from_billing_payload(payload if isinstance(payload, dict) else {})
+        effective_included = _coerce_int(endpoint_included, default=None)
+        if effective_included is None:
+            effective_included = _coerce_int(included, default=None)
+
+        explicit_remaining = _extract_explicit_remaining_from_billing_payload(payload if isinstance(payload, dict) else {})
+        inferred_remaining, total_used = _infer_remaining_from_billing_payload(
+            payload if isinstance(payload, dict) else {},
+            effective_included,
+        )
+        reset_date = quota_summary.get("reset_date")
+        if isinstance(payload, dict):
+            reset_date = payload.get("resetDate") or payload.get("reset_date") or reset_date
+        result = {
+            "available": True,
+            "loaded_at": self.utc_now_iso(),
+            "scope": scope,
+            "target": target,
+            "remaining": explicit_remaining if explicit_remaining is not None else inferred_remaining,
+            "used": total_used,
+            "included": effective_included,
+            "reset_date": reset_date,
+            "source": "github-rest-billing-api",
+            "raw": payload if isinstance(payload, dict) else None,
+            "error": None,
+            "inference": "explicit" if explicit_remaining is not None else "usageItems",
+        }
+        self.sqlite_cache_put(cache_key, result)
+        self.sqlite_cache_put("premium_usage:latest", result)
+        return result
+
+    def refresh_official_premium_cache_sync(self):
+        with _premium_cache_lock:
+            _premium_cache["refreshing"] = True
+            _premium_cache["last_started_at"] = self.utc_now_iso()
+
+        try:
+            result = self.collect_official_premium_payload(skip_cache=True)
+            self.sqlite_cache_put("premium_usage:latest", result)
+            with _premium_cache_lock:
+                _premium_cache["loaded_at"] = time.monotonic()
+                _premium_cache["payload"] = result
+                _premium_cache["last_error"] = None
+            self.notify_dashboard_stream_listeners()
+        except Exception as exc:
+            with _premium_cache_lock:
+                _premium_cache["last_error"] = str(exc)
+        finally:
+            with _premium_cache_lock:
+                _premium_cache["refreshing"] = False
+
+    def trigger_official_premium_refresh(self, force: bool = False):
+        with _premium_cache_lock:
+            payload = _premium_cache.get("payload")
+            loaded_at = _premium_cache.get("loaded_at", 0.0)
+            refreshing = _premium_cache.get("refreshing", False)
+            is_stale = payload is None or (time.monotonic() - loaded_at) >= PREMIUM_CACHE_TTL_SECONDS
+            should_refresh = force or is_stale
+            if refreshing or not should_refresh:
+                return
+            _premium_cache["refreshing"] = True
+            _premium_cache["last_started_at"] = self.utc_now_iso()
+
+        collector = self.collect_official_premium_payload
+        sqlite_cache_put = self.sqlite_cache_put
+        notify_listeners = self.notify_dashboard_stream_listeners
+
+        def _runner():
+            try:
+                result = collector(skip_cache=force)
+                sqlite_cache_put("premium_usage:latest", result)
+                with _premium_cache_lock:
+                    _premium_cache["loaded_at"] = time.monotonic()
+                    _premium_cache["payload"] = result
+                    _premium_cache["last_error"] = None
+                notify_listeners()
+            except Exception as exc:
+                with _premium_cache_lock:
+                    _premium_cache["last_error"] = str(exc)
+            finally:
+                with _premium_cache_lock:
+                    _premium_cache["refreshing"] = False
+
+        self._resolved_thread_class()(target=_runner, daemon=True).start()
+
+    def get_official_premium_payload(self, force_refresh: bool = False) -> dict:
+        if force_refresh:
+            self.refresh_official_premium_cache_sync()
+        else:
+            self.trigger_official_premium_refresh(force=False)
+        with _premium_cache_lock:
+            payload = _premium_cache.get("payload") or _empty_official_premium_payload()
+            age_seconds = None
+            loaded_at = _premium_cache.get("loaded_at", 0.0)
+            if loaded_at:
+                age_seconds = max(0.0, time.monotonic() - loaded_at)
+            return {
+                **payload,
+                "refreshing": bool(_premium_cache.get("refreshing")),
+                "age_seconds": age_seconds,
+                "last_error": _premium_cache.get("last_error"),
+                "last_started_at": _premium_cache.get("last_started_at"),
+            }
+
+    def build_payload(self, force_refresh: bool = False) -> dict:
+        now = self.utc_now()
+        month_start, month_end = _current_billing_month_bounds(now)
+        current_month_key = _month_key(now)
+        usage_events = self.dependencies.snapshot_all_usage_events()
+        detailed_usage_events = self.dependencies.snapshot_usage_events()
+        current_month_events = []
+        for event in usage_events:
+            recorded_at = _parse_iso_datetime(event.get("finished_at") or event.get("started_at"))
+            if recorded_at is None:
+                continue
+            if month_start <= recorded_at < month_end:
+                current_month_events.append(event)
+
+        premium_used = round(sum(_coerce_float(event.get("premium_requests")) for event in current_month_events), 2)
+        api_key_payload = self.dependencies.load_api_key_payload()
+        if not isinstance(api_key_payload, dict):
+            api_key_payload = {}
+        quota_summary = _extract_quota_summary(api_key_payload)
+        included = quota_summary.get("included")
+        has_tracked_premium_data = bool(current_month_events)
+        tracked_remaining = None
+        if included is not None and has_tracked_premium_data:
+            tracked_remaining = round(max(included - premium_used, 0.0), 2)
+        official_premium = self.get_official_premium_payload(force_refresh=force_refresh)
+        official_included = official_premium.get("included")
+        official_used = official_premium.get("used")
+        official_remaining = official_premium.get("remaining")
+        official_reset_date = official_premium.get("reset_date")
+        official_available = bool(official_premium.get("available"))
+
+        local_usage = collect_local_dashboard_usage(usage_events)
+        month_rows = list(local_usage.get("month_rows") or [])
+        current_month_usage = _combine_usage_rows(
+            [row for row in month_rows if row.get("month_key") == current_month_key],
+            month_key=current_month_key,
+        )
+        all_time_usage = _combine_usage_rows(month_rows)
+        all_time_usage["months_tracked"] = len(local_usage.get("month_history") or [])
+
+        recent_requests = sorted(
+            detailed_usage_events,
+            key=lambda item: item.get("finished_at") or item.get("started_at") or "",
+            reverse=True,
+        )[:DETAILED_REQUEST_HISTORY_LIMIT]
+
+        return {
+            "generated_at": now.isoformat(),
+            "premium": {
+                "sku": quota_summary.get("sku") or official_premium.get("raw", {}).get("sku"),
+                "included": official_included if official_included is not None else included,
+                "used": official_used if official_available and official_used is not None else premium_used,
+                "tracked_remaining": tracked_remaining,
+                "has_tracked_data": has_tracked_premium_data,
+                "official_remaining": official_remaining if official_available else quota_summary.get("official_remaining"),
+                "reset_date": official_reset_date if official_reset_date is not None else quota_summary.get("reset_date"),
+                "source": official_premium.get("source") if official_available else "proxy-request-log",
+                "official": official_premium,
+            },
+            "current_month": {
+                "label": current_month_key,
+                "start_at": month_start.isoformat(),
+                "end_at": month_end.isoformat(),
+                "proxy_requests": len(current_month_events),
+                "sessions": local_usage.get("session_count", 0),
+                "usage": current_month_usage,
+            },
+            "all_time": {
+                "proxy_requests": len(usage_events),
+                "archived_requests": max(len(usage_events) - len(detailed_usage_events), 0),
+                "detailed_requests": len(detailed_usage_events),
+                "sessions": local_usage.get("session_count", 0),
+                "usage": all_time_usage,
+            },
+            "recent_sessions": local_usage.get("recent_sessions") or [],
+            "recent_requests": recent_requests,
+            "month_history": (local_usage.get("month_history") or [])[:12],
+        }

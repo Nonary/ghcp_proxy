@@ -32,7 +32,6 @@ from initiator_policy import InitiatorPolicy
 from event_bus import EventBus
 from proxy_runtime import (
     AuthRuntimeBindings,
-    DashboardRuntimeBindings,
     ProxyRuntime,
     ProxySettings,
     UsageTrackingRuntimeBindings,
@@ -186,10 +185,11 @@ from usage_tracking import (
 )
 
 from dashboard import (
+    DashboardDependencies,
+    DashboardService,
+    seed_cached_payloads_from_sqlite,
     _init_sqlite_cache,
     _sqlite_cache_lock,
-    _sqlite_cache_enabled,
-    _sqlite_cache_error,
     _sqlite_connect,
     _sqlite_cache_put,
     _set_sqlite_cache_unavailable,
@@ -200,11 +200,8 @@ from dashboard import (
     _fetch_github_identity,
     _load_cached_github_identity,
     _load_billing_org_candidates,
-    _collect_official_premium_payload,
     _empty_official_premium_payload,
     _current_billing_month_bounds,
-    _refresh_official_premium_cache_sync,
-    _get_official_premium_payload,
     _register_dashboard_stream_listener,
     _unregister_dashboard_stream_listener,
     _notify_dashboard_stream_listeners,
@@ -214,12 +211,9 @@ from dashboard import (
     _ingest_usage_event,
     _finalize_usage_bucket,
     _aggregate_usage_event_buckets,
-    _collect_local_dashboard_usage,
-    _normalize_session,
     _normalize_month_row,
     _combine_month_rows,
     _combine_usage_rows,
-    _build_dashboard_payload,
     _usage_event_group_key,
     _usage_event_session_descriptor,
 )
@@ -290,21 +284,24 @@ _runtime = ProxyRuntime(
     auth_runtime=AuthRuntimeBindings(
         load_api_key_payload=lambda: _load_api_key_payload(),
     ),
-    dashboard_runtime=DashboardRuntimeBindings(
-        sqlite_cache_enabled=lambda: _sqlite_cache_enabled,
-        sqlite_cache_error=lambda: _sqlite_cache_error,
-        sqlite_connect=lambda: _sqlite_connect(),
-        sqlite_cache_put=lambda cache_key, payload: _sqlite_cache_put(cache_key, payload),
-        collect_official_premium_payload=lambda *args, **kwargs: _collect_official_premium_payload(*args, **kwargs),
-        get_official_premium_payload=lambda *args, **kwargs: _get_official_premium_payload(*args, **kwargs),
-        notify_dashboard_stream_listeners=lambda: _notify_dashboard_stream_listeners(),
-        utc_now=lambda: _utc_now(),
-        utc_now_iso=lambda: _utc_now_iso(),
-        thread_class=lambda: Thread,
-    ),
     usage_tracking_runtime=UsageTrackingRuntimeBindings(
         state_provider=_current_usage_tracking_state,
     ),
+)
+
+dashboard_service = DashboardService(
+    dependencies=DashboardDependencies(
+        load_billing_token=lambda: _load_billing_token(),
+        load_access_token=lambda: _load_access_token(),
+        load_api_key_payload=lambda: _load_api_key_payload(),
+        snapshot_all_usage_events=lambda: _snapshot_all_usage_events(),
+        snapshot_usage_events=lambda: _snapshot_usage_events(),
+    ),
+    utc_now=lambda: _utc_now(),
+    utc_now_iso=lambda: _utc_now_iso(),
+    sqlite_cache_put=lambda cache_key, payload: _sqlite_cache_put(cache_key, payload),
+    notify_dashboard_stream_listeners=lambda: _notify_dashboard_stream_listeners(),
+    thread_class=lambda: Thread,
 )
 
 
@@ -328,14 +325,12 @@ _load_archived_usage_history = _runtime.load_archived_usage_history
 _load_usage_history = _runtime.load_usage_history
 _compact_usage_history_if_needed = _runtime.compact_usage_history_if_needed
 _finish_usage_event = _runtime.finish_usage_event
-_seed_cached_payloads_from_sqlite = _runtime.seed_cached_payloads_from_sqlite
-_trigger_official_premium_refresh = _runtime.trigger_official_premium_refresh
-_build_dashboard_payload = _runtime.build_dashboard_payload
 
 
 # ─── Initialization ──────────────────────────────────────────────────────────
 
 _runtime.initialize(_initiator_policy)
+seed_cached_payloads_from_sqlite()
 
 
 # ─── Upstream response helpers ────────────────────────────────────────────────
@@ -626,7 +621,7 @@ async def proxy_anthropic_streaming_response(
     )
 
 
-_trigger_official_premium_refresh()
+dashboard_service.trigger_official_premium_refresh()
 
 
 # ─── Dashboard routes ─────────────────────────────────────────────────────────
@@ -645,7 +640,7 @@ async def dashboard():
 @app.get("/api/dashboard")
 async def dashboard_api(request: Request):
     refresh = request.query_params.get("refresh", "").lower() in {"1", "true", "yes"}
-    payload = await asyncio.to_thread(_build_dashboard_payload, refresh)
+    payload = await asyncio.to_thread(dashboard_service.build_payload, refresh)
     return JSONResponse(content=payload, headers={"Cache-Control": "no-store"})
 
 
@@ -660,7 +655,7 @@ async def dashboard_stream(request: Request):
         nonlocal last_version
         last_heartbeat = time.monotonic()
         try:
-            initial_payload = await asyncio.to_thread(_build_dashboard_payload, False)
+            initial_payload = await asyncio.to_thread(dashboard_service.build_payload, False)
             yield _sse_encode("dashboard", initial_payload)
             while True:
                 if await request.is_disconnected():
@@ -678,7 +673,7 @@ async def dashboard_stream(request: Request):
                 if version == last_version:
                     continue
                 last_version = version
-                payload = await asyncio.to_thread(_build_dashboard_payload, False)
+                payload = await asyncio.to_thread(dashboard_service.build_payload, False)
                 yield _sse_encode("dashboard", payload)
         finally:
             _unregister_dashboard_stream_listener(queue)

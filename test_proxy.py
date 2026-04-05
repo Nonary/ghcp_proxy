@@ -1,4 +1,5 @@
 import compression.zstd as pyzstd
+import dashboard
 import gzip
 import os
 import unittest
@@ -276,6 +277,29 @@ class ProxyInitiatorTests(unittest.TestCase):
 
         tool_msg = [m for m in outbound["messages"] if m["role"] == "tool"][0]
         self.assertNotIn("copilot_cache_control", tool_msg)
+
+    def test_build_fake_compaction_request_clamps_openai_xhigh_reasoning_to_high(self):
+        body = {
+            "model": "openai/gpt-5.4",
+            "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hello"}]}],
+            "reasoning": {"effort": "xhigh", "summary": "auto"},
+        }
+
+        compact_request = proxy.build_fake_compaction_request(body)
+
+        self.assertEqual(compact_request["reasoning"], {"effort": "high", "summary": "auto"})
+        self.assertEqual(body["reasoning"], {"effort": "xhigh", "summary": "auto"})
+
+    def test_build_fake_compaction_request_clamps_anthropic_max_reasoning_to_high(self):
+        body = {
+            "model": "anthropic/claude-sonnet-4.6",
+            "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hello"}]}],
+            "reasoning": {"effort": "max"},
+        }
+
+        compact_request = proxy.build_fake_compaction_request(body)
+
+        self.assertEqual(compact_request["reasoning"], {"effort": "high"})
 
     def test_anthropic_request_to_chat_stream_requests_usage_chunks(self):
         body = {
@@ -1763,8 +1787,8 @@ class ProxyInitiatorTests(unittest.TestCase):
             mock.patch.object(proxy, "_utc_now", return_value=fixed_now),
             mock.patch.object(proxy, "_load_api_key_payload", return_value={"sku": "plus_monthly_subscriber_quota"}),
             mock.patch.object(
-                proxy,
-                "_get_official_premium_payload",
+                proxy.dashboard_service,
+                "get_official_premium_payload",
                 return_value={
                     "available": True,
                     "remaining": 1420,
@@ -1778,7 +1802,7 @@ class ProxyInitiatorTests(unittest.TestCase):
                 },
             ),
         ):
-            payload = proxy._build_dashboard_payload()
+            payload = proxy.dashboard_service.build_payload()
 
         self.assertEqual(payload["premium"]["included"], 1500)
         self.assertEqual(payload["premium"]["used"], 80)
@@ -1835,8 +1859,8 @@ class ProxyInitiatorTests(unittest.TestCase):
             mock.patch.object(proxy, "_utc_now", return_value=fixed_now),
             mock.patch.object(proxy, "_load_api_key_payload", return_value={"sku": "plus_monthly_subscriber_quota"}),
             mock.patch.object(
-                proxy,
-                "_get_official_premium_payload",
+                proxy.dashboard_service,
+                "get_official_premium_payload",
                 return_value={
                     "available": False,
                     "remaining": None,
@@ -1850,7 +1874,7 @@ class ProxyInitiatorTests(unittest.TestCase):
                 },
             ),
         ):
-            payload = proxy._build_dashboard_payload()
+            payload = proxy.dashboard_service.build_payload()
 
         self.assertEqual(payload["all_time"]["proxy_requests"], 2)
         self.assertEqual(payload["all_time"]["archived_requests"], 1)
@@ -1945,7 +1969,7 @@ class ProxyInitiatorTests(unittest.TestCase):
         with mock.patch.object(proxy.asyncio, "to_thread", mocked_to_thread):
             response = proxy.asyncio.run(proxy.dashboard_api(request))
 
-        mocked_to_thread.assert_awaited_once_with(proxy._build_dashboard_payload, True)
+        mocked_to_thread.assert_awaited_once_with(proxy.dashboard_service.build_payload, True)
         self.assertEqual(response.headers["cache-control"], "no-store")
 
     def test_trigger_official_premium_refresh_notifies_dashboard_stream_listeners(self):
@@ -1971,12 +1995,16 @@ class ProxyInitiatorTests(unittest.TestCase):
         }
 
         with (
-            mock.patch.object(proxy, "_collect_official_premium_payload", return_value=premium_payload),
-            mock.patch.object(proxy, "_sqlite_cache_put"),
-            mock.patch.object(proxy, "_notify_dashboard_stream_listeners") as notify,
-            mock.patch.object(proxy, "Thread", ImmediateThread),
+            mock.patch.object(
+                proxy.dashboard_service,
+                "collect_official_premium_payload",
+                return_value=premium_payload,
+            ),
+            mock.patch.object(proxy.dashboard_service, "sqlite_cache_put"),
+            mock.patch.object(proxy.dashboard_service, "notify_dashboard_stream_listeners") as notify,
+            mock.patch.object(proxy.dashboard_service, "thread_class", ImmediateThread),
         ):
-            proxy._trigger_official_premium_refresh()
+            proxy.dashboard_service.trigger_official_premium_refresh()
 
         notify.assert_called_once_with()
         with proxy._premium_cache_lock:
@@ -1986,7 +2014,7 @@ class ProxyInitiatorTests(unittest.TestCase):
             self.assertGreater(proxy._premium_cache["loaded_at"], 0.0)
 
     def test_normalize_session_claude_accepts_cached_input_tokens_shape(self):
-        normalized = proxy._normalize_session(
+        normalized = dashboard.normalize_session(
             "claude",
             {
                 "sessionId": "claude-session",
@@ -2007,7 +2035,7 @@ class ProxyInitiatorTests(unittest.TestCase):
         self.assertEqual(normalized["models"], ["claude-sonnet-4-6"])
 
     def test_collect_local_dashboard_usage_prefers_request_id_rows_over_chain_rows(self):
-        usage = proxy._collect_local_dashboard_usage(
+        usage = dashboard.collect_local_dashboard_usage(
             [
                 {
                     "request_id": "claude-req",

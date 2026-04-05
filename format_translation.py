@@ -950,6 +950,16 @@ def _summary_message_item(summary_text: str) -> dict:
     }
 
 
+def _compact_reasoning_override(reasoning):
+    if isinstance(reasoning, dict):
+        effort = reasoning.get("effort")
+        if isinstance(effort, str) and effort.lower() in {"max", "xhigh"}:
+            overridden = dict(reasoning)
+            overridden["effort"] = "high"
+            return overridden
+    return reasoning
+
+
 def input_contains_compaction(input_items) -> bool:
     if not isinstance(input_items, list):
         return False
@@ -1039,7 +1049,7 @@ def build_fake_compaction_request(body: dict) -> dict:
         "tools": [],
         "parallel_tool_calls": False,
         "include": [],
-        "reasoning": body.get("reasoning"),
+        "reasoning": _compact_reasoning_override(body.get("reasoning")),
         "text": body.get("text"),
     }
 

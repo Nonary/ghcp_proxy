@@ -341,7 +341,7 @@ def _disable_client_proxy_config(config_path: str, status_fn) -> dict[str, bool 
 
     try:
         if backup_path:
-            shutil.move(backup_path, config_path)
+            os.replace(backup_path, config_path)
             restored_from_backup = True
             operation_message = f"restored config from backup ({backup_path})"
         else:
