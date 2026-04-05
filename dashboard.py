@@ -68,135 +68,174 @@ class DashboardDependencies:
 
 # ─── SQLite cache functions ──────────────────────────────────────────────────
 
+class DashboardCacheStore:
+    """Owns dashboard SQLite cache lifecycle and adapts it for runtime consumers."""
+
+    @property
+    def lock(self) -> Lock:
+        return _sqlite_cache_lock
+
+    def mark_unavailable(self, error: str):
+        global _sqlite_cache_enabled, _sqlite_cache_error
+        if _sqlite_cache_enabled:
+            print(f"[sqlite] cache disabled: {error}", flush=True)
+            _sqlite_cache_enabled = False
+            _sqlite_cache_error = error
+
+    def connect(self) -> sqlite3.Connection:
+        if not _sqlite_cache_enabled:
+            raise RuntimeError("sqlite cache disabled")
+        cache_dir = os.path.dirname(SQLITE_CACHE_FILE) or TOKEN_DIR
+        os.makedirs(cache_dir, exist_ok=True)
+        connection = sqlite3.connect(SQLITE_CACHE_FILE, timeout=10)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA journal_mode=WAL")
+        return connection
+
+    def initialize(self) -> bool:
+        if not _sqlite_cache_enabled:
+            return False
+        try:
+            with self.lock:
+                with closing(self.connect()) as connection:
+                    connection.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS cache_entries (
+                            cache_key TEXT PRIMARY KEY,
+                            payload_json TEXT NOT NULL,
+                            updated_at TEXT NOT NULL
+                        )
+                        """
+                    )
+                    connection.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS archived_usage_events (
+                            archive_key TEXT PRIMARY KEY,
+                            recorded_at TEXT NOT NULL,
+                            payload_json TEXT NOT NULL
+                        )
+                        """
+                    )
+                    connection.execute(
+                        """
+                        CREATE INDEX IF NOT EXISTS idx_archived_usage_events_recorded_at
+                        ON archived_usage_events (recorded_at DESC)
+                        """
+                    )
+                    connection.commit()
+            return True
+        except Exception as exc:
+            self.mark_unavailable(str(exc))
+            return False
+
+    def get(self, cache_key: str) -> dict | None:
+        if not self.initialize():
+            return None
+        try:
+            with self.lock:
+                with closing(self.connect()) as connection:
+                    row = connection.execute(
+                        "SELECT payload_json, updated_at FROM cache_entries WHERE cache_key = ?",
+                        (cache_key,),
+                    ).fetchone()
+        except Exception as exc:
+            self.mark_unavailable(str(exc))
+            return None
+        if row is None:
+            return None
+        try:
+            payload = json.loads(row["payload_json"])
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        payload.setdefault("loaded_at", row["updated_at"])
+        return payload
+
+    def get_latest(self, cache_key_prefix: str) -> dict | None:
+        if not self.initialize():
+            return None
+        try:
+            with self.lock:
+                with closing(self.connect()) as connection:
+                    row = connection.execute(
+                        "SELECT payload_json, updated_at FROM cache_entries WHERE cache_key LIKE ? ORDER BY updated_at DESC LIMIT 1",
+                        (f"{cache_key_prefix}%",),
+                    ).fetchone()
+        except Exception as exc:
+            self.mark_unavailable(str(exc))
+            return None
+        if row is None:
+            return None
+        try:
+            payload = json.loads(row["payload_json"])
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        payload.setdefault("loaded_at", row["updated_at"])
+        return payload
+
+    def put(self, cache_key: str, payload: dict):
+        if not isinstance(payload, dict):
+            return
+        if not self.initialize():
+            return
+        updated_at = utc_now_iso()
+        serialized = json.dumps(payload, separators=(",", ":"), default=_json_default)
+        try:
+            with self.lock:
+                with closing(self.connect()) as connection:
+                    connection.execute(
+                        """
+                        INSERT INTO cache_entries (cache_key, payload_json, updated_at)
+                        VALUES (?, ?, ?)
+                        ON CONFLICT(cache_key) DO UPDATE SET
+                            payload_json = excluded.payload_json,
+                            updated_at = excluded.updated_at
+                        """,
+                        (cache_key, serialized, updated_at),
+                    )
+                    connection.commit()
+        except Exception as exc:
+            self.mark_unavailable(f"failed to write cache key '{cache_key}': {exc}")
+
+    def usage_archive_store(self):
+        from usage_tracking import UsageArchiveStore
+
+        return UsageArchiveStore(
+            init_storage=self.initialize,
+            lock=self.lock,
+            connect=self.connect,
+            mark_unavailable=self.mark_unavailable,
+        )
+
+
+dashboard_cache_store = DashboardCacheStore()
+
+
 def _set_sqlite_cache_unavailable(error: str):
-    global _sqlite_cache_enabled, _sqlite_cache_error
-    if _sqlite_cache_enabled:
-        print(f"[sqlite] cache disabled: {error}", flush=True)
-        _sqlite_cache_enabled = False
-        _sqlite_cache_error = error
+    dashboard_cache_store.mark_unavailable(error)
 
 
 def _sqlite_connect() -> sqlite3.Connection:
-    if not _sqlite_cache_enabled:
-        raise RuntimeError("sqlite cache disabled")
-    cache_dir = os.path.dirname(SQLITE_CACHE_FILE) or TOKEN_DIR
-    os.makedirs(cache_dir, exist_ok=True)
-    connection = sqlite3.connect(SQLITE_CACHE_FILE, timeout=10)
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA journal_mode=WAL")
-    return connection
+    return dashboard_cache_store.connect()
 
 
 def _init_sqlite_cache():
-    if not _sqlite_cache_enabled:
-        return False
-    try:
-        with _sqlite_cache_lock:
-            with closing(_sqlite_connect()) as connection:
-                connection.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS cache_entries (
-                        cache_key TEXT PRIMARY KEY,
-                        payload_json TEXT NOT NULL,
-                        updated_at TEXT NOT NULL
-                    )
-                    """
-                )
-                connection.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS archived_usage_events (
-                        archive_key TEXT PRIMARY KEY,
-                        recorded_at TEXT NOT NULL,
-                        payload_json TEXT NOT NULL
-                    )
-                    """
-                )
-                connection.execute(
-                    """
-                    CREATE INDEX IF NOT EXISTS idx_archived_usage_events_recorded_at
-                    ON archived_usage_events (recorded_at DESC)
-                    """
-                )
-                connection.commit()
-        return True
-    except Exception as exc:
-        _set_sqlite_cache_unavailable(str(exc))
-        return False
+    return dashboard_cache_store.initialize()
 
 
 def _sqlite_cache_get(cache_key: str) -> dict | None:
-    if not _init_sqlite_cache():
-        return None
-    try:
-        with _sqlite_cache_lock:
-            with closing(_sqlite_connect()) as connection:
-                row = connection.execute(
-                    "SELECT payload_json, updated_at FROM cache_entries WHERE cache_key = ?",
-                    (cache_key,),
-                ).fetchone()
-    except Exception as exc:
-        _set_sqlite_cache_unavailable(str(exc))
-        return None
-    if row is None:
-        return None
-    try:
-        payload = json.loads(row["payload_json"])
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(payload, dict):
-        return None
-    payload.setdefault("loaded_at", row["updated_at"])
-    return payload
+    return dashboard_cache_store.get(cache_key)
 
 
 def _sqlite_cache_get_latest(cache_key_prefix: str) -> dict | None:
-    if not _init_sqlite_cache():
-        return None
-    try:
-        with _sqlite_cache_lock:
-            with closing(_sqlite_connect()) as connection:
-                row = connection.execute(
-                    "SELECT payload_json, updated_at FROM cache_entries WHERE cache_key LIKE ? ORDER BY updated_at DESC LIMIT 1",
-                    (f"{cache_key_prefix}%",),
-                ).fetchone()
-    except Exception as exc:
-        _set_sqlite_cache_unavailable(str(exc))
-        return None
-    if row is None:
-        return None
-    try:
-        payload = json.loads(row["payload_json"])
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(payload, dict):
-        return None
-    payload.setdefault("loaded_at", row["updated_at"])
-    return payload
+    return dashboard_cache_store.get_latest(cache_key_prefix)
 
 
 def _sqlite_cache_put(cache_key: str, payload: dict):
-    if not isinstance(payload, dict):
-        return
-    if not _init_sqlite_cache():
-        return
-    updated_at = utc_now_iso()
-    serialized = json.dumps(payload, separators=(",", ":"), default=_json_default)
-    try:
-        with _sqlite_cache_lock:
-            with closing(_sqlite_connect()) as connection:
-                connection.execute(
-                    """
-                    INSERT INTO cache_entries (cache_key, payload_json, updated_at)
-                    VALUES (?, ?, ?)
-                    ON CONFLICT(cache_key) DO UPDATE SET
-                        payload_json = excluded.payload_json,
-                        updated_at = excluded.updated_at
-                    """,
-                    (cache_key, serialized, updated_at),
-                )
-                connection.commit()
-    except Exception as exc:
-        _set_sqlite_cache_unavailable(f"failed to write cache key '{cache_key}': {exc}")
+    dashboard_cache_store.put(cache_key, payload)
 
 
 # ─── GitHub billing API ──────────────────────────────────────────────────────
@@ -453,38 +492,57 @@ def _current_billing_month_bounds(now: datetime | None = None) -> tuple[datetime
 
 # ─── Dashboard SSE stream ────────────────────────────────────────────────────
 
+class DashboardStreamBroker:
+    """Coordinates dashboard SSE subscriptions without exposing module internals."""
+
+    def current_version(self) -> int:
+        return _dashboard_stream_version
+
+    def register_listener(self) -> asyncio.Queue[int]:
+        queue: asyncio.Queue[int] = asyncio.Queue(maxsize=1)
+        with _dashboard_stream_lock:
+            _dashboard_stream_subscribers.add(queue)
+        return queue
+
+    def unregister_listener(self, queue: asyncio.Queue[int]):
+        with _dashboard_stream_lock:
+            _dashboard_stream_subscribers.discard(queue)
+
+    def notify_listeners(self):
+        global _dashboard_stream_version
+
+        _dashboard_stream_version += 1
+        with _dashboard_stream_lock:
+            if not _dashboard_stream_subscribers:
+                return
+            subscribers = list(_dashboard_stream_subscribers)
+
+        for queue in subscribers:
+            try:
+                queue.put_nowait(_dashboard_stream_version)
+            except asyncio.QueueFull:
+                try:
+                    queue.get_nowait()
+                    queue.put_nowait(_dashboard_stream_version)
+                except asyncio.QueueEmpty:
+                    pass
+                except RuntimeError:
+                    self.unregister_listener(queue)
+
+
+dashboard_stream_broker = DashboardStreamBroker()
+
+
 def _register_dashboard_stream_listener() -> asyncio.Queue[int]:
-    queue: asyncio.Queue[int] = asyncio.Queue(maxsize=1)
-    with _dashboard_stream_lock:
-        _dashboard_stream_subscribers.add(queue)
-    return queue
+    return dashboard_stream_broker.register_listener()
 
 
 def _unregister_dashboard_stream_listener(queue: asyncio.Queue[int]):
-    with _dashboard_stream_lock:
-        _dashboard_stream_subscribers.discard(queue)
+    dashboard_stream_broker.unregister_listener(queue)
 
 
 def _notify_dashboard_stream_listeners():
-    global _dashboard_stream_version
-
-    _dashboard_stream_version += 1
-    with _dashboard_stream_lock:
-        if not _dashboard_stream_subscribers:
-            return
-        subscribers = list(_dashboard_stream_subscribers)
-
-    for queue in subscribers:
-        try:
-            queue.put_nowait(_dashboard_stream_version)
-        except asyncio.QueueFull:
-            try:
-                queue.get_nowait()
-                queue.put_nowait(_dashboard_stream_version)
-            except asyncio.QueueEmpty:
-                pass
-            except RuntimeError:
-                _unregister_dashboard_stream_listener(queue)
+    dashboard_stream_broker.notify_listeners()
 
 
 # ─── Usage event session descriptors ─────────────────────────────────────────
@@ -577,7 +635,7 @@ def _monotonic_loaded_at_from_payload(payload: dict | None) -> float:
 
 
 def seed_cached_payloads_from_sqlite():
-    premium_payload = _sqlite_cache_get_latest("premium_usage:")
+    premium_payload = dashboard_cache_store.get_latest("premium_usage:")
     if isinstance(premium_payload, dict):
         with _premium_cache_lock:
             _premium_cache["payload"] = premium_payload
@@ -928,8 +986,8 @@ class DashboardService:
         dependencies: DashboardDependencies | None = None,
         utc_now: Callable[[], datetime] = utc_now,
         utc_now_iso: Callable[[], str] = utc_now_iso,
-        sqlite_cache_put: Callable[[str, dict], None] = _sqlite_cache_put,
-        notify_dashboard_stream_listeners: Callable[[], None] = _notify_dashboard_stream_listeners,
+        sqlite_cache_put: Callable[[str, dict], None] = dashboard_cache_store.put,
+        notify_dashboard_stream_listeners: Callable[[], None] = dashboard_stream_broker.notify_listeners,
         thread_class: Callable[[], type] | type = Thread,
     ):
         self.dependencies = dependencies or DashboardDependencies()

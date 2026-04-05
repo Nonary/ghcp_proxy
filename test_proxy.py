@@ -4,6 +4,7 @@ import auth
 import dashboard
 import format_translation
 import gzip
+import json
 import os
 import unittest
 import tempfile
@@ -24,14 +25,7 @@ import usage_tracking
 class ProxyInitiatorTests(unittest.TestCase):
     def setUp(self):
         proxy.set_initiator_policy(initiator_policy.InitiatorPolicy())
-        state = proxy.usage_tracker.state
-        with state.usage_log_lock:
-            state.recent_usage_events.clear()
-            state.archived_usage_events.clear()
-        with state.session_request_id_lock:
-            state.latest_server_request_ids_by_chain.clear()
-            state.active_server_request_ids_by_request.clear()
-            state.latest_claude_user_session_contexts.clear()
+        proxy.usage_tracker.clear_state()
         proxy.dashboard_service.reset_official_premium_cache()
 
     def test_configured_upstream_timeout_seconds_defaults_to_300(self):
@@ -651,8 +645,7 @@ class ProxyInitiatorTests(unittest.TestCase):
 
     def test_start_usage_event_agent_inherits_latest_session_server_request_id(self):
         tracker = self._make_usage_tracker()
-        with tracker.state.session_request_id_lock:
-            tracker.state.latest_server_request_ids_by_chain[("session:session-123", "__root__")] = "server-prev"
+        tracker.remember_latest_server_request_id("session-123", None, None, "server-prev")
 
         request = SimpleNamespace(
             url=SimpleNamespace(path="/v1/responses"),
@@ -672,8 +665,7 @@ class ProxyInitiatorTests(unittest.TestCase):
 
     def test_start_usage_event_agent_inherits_latest_body_session_server_request_id(self):
         tracker = self._make_usage_tracker()
-        with tracker.state.session_request_id_lock:
-            tracker.state.latest_server_request_ids_by_chain[("session:session-123", "__root__")] = "server-prev"
+        tracker.remember_latest_server_request_id("session-123", None, None, "server-prev")
 
         request = SimpleNamespace(
             url=SimpleNamespace(path="/v1/responses"),
@@ -805,7 +797,7 @@ class ProxyInitiatorTests(unittest.TestCase):
                 response_payload=response_payload,
             )
 
-        finished = tracker.state.recent_usage_events[0]
+        finished = tracker.snapshot_usage_events()[0]
         self.assertEqual(finished["response_id"], "resp_123")
         self.assertEqual(finished["upstream_request_id"], "server-abc")
         self.assertEqual(finished["usage"]["input_tokens"], 11)
@@ -850,7 +842,7 @@ class ProxyInitiatorTests(unittest.TestCase):
         with mock.patch.object(usage_tracking, "USAGE_LOG_FILE", str(log_path)):
             tracker.finish_event(event, 200, usage=usage)
 
-        finished = tracker.state.recent_usage_events[0]
+        finished = tracker.snapshot_usage_events()[0]
         self.assertAlmostEqual(finished["cost_usd"], 17.75)
 
     def test_sse_usage_capture_extracts_token_usage(self):
@@ -884,8 +876,7 @@ class ProxyInitiatorTests(unittest.TestCase):
         self.assertEqual(capture.usage["cached_input_tokens"], 7)
 
     def test_build_responses_headers_for_request_forwards_latest_server_request_id(self):
-        with proxy.usage_tracker.state.session_request_id_lock:
-            proxy.usage_tracker.state.latest_server_request_ids_by_chain[("session:session-123", "__root__")] = "server-prev"
+        proxy.usage_tracker.remember_latest_server_request_id("session-123", None, None, "server-prev")
 
         request = SimpleNamespace(
             headers={"session_id": "session-123"},
@@ -942,7 +933,7 @@ class ProxyInitiatorTests(unittest.TestCase):
 
         with mock.patch.object(usage_tracking, "USAGE_LOG_FILE", str(log_path)):
             tracker.load_history()
-            events = list(tracker.state.recent_usage_events)
+            events = tracker.snapshot_usage_events()
 
         self.assertEqual(events[0]["usage"]["input_tokens"], 13)
         self.assertEqual(events[0]["usage"]["total_tokens"], 17)
@@ -962,7 +953,7 @@ class ProxyInitiatorTests(unittest.TestCase):
 
         with mock.patch.object(usage_tracking, "USAGE_LOG_FILE", str(log_path)):
             tracker.load_history()
-            events = list(tracker.state.recent_usage_events)
+            events = tracker.snapshot_usage_events()
 
         self.assertEqual(events[0]["usage"]["input_tokens"], 13)
         self.assertEqual(events[0]["usage"]["total_tokens"], 17)
@@ -1799,10 +1790,7 @@ class ProxyInitiatorTests(unittest.TestCase):
             },
         ]
 
-        with proxy.usage_tracker.state.usage_log_lock:
-            proxy.usage_tracker.state.archived_usage_events.clear()
-            proxy.usage_tracker.state.recent_usage_events.clear()
-            proxy.usage_tracker.state.recent_usage_events.extend(usage_events)
+        proxy.usage_tracker.replace_history(recent_events=usage_events)
 
         with (
             mock.patch.object(proxy.dashboard_service, "utc_now", return_value=fixed_now),
@@ -1870,11 +1858,10 @@ class ProxyInitiatorTests(unittest.TestCase):
             "cost_usd": 2.75,
         }
 
-        with proxy.usage_tracker.state.usage_log_lock:
-            proxy.usage_tracker.state.archived_usage_events.clear()
-            proxy.usage_tracker.state.recent_usage_events.clear()
-            proxy.usage_tracker.state.archived_usage_events.append(archived_event)
-            proxy.usage_tracker.state.recent_usage_events.append(recent_event)
+        proxy.usage_tracker.replace_history(
+            recent_events=[recent_event],
+            archived_events=[archived_event],
+        )
 
         with (
             mock.patch.object(proxy.dashboard_service, "utc_now", return_value=fixed_now),
@@ -1933,7 +1920,7 @@ class ProxyInitiatorTests(unittest.TestCase):
         log_path = self._make_usage_log_path(prefix="usage-history-")
         log_path.write_text(
             "".join(
-                f"{usage_tracking.json.dumps(event, separators=(',', ':'), default=usage_tracking._json_default)}\n"
+                f"{json.dumps(event, separators=(',', ':'))}\n"
                 for event in events
             ),
             encoding="utf-8",
@@ -1972,11 +1959,13 @@ class ProxyInitiatorTests(unittest.TestCase):
         ):
             tracker.load_history()
 
-        self.assertEqual(len(tracker.state.recent_usage_events), proxy.DETAILED_REQUEST_HISTORY_LIMIT)
-        self.assertEqual(len(tracker.state.archived_usage_events), 2)
-        self.assertEqual(tracker.state.archived_usage_events[0]["request_id"], "req-0000")
-        self.assertEqual(tracker.state.archived_usage_events[1]["request_id"], "req-0001")
-        self.assertEqual(tracker.state.recent_usage_events[0]["request_id"], "req-0002")
+        recent_events = tracker.snapshot_usage_events()
+        archived_events = tracker.snapshot_archived_usage_events()
+        self.assertEqual(len(recent_events), proxy.DETAILED_REQUEST_HISTORY_LIMIT)
+        self.assertEqual(len(archived_events), 2)
+        self.assertEqual(archived_events[0]["request_id"], "req-0000")
+        self.assertEqual(archived_events[1]["request_id"], "req-0001")
+        self.assertEqual(recent_events[0]["request_id"], "req-0002")
         rewrite_usage_log.assert_called_once()
         self.assertEqual(len(rewrite_usage_log.call_args.args[0]), proxy.DETAILED_REQUEST_HISTORY_LIMIT)
         archived_count = keeper.execute("SELECT COUNT(*) FROM archived_usage_events").fetchone()[0]

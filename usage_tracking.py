@@ -786,6 +786,54 @@ class UsageTracker:
     def create_sse_capture(self, stream_type: str) -> SSEUsageCapture:
         return SSEUsageCapture(stream_type)
 
+    def clear_state(self):
+        with self.state.usage_log_lock:
+            self.state.recent_usage_events.clear()
+            self.state.archived_usage_events.clear()
+        with self.state.session_request_id_lock:
+            self.state.latest_server_request_ids_by_chain.clear()
+            self.state.active_server_request_ids_by_request.clear()
+            self.state.latest_claude_user_session_contexts.clear()
+
+    def replace_history(
+        self,
+        *,
+        recent_events: list[dict] | None = None,
+        archived_events: list[dict] | None = None,
+    ):
+        normalized_recent = [
+            normalized
+            for event in (recent_events or [])
+            if (normalized := _normalize_recorded_usage_event(event)) is not None
+        ]
+        normalized_archived = [
+            normalized
+            for event in (archived_events or [])
+            if (normalized := _normalize_recorded_usage_event(event)) is not None
+        ]
+        with self.state.usage_log_lock:
+            self.state.recent_usage_events.clear()
+            self.state.recent_usage_events.extend(normalized_recent)
+            self.state.archived_usage_events.clear()
+            self.state.archived_usage_events.extend(normalized_archived)
+
+    def snapshot_archived_usage_events(self) -> list[dict]:
+        with self.state.usage_log_lock:
+            return list(self.state.archived_usage_events)
+
+    def remember_latest_server_request_id(
+        self,
+        session_id: str | None,
+        client_request_id: str | None,
+        subagent: str | None,
+        server_request_id: str | None,
+    ):
+        if not isinstance(server_request_id, str) or not server_request_id:
+            return
+        chain_key = _server_request_chain_key(session_id, client_request_id, subagent)
+        with self.state.session_request_id_lock:
+            self.state.latest_server_request_ids_by_chain[chain_key] = server_request_id
+
     def start_event(self, *args, **kwargs) -> dict:
         with self._bound_runtime():
             return _start_usage_event(*args, **kwargs)

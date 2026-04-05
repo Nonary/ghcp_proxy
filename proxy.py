@@ -39,7 +39,6 @@ from proxy_runtime import (
     AuthRuntimeBindings,
     ProxyRuntime,
     ProxySettings,
-    UsageTrackingRuntimeBindings,
 )
 
 # ─── Import from new modules ─────────────────────────────────────────────────
@@ -90,26 +89,14 @@ def set_initiator_policy(policy: InitiatorPolicy):
     _initiator_policy = policy
 
 
-def _current_usage_tracking_state() -> usage_tracking.UsageTrackingState:
-    return usage_tracking.current_usage_tracking_state()
-
-
 usage_event_bus.subscribe(
     usage_tracking.REQUEST_FINISHED_EVENT,
-    lambda request_id, finished_at=None: _initiator_policy.note_request_finished(
-        request_id,
-        finished_at=finished_at,
-    ),
+    _initiator_policy.note_request_finished,
 )
 
 usage_tracker = usage_tracking.UsageTracker(
-    state=_current_usage_tracking_state(),
-    archive_store=usage_tracking.UsageArchiveStore(
-        init_storage=lambda: dashboard_module._init_sqlite_cache(),
-        lock=dashboard_module._sqlite_cache_lock,
-        connect=lambda: dashboard_module._sqlite_connect(),
-        mark_unavailable=lambda error: dashboard_module._set_sqlite_cache_unavailable(error),
-    ),
+    state=usage_tracking.current_usage_tracking_state(),
+    archive_store=dashboard_module.dashboard_cache_store.usage_archive_store(),
     event_bus=usage_event_bus,
 )
 usage_tracking.configure_usage_tracking(
@@ -133,31 +120,28 @@ def _current_proxy_settings() -> ProxySettings:
 _runtime = ProxyRuntime(
     settings_provider=_current_proxy_settings,
     auth_runtime=AuthRuntimeBindings(
-        load_api_key_payload=lambda: auth.load_api_key_payload(),
-    ),
-    usage_tracking_runtime=UsageTrackingRuntimeBindings(
-        state_provider=_current_usage_tracking_state,
+        load_api_key_payload=auth.load_api_key_payload,
     ),
 )
 
 dashboard_service = dashboard_module.DashboardService(
     dependencies=dashboard_module.DashboardDependencies(
-        load_billing_token=lambda: auth.load_billing_token(),
-        load_access_token=lambda: auth.load_access_token(),
-        load_api_key_payload=lambda: auth.load_api_key_payload(),
+        load_billing_token=auth.load_billing_token,
+        load_access_token=auth.load_access_token,
+        load_api_key_payload=auth.load_api_key_payload,
         snapshot_all_usage_events=usage_tracker.snapshot_all_usage_events,
         snapshot_usage_events=usage_tracker.snapshot_usage_events,
     ),
     utc_now=util.utc_now,
     utc_now_iso=util.utc_now_iso,
-    sqlite_cache_put=lambda cache_key, payload: dashboard_module._sqlite_cache_put(cache_key, payload),
-    notify_dashboard_stream_listeners=lambda: dashboard_module._notify_dashboard_stream_listeners(),
-    thread_class=lambda: Thread,
+    sqlite_cache_put=dashboard_module.dashboard_cache_store.put,
+    notify_dashboard_stream_listeners=dashboard_module.dashboard_stream_broker.notify_listeners,
+    thread_class=Thread,
 )
 
 usage_event_bus.subscribe(
     usage_tracking.USAGE_EVENT_RECORDED_EVENT,
-    lambda _event: dashboard_service.notify_dashboard_stream_listeners(),
+    lambda _event: dashboard_module.dashboard_stream_broker.notify_listeners(),
 )
 
 
@@ -203,7 +187,9 @@ def configured_upstream_timeout_seconds() -> int:
 
 # ─── Initialization ──────────────────────────────────────────────────────────
 
-_runtime.initialize(_initiator_policy)
+usage_tracker.load_archived_history()
+usage_tracker.load_history()
+_initiator_policy.seed_from_usage_events(usage_tracker.snapshot_usage_events())
 dashboard_module.seed_cached_payloads_from_sqlite()
 
 
@@ -526,8 +512,9 @@ async def dashboard_api(request: Request):
 async def dashboard_stream(request: Request):
     heartbeat_seconds = 20
     poll_seconds = 1.0
-    queue = dashboard_module._register_dashboard_stream_listener()
-    last_version = _runtime.dashboard_stream_version
+    stream_broker = dashboard_module.dashboard_stream_broker
+    queue = stream_broker.register_listener()
+    last_version = stream_broker.current_version()
 
     async def stream():
         nonlocal last_version
@@ -554,7 +541,7 @@ async def dashboard_stream(request: Request):
                 payload = await asyncio.to_thread(dashboard_service.build_payload, False)
                 yield format_translation.sse_encode("dashboard", payload)
         finally:
-            dashboard_module._unregister_dashboard_stream_listener(queue)
+            stream_broker.unregister_listener(queue)
 
     return GracefulStreamingResponse(
         stream(),
