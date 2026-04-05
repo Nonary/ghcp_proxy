@@ -200,7 +200,6 @@ _latest_server_request_ids_by_chain: dict[tuple[str, str], str] = {}
 _active_server_request_ids_by_request: dict[str, dict[str, str | None]] = {}
 _latest_session_contexts_by_fallback_chain: dict[tuple[str, str], dict[str, str | None]] = {}
 _initiator_policy = InitiatorPolicy()
-_ccusage_cache_lock = Lock()
 _sqlite_cache_lock = Lock()
 _sqlite_cache_enabled = True
 _sqlite_cache_error = None
@@ -208,13 +207,6 @@ _premium_cache_lock = Lock()
 _dashboard_stream_subscribers = set()
 _dashboard_stream_lock = Lock()
 _dashboard_stream_version = 0
-_ccusage_cache = {
-    "loaded_at": 0.0,
-    "payload": None,
-    "refreshing": False,
-    "last_error": None,
-    "last_started_at": None,
-}
 _premium_cache = {
     "loaded_at": 0.0,
     "payload": None,
@@ -228,7 +220,6 @@ _claude_history_cache = {
     "size": None,
     "entries": [],
 }
-CCUSAGE_CACHE_TTL_SECONDS = 300.0
 PREMIUM_CACHE_TTL_SECONDS = 60.0
 CLAUDE_HISTORY_CACHE_MAX_ENTRIES = 400
 CLAUDE_HISTORY_MATCH_MAX_AGE_SECONDS = 300.0
@@ -1871,15 +1862,6 @@ def _snapshot_usage_events() -> list[dict]:
         return list(_recent_usage_events)
 
 
-def _empty_ccusage_payload() -> dict:
-    return {
-        "available": True,
-        "generated_by": "local-request-log",
-        "loaded_at": None,
-        "sources": {},
-        "errors": [],
-    }
-
 
 def _new_usage_aggregate_bucket() -> dict:
     return {
@@ -1986,42 +1968,6 @@ def _finalize_usage_bucket(bucket: dict, source: str, *, session_id: str | None 
     return result
 
 
-def _collect_ccusage_payload() -> dict:
-    usage_events = _snapshot_usage_events()
-    source_month_buckets, source_session_buckets = _aggregate_usage_event_buckets(usage_events)
- 
-    result = {
-        "available": True,
-        "generated_by": "local-request-log",
-        "loaded_at": _utc_now_iso(),
-        "sources": {},
-        "errors": [],
-    }
- 
-    for source in sorted(set(source_month_buckets) | set(source_session_buckets)):
-        month_buckets = source_month_buckets.get(source, {})
-        session_buckets = source_session_buckets.get(source, {})
-        monthly_rows = []
-        for month_key, bucket in month_buckets.items():
-            monthly_rows.append(_finalize_usage_bucket(bucket, source, month=month_key))
-        monthly_rows.sort(key=lambda row: row.get("month") or "", reverse=True)
- 
-        session_rows = []
-        for session_id, bucket in session_buckets.items():
-            session_rows.append(_finalize_usage_bucket(bucket, source, session_id=bucket.get("session_id")))
-        session_rows.sort(key=lambda row: row.get("lastActivity") or "", reverse=True)
- 
-        source_payload = {
-            "available": bool(monthly_rows or session_rows),
-            "monthly": {"monthly": monthly_rows},
-            "sessions": {"sessions": session_rows},
-            "error": None,
-        }
-        result["sources"][source] = source_payload
- 
-    result["available"] = any(item.get("available") for item in result["sources"].values())
-    return result
-
 
 def _aggregate_usage_event_buckets(usage_events: list[dict] | None = None) -> tuple[dict[str, dict[str, dict]], dict[str, dict[str, dict]]]:
     usage_events = list(usage_events) if isinstance(usage_events, list) else _snapshot_usage_events()
@@ -2088,73 +2034,6 @@ def _collect_local_dashboard_usage(usage_events: list[dict] | None = None) -> di
     }
 
 
-def _refresh_ccusage_cache_sync():
-    with _ccusage_cache_lock:
-        _ccusage_cache["refreshing"] = True
-        _ccusage_cache["last_started_at"] = _utc_now_iso()
-
-    try:
-        result = _collect_ccusage_payload()
-        _sqlite_cache_put("ccusage:v1", result)
-        with _ccusage_cache_lock:
-            _ccusage_cache["loaded_at"] = time.monotonic()
-            _ccusage_cache["payload"] = result
-            _ccusage_cache["last_error"] = None
-    except Exception as exc:
-        with _ccusage_cache_lock:
-            _ccusage_cache["last_error"] = str(exc)
-    finally:
-        with _ccusage_cache_lock:
-            _ccusage_cache["refreshing"] = False
-
-
-def _trigger_ccusage_refresh(force: bool = False):
-    with _ccusage_cache_lock:
-        payload = _ccusage_cache.get("payload")
-        loaded_at = _ccusage_cache.get("loaded_at", 0.0)
-        refreshing = _ccusage_cache.get("refreshing", False)
-        is_stale = payload is None or (time.monotonic() - loaded_at) >= CCUSAGE_CACHE_TTL_SECONDS
-        should_refresh = force or is_stale
-        if refreshing or not should_refresh:
-            return
-        _ccusage_cache["refreshing"] = True
-        _ccusage_cache["last_started_at"] = _utc_now_iso()
-
-    def _runner():
-        try:
-            result = _collect_ccusage_payload()
-            _sqlite_cache_put("ccusage:v1", result)
-            with _ccusage_cache_lock:
-                _ccusage_cache["loaded_at"] = time.monotonic()
-                _ccusage_cache["payload"] = result
-                _ccusage_cache["last_error"] = None
-        except Exception as exc:
-            with _ccusage_cache_lock:
-                _ccusage_cache["last_error"] = str(exc)
-        finally:
-            with _ccusage_cache_lock:
-                _ccusage_cache["refreshing"] = False
-
-    Thread(target=_runner, daemon=True).start()
-
-
-def _get_ccusage_payload(force_refresh: bool = False) -> dict:
-    _trigger_ccusage_refresh(force=force_refresh)
-
-    with _ccusage_cache_lock:
-        payload = _ccusage_cache.get("payload") or _empty_ccusage_payload()
-        age_seconds = None
-        loaded_at = _ccusage_cache.get("loaded_at", 0.0)
-        if loaded_at:
-            age_seconds = max(0.0, time.monotonic() - loaded_at)
-        annotated = {
-            **payload,
-            "refreshing": bool(_ccusage_cache.get("refreshing")),
-            "age_seconds": age_seconds,
-            "last_error": _ccusage_cache.get("last_error"),
-            "last_started_at": _ccusage_cache.get("last_started_at"),
-        }
-    return annotated
 
 
 def _refresh_official_premium_cache_sync():
@@ -2228,17 +2107,6 @@ def _monotonic_loaded_at_from_payload(payload: dict | None) -> float:
 
 
 def _seed_cached_payloads_from_sqlite():
-    ccusage_payload = _sqlite_cache_get("ccusage:v1")
-    if isinstance(ccusage_payload, dict):
-        with _ccusage_cache_lock:
-            _ccusage_cache["payload"] = ccusage_payload
-            _ccusage_cache["loaded_at"] = _monotonic_loaded_at_from_payload(ccusage_payload)
-            _ccusage_cache["last_error"] = ccusage_payload.get("error") or None
-            _ccusage_cache["refreshing"] = False
-            _ccusage_cache["last_started_at"] = None
-            if ccusage_payload.get("generated_by") != "local-request-log":
-                _ccusage_cache["loaded_at"] = 0.0
-
     premium_payload = _sqlite_cache_get_latest("premium_usage:")
     if isinstance(premium_payload, dict):
         with _premium_cache_lock:
@@ -2461,18 +2329,12 @@ def _build_dashboard_payload(force_refresh: bool = False) -> dict:
         "recent_sessions": local_usage.get("recent_sessions") or [],
         "recent_requests": recent_requests,
         "month_history": (local_usage.get("month_history") or [])[:12],
-        "ccusage": {
-            "available": True,
-            "generated_by": "local-request-log",
-            "errors": local_usage.get("errors") or [],
-        },
     }
 
 
 _load_usage_history()
 _initiator_policy.seed_from_usage_events(_snapshot_usage_events())
 _seed_cached_payloads_from_sqlite()
-_trigger_ccusage_refresh()
 
 
 # ─── Auth helpers ─────────────────────────────────────────────────────────────

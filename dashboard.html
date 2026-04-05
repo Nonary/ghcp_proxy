@@ -423,10 +423,7 @@
           <div :class="['status', dashboardStreamConnected ? 'good' : 'warn']">{{ liveStatusLabel }}</div>
           <div v-if="dashboardStreamError" class="status error">{{ dashboardStreamError }}</div>
           <div v-if="premium.official?.error" class="status error">github-billing: {{ premium.official.error }}</div>
-          <div v-if="ccusage.errors?.length">
-            <div v-for="item in ccusage.errors" :key="item.source" class="status error">{{ item.source }}: {{ item.error }}</div>
-          </div>
-          <div v-else-if="!premium.official?.error" class="status good">
+          <div v-else class="status good">
             No source errors.
           </div>
         </article>
@@ -557,7 +554,6 @@
             recent_sessions: [],
             recent_requests: [],
             month_history: [],
-            ccusage: { errors: [] },
           },
           billingToken: {
             configured: false,
@@ -576,8 +572,7 @@
       },
       computed: {
         premium() { return this.data.premium || {}; },
-        ccusage() { return this.data.ccusage || {}; },
-        currentMonth() { return this.data.current_month?.usage || this.data.current_month?.ccusage || {}; },
+        currentMonth() { return this.data.current_month?.usage || {}; },
         sourceCards() { return this.currentMonth.sources || {}; },
         premiumRemainingLabel() {
           const remaining = this.premium.official_remaining ?? this.premium.tracked_remaining;
@@ -1061,7 +1056,7 @@
             const payload = await response.json();
             this._applyDashboardPayload(payload);
           } catch (error) {
-            this.data.ccusage = { ...(this.data.ccusage || {}), errors: [{ source: 'dashboard', error: error.message }] };
+            console.error('Dashboard load failed:', error.message);
           }
         },
       },

@@ -1449,51 +1449,6 @@ class ProxyInitiatorTests(unittest.TestCase):
         self.assertEqual(proxy._month_key_for_source_row("claude", {"month": "2026-04"}), "2026-04")
         self.assertEqual(proxy._month_key_for_source_row("codex", {"month": "Apr 2026"}), "2026-04")
 
-    def test_collect_ccusage_payload_aggregates_local_usage_costs(self):
-        events = [
-            {
-                "request_id": "claude-req",
-                "session_id": "claude-session",
-                "server_request_id": "claude-chain",
-                "started_at": "2026-04-04T17:50:00+00:00",
-                "finished_at": "2026-04-04T17:51:00+00:00",
-                "resolved_model": "claude-opus-4.1",
-                "usage": {
-                    "input_tokens": 1_000_000,
-                    "output_tokens": 1_000_000,
-                    "cached_input_tokens": 1_000_000,
-                    "cache_creation_input_tokens": 1_000_000,
-                    "total_tokens": 2_000_000,
-                },
-            },
-            {
-                "request_id": "gpt-req",
-                "session_id": "codex-session",
-                "server_request_id": "codex-chain",
-                "started_at": "2026-04-04T18:00:00+00:00",
-                "finished_at": "2026-04-04T18:01:00+00:00",
-                "resolved_model": "gpt-5.4",
-                "usage": {
-                    "input_tokens": 1_000_000,
-                    "output_tokens": 1_000_000,
-                    "cached_input_tokens": 1_000_000,
-                    "total_tokens": 2_000_000,
-                },
-            },
-        ]
-
-        with mock.patch.object(proxy, "_snapshot_usage_events", return_value=events):
-            payload = proxy._collect_ccusage_payload()
-
-        self.assertEqual(payload["generated_by"], "local-request-log")
-        self.assertEqual(set(payload["sources"].keys()), {"claude", "codex"})
-
-        claude_month = payload["sources"]["claude"]["monthly"]["monthly"][0]
-        codex_month = payload["sources"]["codex"]["monthly"]["monthly"][0]
-        self.assertAlmostEqual(claude_month["totalCost"], 110.25)
-        self.assertAlmostEqual(codex_month["costUSD"], 17.75)
-        self.assertEqual(payload["sources"]["claude"]["sessions"]["sessions"][0]["modelsUsed"], ["claude-opus-4.1"])
-        self.assertEqual(set(payload["sources"]["codex"]["sessions"]["sessions"][0]["models"].keys()), {"gpt-5.4"})
 
     def test_build_dashboard_payload_combines_claude_and_codex(self):
         fixed_now = datetime(2026, 4, 4, 18, 0, tzinfo=timezone.utc)
@@ -1540,7 +1495,6 @@ class ProxyInitiatorTests(unittest.TestCase):
             mock.patch.object(proxy, "_utc_now", return_value=fixed_now),
             mock.patch.object(proxy, "_snapshot_usage_events", return_value=usage_events),
             mock.patch.object(proxy, "_load_api_key_payload", return_value={"sku": "plus_monthly_subscriber_quota"}),
-            mock.patch.object(proxy, "_get_ccusage_payload", side_effect=AssertionError("dashboard should not use ccusage")),
             mock.patch.object(
                 proxy,
                 "_get_official_premium_payload",
