@@ -54,7 +54,9 @@ class ProxyRuntime:
         self.load_archived_usage_history()
         self.load_usage_history()
         self._apply_usage_tracking_runtime()
-        initiator_policy.seed_from_usage_events(usage_tracking_module._snapshot_usage_events())
+        initiator_policy.seed_from_usage_events(
+            list(self._usage_tracking_runtime.state_provider().recent_usage_events)
+        )
 
     def _apply_auth_settings(self):
         settings = self._settings_provider()
@@ -70,7 +72,7 @@ class ProxyRuntime:
         auth_module.CLAUDE_PROXY_SETTINGS = settings.claude_proxy_settings
         auth_module.CLAUDE_MAX_CONTEXT_TOKENS = settings.claude_max_context_tokens
         auth_module.CLAUDE_MAX_OUTPUT_TOKENS = settings.claude_max_output_tokens
-        auth_module._load_api_key_payload = self._auth_runtime.load_api_key_payload
+        auth_module.load_api_key_payload = self._auth_runtime.load_api_key_payload
 
     def _apply_usage_tracking_runtime(self):
         state = self._usage_tracking_runtime.state_provider()
@@ -87,31 +89,31 @@ class ProxyRuntime:
 
     def codex_proxy_status(self):
         self._apply_auth_settings()
-        return auth_module._codex_proxy_status()
+        return auth_module.codex_proxy_status()
 
     def claude_proxy_status(self):
         self._apply_auth_settings()
-        return auth_module._claude_proxy_status()
+        return auth_module.claude_proxy_status()
 
     def write_codex_proxy_config(self):
         self._apply_auth_settings()
-        return auth_module._write_codex_proxy_config()
+        return auth_module.write_codex_proxy_config()
 
     def write_claude_proxy_settings(self):
         self._apply_auth_settings()
-        return auth_module._write_claude_proxy_settings()
+        return auth_module.write_claude_proxy_settings()
 
     def disable_codex_proxy_config(self):
         self._apply_auth_settings()
-        return auth_module._disable_codex_proxy_config()
+        return auth_module.disable_codex_proxy_config()
 
     def disable_claude_proxy_settings(self):
         self._apply_auth_settings()
-        return auth_module._disable_claude_proxy_settings()
+        return auth_module.disable_claude_proxy_settings()
 
     def proxy_client_status_payload(self):
         self._apply_auth_settings()
-        return auth_module._proxy_client_status_payload()
+        return auth_module.proxy_client_status_payload()
 
     def load_archived_usage_history(self):
         self._apply_usage_tracking_runtime()

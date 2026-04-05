@@ -7,14 +7,7 @@ from dataclasses import dataclass
 from typing import AsyncIterator, Callable
 from uuid import uuid4
 
-from format_translation import (
-    _chat_stop_reason_to_anthropic,
-    _chat_usage_to_anthropic,
-    _extract_text_from_chat_delta,
-    _extract_tool_call_deltas,
-    _iter_sse_messages,
-    _sse_encode,
-)
+import format_translation
 
 
 @dataclass
@@ -88,7 +81,7 @@ class AnthropicStreamTranslator:
         }
 
     def _message_start_event(self, usage_payload: dict) -> bytes:
-        return _sse_encode(
+        return format_translation.sse_encode(
             "message_start",
             {
                 "type": "message_start",
@@ -110,7 +103,7 @@ class AnthropicStreamTranslator:
             return []
         block.closed = True
         return [
-            _sse_encode(
+            format_translation.sse_encode(
                 "content_block_stop",
                 {
                     "type": "content_block_stop",
@@ -158,7 +151,7 @@ class AnthropicStreamTranslator:
         self._next_block_index += 1
         self._active_block = ("text", self._text_block.anthropic_index)
         events.append(
-            _sse_encode(
+            format_translation.sse_encode(
                 "content_block_start",
                 {
                     "type": "content_block_start",
@@ -206,7 +199,7 @@ class AnthropicStreamTranslator:
         state.closed = False
         self._active_block = ("tool", openai_index)
         events.append(
-            _sse_encode(
+            format_translation.sse_encode(
                 "content_block_start",
                 {
                     "type": "content_block_start",
@@ -227,7 +220,7 @@ class AnthropicStreamTranslator:
         if self._text_block is None and not self._tool_blocks:
             empty_text_block = TextBlockState(anthropic_index=self._next_block_index)
             events.append(
-                _sse_encode(
+                format_translation.sse_encode(
                     "content_block_start",
                     {
                         "type": "content_block_start",
@@ -249,7 +242,7 @@ class AnthropicStreamTranslator:
         if not isinstance(usage, dict):
             return
 
-        anthropic_usage = _chat_usage_to_anthropic(usage)
+        anthropic_usage = format_translation.chat_usage_to_anthropic(usage)
         self._input_tokens = anthropic_usage.get("input_tokens", self._input_tokens) or self._input_tokens
         self._output_tokens = anthropic_usage.get("output_tokens", self._output_tokens) or self._output_tokens
         self._cache_creation_input_tokens = (
@@ -265,7 +258,7 @@ class AnthropicStreamTranslator:
         )
 
     async def translate(self, byte_iter) -> AsyncIterator[bytes]:
-        async for _event_name, data in _iter_sse_messages(byte_iter):
+        async for _event_name, data in format_translation.iter_sse_messages(byte_iter):
             if data == "[DONE]":
                 break
 
@@ -285,14 +278,14 @@ class AnthropicStreamTranslator:
             first_choice = choices[0] if isinstance(choices, list) and choices else {}
             delta = first_choice.get("delta") if isinstance(first_choice, dict) else {}
 
-            text_delta = _extract_text_from_chat_delta(delta)
+            text_delta = format_translation.extract_text_from_chat_delta(delta)
             if text_delta:
                 self._response_text_parts.append(text_delta)
                 if self._mark_first_output is not None:
                     self._mark_first_output()
                 for event in self._ensure_text_block():
                     yield event
-                yield _sse_encode(
+                yield format_translation.sse_encode(
                     "content_block_delta",
                     {
                         "type": "content_block_delta",
@@ -301,7 +294,7 @@ class AnthropicStreamTranslator:
                     },
                 )
 
-            for tool_delta in _extract_tool_call_deltas(delta):
+            for tool_delta in format_translation.extract_tool_call_deltas(delta):
                 for event in self._ensure_tool_block(tool_delta):
                     yield event
                 tool_state = self._tool_blocks.get(
@@ -310,7 +303,7 @@ class AnthropicStreamTranslator:
                 function = tool_delta.get("function") if isinstance(tool_delta.get("function"), dict) else {}
                 arguments_chunk = function.get("arguments")
                 if isinstance(arguments_chunk, str) and arguments_chunk and tool_state is not None:
-                    yield _sse_encode(
+                    yield format_translation.sse_encode(
                         "content_block_delta",
                         {
                             "type": "content_block_delta",
@@ -323,7 +316,7 @@ class AnthropicStreamTranslator:
                     )
 
             finish_reason = first_choice.get("finish_reason") if isinstance(first_choice, dict) else None
-            mapped_stop_reason = _chat_stop_reason_to_anthropic(finish_reason)
+            mapped_stop_reason = format_translation.chat_stop_reason_to_anthropic(finish_reason)
             if mapped_stop_reason is not None:
                 self._stop_reason = mapped_stop_reason
 
@@ -334,7 +327,7 @@ class AnthropicStreamTranslator:
         for event in self._finish_content_blocks():
             yield event
 
-        yield _sse_encode(
+        yield format_translation.sse_encode(
             "message_delta",
             {
                 "type": "message_delta",
@@ -345,4 +338,4 @@ class AnthropicStreamTranslator:
                 "usage": self._usage_payload(),
             },
         )
-        yield _sse_encode("message_stop", {"type": "message_stop"})
+        yield format_translation.sse_encode("message_stop", {"type": "message_stop"})

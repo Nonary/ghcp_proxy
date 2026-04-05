@@ -1,5 +1,7 @@
 import compression.zstd as pyzstd
+import auth
 import dashboard
+import format_translation
 import gzip
 import os
 import unittest
@@ -14,27 +16,31 @@ from uuid import uuid4
 import httpx
 import initiator_policy
 import proxy
+import util
 import usage_tracking
 
 
 class ProxyInitiatorTests(unittest.TestCase):
     def setUp(self):
-        proxy._initiator_policy = initiator_policy.InitiatorPolicy()
-        with proxy._usage_log_lock:
-            proxy._recent_usage_events.clear()
-            proxy._archived_usage_events.clear()
-        with proxy._session_request_id_lock:
-            proxy._latest_server_request_ids_by_chain.clear()
-            proxy._active_server_request_ids_by_request.clear()
-            proxy._latest_claude_user_session_contexts.clear()
-        with proxy._premium_cache_lock:
-            proxy._premium_cache.update({
-                "loaded_at": 0.0,
-                "payload": None,
-                "refreshing": False,
-                "last_error": None,
-                "last_started_at": None,
-            })
+        proxy.set_initiator_policy(initiator_policy.InitiatorPolicy())
+        state = proxy.usage_tracker.state
+        with state.usage_log_lock:
+            state.recent_usage_events.clear()
+            state.archived_usage_events.clear()
+        with state.session_request_id_lock:
+            state.latest_server_request_ids_by_chain.clear()
+            state.active_server_request_ids_by_request.clear()
+            state.latest_claude_user_session_contexts.clear()
+        proxy.dashboard_service.reset_official_premium_cache()
+
+    def test_configured_upstream_timeout_seconds_defaults_to_300(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("GHCP_UPSTREAM_TIMEOUT_SECONDS", None)
+            self.assertEqual(proxy.configured_upstream_timeout_seconds(), 300)
+
+    def test_configured_upstream_timeout_seconds_uses_env_override(self):
+        with mock.patch.dict(os.environ, {"GHCP_UPSTREAM_TIMEOUT_SECONDS": "480"}, clear=False):
+            self.assertEqual(proxy.configured_upstream_timeout_seconds(), 480)
 
     def _make_usage_tracker(
         self,
@@ -89,7 +95,7 @@ class ProxyInitiatorTests(unittest.TestCase):
             "input": "hello",
         }
 
-        headers = proxy.build_responses_headers_for_request(request, body, "test-key")
+        headers = format_translation.build_responses_headers_for_request(request, body, "test-key")
 
         self.assertEqual(headers["X-Initiator"], "user")
         self.assertEqual(body["input"], "hello")
@@ -101,7 +107,7 @@ class ProxyInitiatorTests(unittest.TestCase):
             "input": "_hello",
         }
 
-        headers = proxy.build_responses_headers_for_request(request, body, "test-key")
+        headers = format_translation.build_responses_headers_for_request(request, body, "test-key")
 
         self.assertEqual(headers["X-Initiator"], "agent")
         self.assertEqual(body["input"], "hello")
@@ -117,7 +123,7 @@ class ProxyInitiatorTests(unittest.TestCase):
             ],
         }
 
-        headers = proxy.build_responses_headers_for_request(request, body, "test-key")
+        headers = format_translation.build_responses_headers_for_request(request, body, "test-key")
 
         self.assertEqual(headers["X-Initiator"], "user")
         self.assertEqual(body["input"][-1]["content"], "new request")
@@ -129,7 +135,7 @@ class ProxyInitiatorTests(unittest.TestCase):
             {"role": "user", "content": "_finish the task"},
         ]
 
-        headers = proxy.build_chat_headers_for_request(request, messages, "gpt-4.1", "test-key")
+        headers = format_translation.build_chat_headers_for_request(request, messages, "gpt-4.1", "test-key")
 
         self.assertEqual(headers["X-Initiator"], "agent")
         self.assertEqual(messages[-1]["content"], "finish the task")
@@ -146,7 +152,7 @@ class ProxyInitiatorTests(unittest.TestCase):
             ],
         }
 
-        headers = proxy.build_anthropic_headers_for_request(request, body, "test-key")
+        headers = format_translation.build_anthropic_headers_for_request(request, body, "test-key")
 
         self.assertEqual(headers["X-Initiator"], "agent")
         self.assertEqual(body["messages"][0]["content"][0]["text"], "hello")
@@ -164,7 +170,7 @@ class ProxyInitiatorTests(unittest.TestCase):
             ],
         }
 
-        headers = proxy.build_anthropic_headers_for_request(request, body, "test-key")
+        headers = format_translation.build_anthropic_headers_for_request(request, body, "test-key")
 
         self.assertEqual(headers["session_id"], "claude-session")
 
@@ -194,7 +200,7 @@ class ProxyInitiatorTests(unittest.TestCase):
             ],
         }
 
-        outbound = proxy.asyncio.run(proxy.anthropic_request_to_chat(body, "https://example.invalid", "test-key"))
+        outbound = proxy.asyncio.run(format_translation.anthropic_request_to_chat(body, "https://example.invalid", "test-key"))
 
         self.assertEqual(outbound["model"], "claude-sonnet-4.6")
         self.assertEqual(outbound["thinking_budget"], 4096)
@@ -238,7 +244,7 @@ class ProxyInitiatorTests(unittest.TestCase):
             ],
         }
 
-        outbound = proxy.asyncio.run(proxy.anthropic_request_to_chat(body, "https://example.invalid", "test-key"))
+        outbound = proxy.asyncio.run(format_translation.anthropic_request_to_chat(body, "https://example.invalid", "test-key"))
 
         tool_msg = [m for m in outbound["messages"] if m["role"] == "tool"][0]
         self.assertEqual(
@@ -273,7 +279,7 @@ class ProxyInitiatorTests(unittest.TestCase):
             ],
         }
 
-        outbound = proxy.asyncio.run(proxy.anthropic_request_to_chat(body, "https://example.invalid", "test-key"))
+        outbound = proxy.asyncio.run(format_translation.anthropic_request_to_chat(body, "https://example.invalid", "test-key"))
 
         tool_msg = [m for m in outbound["messages"] if m["role"] == "tool"][0]
         self.assertNotIn("copilot_cache_control", tool_msg)
@@ -285,7 +291,7 @@ class ProxyInitiatorTests(unittest.TestCase):
             "reasoning": {"effort": "xhigh", "summary": "auto"},
         }
 
-        compact_request = proxy.build_fake_compaction_request(body)
+        compact_request = format_translation.build_fake_compaction_request(body)
 
         self.assertEqual(compact_request["reasoning"], {"effort": "high", "summary": "auto"})
         self.assertEqual(body["reasoning"], {"effort": "xhigh", "summary": "auto"})
@@ -297,7 +303,7 @@ class ProxyInitiatorTests(unittest.TestCase):
             "reasoning": {"effort": "max"},
         }
 
-        compact_request = proxy.build_fake_compaction_request(body)
+        compact_request = format_translation.build_fake_compaction_request(body)
 
         self.assertEqual(compact_request["reasoning"], {"effort": "high"})
 
@@ -313,7 +319,7 @@ class ProxyInitiatorTests(unittest.TestCase):
             ],
         }
 
-        outbound = proxy.asyncio.run(proxy.anthropic_request_to_chat(body, "https://example.invalid", "test-key"))
+        outbound = proxy.asyncio.run(format_translation.anthropic_request_to_chat(body, "https://example.invalid", "test-key"))
 
         self.assertEqual(outbound["stream_options"], {"include_usage": True})
 
@@ -877,8 +883,8 @@ class ProxyInitiatorTests(unittest.TestCase):
         self.assertEqual(capture.usage["cached_input_tokens"], 7)
 
     def test_build_responses_headers_for_request_forwards_latest_server_request_id(self):
-        with proxy._session_request_id_lock:
-            proxy._latest_server_request_ids_by_chain[("session:session-123", "__root__")] = "server-prev"
+        with proxy.usage_tracker.state.session_request_id_lock:
+            proxy.usage_tracker.state.latest_server_request_ids_by_chain[("session:session-123", "__root__")] = "server-prev"
 
         request = SimpleNamespace(
             headers={"session_id": "session-123"},
@@ -886,7 +892,7 @@ class ProxyInitiatorTests(unittest.TestCase):
         )
         body = {"model": "gpt-5.4", "input": "hello"}
 
-        headers = proxy.build_responses_headers_for_request(request, body, "test-key")
+        headers = format_translation.build_responses_headers_for_request(request, body, "test-key")
 
         self.assertNotIn("x-request-id", headers)
         self.assertNotIn("x-github-request-id", headers)
@@ -898,7 +904,7 @@ class ProxyInitiatorTests(unittest.TestCase):
         )
         body = {"model": "gpt-5.4", "input": "hello"}
 
-        headers = proxy.build_responses_headers_for_request(request, body, "test-key")
+        headers = format_translation.build_responses_headers_for_request(request, body, "test-key")
 
         self.assertEqual(headers["session_id"], "session-123")
 
@@ -909,7 +915,7 @@ class ProxyInitiatorTests(unittest.TestCase):
         )
         body = {"model": "gpt-5.4", "input": "hello", "sessionId": "session-123"}
 
-        headers = proxy.build_responses_headers_for_request(request, body, "test-key")
+        headers = format_translation.build_responses_headers_for_request(request, body, "test-key")
 
         self.assertEqual(headers["session_id"], "session-123")
 
@@ -920,7 +926,7 @@ class ProxyInitiatorTests(unittest.TestCase):
         )
         body = {"model": "gpt-5.4", "input": "hello"}
 
-        headers = proxy.build_responses_headers_for_request(request, body, "test-key")
+        headers = format_translation.build_responses_headers_for_request(request, body, "test-key")
 
         self.assertEqual(headers["x-request-id"], "server-prev")
         self.assertEqual(headers["x-github-request-id"], "server-prev")
@@ -967,7 +973,7 @@ class ProxyInitiatorTests(unittest.TestCase):
         )
 
     def test_normalize_usage_payload_preserves_explicit_cached_input_shape(self):
-        normalized = proxy._normalize_usage_payload(
+        normalized = util.normalize_usage_payload(
             {
                 "input_tokens": 20,
                 "output_tokens": 4,
@@ -1004,7 +1010,7 @@ class ProxyInitiatorTests(unittest.TestCase):
             },
         }
 
-        translated = proxy.chat_completion_to_anthropic(payload)
+        translated = format_translation.chat_completion_to_anthropic(payload)
 
         self.assertEqual(translated["usage"]["input_tokens"], 20)
         self.assertEqual(translated["usage"]["output_tokens"], 25)
@@ -1033,7 +1039,7 @@ class ProxyInitiatorTests(unittest.TestCase):
             },
         }
 
-        translated = proxy.chat_completion_to_anthropic(payload)
+        translated = format_translation.chat_completion_to_anthropic(payload)
 
         self.assertEqual(translated["usage"]["input_tokens"], 10200)
         self.assertEqual(translated["usage"]["cache_read_input_tokens"], 125000)
@@ -1113,7 +1119,7 @@ class ProxyInitiatorTests(unittest.TestCase):
         with (
             mock.patch.object(proxy.httpx, "AsyncClient", return_value=fake_client),
             mock.patch.object(proxy, "throttled_client_send", mock.AsyncMock(side_effect=connect_error)),
-            mock.patch.object(proxy, "_finish_usage_event") as finish_usage,
+            mock.patch.object(proxy.usage_tracker, "finish_event") as finish_usage,
         ):
             response = proxy.asyncio.run(
                 proxy.proxy_streaming_response(
@@ -1141,7 +1147,7 @@ class ProxyInitiatorTests(unittest.TestCase):
         timeout_error = httpx.ReadTimeout("Timed out", request=request)
 
         self.assertEqual(
-            proxy._upstream_request_error_status_and_message(timeout_error),
+            format_translation.upstream_request_error_status_and_message(timeout_error),
             (504, "Upstream request timed out: Timed out"),
         )
 
@@ -1153,7 +1159,7 @@ class ProxyInitiatorTests(unittest.TestCase):
             }
         }
 
-        translated = proxy.anthropic_error_payload_from_openai(payload, 400)
+        translated = format_translation.anthropic_error_payload_from_openai(payload, 400)
 
         self.assertEqual(
             translated,
@@ -1177,7 +1183,7 @@ class ProxyInitiatorTests(unittest.TestCase):
             headers={"retry-after": "12"},
         )
 
-        response = proxy.anthropic_error_response_from_upstream(upstream)
+        response = format_translation.anthropic_error_response_from_upstream(upstream)
 
         self.assertEqual(response.status_code, 429)
         self.assertEqual(response.headers["retry-after"], "12")
@@ -1219,14 +1225,14 @@ class ProxyInitiatorTests(unittest.TestCase):
 
         with (
             mock.patch.object(proxy, "parse_json_request", mock.AsyncMock(return_value=body)),
-            mock.patch.object(proxy, "get_api_key", return_value="test-key"),
-            mock.patch.object(proxy, "_get_api_base", return_value="https://example.invalid"),
-            mock.patch.object(proxy, "anthropic_request_to_chat", mock.AsyncMock(return_value=outbound)),
-            mock.patch.object(proxy, "log_proxy_request"),
-            mock.patch.object(proxy, "_start_usage_event", return_value=None),
-            mock.patch.object(proxy, "_finish_usage_event"),
-            mock.patch.object(proxy, "build_anthropic_headers_for_request", return_value={"X-Initiator": "user"}) as build_headers,
-            mock.patch.object(proxy, "build_chat_headers_for_request", side_effect=AssertionError("unexpected chat headers")),
+            mock.patch.object(auth, "get_api_key", return_value="test-key"),
+            mock.patch.object(auth, "get_api_base", return_value="https://example.invalid"),
+            mock.patch.object(format_translation, "anthropic_request_to_chat", mock.AsyncMock(return_value=outbound)),
+            mock.patch.object(usage_tracking, "log_proxy_request"),
+            mock.patch.object(proxy.usage_tracker, "start_event", return_value=None),
+            mock.patch.object(proxy.usage_tracker, "finish_event"),
+            mock.patch.object(format_translation, "build_anthropic_headers_for_request", return_value={"X-Initiator": "user"}) as build_headers,
+            mock.patch.object(format_translation, "build_chat_headers_for_request", side_effect=AssertionError("unexpected chat headers")),
             mock.patch.object(proxy, "throttled_client_post", mock.AsyncMock(return_value=upstream)) as post,
         ):
             response = proxy.asyncio.run(proxy.anthropic_messages(request))
@@ -1279,12 +1285,12 @@ class ProxyInitiatorTests(unittest.TestCase):
 
         with (
             mock.patch.object(proxy, "parse_json_request", mock.AsyncMock(return_value=body)),
-            mock.patch.object(proxy, "get_api_key", return_value="test-key"),
-            mock.patch.object(proxy, "_get_api_base", return_value="https://example.invalid"),
-            mock.patch.object(proxy, "build_responses_headers_for_request", return_value={"X-Initiator": "agent"}),
-            mock.patch.object(proxy, "log_proxy_request"),
-            mock.patch.object(proxy, "_start_usage_event", return_value=None),
-            mock.patch.object(proxy, "_finish_usage_event") as finish_usage,
+            mock.patch.object(auth, "get_api_key", return_value="test-key"),
+            mock.patch.object(auth, "get_api_base", return_value="https://example.invalid"),
+            mock.patch.object(format_translation, "build_responses_headers_for_request", return_value={"X-Initiator": "agent"}),
+            mock.patch.object(usage_tracking, "log_proxy_request"),
+            mock.patch.object(proxy.usage_tracker, "start_event", return_value=None),
+            mock.patch.object(proxy.usage_tracker, "finish_event") as finish_usage,
             mock.patch.object(proxy, "throttled_client_post", mock.AsyncMock(side_effect=connect_error)),
         ):
             response = proxy.asyncio.run(proxy.responses(request))
@@ -1347,13 +1353,13 @@ class ProxyInitiatorTests(unittest.TestCase):
 
         with (
             mock.patch.object(proxy, "parse_json_request", mock.AsyncMock(return_value=body)),
-            mock.patch.object(proxy, "get_api_key", return_value="test-key"),
-            mock.patch.object(proxy, "_get_api_base", return_value="https://example.invalid"),
-            mock.patch.object(proxy, "anthropic_request_to_chat", mock.AsyncMock(return_value=outbound)),
-            mock.patch.object(proxy, "build_anthropic_headers_for_request", return_value={"X-Initiator": "agent"}),
-            mock.patch.object(proxy, "log_proxy_request"),
-            mock.patch.object(proxy, "_start_usage_event", return_value=None),
-            mock.patch.object(proxy, "_finish_usage_event") as finish_usage,
+            mock.patch.object(auth, "get_api_key", return_value="test-key"),
+            mock.patch.object(auth, "get_api_base", return_value="https://example.invalid"),
+            mock.patch.object(format_translation, "anthropic_request_to_chat", mock.AsyncMock(return_value=outbound)),
+            mock.patch.object(format_translation, "build_anthropic_headers_for_request", return_value={"X-Initiator": "agent"}),
+            mock.patch.object(usage_tracking, "log_proxy_request"),
+            mock.patch.object(proxy.usage_tracker, "start_event", return_value=None),
+            mock.patch.object(proxy.usage_tracker, "finish_event") as finish_usage,
             mock.patch.object(proxy, "throttled_client_post", mock.AsyncMock(side_effect=connect_error)),
         ):
             response = proxy.asyncio.run(proxy.anthropic_messages(request))
@@ -1376,7 +1382,7 @@ class ProxyInitiatorTests(unittest.TestCase):
             "input": "hello",
         }
 
-        headers = proxy.build_responses_headers_for_request(
+        headers = format_translation.build_responses_headers_for_request(
             request,
             body,
             "test-key",
@@ -1393,13 +1399,13 @@ class ProxyInitiatorTests(unittest.TestCase):
             "input": "hello",
         }
 
-        headers = proxy.build_responses_headers_for_request(request, body, "test-key")
+        headers = format_translation.build_responses_headers_for_request(request, body, "test-key")
 
         self.assertEqual(headers["X-Initiator"], "agent")
 
     def test_resolve_copilot_model_name_maps_dated_haiku_to_canonical_form(self):
         self.assertEqual(
-            proxy.resolve_copilot_model_name("claude-haiku-4-5-20251001"),
+            format_translation.resolve_copilot_model_name("claude-haiku-4-5-20251001"),
             "claude-haiku-4.5",
         )
 
@@ -1409,17 +1415,17 @@ class ProxyInitiatorTests(unittest.TestCase):
 
         policy.note_request_started("req-1", "user", started_at=start)
 
-        with mock.patch.object(initiator_policy, "_utc_now", return_value=start.replace(second=5)):
+        with mock.patch.object(initiator_policy, "utc_now", return_value=start.replace(second=5)):
             self.assertEqual(policy.resolve_initiator("user", "gpt-5"), "agent")
 
     def test_request_resolution_with_request_id_marks_activity_for_other_requests(self):
         policy = initiator_policy.InitiatorPolicy()
         start = datetime(2026, 4, 4, 18, 5, tzinfo=timezone.utc)
 
-        with mock.patch.object(initiator_policy, "_utc_now", return_value=start):
+        with mock.patch.object(initiator_policy, "utc_now", return_value=start):
             self.assertEqual(policy.resolve_initiator("user", "gpt-5", request_id="req-1"), "user")
 
-        with mock.patch.object(initiator_policy, "_utc_now", return_value=start.replace(second=1)):
+        with mock.patch.object(initiator_policy, "utc_now", return_value=start.replace(second=1)):
             self.assertEqual(policy.resolve_initiator("user", "gpt-5", request_id="req-2"), "agent")
 
     def test_recent_finished_request_forces_following_user_looking_request_to_agent(self):
@@ -1429,7 +1435,7 @@ class ProxyInitiatorTests(unittest.TestCase):
         policy.note_request_started("req-1", "user", started_at=finished_at.replace(second=0))
         policy.note_request_finished("req-1", finished_at=finished_at)
 
-        with mock.patch.object(initiator_policy, "_utc_now", return_value=finished_at.replace(second=10)):
+        with mock.patch.object(initiator_policy, "utc_now", return_value=finished_at.replace(second=10)):
             self.assertEqual(policy.resolve_initiator("user", "gpt-5"), "agent")
 
     def test_guard_expires_15_seconds_after_request_finishes(self):
@@ -1442,10 +1448,10 @@ class ProxyInitiatorTests(unittest.TestCase):
         policy.note_request_started("req-1", "agent", started_at=base.replace(second=10))
         policy.note_request_finished("req-1", finished_at=base.replace(second=12))
 
-        with mock.patch.object(initiator_policy, "_utc_now", return_value=base.replace(second=25)):
+        with mock.patch.object(initiator_policy, "utc_now", return_value=base.replace(second=25)):
             self.assertEqual(policy.resolve_initiator("user", "gpt-5"), "agent")
 
-        with mock.patch.object(initiator_policy, "_utc_now", return_value=base.replace(second=28)):
+        with mock.patch.object(initiator_policy, "utc_now", return_value=base.replace(second=28)):
             self.assertEqual(policy.resolve_initiator("user", "gpt-5"), "user")
 
     def test_any_request_activity_refreshes_the_15_second_timer(self):
@@ -1460,10 +1466,10 @@ class ProxyInitiatorTests(unittest.TestCase):
         policy.note_request_started("req-2", "agent", started_at=second_start)
         policy.note_request_finished("req-2", finished_at=second_finish)
 
-        with mock.patch.object(initiator_policy, "_utc_now", return_value=datetime(2026, 4, 4, 18, 40, 30, tzinfo=timezone.utc)):
+        with mock.patch.object(initiator_policy, "utc_now", return_value=datetime(2026, 4, 4, 18, 40, 30, tzinfo=timezone.utc)):
             self.assertEqual(policy.resolve_initiator("user", "gpt-5"), "agent")
 
-        with mock.patch.object(initiator_policy, "_utc_now", return_value=datetime(2026, 4, 4, 18, 40, 34, tzinfo=timezone.utc)):
+        with mock.patch.object(initiator_policy, "utc_now", return_value=datetime(2026, 4, 4, 18, 40, 34, tzinfo=timezone.utc)):
             self.assertEqual(policy.resolve_initiator("user", "gpt-5"), "user")
 
     def test_stream_like_request_stays_active_until_finished(self):
@@ -1473,15 +1479,15 @@ class ProxyInitiatorTests(unittest.TestCase):
 
         policy.note_request_started("stream-1", "user", started_at=started_at)
 
-        with mock.patch.object(initiator_policy, "_utc_now", return_value=finished_at):
+        with mock.patch.object(initiator_policy, "utc_now", return_value=finished_at):
             self.assertEqual(policy.resolve_initiator("user", "gpt-5"), "agent")
 
         policy.note_request_finished("stream-1", finished_at=finished_at)
 
-        with mock.patch.object(initiator_policy, "_utc_now", return_value=finished_at.replace(second=10)):
+        with mock.patch.object(initiator_policy, "utc_now", return_value=finished_at.replace(second=10)):
             self.assertEqual(policy.resolve_initiator("user", "gpt-5"), "agent")
 
-        with mock.patch.object(initiator_policy, "_utc_now", return_value=finished_at.replace(second=16)):
+        with mock.patch.object(initiator_policy, "utc_now", return_value=finished_at.replace(second=16)):
             self.assertEqual(policy.resolve_initiator("user", "gpt-5"), "user")
 
     def test_safeguard_inactive_until_first_user_request(self):
@@ -1491,7 +1497,7 @@ class ProxyInitiatorTests(unittest.TestCase):
         policy.note_request_started("req-1", "agent", started_at=start)
         policy.note_request_finished("req-1", finished_at=start.replace(second=10))
 
-        with mock.patch.object(initiator_policy, "_utc_now", return_value=start.replace(second=12)):
+        with mock.patch.object(initiator_policy, "utc_now", return_value=start.replace(second=12)):
             self.assertEqual(policy.resolve_initiator("user", "gpt-5"), "user")
 
     def test_active_stream_does_not_block_user_before_first_user_request(self):
@@ -1500,14 +1506,14 @@ class ProxyInitiatorTests(unittest.TestCase):
 
         policy.note_request_started("stream-1", "agent", started_at=start)
 
-        with mock.patch.object(initiator_policy, "_utc_now", return_value=start.replace(second=5)):
+        with mock.patch.object(initiator_policy, "utc_now", return_value=start.replace(second=5)):
             self.assertEqual(policy.resolve_initiator("user", "gpt-5"), "user")
 
     def test_haiku_then_opus_user_prompt_is_user(self):
         policy = initiator_policy.InitiatorPolicy()
         start = datetime(2026, 4, 4, 18, 0, tzinfo=timezone.utc)
 
-        with mock.patch.object(initiator_policy, "_utc_now", return_value=start):
+        with mock.patch.object(initiator_policy, "utc_now", return_value=start):
             self.assertEqual(
                 policy.resolve_initiator("user", "claude-haiku-4.5", request_id="haiku-1"),
                 "agent",
@@ -1515,7 +1521,7 @@ class ProxyInitiatorTests(unittest.TestCase):
 
         policy.note_request_finished("haiku-1", finished_at=start.replace(second=2))
 
-        with mock.patch.object(initiator_policy, "_utc_now", return_value=start.replace(second=3)):
+        with mock.patch.object(initiator_policy, "utc_now", return_value=start.replace(second=3)):
             self.assertEqual(
                 policy.resolve_initiator("user", "claude-sonnet-4.6", request_id="opus-1"),
                 "user",
@@ -1525,19 +1531,19 @@ class ProxyInitiatorTests(unittest.TestCase):
         policy = initiator_policy.InitiatorPolicy()
         start = datetime(2026, 4, 4, 18, 0, tzinfo=timezone.utc)
 
-        with mock.patch.object(initiator_policy, "_utc_now", return_value=start):
+        with mock.patch.object(initiator_policy, "utc_now", return_value=start):
             self.assertEqual(
                 policy.resolve_initiator("user", "claude-haiku-4.5", request_id="haiku-1"),
                 "agent",
             )
 
-        with mock.patch.object(initiator_policy, "_utc_now", return_value=start.replace(second=1)):
+        with mock.patch.object(initiator_policy, "utc_now", return_value=start.replace(second=1)):
             self.assertEqual(
                 policy.resolve_initiator("user", "claude-sonnet-4.6", request_id="opus-1"),
                 "user",
             )
 
-        with mock.patch.object(initiator_policy, "_utc_now", return_value=start.replace(second=2)):
+        with mock.patch.object(initiator_policy, "utc_now", return_value=start.replace(second=2)):
             self.assertEqual(
                 policy.resolve_initiator("user", "claude-sonnet-4.6"),
                 "agent",
@@ -1550,28 +1556,28 @@ class ProxyInitiatorTests(unittest.TestCase):
         policy.note_request_started("req-1", "agent", started_at=start)
         policy.note_request_finished("req-1", finished_at=start.replace(second=5))
 
-        with mock.patch.object(initiator_policy, "_utc_now", return_value=start.replace(second=6)):
+        with mock.patch.object(initiator_policy, "utc_now", return_value=start.replace(second=6)):
             self.assertEqual(
                 policy.resolve_initiator("user", "gpt-5", request_id="req-2"),
                 "user",
             )
 
-        with mock.patch.object(initiator_policy, "_utc_now", return_value=start.replace(second=7)):
+        with mock.patch.object(initiator_policy, "utc_now", return_value=start.replace(second=7)):
             self.assertEqual(policy.resolve_initiator("user", "gpt-5"), "agent")
 
     def test_any_copilot_activity_reactivates_safeguard_after_first_user_request(self):
         policy = initiator_policy.InitiatorPolicy()
         start = datetime(2026, 4, 4, 18, 0, tzinfo=timezone.utc)
 
-        with mock.patch.object(initiator_policy, "_utc_now", return_value=start):
+        with mock.patch.object(initiator_policy, "utc_now", return_value=start):
             policy.resolve_initiator("user", "gpt-5", request_id="req-1")
 
         policy.note_request_finished("req-1", finished_at=start.replace(second=5))
 
-        with mock.patch.object(initiator_policy, "_utc_now", return_value=start.replace(second=10)):
+        with mock.patch.object(initiator_policy, "utc_now", return_value=start.replace(second=10)):
             self.assertEqual(policy.resolve_initiator("user", "gpt-5"), "agent")
 
-        with mock.patch.object(initiator_policy, "_utc_now", return_value=start.replace(second=25)):
+        with mock.patch.object(initiator_policy, "utc_now", return_value=start.replace(second=25)):
             self.assertEqual(
                 policy.resolve_initiator("user", "claude-haiku-4.5", request_id="haiku-1"),
                 "agent",
@@ -1579,7 +1585,7 @@ class ProxyInitiatorTests(unittest.TestCase):
 
         policy.note_request_finished("haiku-1", finished_at=start.replace(second=26))
 
-        with mock.patch.object(initiator_policy, "_utc_now", return_value=start.replace(second=27)):
+        with mock.patch.object(initiator_policy, "utc_now", return_value=start.replace(second=27)):
             self.assertEqual(
                 policy.resolve_initiator("user", "claude-opus-4.6", request_id="opus-1"),
                 "agent",
@@ -1595,13 +1601,13 @@ class ProxyInitiatorTests(unittest.TestCase):
             {"finished_at": old_time.replace(second=5).isoformat(), "initiator": "agent"},
         ])
 
-        with mock.patch.object(initiator_policy, "_utc_now", return_value=now):
+        with mock.patch.object(initiator_policy, "utc_now", return_value=now):
             self.assertEqual(
                 policy.resolve_initiator("user", "claude-haiku-4.5", request_id="haiku-1"),
                 "agent",
             )
 
-        with mock.patch.object(initiator_policy, "_utc_now", return_value=now.replace(second=1)):
+        with mock.patch.object(initiator_policy, "utc_now", return_value=now.replace(second=1)):
             self.assertEqual(
                 policy.resolve_initiator("user", "claude-opus-4.6", request_id="opus-1"),
                 "user",
@@ -1615,7 +1621,7 @@ class ProxyInitiatorTests(unittest.TestCase):
             config_path.write_text(proxy.CODEX_PROXY_CONFIG + "\n", encoding="utf-8")
 
             with mock.patch.object(proxy, "CODEX_CONFIG_FILE", str(config_path)):
-                status = proxy._write_codex_proxy_config()
+                status = proxy.write_codex_proxy_config()
 
             backups = list(config_path.parent.glob(f"{config_path.name}.ghcp-proxy.bak.*"))
             self.assertTrue(status["configured"])
@@ -1634,7 +1640,7 @@ class ProxyInitiatorTests(unittest.TestCase):
         try:
 
             with mock.patch.object(proxy, "CODEX_CONFIG_FILE", str(config_path)):
-                status = proxy._disable_codex_proxy_config()
+                status = proxy.disable_codex_proxy_config()
 
             self.assertFalse(status["configured"])
             self.assertEqual(status["status_message"], "proxy already disabled")
@@ -1653,7 +1659,7 @@ class ProxyInitiatorTests(unittest.TestCase):
             backup_path.write_text(backup_contents, encoding="utf-8")
 
             with mock.patch.object(proxy, "CODEX_CONFIG_FILE", str(config_path)):
-                status = proxy._disable_codex_proxy_config()
+                status = proxy.disable_codex_proxy_config()
 
             self.assertFalse(status["configured"])
             self.assertTrue(status["restored_from_backup"])
@@ -1682,7 +1688,7 @@ class ProxyInitiatorTests(unittest.TestCase):
             )
 
             with mock.patch.object(proxy, "CLAUDE_SETTINGS_FILE", str(settings_path)):
-                status = proxy._claude_proxy_status()
+                status = proxy.claude_proxy_status()
 
             self.assertFalse(status["configured"])
             self.assertEqual(status["status_message"], "proxy configured, missing context cap and output cap")
@@ -1712,7 +1718,7 @@ class ProxyInitiatorTests(unittest.TestCase):
             )
 
             with mock.patch.object(proxy, "CLAUDE_SETTINGS_FILE", str(settings_path)):
-                status = proxy._write_claude_proxy_settings()
+                status = proxy.write_claude_proxy_settings()
 
             written = proxy.json.loads(settings_path.read_text(encoding="utf-8"))
             self.assertTrue(status["configured"])
@@ -1733,8 +1739,8 @@ class ProxyInitiatorTests(unittest.TestCase):
                 backup_path.unlink(missing_ok=True)
 
     def test_month_key_for_source_rows(self):
-        self.assertEqual(proxy._month_key_for_source_row("claude", {"month": "2026-04"}), "2026-04")
-        self.assertEqual(proxy._month_key_for_source_row("codex", {"month": "Apr 2026"}), "2026-04")
+        self.assertEqual(util.month_key_for_source_row("claude", {"month": "2026-04"}), "2026-04")
+        self.assertEqual(util.month_key_for_source_row("codex", {"month": "Apr 2026"}), "2026-04")
 
 
     def test_build_dashboard_payload_combines_claude_and_codex(self):
@@ -1784,8 +1790,8 @@ class ProxyInitiatorTests(unittest.TestCase):
             proxy.usage_tracker.state.recent_usage_events.extend(usage_events)
 
         with (
-            mock.patch.object(proxy, "_utc_now", return_value=fixed_now),
-            mock.patch.object(proxy, "_load_api_key_payload", return_value={"sku": "plus_monthly_subscriber_quota"}),
+            mock.patch.object(proxy.dashboard_service, "utc_now", return_value=fixed_now),
+            mock.patch.object(auth, "load_api_key_payload", return_value={"sku": "plus_monthly_subscriber_quota"}),
             mock.patch.object(
                 proxy.dashboard_service,
                 "get_official_premium_payload",
@@ -1856,8 +1862,8 @@ class ProxyInitiatorTests(unittest.TestCase):
             proxy.usage_tracker.state.recent_usage_events.append(recent_event)
 
         with (
-            mock.patch.object(proxy, "_utc_now", return_value=fixed_now),
-            mock.patch.object(proxy, "_load_api_key_payload", return_value={"sku": "plus_monthly_subscriber_quota"}),
+            mock.patch.object(proxy.dashboard_service, "utc_now", return_value=fixed_now),
+            mock.patch.object(auth, "load_api_key_payload", return_value={"sku": "plus_monthly_subscriber_quota"}),
             mock.patch.object(
                 proxy.dashboard_service,
                 "get_official_premium_payload",
@@ -1947,7 +1953,7 @@ class ProxyInitiatorTests(unittest.TestCase):
 
         with (
             mock.patch.object(usage_tracking, "USAGE_LOG_FILE", str(log_path)),
-            mock.patch.object(usage_tracking, "_rewrite_usage_log_locked") as rewrite_usage_log,
+            mock.patch.object(usage_tracking, "rewrite_usage_log_locked") as rewrite_usage_log,
         ):
             tracker.load_history()
 
@@ -2007,11 +2013,11 @@ class ProxyInitiatorTests(unittest.TestCase):
             proxy.dashboard_service.trigger_official_premium_refresh()
 
         notify.assert_called_once_with()
-        with proxy._premium_cache_lock:
-            self.assertEqual(proxy._premium_cache["payload"], premium_payload)
-            self.assertFalse(proxy._premium_cache["refreshing"])
-            self.assertIsNone(proxy._premium_cache["last_error"])
-            self.assertGreater(proxy._premium_cache["loaded_at"], 0.0)
+        cache_state = proxy.dashboard_service.official_premium_cache_state()
+        self.assertEqual(cache_state["payload"], premium_payload)
+        self.assertFalse(cache_state["refreshing"])
+        self.assertIsNone(cache_state["last_error"])
+        self.assertGreater(cache_state["loaded_at"], 0.0)
 
     def test_normalize_session_claude_accepts_cached_input_tokens_shape(self):
         normalized = dashboard.normalize_session(

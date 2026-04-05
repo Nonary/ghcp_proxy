@@ -37,7 +37,7 @@ def _gh_headers(access_token: str = None) -> dict:
     return h
 
 
-def _load_access_token() -> str | None:
+def load_access_token() -> str | None:
     try:
         with open(ACCESS_TOKEN_FILE, encoding="utf-8") as f:
             tok = f.read().strip()
@@ -46,7 +46,7 @@ def _load_access_token() -> str | None:
         return None
 
 
-def _load_billing_token() -> str | None:
+def load_billing_token() -> str | None:
     env_token = os.environ.get("GHCP_GITHUB_BILLING_TOKEN", "").strip()
     if env_token:
         return env_token
@@ -59,20 +59,20 @@ def _load_billing_token() -> str | None:
         return None
 
 
-def _save_billing_token(token: str):
+def save_billing_token(token: str):
     os.makedirs(TOKEN_DIR, exist_ok=True)
     with open(BILLING_TOKEN_FILE, "w", encoding="utf-8") as f:
         f.write(token.strip())
 
 
-def _clear_billing_token():
+def clear_billing_token():
     try:
         os.remove(BILLING_TOKEN_FILE)
     except OSError:
         pass
 
 
-def _billing_token_status() -> dict[str, bool | str]:
+def billing_token_status() -> dict[str, bool | str]:
     env_token = os.environ.get("GHCP_GITHUB_BILLING_TOKEN", "").strip()
     if env_token:
         return {"configured": True, "source": "environment", "readonly": True}
@@ -144,7 +144,7 @@ def _parse_toml_values(content: str) -> dict:
     return data
 
 
-def _codex_proxy_status() -> dict[str, bool | str | None]:
+def codex_proxy_status() -> dict[str, bool | str | None]:
     status = {
         "client": "codex",
         "configured": False,
@@ -186,7 +186,7 @@ def _codex_proxy_status() -> dict[str, bool | str | None]:
     return status
 
 
-def _empty_proxy_status(client: str, path: str) -> dict[str, bool | str | None]:
+def empty_proxy_status(client: str, path: str) -> dict[str, bool | str | None]:
     return {
         "client": client,
         "configured": False,
@@ -198,7 +198,7 @@ def _empty_proxy_status(client: str, path: str) -> dict[str, bool | str | None]:
     }
 
 
-def _claude_proxy_status() -> dict[str, bool | str | None]:
+def claude_proxy_status() -> dict[str, bool | str | None]:
     status = {
         "client": "claude",
         "configured": False,
@@ -273,8 +273,8 @@ def _merged_claude_proxy_settings(existing_payload: dict | None) -> dict:
     return merged
 
 
-def _write_codex_proxy_config() -> dict[str, bool | str | None]:
-    status = _codex_proxy_status()
+def write_codex_proxy_config() -> dict[str, bool | str | None]:
+    status = codex_proxy_status()
     if status.get("error"):
         return status
     if status.get("configured"):
@@ -287,14 +287,14 @@ def _write_codex_proxy_config() -> dict[str, bool | str | None]:
     with open(CODEX_CONFIG_FILE, "w", encoding="utf-8") as f:
         f.write(CODEX_PROXY_CONFIG)
         f.write("\n")
-    status = _codex_proxy_status()
+    status = codex_proxy_status()
     status["backup_path"] = backup_path
     status["status_message"] = "installed proxy config"
     return status
 
 
-def _write_claude_proxy_settings() -> dict[str, bool | str | None]:
-    status = _claude_proxy_status()
+def write_claude_proxy_settings() -> dict[str, bool | str | None]:
+    status = claude_proxy_status()
     if status.get("error"):
         return status
     if status.get("configured"):
@@ -314,16 +314,16 @@ def _write_claude_proxy_settings() -> dict[str, bool | str | None]:
     with open(CLAUDE_SETTINGS_FILE, "w", encoding="utf-8") as f:
         json.dump(_merged_claude_proxy_settings(existing_payload), f, indent=2)
         f.write("\n")
-    status = _claude_proxy_status()
+    status = claude_proxy_status()
     status["backup_path"] = backup_path
     status["status_message"] = "installed proxy settings"
     return status
 
 
-def _disable_client_proxy_config(config_path: str, status_fn) -> dict[str, bool | str | None]:
+def disable_client_proxy_config(config_path: str, status_fn) -> dict[str, bool | str | None]:
     status = status_fn()
     if not isinstance(status, dict):
-        status = _empty_proxy_status("unknown", config_path)
+        status = empty_proxy_status("unknown", config_path)
     if status.get("error"):
         return status
     if not isinstance(config_path, str) or not config_path:
@@ -364,17 +364,17 @@ def _disable_client_proxy_config(config_path: str, status_fn) -> dict[str, bool 
     return status
 
 
-def _disable_codex_proxy_config() -> dict[str, bool | str | None]:
-    return _disable_client_proxy_config(CODEX_CONFIG_FILE, _codex_proxy_status)
+def disable_codex_proxy_config() -> dict[str, bool | str | None]:
+    return disable_client_proxy_config(CODEX_CONFIG_FILE, codex_proxy_status)
 
 
-def _disable_claude_proxy_settings() -> dict[str, bool | str | None]:
-    return _disable_client_proxy_config(CLAUDE_SETTINGS_FILE, _claude_proxy_status)
+def disable_claude_proxy_settings() -> dict[str, bool | str | None]:
+    return disable_client_proxy_config(CLAUDE_SETTINGS_FILE, claude_proxy_status)
 
 
-def _proxy_client_status_payload() -> dict[str, object]:
-    codex_status = _codex_proxy_status()
-    claude_status = _claude_proxy_status()
+def proxy_client_status_payload() -> dict[str, object]:
+    codex_status = codex_proxy_status()
+    claude_status = claude_proxy_status()
     codex_status["backup_path"] = _latest_backup_path(CODEX_CONFIG_FILE)
     claude_status["backup_path"] = _latest_backup_path(CLAUDE_SETTINGS_FILE)
     codex_status["restored_from_backup"] = False
@@ -382,7 +382,7 @@ def _proxy_client_status_payload() -> dict[str, object]:
     return {"clients": {"codex": codex_status, "claude": claude_status}}
 
 
-def _normalize_proxy_targets(payload: dict) -> list[str]:
+def normalize_proxy_targets(payload: dict) -> list[str]:
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="Request body must be an object")
 
@@ -420,7 +420,7 @@ def _save_access_token(token: str):
         f.write(token)
 
 
-def _load_api_key() -> str | None:
+def load_api_key() -> str | None:
     try:
         with open(API_KEY_FILE, encoding="utf-8") as f:
             data = json.load(f)
@@ -431,7 +431,7 @@ def _load_api_key() -> str | None:
     return None
 
 
-def _load_api_key_payload() -> dict:
+def load_api_key_payload() -> dict:
     try:
         with open(API_KEY_FILE, encoding="utf-8") as f:
             data = json.load(f)
@@ -440,7 +440,7 @@ def _load_api_key_payload() -> dict:
         return {}
 
 
-def _get_api_base() -> str:
+def get_api_base() -> str:
     """Use the endpoint embedded in api-key.json if present, else default."""
     try:
         with open(API_KEY_FILE, encoding="utf-8") as f:
@@ -531,10 +531,10 @@ def _refresh_api_key(access_token: str) -> str:
 
 def get_api_key() -> str:
     """Returns a valid GHCP API key, refreshing transparently when expired."""
-    key = _load_api_key()
+    key = load_api_key()
     if key:
         return key
-    access_token = _load_access_token() or _device_flow()
+    access_token = load_access_token() or _device_flow()
     return _refresh_api_key(access_token)
 
 

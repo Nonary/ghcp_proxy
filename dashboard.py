@@ -21,11 +21,11 @@ from constants import (
 )
 from util import (
     _json_default, _coerce_float, _coerce_int,
-    _utc_now, _utc_now_iso, _parse_iso_datetime,
-    _normalize_usage_payload, _normalize_model_name,
+    utc_now, utc_now_iso, _parse_iso_datetime,
+    normalize_usage_payload, _normalize_model_name,
     _usage_event_model_name, _usage_event_source,
     _pricing_entry_for_model, _usage_event_cost,
-    _premium_request_multiplier, _month_key, _month_key_for_source_row,
+    _premium_request_multiplier, _month_key, month_key_for_source_row,
 )
 
 
@@ -179,7 +179,7 @@ def _sqlite_cache_put(cache_key: str, payload: dict):
         return
     if not _init_sqlite_cache():
         return
-    updated_at = _utc_now_iso()
+    updated_at = utc_now_iso()
     serialized = json.dumps(payload, separators=(",", ":"), default=_json_default)
     try:
         with _sqlite_cache_lock:
@@ -442,7 +442,7 @@ def _empty_official_premium_payload() -> dict:
 
 
 def _current_billing_month_bounds(now: datetime | None = None) -> tuple[datetime, datetime]:
-    current = now or _utc_now()
+    current = now or utc_now()
     start = datetime(current.year, current.month, 1, tzinfo=timezone.utc)
     if current.month == 12:
         end = datetime(current.year + 1, 1, 1, tzinfo=timezone.utc)
@@ -569,7 +569,7 @@ def _monotonic_loaded_at_from_payload(payload: dict | None) -> float:
     if isinstance(loaded_at_value, str):
         parsed_at = _parse_iso_datetime(loaded_at_value)
         if parsed_at is not None:
-            age_seconds = (_utc_now() - parsed_at).total_seconds()
+            age_seconds = (utc_now() - parsed_at).total_seconds()
             if age_seconds >= 0:
                 return max(0.0, time.monotonic() - age_seconds)
 
@@ -613,7 +613,7 @@ def _ingest_usage_event(bucket: dict, event: dict):
     if not isinstance(bucket, dict) or not isinstance(event, dict):
         return
 
-    usage = _normalize_usage_payload(event.get("usage")) or {}
+    usage = normalize_usage_payload(event.get("usage")) or {}
     event_cost = event.get("cost_usd")
     if not isinstance(event_cost, (int, float)):
         event_cost = _usage_event_cost(_usage_event_model_name(event), usage)
@@ -827,7 +827,7 @@ def _normalize_month_row(source: str, row: dict) -> dict:
 
     return {
         "source": source,
-        "month_key": _month_key_for_source_row(source, row),
+        "month_key": month_key_for_source_row(source, row),
         "month_label": row.get("month"),
         "input_tokens": _coerce_int(row.get("inputTokens")),
         "output_tokens": _coerce_int(row.get("outputTokens")),
@@ -926,8 +926,8 @@ class DashboardService:
         self,
         *,
         dependencies: DashboardDependencies | None = None,
-        utc_now: Callable[[], datetime] = _utc_now,
-        utc_now_iso: Callable[[], str] = _utc_now_iso,
+        utc_now: Callable[[], datetime] = utc_now,
+        utc_now_iso: Callable[[], str] = utc_now_iso,
         sqlite_cache_put: Callable[[str, dict], None] = _sqlite_cache_put,
         notify_dashboard_stream_listeners: Callable[[], None] = _notify_dashboard_stream_listeners,
         thread_class: Callable[[], type] | type = Thread,
@@ -944,6 +944,22 @@ class DashboardService:
         if callable(resolved_thread_class) and not isinstance(resolved_thread_class, type):
             resolved_thread_class = resolved_thread_class()
         return resolved_thread_class
+
+    def reset_official_premium_cache(self):
+        with _premium_cache_lock:
+            _premium_cache.update(
+                {
+                    "loaded_at": 0.0,
+                    "payload": None,
+                    "refreshing": False,
+                    "last_error": None,
+                    "last_started_at": None,
+                }
+            )
+
+    def official_premium_cache_state(self) -> dict:
+        with _premium_cache_lock:
+            return dict(_premium_cache)
 
     def collect_official_premium_payload(
         self,

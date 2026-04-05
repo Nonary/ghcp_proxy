@@ -14,11 +14,16 @@ Configure Codex:
 """
 
 import asyncio
+import auth
+import dashboard as dashboard_module
+import format_translation
 import json
 import os
 import sqlite3
 import sys
 import time
+import usage_tracking
+import util
 from dataclasses import dataclass
 from threading import Thread
 from uuid import uuid4
@@ -48,174 +53,13 @@ from constants import (
     CLAUDE_PROXY_SETTINGS,
     CLAUDE_MAX_CONTEXT_TOKENS,
     CLAUDE_MAX_OUTPUT_TOKENS,
-)
-
-from util import (
-    _json_default,
-    _utc_now,
-    _utc_now_iso,
-    _normalize_usage_payload,
-    _extract_payload_usage,
-    _usage_event_cost,
-    _premium_request_multiplier,
-    _month_key_for_source_row,
-    parse_json_request as _parse_json_request_impl,
+    DEFAULT_UPSTREAM_TIMEOUT_SECONDS,
 )
 
 from rate_limiting import (
     throttle_upstream_request,
     throttled_client_post,
     throttled_client_send,
-)
-
-from format_translation import (
-    has_vision_input,
-    model_requires_anthropic_beta,
-    normalize_upstream_model_name,
-    resolve_copilot_model_name,
-    _normalize_anthropic_cache_control,
-    _attach_copilot_cache_control,
-    _anthropic_image_block_to_chat,
-    _normalize_anthropic_content_blocks,
-    _anthropic_text_or_image_block_to_chat,
-    _anthropic_system_to_chat_content,
-    _anthropic_blocks_to_chat_content,
-    _anthropic_tool_result_content_to_text,
-    _anthropic_tool_use_to_chat_tool_call,
-    anthropic_message_to_chat_messages,
-    anthropic_tools_to_chat,
-    anthropic_tool_choice_to_chat,
-    anthropic_request_to_chat,
-    _chat_usage_to_anthropic,
-    _chat_stop_reason_to_anthropic,
-    _extract_chat_message_text,
-    _parse_tool_call_arguments,
-    _chat_message_to_anthropic_content,
-    chat_completion_to_anthropic,
-    _anthropic_error_type_for_status,
-    anthropic_error_payload_from_openai,
-    anthropic_error_response,
-    anthropic_error_response_from_upstream,
-    _openai_error_type_for_status,
-    openai_error_response,
-    _upstream_request_error_status_and_message,
-    _http_exception_detail_to_message,
-    _sse_encode,
-    _parse_sse_block,
-    _iter_sse_messages,
-    _extract_text_from_chat_delta,
-    _extract_tool_call_deltas,
-    build_copilot_headers,
-    _apply_forwarded_request_headers,
-    build_responses_headers_for_request,
-    build_chat_headers_for_request,
-    build_anthropic_headers_for_request,
-    _anthropic_messages_has_vision,
-    _strip_anthropic_cache_control,
-    prepare_anthropic_outbound_body,
-    encode_fake_compaction,
-    decode_fake_compaction,
-    _summary_message_item,
-    input_contains_compaction,
-    sanitize_input,
-    build_fake_compaction_request,
-    extract_response_output_text,
-    build_fake_compaction_response,
-)
-
-from auth import (
-    _gh_headers,
-    _load_access_token,
-    _save_access_token,
-    _load_billing_token,
-    _save_billing_token,
-    _clear_billing_token,
-    _billing_token_status,
-    _backup_config_file,
-    _latest_backup_path,
-    _parse_toml_values,
-    _empty_proxy_status,
-    _disable_client_proxy_config,
-    _normalize_proxy_targets,
-    _load_api_key,
-    _load_api_key_payload,
-    _get_api_base,
-    _device_flow,
-    _refresh_api_key,
-    get_api_key,
-    ensure_authenticated,
-)
-
-from usage_tracking import (
-    REQUEST_FINISHED_EVENT,
-    USAGE_EVENT_RECORDED_EVENT,
-    UsageArchiveStore,
-    UsageTracker,
-    UsageTrackingState,
-    configure_usage_tracking,
-    _usage_log_lock,
-    _recent_usage_events,
-    _archived_usage_events,
-    _session_request_id_lock,
-    _latest_server_request_ids_by_chain,
-    _active_server_request_ids_by_request,
-    _latest_claude_user_session_contexts,
-    _request_session_id,
-    _remember_server_request_id,
-    _remember_active_server_request_id,
-    _forget_active_server_request_id,
-    _get_active_server_request_id_for_request,
-    _get_active_request_context_for_request,
-    _get_latest_server_request_id_for_request,
-    _resolve_server_request_id,
-    _apply_missing_claude_session_context,
-    _normalize_recorded_usage_event,
-    _start_usage_event,
-    _mark_usage_event_first_output,
-    _snapshot_usage_events,
-    _snapshot_all_usage_events,
-    _record_usage_event,
-    _record_request_error,
-    _rewrite_usage_log_locked,
-    _usage_event_archive_summary,
-    _usage_event_archive_key,
-    _SSEUsageCapture,
-    _initiator_log_label,
-    log_proxy_request,
-)
-
-from dashboard import (
-    DashboardDependencies,
-    DashboardService,
-    seed_cached_payloads_from_sqlite,
-    _init_sqlite_cache,
-    _sqlite_cache_lock,
-    _sqlite_connect,
-    _sqlite_cache_put,
-    _set_sqlite_cache_unavailable,
-    _infer_premium_allowance,
-    _extract_quota_summary,
-    _github_rest_headers,
-    _github_rest_get_json,
-    _fetch_github_identity,
-    _load_cached_github_identity,
-    _load_billing_org_candidates,
-    _empty_official_premium_payload,
-    _current_billing_month_bounds,
-    _register_dashboard_stream_listener,
-    _unregister_dashboard_stream_listener,
-    _notify_dashboard_stream_listeners,
-    _premium_cache_lock,
-    _premium_cache,
-    _new_usage_aggregate_bucket,
-    _ingest_usage_event,
-    _finalize_usage_bucket,
-    _aggregate_usage_event_buckets,
-    _normalize_month_row,
-    _combine_month_rows,
-    _combine_usage_rows,
-    _usage_event_group_key,
-    _usage_event_session_descriptor,
 )
 
 
@@ -227,41 +71,38 @@ _initiator_policy = InitiatorPolicy()
 usage_event_bus = EventBus()
 
 
-def _current_usage_tracking_state() -> UsageTrackingState:
-    return UsageTrackingState(
-        usage_log_lock=_usage_log_lock,
-        recent_usage_events=_recent_usage_events,
-        archived_usage_events=_archived_usage_events,
-        session_request_id_lock=_session_request_id_lock,
-        latest_server_request_ids_by_chain=_latest_server_request_ids_by_chain,
-        active_server_request_ids_by_request=_active_server_request_ids_by_request,
-        latest_claude_user_session_contexts=_latest_claude_user_session_contexts,
-    )
+def get_initiator_policy() -> InitiatorPolicy:
+    return _initiator_policy
+
+
+def set_initiator_policy(policy: InitiatorPolicy):
+    global _initiator_policy
+    _initiator_policy = policy
+
+
+def _current_usage_tracking_state() -> usage_tracking.UsageTrackingState:
+    return usage_tracking.current_usage_tracking_state()
 
 
 usage_event_bus.subscribe(
-    REQUEST_FINISHED_EVENT,
+    usage_tracking.REQUEST_FINISHED_EVENT,
     lambda request_id, finished_at=None: _initiator_policy.note_request_finished(
         request_id,
         finished_at=finished_at,
     ),
 )
-usage_event_bus.subscribe(
-    USAGE_EVENT_RECORDED_EVENT,
-    lambda _event: _notify_dashboard_stream_listeners(),
-)
 
-usage_tracker = UsageTracker(
+usage_tracker = usage_tracking.UsageTracker(
     state=_current_usage_tracking_state(),
-    archive_store=UsageArchiveStore(
-        init_storage=lambda: _init_sqlite_cache(),
-        lock=_sqlite_cache_lock,
-        connect=lambda: _sqlite_connect(),
-        mark_unavailable=lambda error: _set_sqlite_cache_unavailable(error),
+    archive_store=usage_tracking.UsageArchiveStore(
+        init_storage=lambda: dashboard_module._init_sqlite_cache(),
+        lock=dashboard_module._sqlite_cache_lock,
+        connect=lambda: dashboard_module._sqlite_connect(),
+        mark_unavailable=lambda error: dashboard_module._set_sqlite_cache_unavailable(error),
     ),
     event_bus=usage_event_bus,
 )
-configure_usage_tracking(
+usage_tracking.configure_usage_tracking(
     state=usage_tracker.state,
     archive_store=usage_tracker.archive_store,
     event_bus=usage_event_bus,
@@ -282,26 +123,31 @@ def _current_proxy_settings() -> ProxySettings:
 _runtime = ProxyRuntime(
     settings_provider=_current_proxy_settings,
     auth_runtime=AuthRuntimeBindings(
-        load_api_key_payload=lambda: _load_api_key_payload(),
+        load_api_key_payload=lambda: auth.load_api_key_payload(),
     ),
     usage_tracking_runtime=UsageTrackingRuntimeBindings(
         state_provider=_current_usage_tracking_state,
     ),
 )
 
-dashboard_service = DashboardService(
-    dependencies=DashboardDependencies(
-        load_billing_token=lambda: _load_billing_token(),
-        load_access_token=lambda: _load_access_token(),
-        load_api_key_payload=lambda: _load_api_key_payload(),
-        snapshot_all_usage_events=lambda: _snapshot_all_usage_events(),
-        snapshot_usage_events=lambda: _snapshot_usage_events(),
+dashboard_service = dashboard_module.DashboardService(
+    dependencies=dashboard_module.DashboardDependencies(
+        load_billing_token=lambda: auth.load_billing_token(),
+        load_access_token=lambda: auth.load_access_token(),
+        load_api_key_payload=lambda: auth.load_api_key_payload(),
+        snapshot_all_usage_events=usage_tracker.snapshot_all_usage_events,
+        snapshot_usage_events=usage_tracker.snapshot_usage_events,
     ),
-    utc_now=lambda: _utc_now(),
-    utc_now_iso=lambda: _utc_now_iso(),
-    sqlite_cache_put=lambda cache_key, payload: _sqlite_cache_put(cache_key, payload),
-    notify_dashboard_stream_listeners=lambda: _notify_dashboard_stream_listeners(),
+    utc_now=util.utc_now,
+    utc_now_iso=util.utc_now_iso,
+    sqlite_cache_put=lambda cache_key, payload: dashboard_module._sqlite_cache_put(cache_key, payload),
+    notify_dashboard_stream_listeners=lambda: dashboard_module._notify_dashboard_stream_listeners(),
     thread_class=lambda: Thread,
+)
+
+usage_event_bus.subscribe(
+    usage_tracking.USAGE_EVENT_RECORDED_EVENT,
+    lambda _event: dashboard_service.notify_dashboard_stream_listeners(),
 )
 
 
@@ -310,27 +156,45 @@ dashboard_service = DashboardService(
 # request parsing errors.
 
 async def parse_json_request(request: Request) -> dict:
-    return await _parse_json_request_impl(request, error_callback=_record_request_error)
+    return await util.parse_json_request(request, error_callback=usage_tracker.record_request_error)
 
 
-# Runtime-backed compatibility surface for tests and route handlers.
-_codex_proxy_status = _runtime.codex_proxy_status
-_claude_proxy_status = _runtime.claude_proxy_status
-_write_codex_proxy_config = _runtime.write_codex_proxy_config
-_write_claude_proxy_settings = _runtime.write_claude_proxy_settings
-_disable_codex_proxy_config = _runtime.disable_codex_proxy_config
-_disable_claude_proxy_settings = _runtime.disable_claude_proxy_settings
-_proxy_client_status_payload = _runtime.proxy_client_status_payload
-_load_archived_usage_history = _runtime.load_archived_usage_history
-_load_usage_history = _runtime.load_usage_history
-_compact_usage_history_if_needed = _runtime.compact_usage_history_if_needed
-_finish_usage_event = _runtime.finish_usage_event
+codex_proxy_status = _runtime.codex_proxy_status
+claude_proxy_status = _runtime.claude_proxy_status
+write_codex_proxy_config = _runtime.write_codex_proxy_config
+write_claude_proxy_settings = _runtime.write_claude_proxy_settings
+disable_codex_proxy_config = _runtime.disable_codex_proxy_config
+disable_claude_proxy_settings = _runtime.disable_claude_proxy_settings
+proxy_client_status_payload = _runtime.proxy_client_status_payload
+
+
+def configured_upstream_timeout_seconds() -> int:
+    raw = str(os.environ.get("GHCP_UPSTREAM_TIMEOUT_SECONDS", "")).strip()
+    if not raw:
+        return DEFAULT_UPSTREAM_TIMEOUT_SECONDS
+    try:
+        value = int(raw)
+    except ValueError:
+        print(
+            f"Warning: ignoring invalid GHCP_UPSTREAM_TIMEOUT_SECONDS={raw!r}; using {DEFAULT_UPSTREAM_TIMEOUT_SECONDS}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return DEFAULT_UPSTREAM_TIMEOUT_SECONDS
+    if value <= 0:
+        print(
+            f"Warning: GHCP_UPSTREAM_TIMEOUT_SECONDS must be > 0; using {DEFAULT_UPSTREAM_TIMEOUT_SECONDS}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return DEFAULT_UPSTREAM_TIMEOUT_SECONDS
+    return value
 
 
 # ─── Initialization ──────────────────────────────────────────────────────────
 
 _runtime.initialize(_initiator_policy)
-seed_cached_payloads_from_sqlite()
+dashboard_module.seed_cached_payloads_from_sqlite()
 
 
 # ─── Upstream response helpers ────────────────────────────────────────────────
@@ -386,13 +250,13 @@ def _prepare_upstream_request(
     effective_api_key = api_key
     if effective_api_key is None:
         try:
-            effective_api_key = get_api_key()
+            effective_api_key = auth.get_api_key()
         except Exception as exc:
             return None, error_response(401, f"GHCP auth failed: {exc}")
 
     headers = header_builder(effective_api_key, request_id)
-    log_proxy_request(request, requested_model, resolved_model, headers.get("X-Initiator"))
-    usage_event = _start_usage_event(
+    usage_tracking.log_proxy_request(request, requested_model, resolved_model, headers.get("X-Initiator"))
+    usage_event = usage_tracker.start_event(
         request,
         requested_model,
         resolved_model,
@@ -417,14 +281,14 @@ def _prepare_upstream_request(
 
 async def _post_non_streaming_request(plan: UpstreamRequestPlan, *, error_response) -> Response:
     try:
-        async with httpx.AsyncClient(timeout=120) as client:
+        async with httpx.AsyncClient(timeout=configured_upstream_timeout_seconds()) as client:
             upstream = await throttled_client_post(
                 client,
                 plan.upstream_url,
                 headers=plan.headers,
                 json=plan.body,
             )
-        _finish_usage_event(
+        usage_tracker.finish_event(
             plan.usage_event,
             upstream.status_code,
             upstream=upstream,
@@ -433,11 +297,11 @@ async def _post_non_streaming_request(plan: UpstreamRequestPlan, *, error_respon
         )
         return proxy_non_streaming_response(upstream)
     except httpx.RequestError as exc:
-        status_code, message = _upstream_request_error_status_and_message(exc)
-        _finish_usage_event(plan.usage_event, status_code, response_text=message)
+        status_code, message = format_translation.upstream_request_error_status_and_message(exc)
+        usage_tracker.finish_event(plan.usage_event, status_code, response_text=message)
         return error_response(status_code, message)
     except Exception:
-        _finish_usage_event(plan.usage_event, 599)
+        usage_tracker.finish_event(plan.usage_event, 599)
         raise
 
 
@@ -492,19 +356,19 @@ async def proxy_streaming_response(
     try:
         upstream = await throttled_client_send(client, request, stream=True)
     except httpx.RequestError as exc:
-        status_code, message = _upstream_request_error_status_and_message(exc)
-        _finish_usage_event(usage_event, status_code, response_text=message)
+        status_code, message = format_translation.upstream_request_error_status_and_message(exc)
+        usage_tracker.finish_event(usage_event, status_code, response_text=message)
         await client.aclose()
-        return openai_error_response(status_code, message)
+        return format_translation.openai_error_response(status_code, message)
     except Exception:
-        _finish_usage_event(usage_event, 599)
+        usage_tracker.finish_event(usage_event, 599)
         await client.aclose()
         raise
 
     if upstream.status_code >= 400:
         try:
             await upstream.aread()
-            _finish_usage_event(
+            usage_tracker.finish_event(
                 usage_event,
                 upstream.status_code,
                 upstream=upstream,
@@ -522,14 +386,14 @@ async def proxy_streaming_response(
         response_headers["content-type"] = content_type
 
     async def stream_upstream():
-        capture = _SSEUsageCapture(stream_type)
+        capture = usage_tracker.create_sse_capture(stream_type)
         try:
             async for chunk in upstream.aiter_bytes():
                 if capture.feed(chunk):
-                    _mark_usage_event_first_output(usage_event)
+                    usage_tracker.mark_first_output(usage_event)
                 yield chunk
         finally:
-            _finish_usage_event(
+            usage_tracker.finish_event(
                 usage_event,
                 upstream.status_code,
                 upstream=upstream,
@@ -561,12 +425,12 @@ async def proxy_anthropic_streaming_response(
     try:
         upstream = await throttled_client_send(client, request, stream=True)
     except httpx.RequestError as exc:
-        status_code, message = _upstream_request_error_status_and_message(exc)
-        _finish_usage_event(usage_event, status_code, response_text=message)
+        status_code, message = format_translation.upstream_request_error_status_and_message(exc)
+        usage_tracker.finish_event(usage_event, status_code, response_text=message)
         await client.aclose()
-        return anthropic_error_response(status_code, message)
+        return format_translation.anthropic_error_response(status_code, message)
     except Exception:
-        _finish_usage_event(usage_event, 599)
+        usage_tracker.finish_event(usage_event, 599)
         await client.aclose()
         raise
 
@@ -574,15 +438,19 @@ async def proxy_anthropic_streaming_response(
         try:
             await upstream.aread()
             fallback_message = _extract_upstream_text(upstream) or f"Upstream request failed with status {upstream.status_code}"
-            error_payload = anthropic_error_payload_from_openai(_extract_upstream_json_payload(upstream), upstream.status_code, fallback_message)
-            _finish_usage_event(
+            error_payload = format_translation.anthropic_error_payload_from_openai(
+                _extract_upstream_json_payload(upstream),
+                upstream.status_code,
+                fallback_message,
+            )
+            usage_tracker.finish_event(
                 usage_event,
                 upstream.status_code,
                 upstream=upstream,
                 response_payload=error_payload,
                 response_text=error_payload.get("error", {}).get("message"),
             )
-            return anthropic_error_response_from_upstream(upstream)
+            return format_translation.anthropic_error_response_from_upstream(upstream)
         finally:
             await upstream.aclose()
             await client.aclose()
@@ -596,14 +464,14 @@ async def proxy_anthropic_streaming_response(
     async def stream_translated():
         translator = AnthropicStreamTranslator(
             fallback_model,
-            mark_first_output=lambda: _mark_usage_event_first_output(usage_event),
+            mark_first_output=lambda: usage_tracker.mark_first_output(usage_event),
         )
         try:
             async for event in translator.translate(upstream.aiter_bytes()):
                 yield event
         finally:
             response_payload = translator.build_response_payload()
-            _finish_usage_event(
+            usage_tracker.finish_event(
                 usage_event,
                 upstream.status_code,
                 upstream=upstream,
@@ -648,7 +516,7 @@ async def dashboard_api(request: Request):
 async def dashboard_stream(request: Request):
     heartbeat_seconds = 20
     poll_seconds = 1.0
-    queue = _register_dashboard_stream_listener()
+    queue = dashboard_module._register_dashboard_stream_listener()
     last_version = _runtime.dashboard_stream_version
 
     async def stream():
@@ -656,7 +524,7 @@ async def dashboard_stream(request: Request):
         last_heartbeat = time.monotonic()
         try:
             initial_payload = await asyncio.to_thread(dashboard_service.build_payload, False)
-            yield _sse_encode("dashboard", initial_payload)
+            yield format_translation.sse_encode("dashboard", initial_payload)
             while True:
                 if await request.is_disconnected():
                     break
@@ -667,16 +535,16 @@ async def dashboard_stream(request: Request):
                     now = time.monotonic()
                     if now - last_heartbeat >= heartbeat_seconds:
                         last_heartbeat = now
-                        yield _sse_encode("heartbeat", {"at": _utc_now_iso()})
+                        yield format_translation.sse_encode("heartbeat", {"at": util.utc_now_iso()})
                     continue
 
                 if version == last_version:
                     continue
                 last_version = version
                 payload = await asyncio.to_thread(dashboard_service.build_payload, False)
-                yield _sse_encode("dashboard", payload)
+                yield format_translation.sse_encode("dashboard", payload)
         finally:
-            _unregister_dashboard_stream_listener(queue)
+            dashboard_module._unregister_dashboard_stream_listener(queue)
 
     return StreamingResponse(
         stream(),
@@ -692,7 +560,7 @@ async def dashboard_stream(request: Request):
 
 @app.get("/api/config/billing-token")
 async def billing_token_status_api():
-    return JSONResponse(content=_billing_token_status())
+    return JSONResponse(content=auth.billing_token_status())
 
 
 @app.post("/api/config/billing-token")
@@ -702,8 +570,8 @@ async def billing_token_config_api(request: Request):
         raise HTTPException(status_code=400, detail="Request body must be an object")
 
     if bool(payload.get("clear")):
-        _clear_billing_token()
-        return JSONResponse(content=_billing_token_status())
+        auth.clear_billing_token()
+        return JSONResponse(content=auth.billing_token_status())
 
     token = payload.get("token")
     if token is None:
@@ -714,20 +582,20 @@ async def billing_token_config_api(request: Request):
     if not token:
         raise HTTPException(status_code=400, detail="Token must not be empty")
 
-    current_status = _billing_token_status()
+    current_status = auth.billing_token_status()
     if current_status.get("readonly"):
         raise HTTPException(
             status_code=409,
             detail="Billing token is configured via GHCP_GITHUB_BILLING_TOKEN and cannot be changed via UI.",
         )
 
-    _save_billing_token(token)
-    return JSONResponse(content=_billing_token_status())
+    auth.save_billing_token(token)
+    return JSONResponse(content=auth.billing_token_status())
 
 
 @app.get("/api/config/client-proxy")
 async def client_proxy_status_api():
-    return JSONResponse(content=_proxy_client_status_payload())
+    return JSONResponse(content=proxy_client_status_payload())
 
 
 @app.post("/api/config/client-proxy")
@@ -735,7 +603,7 @@ async def client_proxy_install_api(request: Request):
     payload = await parse_json_request(request)
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="Request body must be an object")
-    targets = _normalize_proxy_targets(payload)
+    targets = auth.normalize_proxy_targets(payload)
     action = payload.get("action", "enable")
     if not isinstance(action, str):
         raise HTTPException(status_code=400, detail='Action must be "enable" or "disable".')
@@ -752,15 +620,15 @@ async def client_proxy_install_api(request: Request):
         try:
             if action == "disable":
                 if target == "codex":
-                    clients[target] = _disable_codex_proxy_config()
+                    clients[target] = disable_codex_proxy_config()
                 else:
-                    clients[target] = _disable_claude_proxy_settings()
+                    clients[target] = disable_claude_proxy_settings()
             elif target == "codex":
-                clients[target] = _write_codex_proxy_config()
+                clients[target] = write_codex_proxy_config()
             else:
-                clients[target] = _write_claude_proxy_settings()
+                clients[target] = write_claude_proxy_settings()
         except Exception as exc:
-            clients[target] = _empty_proxy_status(
+            clients[target] = auth.empty_proxy_status(
                 target,
                 CODEX_CONFIG_FILE if target == "codex" else CLAUDE_SETTINGS_FILE,
             )
@@ -794,15 +662,18 @@ async def responses(request: Request):
     try:
         body = await parse_json_request(request)
     except HTTPException as exc:
-        return openai_error_response(exc.status_code, _http_exception_detail_to_message(exc.detail))
+        return format_translation.openai_error_response(
+            exc.status_code,
+            format_translation.http_exception_detail_to_message(exc.detail),
+        )
 
     # Sanitize input (multi-turn encrypted_content passthrough)
     raw_input = body.get("input")
-    has_compaction_input = input_contains_compaction(raw_input)
+    has_compaction_input = format_translation.input_contains_compaction(raw_input)
     if raw_input is not None:
-        body["input"] = sanitize_input(raw_input)
+        body["input"] = format_translation.sanitize_input(raw_input)
 
-    upstream_url = f"{_get_api_base().rstrip('/')}/responses"
+    upstream_url = f"{auth.get_api_base().rstrip('/')}/responses"
     plan, error_response = _prepare_upstream_request(
         request,
         body=body,
@@ -810,14 +681,14 @@ async def responses(request: Request):
         resolved_model=body.get("model"),
         upstream_path="/responses",
         upstream_url=upstream_url,
-        header_builder=lambda api_key, request_id: build_responses_headers_for_request(
+        header_builder=lambda api_key, request_id: format_translation.build_responses_headers_for_request(
             request,
             body,
             api_key,
             force_initiator="agent" if has_compaction_input else None,
             request_id=request_id,
         ),
-        error_response=openai_error_response,
+        error_response=format_translation.openai_error_response,
     )
     if error_response is not None:
         return error_response
@@ -831,7 +702,7 @@ async def responses(request: Request):
             usage_event=plan.usage_event,
             stream_type="responses",
         )
-    return await _post_non_streaming_request(plan, error_response=openai_error_response)
+    return await _post_non_streaming_request(plan, error_response=format_translation.openai_error_response)
 
 
 @app.post("/v1/responses/compact")
@@ -839,10 +710,13 @@ async def responses_compact(request: Request):
     try:
         body = await parse_json_request(request)
     except HTTPException as exc:
-        return openai_error_response(exc.status_code, _http_exception_detail_to_message(exc.detail))
+        return format_translation.openai_error_response(
+            exc.status_code,
+            format_translation.http_exception_detail_to_message(exc.detail),
+        )
 
-    summary_request = build_fake_compaction_request(body)
-    upstream_url = f"{_get_api_base().rstrip('/')}/responses"
+    summary_request = format_translation.build_fake_compaction_request(body)
+    upstream_url = f"{auth.get_api_base().rstrip('/')}/responses"
     plan, error_response = _prepare_upstream_request(
         request,
         body=summary_request,
@@ -850,20 +724,20 @@ async def responses_compact(request: Request):
         resolved_model=summary_request.get("model"),
         upstream_path="/responses",
         upstream_url=upstream_url,
-        header_builder=lambda api_key, request_id: build_responses_headers_for_request(
+        header_builder=lambda api_key, request_id: format_translation.build_responses_headers_for_request(
             request,
             summary_request,
             api_key,
             force_initiator="agent",
             request_id=request_id,
         ),
-        error_response=openai_error_response,
+        error_response=format_translation.openai_error_response,
     )
     if error_response is not None:
         return error_response
 
     try:
-        async with httpx.AsyncClient(timeout=120) as client:
+        async with httpx.AsyncClient(timeout=configured_upstream_timeout_seconds()) as client:
             upstream = await throttled_client_post(
                 client,
                 plan.upstream_url,
@@ -871,15 +745,15 @@ async def responses_compact(request: Request):
                 json=plan.body,
             )
     except httpx.RequestError as exc:
-        status_code, message = _upstream_request_error_status_and_message(exc)
-        _finish_usage_event(plan.usage_event, status_code, response_text=message)
-        return openai_error_response(status_code, message)
+        status_code, message = format_translation.upstream_request_error_status_and_message(exc)
+        usage_tracker.finish_event(plan.usage_event, status_code, response_text=message)
+        return format_translation.openai_error_response(status_code, message)
     except Exception:
-        _finish_usage_event(plan.usage_event, 599)
+        usage_tracker.finish_event(plan.usage_event, 599)
         raise
 
     if upstream.status_code >= 400:
-        _finish_usage_event(
+        usage_tracker.finish_event(
             plan.usage_event,
             upstream.status_code,
             upstream=upstream,
@@ -891,27 +765,27 @@ async def responses_compact(request: Request):
     try:
         upstream_payload = upstream.json()
     except json.JSONDecodeError as e:
-        _finish_usage_event(
+        usage_tracker.finish_event(
             plan.usage_event,
             502,
             upstream=upstream,
             response_text=f"Invalid JSON from upstream summarization response: {e}",
         )
-        return openai_error_response(502, f"Invalid JSON from upstream summarization response: {e}")
+        return format_translation.openai_error_response(502, f"Invalid JSON from upstream summarization response: {e}")
 
-    summary_text = extract_response_output_text(upstream_payload)
+    summary_text = format_translation.extract_response_output_text(upstream_payload)
     if not summary_text:
-        _finish_usage_event(
+        usage_tracker.finish_event(
             plan.usage_event,
             502,
             upstream=upstream,
             response_payload=upstream_payload,
             response_text="Upstream summarization response did not include assistant text output",
         )
-        return openai_error_response(502, "Upstream summarization response did not include assistant text output")
+        return format_translation.openai_error_response(502, "Upstream summarization response did not include assistant text output")
 
-    compacted_response = build_fake_compaction_response(body, summary_text, upstream_payload.get("usage"))
-    _finish_usage_event(
+    compacted_response = format_translation.build_fake_compaction_response(body, summary_text, upstream_payload.get("usage"))
+    usage_tracker.finish_event(
         plan.usage_event,
         upstream.status_code,
         upstream=upstream,
@@ -931,11 +805,14 @@ async def chat_completions(request: Request):
     try:
         body = await parse_json_request(request)
     except HTTPException as exc:
-        return openai_error_response(exc.status_code, _http_exception_detail_to_message(exc.detail))
+        return format_translation.openai_error_response(
+            exc.status_code,
+            format_translation.http_exception_detail_to_message(exc.detail),
+        )
 
     messages = body.get("messages", [])
 
-    upstream_url = f"{_get_api_base().rstrip('/')}/chat/completions"
+    upstream_url = f"{auth.get_api_base().rstrip('/')}/chat/completions"
     plan, error_response = _prepare_upstream_request(
         request,
         body=body,
@@ -943,14 +820,14 @@ async def chat_completions(request: Request):
         resolved_model=body.get("model"),
         upstream_path="/chat/completions",
         upstream_url=upstream_url,
-        header_builder=lambda api_key, request_id: build_chat_headers_for_request(
+        header_builder=lambda api_key, request_id: format_translation.build_chat_headers_for_request(
             request,
             messages,
             body.get("model"),
             api_key,
             request_id=request_id,
         ),
-        error_response=openai_error_response,
+        error_response=format_translation.openai_error_response,
     )
     if error_response is not None:
         return error_response
@@ -964,7 +841,7 @@ async def chat_completions(request: Request):
             usage_event=plan.usage_event,
             stream_type="chat",
         )
-    return await _post_non_streaming_request(plan, error_response=openai_error_response)
+    return await _post_non_streaming_request(plan, error_response=format_translation.openai_error_response)
 
 
 @app.post("/v1/messages")
@@ -977,18 +854,21 @@ async def anthropic_messages(request: Request):
     try:
         body = await parse_json_request(request)
     except HTTPException as exc:
-        return anthropic_error_response(exc.status_code, _http_exception_detail_to_message(exc.detail))
+        return format_translation.anthropic_error_response(
+            exc.status_code,
+            format_translation.http_exception_detail_to_message(exc.detail),
+        )
 
     try:
-        api_key = get_api_key()
+        api_key = auth.get_api_key()
     except Exception as exc:
-        return anthropic_error_response(401, f"GHCP auth failed: {exc}")
+        return format_translation.anthropic_error_response(401, f"GHCP auth failed: {exc}")
 
-    api_base = _get_api_base()
+    api_base = auth.get_api_base()
     try:
-        outbound_body = await anthropic_request_to_chat(body, api_base, api_key)
+        outbound_body = await format_translation.anthropic_request_to_chat(body, api_base, api_key)
     except ValueError as exc:
-        return anthropic_error_response(400, str(exc))
+        return format_translation.anthropic_error_response(400, str(exc))
 
     upstream_url = f"{api_base.rstrip('/')}/chat/completions"
     plan, error_response = _prepare_upstream_request(
@@ -998,13 +878,13 @@ async def anthropic_messages(request: Request):
         resolved_model=outbound_body.get("model"),
         upstream_path="/chat/completions",
         upstream_url=upstream_url,
-        header_builder=lambda resolved_api_key, request_id: build_anthropic_headers_for_request(
+        header_builder=lambda resolved_api_key, request_id: format_translation.build_anthropic_headers_for_request(
             request,
             body,
             resolved_api_key,
             request_id=request_id,
         ),
-        error_response=anthropic_error_response,
+        error_response=format_translation.anthropic_error_response,
         api_key=api_key,
     )
     if error_response is not None:
@@ -1021,7 +901,7 @@ async def anthropic_messages(request: Request):
         )
 
     try:
-        async with httpx.AsyncClient(timeout=120) as client:
+        async with httpx.AsyncClient(timeout=configured_upstream_timeout_seconds()) as client:
             upstream = await throttled_client_post(
                 client,
                 plan.upstream_url,
@@ -1030,22 +910,29 @@ async def anthropic_messages(request: Request):
             )
         if upstream.status_code >= 400:
             fallback_message = _extract_upstream_text(upstream) or f"Upstream request failed with status {upstream.status_code}"
-            error_payload = anthropic_error_payload_from_openai(_extract_upstream_json_payload(upstream), upstream.status_code, fallback_message)
-            _finish_usage_event(
+            error_payload = format_translation.anthropic_error_payload_from_openai(
+                _extract_upstream_json_payload(upstream),
+                upstream.status_code,
+                fallback_message,
+            )
+            usage_tracker.finish_event(
                 plan.usage_event,
                 upstream.status_code,
                 upstream=upstream,
                 response_payload=error_payload,
                 response_text=error_payload.get("error", {}).get("message"),
             )
-            return anthropic_error_response(
+            return format_translation.anthropic_error_response(
                 upstream.status_code,
                 error_payload["error"]["message"],
                 error_payload["error"]["type"],
                 {"retry-after": upstream.headers.get("retry-after")} if upstream.headers.get("retry-after") else None,
             )
-        translated = chat_completion_to_anthropic(upstream.json(), fallback_model=outbound_body.get("model"))
-        _finish_usage_event(
+        translated = format_translation.chat_completion_to_anthropic(
+            upstream.json(),
+            fallback_model=outbound_body.get("model"),
+        )
+        usage_tracker.finish_event(
             plan.usage_event,
             upstream.status_code,
             upstream=upstream,
@@ -1053,11 +940,11 @@ async def anthropic_messages(request: Request):
         )
         return JSONResponse(content=translated, status_code=upstream.status_code)
     except httpx.RequestError as exc:
-        status_code, message = _upstream_request_error_status_and_message(exc)
-        _finish_usage_event(plan.usage_event, status_code, response_text=message)
-        return anthropic_error_response(status_code, message)
+        status_code, message = format_translation.upstream_request_error_status_and_message(exc)
+        usage_tracker.finish_event(plan.usage_event, status_code, response_text=message)
+        return format_translation.anthropic_error_response(status_code, message)
     except Exception:
-        _finish_usage_event(plan.usage_event, 599)
+        usage_tracker.finish_event(plan.usage_event, 599)
         raise
 
 
@@ -1067,7 +954,7 @@ if __name__ == "__main__":
     # Step 1: Run auth interactively in the terminal BEFORE the server starts.
     # If no token exists this will print the device flow prompt and block until
     # the user authorizes (or the script exits on failure).
-    ensure_authenticated()
+    auth.ensure_authenticated()
 
     # Step 2: Start the server in the foreground on this terminal.
     print("Starting GHCP proxy on http://localhost:8000", flush=True)

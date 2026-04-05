@@ -28,6 +28,15 @@ From `~/sources/codex-proxy`:
 python3 proxy.py
 ```
 
+If upstream non-streaming requests are timing out, you can raise the proxy timeout before starting it:
+
+```bash
+export GHCP_UPSTREAM_TIMEOUT_SECONDS=300
+python3 proxy.py
+```
+
+`GHCP_UPSTREAM_TIMEOUT_SECONDS` applies to upstream non-streaming requests, including `/v1/responses/compact`. The default is `300` seconds.
+
 On first run, if no valid Copilot token is cached, the proxy will automatically start the GitHub device-flow login and prompt you in the terminal. After authorization, it caches the token and continues serving.
 
 When running correctly, the proxy listens on:

@@ -22,12 +22,12 @@ from constants import (
 )
 from util import (
     _json_default, _coerce_float, _coerce_int,
-    _utc_now, _utc_now_iso,
-    _normalize_usage_payload, _normalize_model_name,
+    utc_now, utc_now_iso,
+    normalize_usage_payload, _normalize_model_name,
     _usage_event_model_name, _usage_event_source,
     _usage_event_cost, _premium_request_multiplier,
     _server_request_chain_key, _is_claude_request,
-    _extract_item_text, _parse_iso_datetime,
+    extract_item_text, _parse_iso_datetime,
     _extract_payload_usage,
 )
 from event_bus import EventBus
@@ -135,7 +135,7 @@ def _publish_usage_tracking_event(event_name: str, *args, **kwargs):
 # Session / request context tracking
 # ---------------------------------------------------------------------------
 
-def _request_session_id(request: Request, request_body: dict | None = None) -> str | None:
+def request_session_id(request: Request, request_body: dict | None = None) -> str | None:
     for header_name in (
         "session_id",
         "session-id",
@@ -358,7 +358,7 @@ def _resolve_server_request_id(
         return explicit_server_request_id, explicit_server_request_id
 
     if session_id is None:
-        session_id = _request_session_id(request, request_body)
+        session_id = request_session_id(request, request_body)
     if client_request_id is None:
         client_request_id = request.headers.get("x-client-request-id")
     if subagent is None:
@@ -427,7 +427,7 @@ def _normalize_recorded_usage_event(payload: dict | None) -> dict | None:
         return None
 
     normalized_event = dict(payload)
-    normalized_usage = _normalize_usage_payload(normalized_event.get("usage"))
+    normalized_usage = normalize_usage_payload(normalized_event.get("usage"))
     if isinstance(normalized_usage, dict):
         normalized_event["usage"] = normalized_usage
         if normalized_event.get("cost_usd") is None:
@@ -460,7 +460,7 @@ def _usage_event_archive_summary(event: dict) -> dict:
         "cost_usd": round(_coerce_float(event.get("cost_usd")), 6),
     }
 
-    normalized_usage = _normalize_usage_payload(event.get("usage"))
+    normalized_usage = normalize_usage_payload(event.get("usage"))
     if isinstance(normalized_usage, dict):
         summary["usage"] = normalized_usage
 
@@ -504,7 +504,7 @@ def _load_archived_usage_history():
 # Persistence
 # ---------------------------------------------------------------------------
 
-def _rewrite_usage_log_locked(events: list[dict]):
+def rewrite_usage_log_locked(events: list[dict]):
     log_dir = os.path.dirname(USAGE_LOG_FILE) or TOKEN_DIR
     os.makedirs(log_dir, exist_ok=True)
     temp_fd, temp_path = tempfile.mkstemp(prefix="usage-log-", suffix=".jsonl", dir=log_dir)
@@ -554,7 +554,7 @@ def _compact_usage_history_if_needed():
         for event in events_to_archive:
             summary = _usage_event_archive_summary(event)
             archive_key = _usage_event_archive_key(summary)
-            recorded_at = summary.get("finished_at") or summary.get("started_at") or _utc_now_iso()
+            recorded_at = summary.get("finished_at") or summary.get("started_at") or utc_now_iso()
             archive_rows.append(
                 (
                     archive_key,
@@ -577,7 +577,7 @@ def _compact_usage_history_if_needed():
                         archive_rows,
                     )
                     connection.commit()
-            _rewrite_usage_log_locked(remaining_events)
+            rewrite_usage_log_locked(remaining_events)
         except Exception:
             _delete_archived_usage_events(archive_keys)
             return
@@ -661,22 +661,22 @@ class SSEUsageCapture:
 
     def _consume_chat_payload(self, payload: dict) -> bool:
         if isinstance(payload.get("usage"), dict):
-            self.usage = _normalize_usage_payload(payload["usage"])
+            self.usage = normalize_usage_payload(payload["usage"])
 
         choices = payload.get("choices")
         first_choice = choices[0] if isinstance(choices, list) and choices else {}
         delta = first_choice.get("delta") if isinstance(first_choice, dict) else {}
-        from format_translation import _extract_text_from_chat_delta
-        return self._has_text(_extract_text_from_chat_delta(delta))
+        from format_translation import extract_text_from_chat_delta
+        return self._has_text(extract_text_from_chat_delta(delta))
 
     def _consume_responses_payload(self, payload: dict) -> bool:
         event_type = str(payload.get("type", "")).strip().lower()
         response = payload.get("response")
         if isinstance(response, dict):
             if isinstance(response.get("usage"), dict):
-                self.usage = _normalize_usage_payload(response["usage"])
+                self.usage = normalize_usage_payload(response["usage"])
         elif isinstance(payload.get("usage"), dict):
-            self.usage = _normalize_usage_payload(payload["usage"])
+            self.usage = normalize_usage_payload(payload["usage"])
 
         has_output = False
         if event_type == "response.output_text.delta":
@@ -686,7 +686,7 @@ class SSEUsageCapture:
         if event_type == "response.output_item.added":
             item = payload.get("item")
             if isinstance(item, dict):
-                has_output = self._has_text(_extract_item_text(item))
+                has_output = self._has_text(extract_item_text(item))
         if event_type == "response.content_part.added":
             part = payload.get("part")
             if isinstance(part, dict):
@@ -707,8 +707,8 @@ class SSEUsageCapture:
 
         while "\n\n" in normalized:
             raw_block, normalized = normalized.split("\n\n", 1)
-            from format_translation import _parse_sse_block
-            _event_name, data = _parse_sse_block(raw_block)
+            from format_translation import parse_sse_block
+            _event_name, data = parse_sse_block(raw_block)
             if not data or data == "[DONE]":
                 continue
             try:
@@ -781,7 +781,7 @@ class UsageTracker:
             )
 
     def request_session_id(self, request: Request, request_body: dict | None = None) -> str | None:
-        return _request_session_id(request, request_body)
+        return request_session_id(request, request_body)
 
     def create_sse_capture(self, stream_type: str) -> SSEUsageCapture:
         return SSEUsageCapture(stream_type)
@@ -858,7 +858,7 @@ def _start_usage_event(
         isinstance(value, str) and value
         for value in (client_request_id, subagent)
     )
-    session_id = _request_session_id(request, request_body)
+    session_id = request_session_id(request, request_body)
     project_path = None
     session_id_origin = "request" if session_id else None
 
@@ -900,7 +900,7 @@ def _start_usage_event(
             outbound_headers["session_id"] = session_id
         outbound_headers["x-request-id"] = server_request_id
         outbound_headers["x-github-request-id"] = server_request_id
-    started_at = _utc_now_iso()
+    started_at = utc_now_iso()
     event = {
         "request_id": event_request_id,
         "started_at": started_at,
@@ -943,7 +943,7 @@ def _finish_usage_event(
     if not isinstance(event, dict):
         return
 
-    finished_at = _utc_now()
+    finished_at = utc_now()
     _forget_active_server_request_id(event.get("request_id"))
     _publish_usage_tracking_event(
         REQUEST_FINISHED_EVENT,
@@ -985,7 +985,7 @@ def _finish_usage_event(
 
     derived_usage = usage
     if isinstance(derived_usage, dict):
-        derived_usage = _normalize_usage_payload(derived_usage)
+        derived_usage = normalize_usage_payload(derived_usage)
     if derived_usage is None and isinstance(response_payload, dict):
         derived_usage = _extract_payload_usage(response_payload)
     if isinstance(derived_usage, dict):
