@@ -10,7 +10,7 @@ AGENT_INITIATOR_PREFIX = "_"
 REQUEST_FINISH_GUARD_SECONDS = 15.0
 
 
-def _utc_now() -> datetime:
+def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
@@ -267,7 +267,7 @@ class InitiatorPolicy:
         now: datetime | None = None,
         request_id: str | None = None,
     ) -> str:
-        resolved_now = now or _utc_now()
+        resolved_now = now or utc_now()
         with self._lock:
             initiator = self._resolve_locked(candidate_initiator, model_name, resolved_now, force_initiator)
             if isinstance(request_id, str) and request_id:
@@ -285,7 +285,7 @@ class InitiatorPolicy:
             return
         if initiator not in {AGENT_INITIATOR, USER_INITIATOR}:
             return
-        event_time = started_at or _utc_now()
+        event_time = started_at or utc_now()
         with self._lock:
             self._record_request_started_locked(request_id, initiator, event_time)
 
@@ -297,7 +297,7 @@ class InitiatorPolicy:
     ):
         if not isinstance(request_id, str) or not request_id:
             return
-        event_time = finished_at or _utc_now()
+        event_time = finished_at or utc_now()
         with self._lock:
             active = self._active_requests.pop(request_id, None)
             initiator = active.get("initiator") if isinstance(active, dict) else None

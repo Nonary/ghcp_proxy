@@ -8,6 +8,7 @@ from uuid import uuid4
 import httpx
 from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse
+import util
 
 from constants import (
     OPENCODE_VERSION, OPENCODE_HEADER_VERSION, OPENCODE_INTEGRATION_ID,
@@ -15,19 +16,16 @@ from constants import (
     FAKE_COMPACTION_PREFIX, FAKE_COMPACTION_SUMMARY_LABEL,
     COMPACTION_SUMMARY_PROMPT,
 )
-from util import _extract_item_text
-
-
 # ─── Lazy imports to avoid circular dependencies ─────────────────────────────
 
 def _get_initiator_policy():
     import proxy
-    return proxy._initiator_policy
+    return proxy.get_initiator_policy()
 
 
 def _get_request_session_id():
-    from usage_tracking import _request_session_id
-    return _request_session_id
+    from usage_tracking import request_session_id
+    return request_session_id
 
 
 # ─── Model resolution ────────────────────────────────────────────────────────
@@ -408,7 +406,7 @@ async def anthropic_request_to_chat(body: dict, api_base: str, api_key: str) -> 
 
 # ─── Chat → Anthropic translation ────────────────────────────────────────────
 
-def _chat_usage_to_anthropic(usage) -> dict:
+def chat_usage_to_anthropic(usage) -> dict:
     if not isinstance(usage, dict):
         return {
             "input_tokens": 0,
@@ -430,7 +428,7 @@ def _chat_usage_to_anthropic(usage) -> dict:
     }
 
 
-def _chat_stop_reason_to_anthropic(value) -> str | None:
+def chat_stop_reason_to_anthropic(value) -> str | None:
     mapping = {
         "stop": "end_turn",
         "length": "max_tokens",
@@ -499,7 +497,7 @@ def chat_completion_to_anthropic(payload: dict, fallback_model=None) -> dict:
     choices = payload.get("choices") if isinstance(payload, dict) else None
     first_choice = choices[0] if isinstance(choices, list) and choices else {}
     message = first_choice.get("message") if isinstance(first_choice, dict) else {}
-    usage = _chat_usage_to_anthropic(payload.get("usage") if isinstance(payload, dict) else {})
+    usage = chat_usage_to_anthropic(payload.get("usage") if isinstance(payload, dict) else {})
 
     return {
         "id": payload.get("id") if isinstance(payload, dict) else f"msg_{uuid4().hex}",
@@ -507,7 +505,7 @@ def chat_completion_to_anthropic(payload: dict, fallback_model=None) -> dict:
         "role": "assistant",
         "model": (payload.get("model") if isinstance(payload, dict) else None) or fallback_model,
         "content": _chat_message_to_anthropic_content(message if isinstance(message, dict) else {}),
-        "stop_reason": _chat_stop_reason_to_anthropic(first_choice.get("finish_reason") if isinstance(first_choice, dict) else None),
+        "stop_reason": chat_stop_reason_to_anthropic(first_choice.get("finish_reason") if isinstance(first_choice, dict) else None),
         "stop_sequence": None,
         "usage": usage,
     }
@@ -627,7 +625,7 @@ def openai_error_response(status_code: int, message: str, error_type: str | None
     return JSONResponse(content=payload, status_code=status_code, headers=headers)
 
 
-def _upstream_request_error_status_and_message(exc: httpx.RequestError) -> tuple[int, str]:
+def upstream_request_error_status_and_message(exc: httpx.RequestError) -> tuple[int, str]:
     if isinstance(exc, httpx.TimeoutException):
         prefix = "Upstream request timed out"
         status_code = 504
@@ -642,7 +640,7 @@ def _upstream_request_error_status_and_message(exc: httpx.RequestError) -> tuple
     return status_code, f"{prefix}: {detail}" if detail else prefix
 
 
-def _http_exception_detail_to_message(detail) -> str:
+def http_exception_detail_to_message(detail) -> str:
     if isinstance(detail, str) and detail:
         return detail
     if isinstance(detail, dict):
@@ -654,11 +652,11 @@ def _http_exception_detail_to_message(detail) -> str:
 
 # ─── SSE helpers ──────────────────────────────────────────────────────────────
 
-def _sse_encode(event_name: str, payload: dict) -> bytes:
+def sse_encode(event_name: str, payload: dict) -> bytes:
     return f"event: {event_name}\ndata: {json.dumps(payload, separators=(',', ':'))}\n\n".encode("utf-8")
 
 
-def _parse_sse_block(raw_block: str) -> tuple[str | None, str | None]:
+def parse_sse_block(raw_block: str) -> tuple[str | None, str | None]:
     event_name = None
     data_lines = []
     for line in raw_block.replace("\r\n", "\n").split("\n"):
@@ -674,7 +672,7 @@ def _parse_sse_block(raw_block: str) -> tuple[str | None, str | None]:
     return event_name, "\n".join(data_lines)
 
 
-async def _iter_sse_messages(byte_iter):
+async def iter_sse_messages(byte_iter):
     buffer = ""
     async for chunk in byte_iter:
         if isinstance(chunk, bytes):
@@ -685,19 +683,19 @@ async def _iter_sse_messages(byte_iter):
         normalized = buffer.replace("\r\n", "\n")
         while "\n\n" in normalized:
             raw_block, normalized = normalized.split("\n\n", 1)
-            event_name, data = _parse_sse_block(raw_block)
+            event_name, data = parse_sse_block(raw_block)
             if data is not None:
                 yield event_name, data
         buffer = normalized
 
     trailing = buffer.strip()
     if trailing:
-        event_name, data = _parse_sse_block(trailing)
+        event_name, data = parse_sse_block(trailing)
         if data is not None:
             yield event_name, data
 
 
-def _extract_text_from_chat_delta(delta) -> str:
+def extract_text_from_chat_delta(delta) -> str:
     if isinstance(delta, dict):
         content = delta.get("content")
         if isinstance(content, str):
@@ -713,7 +711,7 @@ def _extract_text_from_chat_delta(delta) -> str:
     return ""
 
 
-def _extract_tool_call_deltas(delta) -> list[dict]:
+def extract_tool_call_deltas(delta) -> list[dict]:
     if not isinstance(delta, dict):
         return []
     tool_calls = delta.get("tool_calls")
@@ -1064,7 +1062,7 @@ def extract_response_output_text(payload: dict) -> str | None:
             continue
         if str(item.get("role", "")).lower() != "assistant":
             continue
-        text = _extract_item_text(item).strip()
+        text = util.extract_item_text(item).strip()
         if text:
             parts.append(text)
 

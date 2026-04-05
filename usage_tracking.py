@@ -6,9 +6,11 @@ import os
 import tempfile
 import time
 from collections import deque
-from contextlib import closing
+from contextlib import closing, contextmanager
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from threading import Lock
+from typing import Callable
 from uuid import uuid4
 
 import httpx
@@ -20,14 +22,15 @@ from constants import (
 )
 from util import (
     _json_default, _coerce_float, _coerce_int,
-    _utc_now, _utc_now_iso,
-    _normalize_usage_payload, _normalize_model_name,
+    utc_now, utc_now_iso,
+    normalize_usage_payload, _normalize_model_name,
     _usage_event_model_name, _usage_event_source,
     _usage_event_cost, _premium_request_multiplier,
     _server_request_chain_key, _is_claude_request,
-    _extract_item_text, _parse_iso_datetime,
+    extract_item_text, _parse_iso_datetime,
     _extract_payload_usage,
 )
+from event_bus import EventBus
 
 
 # ---------------------------------------------------------------------------
@@ -44,19 +47,95 @@ _latest_claude_user_session_contexts: dict[tuple[str, str], dict[str, str | None
 
 
 # ---------------------------------------------------------------------------
-# Lazy accessors for cross-module dependencies
+# Runtime configuration
 # ---------------------------------------------------------------------------
 
-def _get_initiator_policy():
-    import proxy
-    return proxy._initiator_policy
+REQUEST_FINISHED_EVENT = "request_finished"
+USAGE_EVENT_RECORDED_EVENT = "usage_event_recorded"
+_EVENT_BUS_UNSET = object()
+
+
+@dataclass
+class UsageArchiveStore:
+    init_storage: Callable[[], bool] = lambda: False
+    lock: object = field(default_factory=Lock)
+    connect: Callable[[], object] = lambda: None
+    mark_unavailable: Callable[[str], None] = lambda error: None
+
+
+@dataclass
+class UsageTrackingState:
+    usage_log_lock: object = field(default_factory=Lock)
+    recent_usage_events: deque[dict] = field(default_factory=deque)
+    archived_usage_events: list[dict] = field(default_factory=list)
+    session_request_id_lock: object = field(default_factory=Lock)
+    latest_server_request_ids_by_chain: dict[tuple[str, str], str] = field(default_factory=dict)
+    active_server_request_ids_by_request: dict[str, dict[str, str | None]] = field(default_factory=dict)
+    latest_claude_user_session_contexts: dict[tuple[str, str], dict[str, str | None]] = field(default_factory=dict)
+
+
+_usage_archive_store = UsageArchiveStore()
+_usage_event_bus: EventBus | None = None
+
+
+def current_usage_tracking_state() -> UsageTrackingState:
+    return UsageTrackingState(
+        usage_log_lock=_usage_log_lock,
+        recent_usage_events=_recent_usage_events,
+        archived_usage_events=_archived_usage_events,
+        session_request_id_lock=_session_request_id_lock,
+        latest_server_request_ids_by_chain=_latest_server_request_ids_by_chain,
+        active_server_request_ids_by_request=_active_server_request_ids_by_request,
+        latest_claude_user_session_contexts=_latest_claude_user_session_contexts,
+    )
+
+
+def _apply_usage_tracking_state(state: UsageTrackingState):
+    global _usage_log_lock
+    global _recent_usage_events
+    global _archived_usage_events
+    global _session_request_id_lock
+    global _latest_server_request_ids_by_chain
+    global _active_server_request_ids_by_request
+    global _latest_claude_user_session_contexts
+
+    _usage_log_lock = state.usage_log_lock
+    _recent_usage_events = state.recent_usage_events
+    _archived_usage_events = state.archived_usage_events
+    _session_request_id_lock = state.session_request_id_lock
+    _latest_server_request_ids_by_chain = state.latest_server_request_ids_by_chain
+    _active_server_request_ids_by_request = state.active_server_request_ids_by_request
+    _latest_claude_user_session_contexts = state.latest_claude_user_session_contexts
+
+
+def configure_usage_tracking(
+    *,
+    state: UsageTrackingState | None = None,
+    archive_store: UsageArchiveStore | None = None,
+    event_bus: EventBus | None | object = _EVENT_BUS_UNSET,
+):
+    global _usage_archive_store
+    global _usage_event_bus
+
+    if state is not None:
+        _apply_usage_tracking_state(state)
+    if archive_store is not None:
+        _usage_archive_store = archive_store
+    if event_bus is not _EVENT_BUS_UNSET:
+        _usage_event_bus = event_bus
+
+
+def _publish_usage_tracking_event(event_name: str, *args, **kwargs):
+    if _usage_event_bus is None:
+        return
+    _usage_event_bus.publish(event_name, *args, **kwargs)
 
 
 # ---------------------------------------------------------------------------
 # Session / request context tracking
 # ---------------------------------------------------------------------------
 
-def _request_session_id(request: Request, request_body: dict | None = None) -> str | None:
+def request_session_id(request: Request, request_body: dict | None = None) -> str | None:
     for header_name in (
         "session_id",
         "session-id",
@@ -279,7 +358,7 @@ def _resolve_server_request_id(
         return explicit_server_request_id, explicit_server_request_id
 
     if session_id is None:
-        session_id = _request_session_id(request, request_body)
+        session_id = request_session_id(request, request_body)
     if client_request_id is None:
         client_request_id = request.headers.get("x-client-request-id")
     if subagent is None:
@@ -348,7 +427,7 @@ def _normalize_recorded_usage_event(payload: dict | None) -> dict | None:
         return None
 
     normalized_event = dict(payload)
-    normalized_usage = _normalize_usage_payload(normalized_event.get("usage"))
+    normalized_usage = normalize_usage_payload(normalized_event.get("usage"))
     if isinstance(normalized_usage, dict):
         normalized_event["usage"] = normalized_usage
         if normalized_event.get("cost_usd") is None:
@@ -381,7 +460,7 @@ def _usage_event_archive_summary(event: dict) -> dict:
         "cost_usd": round(_coerce_float(event.get("cost_usd")), 6),
     }
 
-    normalized_usage = _normalize_usage_payload(event.get("usage"))
+    normalized_usage = normalize_usage_payload(event.get("usage"))
     if isinstance(normalized_usage, dict):
         summary["usage"] = normalized_usage
 
@@ -397,24 +476,17 @@ def _usage_event_archive_key(summary: dict) -> str:
 
 
 def _load_archived_usage_history():
-    from dashboard import (
-        _init_sqlite_cache,
-        _sqlite_cache_lock,
-        _sqlite_connect,
-        _set_sqlite_cache_unavailable,
-    )
-
-    if not _init_sqlite_cache():
+    if not _usage_archive_store.init_storage():
         return
 
     try:
-        with _sqlite_cache_lock:
-            with closing(_sqlite_connect()) as connection:
+        with _usage_archive_store.lock:
+            with closing(_usage_archive_store.connect()) as connection:
                 rows = connection.execute(
                     "SELECT payload_json FROM archived_usage_events ORDER BY recorded_at ASC"
                 ).fetchall()
     except Exception as exc:
-        _set_sqlite_cache_unavailable(str(exc))
+        _usage_archive_store.mark_unavailable(str(exc))
         return
 
     _archived_usage_events.clear()
@@ -432,7 +504,7 @@ def _load_archived_usage_history():
 # Persistence
 # ---------------------------------------------------------------------------
 
-def _rewrite_usage_log_locked(events: list[dict]):
+def rewrite_usage_log_locked(events: list[dict]):
     log_dir = os.path.dirname(USAGE_LOG_FILE) or TOKEN_DIR
     os.makedirs(log_dir, exist_ok=True)
     temp_fd, temp_path = tempfile.mkstemp(prefix="usage-log-", suffix=".jsonl", dir=log_dir)
@@ -451,35 +523,26 @@ def _rewrite_usage_log_locked(events: list[dict]):
 
 
 def _delete_archived_usage_events(keys: list[str]):
-    from dashboard import (
-        _init_sqlite_cache,
-        _sqlite_cache_lock,
-        _sqlite_connect,
-        _set_sqlite_cache_unavailable,
-    )
-
-    if not keys or not _init_sqlite_cache():
+    if not keys or not _usage_archive_store.init_storage():
         return
     try:
-        with _sqlite_cache_lock:
-            with closing(_sqlite_connect()) as connection:
+        with _usage_archive_store.lock:
+            with closing(_usage_archive_store.connect()) as connection:
                 connection.executemany(
                     "DELETE FROM archived_usage_events WHERE archive_key = ?",
                     [(key,) for key in keys],
                 )
                 connection.commit()
     except Exception as exc:
-        _set_sqlite_cache_unavailable(str(exc))
+        _usage_archive_store.mark_unavailable(str(exc))
 
 
 def _compact_usage_history_if_needed():
-    from dashboard import _init_sqlite_cache, _sqlite_cache_lock, _sqlite_connect
-
     with _usage_log_lock:
         overflow = len(_recent_usage_events) - DETAILED_REQUEST_HISTORY_LIMIT
         if overflow <= 0:
             return
-        if not _init_sqlite_cache():
+        if not _usage_archive_store.init_storage():
             return
 
         detailed_events = list(_recent_usage_events)
@@ -491,7 +554,7 @@ def _compact_usage_history_if_needed():
         for event in events_to_archive:
             summary = _usage_event_archive_summary(event)
             archive_key = _usage_event_archive_key(summary)
-            recorded_at = summary.get("finished_at") or summary.get("started_at") or _utc_now_iso()
+            recorded_at = summary.get("finished_at") or summary.get("started_at") or utc_now_iso()
             archive_rows.append(
                 (
                     archive_key,
@@ -503,8 +566,8 @@ def _compact_usage_history_if_needed():
             archive_keys.append(archive_key)
 
         try:
-            with _sqlite_cache_lock:
-                with closing(_sqlite_connect()) as connection:
+            with _usage_archive_store.lock:
+                with closing(_usage_archive_store.connect()) as connection:
                     connection.executemany(
                         """
                         INSERT INTO archived_usage_events (archive_key, recorded_at, payload_json)
@@ -514,7 +577,7 @@ def _compact_usage_history_if_needed():
                         archive_rows,
                     )
                     connection.commit()
-            _rewrite_usage_log_locked(remaining_events)
+            rewrite_usage_log_locked(remaining_events)
         except Exception:
             _delete_archived_usage_events(archive_keys)
             return
@@ -567,8 +630,7 @@ def _record_usage_event(event: dict):
     _compact_usage_history_if_needed()
     _remember_server_request_id(event)
     _remember_latest_claude_user_session_context(event)
-    from dashboard import _notify_dashboard_stream_listeners
-    _notify_dashboard_stream_listeners()
+    _publish_usage_tracking_event(USAGE_EVENT_RECORDED_EVENT, event)
 
 
 def _record_request_error(event: dict):
@@ -586,7 +648,7 @@ def _record_request_error(event: dict):
 # SSE capture class
 # ---------------------------------------------------------------------------
 
-class _SSEUsageCapture:
+class SSEUsageCapture:
     def __init__(self, stream_type: str):
         self.stream_type = stream_type
         self.buffer = ""
@@ -599,22 +661,22 @@ class _SSEUsageCapture:
 
     def _consume_chat_payload(self, payload: dict) -> bool:
         if isinstance(payload.get("usage"), dict):
-            self.usage = _normalize_usage_payload(payload["usage"])
+            self.usage = normalize_usage_payload(payload["usage"])
 
         choices = payload.get("choices")
         first_choice = choices[0] if isinstance(choices, list) and choices else {}
         delta = first_choice.get("delta") if isinstance(first_choice, dict) else {}
-        from format_translation import _extract_text_from_chat_delta
-        return self._has_text(_extract_text_from_chat_delta(delta))
+        from format_translation import extract_text_from_chat_delta
+        return self._has_text(extract_text_from_chat_delta(delta))
 
     def _consume_responses_payload(self, payload: dict) -> bool:
         event_type = str(payload.get("type", "")).strip().lower()
         response = payload.get("response")
         if isinstance(response, dict):
             if isinstance(response.get("usage"), dict):
-                self.usage = _normalize_usage_payload(response["usage"])
+                self.usage = normalize_usage_payload(response["usage"])
         elif isinstance(payload.get("usage"), dict):
-            self.usage = _normalize_usage_payload(payload["usage"])
+            self.usage = normalize_usage_payload(payload["usage"])
 
         has_output = False
         if event_type == "response.output_text.delta":
@@ -624,7 +686,7 @@ class _SSEUsageCapture:
         if event_type == "response.output_item.added":
             item = payload.get("item")
             if isinstance(item, dict):
-                has_output = self._has_text(_extract_item_text(item))
+                has_output = self._has_text(extract_item_text(item))
         if event_type == "response.content_part.added":
             part = payload.get("part")
             if isinstance(part, dict):
@@ -645,8 +707,8 @@ class _SSEUsageCapture:
 
         while "\n\n" in normalized:
             raw_block, normalized = normalized.split("\n\n", 1)
-            from format_translation import _parse_sse_block
-            _event_name, data = _parse_sse_block(raw_block)
+            from format_translation import parse_sse_block
+            _event_name, data = parse_sse_block(raw_block)
             if not data or data == "[DONE]":
                 continue
             try:
@@ -660,6 +722,166 @@ class _SSEUsageCapture:
 
         self.buffer = normalized
         return saw_output
+
+
+_SSEUsageCapture = SSEUsageCapture
+
+
+class UsageTracker:
+    """
+    Public facade for usage tracking with injectable state and side effects.
+
+    The production proxy still uses the module-level compatibility functions.
+    This class provides a stable test surface so unit tests do not need to
+    target those private module functions directly.
+    """
+
+    def __init__(
+        self,
+        *,
+        state: UsageTrackingState | None = None,
+        archive_store: UsageArchiveStore | None = None,
+        event_bus: EventBus | None = None,
+    ):
+        self.state = state or current_usage_tracking_state()
+        self.archive_store = archive_store or _usage_archive_store
+        self.event_bus = event_bus
+
+    def configure(
+        self,
+        *,
+        state: UsageTrackingState | None = None,
+        archive_store: UsageArchiveStore | None = None,
+        event_bus: EventBus | None | object = _EVENT_BUS_UNSET,
+    ):
+        if state is not None:
+            self.state = state
+        if archive_store is not None:
+            self.archive_store = archive_store
+        if event_bus is not _EVENT_BUS_UNSET:
+            self.event_bus = event_bus
+
+    @contextmanager
+    def _bound_runtime(self):
+        previous_state = current_usage_tracking_state()
+        previous_archive_store = _usage_archive_store
+        previous_event_bus = _usage_event_bus
+        configure_usage_tracking(
+            state=self.state,
+            archive_store=self.archive_store,
+            event_bus=self.event_bus,
+        )
+        try:
+            yield
+        finally:
+            configure_usage_tracking(
+                state=previous_state,
+                archive_store=previous_archive_store,
+                event_bus=previous_event_bus,
+            )
+
+    def request_session_id(self, request: Request, request_body: dict | None = None) -> str | None:
+        return request_session_id(request, request_body)
+
+    def create_sse_capture(self, stream_type: str) -> SSEUsageCapture:
+        return SSEUsageCapture(stream_type)
+
+    def clear_state(self):
+        with self.state.usage_log_lock:
+            self.state.recent_usage_events.clear()
+            self.state.archived_usage_events.clear()
+        with self.state.session_request_id_lock:
+            self.state.latest_server_request_ids_by_chain.clear()
+            self.state.active_server_request_ids_by_request.clear()
+            self.state.latest_claude_user_session_contexts.clear()
+
+    def replace_history(
+        self,
+        *,
+        recent_events: list[dict] | None = None,
+        archived_events: list[dict] | None = None,
+    ):
+        normalized_recent = [
+            normalized
+            for event in (recent_events or [])
+            if (normalized := _normalize_recorded_usage_event(event)) is not None
+        ]
+        normalized_archived = [
+            normalized
+            for event in (archived_events or [])
+            if (normalized := _normalize_recorded_usage_event(event)) is not None
+        ]
+        with self.state.usage_log_lock:
+            self.state.recent_usage_events.clear()
+            self.state.recent_usage_events.extend(normalized_recent)
+            self.state.archived_usage_events.clear()
+            self.state.archived_usage_events.extend(normalized_archived)
+
+    def snapshot_archived_usage_events(self) -> list[dict]:
+        with self.state.usage_log_lock:
+            return list(self.state.archived_usage_events)
+
+    def remember_latest_server_request_id(
+        self,
+        session_id: str | None,
+        client_request_id: str | None,
+        subagent: str | None,
+        server_request_id: str | None,
+    ):
+        if not isinstance(server_request_id, str) or not server_request_id:
+            return
+        chain_key = _server_request_chain_key(session_id, client_request_id, subagent)
+        with self.state.session_request_id_lock:
+            self.state.latest_server_request_ids_by_chain[chain_key] = server_request_id
+
+    def start_event(self, *args, **kwargs) -> dict:
+        with self._bound_runtime():
+            return _start_usage_event(*args, **kwargs)
+
+    def mark_first_output(self, event: dict | None):
+        with self._bound_runtime():
+            _mark_usage_event_first_output(event)
+
+    def finish_event(self, *args, **kwargs):
+        with self._bound_runtime():
+            return _finish_usage_event(*args, **kwargs)
+
+    def load_archived_history(self):
+        with self._bound_runtime():
+            return _load_archived_usage_history()
+
+    def load_history(self):
+        with self._bound_runtime():
+            return _load_usage_history()
+
+    def compact_history_if_needed(self):
+        with self._bound_runtime():
+            return _compact_usage_history_if_needed()
+
+    def record_usage_event(self, event: dict):
+        with self._bound_runtime():
+            return _record_usage_event(event)
+
+    def record_request_error(self, event: dict):
+        with self._bound_runtime():
+            return _record_request_error(event)
+
+    def snapshot_usage_events(self) -> list[dict]:
+        with self._bound_runtime():
+            return _snapshot_usage_events()
+
+    def snapshot_all_usage_events(self) -> list[dict]:
+        with self._bound_runtime():
+            return _snapshot_all_usage_events()
+
+    def latest_server_request_id(
+        self,
+        session_id: str | None,
+        client_request_id: str | None,
+        subagent: str | None,
+    ) -> str | None:
+        with self._bound_runtime():
+            return _get_latest_server_request_id_for_request(session_id, client_request_id, subagent)
 
 
 # ---------------------------------------------------------------------------
@@ -684,7 +906,7 @@ def _start_usage_event(
         isinstance(value, str) and value
         for value in (client_request_id, subagent)
     )
-    session_id = _request_session_id(request, request_body)
+    session_id = request_session_id(request, request_body)
     project_path = None
     session_id_origin = "request" if session_id else None
 
@@ -726,7 +948,7 @@ def _start_usage_event(
             outbound_headers["session_id"] = session_id
         outbound_headers["x-request-id"] = server_request_id
         outbound_headers["x-github-request-id"] = server_request_id
-    started_at = _utc_now_iso()
+    started_at = utc_now_iso()
     event = {
         "request_id": event_request_id,
         "started_at": started_at,
@@ -769,9 +991,13 @@ def _finish_usage_event(
     if not isinstance(event, dict):
         return
 
-    finished_at = _utc_now()
+    finished_at = utc_now()
     _forget_active_server_request_id(event.get("request_id"))
-    _get_initiator_policy().note_request_finished(event.get("request_id"), finished_at=finished_at)
+    _publish_usage_tracking_event(
+        REQUEST_FINISHED_EVENT,
+        event.get("request_id"),
+        finished_at=finished_at,
+    )
     finished_event = {
         **{key: value for key, value in event.items() if not str(key).startswith("_")},
         "finished_at": finished_at.isoformat(),
@@ -807,7 +1033,7 @@ def _finish_usage_event(
 
     derived_usage = usage
     if isinstance(derived_usage, dict):
-        derived_usage = _normalize_usage_payload(derived_usage)
+        derived_usage = normalize_usage_payload(derived_usage)
     if derived_usage is None and isinstance(response_payload, dict):
         derived_usage = _extract_payload_usage(response_payload)
     if isinstance(derived_usage, dict):

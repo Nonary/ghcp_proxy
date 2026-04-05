@@ -46,12 +46,12 @@ def _coerce_int(value, default=0) -> int:
 # Datetime helpers
 # ---------------------------------------------------------------------------
 
-def _utc_now() -> datetime:
+def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _utc_now_iso() -> str:
-    return _utc_now().isoformat()
+def utc_now_iso() -> str:
+    return utc_now().isoformat()
 
 
 def _parse_iso_datetime(value: str | None) -> datetime | None:
@@ -68,7 +68,7 @@ def _month_key(value: datetime) -> str:
     return value.strftime("%Y-%m")
 
 
-def _month_key_for_source_row(source: str, row: dict) -> str | None:
+def month_key_for_source_row(source: str, row: dict) -> str | None:
     raw_value = row.get("month")
     if not isinstance(raw_value, str):
         return None
@@ -89,10 +89,10 @@ def _extract_payload_usage(payload: dict | None) -> dict | None:
         return None
 
     usage = payload.get("usage")
-    return _normalize_usage_payload(usage)
+    return normalize_usage_payload(usage)
 
 
-def _normalize_usage_payload(usage: dict | None) -> dict | None:
+def normalize_usage_payload(usage: dict | None) -> dict | None:
     if not isinstance(usage, dict):
         return None
 
@@ -293,7 +293,7 @@ def _premium_request_multiplier(model_name: str | None) -> float:
 # Content extraction helpers
 # ---------------------------------------------------------------------------
 
-def _extract_item_text(item) -> str:
+def extract_item_text(item) -> str:
     if not isinstance(item, dict):
         return ""
 
@@ -370,7 +370,7 @@ async def parse_json_request(request: Request, error_callback=None) -> dict:
         if error_callback is not None:
             error_callback(
                 {
-                    "at": _utc_now_iso(),
+                    "at": utc_now_iso(),
                     "path": path,
                     "content_type": content_type,
                     "content_encoding": content_encoding,
