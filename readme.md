@@ -78,7 +78,9 @@ Recommended `~/.claude/settings.json`:
   "env": {
     "ANTHROPIC_BASE_URL": "http://localhost:8000",
     "ANTHROPIC_AUTH_TOKEN": "sk-dummy",
-    "CLAUDE_CODE_DISABLE_1M_CONTEXT": "1"
+    "CLAUDE_CODE_DISABLE_1M_CONTEXT": "1",
+    "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "128000",
+    "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "64000"
   },
   "effortLevel": "medium"
 }
@@ -88,6 +90,9 @@ Important:
 
 - `ANTHROPIC_BASE_URL` should point at the proxy root, not `/v1`
 - `ANTHROPIC_AUTH_TOKEN` can be any placeholder string because the proxy handles upstream auth
+- `CLAUDE_CODE_MAX_CONTEXT_TOKENS` keeps Claude Code's local `/context` and auto-compact threshold aligned with the `128k` upstream input limit currently enforced on the Copilot-backed Claude path
+- `CLAUDE_CODE_MAX_OUTPUT_TOKENS` aligns Claude Code's default `max_tokens` budget with the `64k` upstream output limit
+- if you already enabled the proxy before these settings existed, re-enable Claude from the dashboard once so the missing caps are written into `~/.claude/settings.json`
 
 ## Billing Behavior
 

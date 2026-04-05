@@ -1599,6 +1599,75 @@ class ProxyInitiatorTests(unittest.TestCase):
             config_path.unlink(missing_ok=True)
             Path(f"{config_path}.ghcp-proxy.bak.20260404_180000").unlink(missing_ok=True)
 
+    def test_claude_proxy_status_requires_token_caps(self):
+        fd, raw_path = tempfile.mkstemp(prefix="claude-settings-", suffix=".json", dir=str(Path.cwd()))
+        os.close(fd)
+        settings_path = Path(raw_path)
+        try:
+            settings_path.write_text(
+                (
+                    '{\n'
+                    '  "env": {\n'
+                    '    "ANTHROPIC_BASE_URL": "http://localhost:8000",\n'
+                    '    "ANTHROPIC_AUTH_TOKEN": "sk-dummy",\n'
+                    '    "CLAUDE_CODE_DISABLE_1M_CONTEXT": "1"\n'
+                    '  }\n'
+                    '}\n'
+                ),
+                encoding="utf-8",
+            )
+
+            with mock.patch.object(proxy, "CLAUDE_SETTINGS_FILE", str(settings_path)):
+                status = proxy._claude_proxy_status()
+
+            self.assertFalse(status["configured"])
+            self.assertEqual(status["status_message"], "proxy configured, missing context cap and output cap")
+        finally:
+            settings_path.unlink(missing_ok=True)
+            for backup_path in settings_path.parent.glob(f"{settings_path.name}.ghcp-proxy.bak.*"):
+                backup_path.unlink(missing_ok=True)
+
+    def test_write_claude_proxy_settings_preserves_existing_keys_and_adds_context_cap(self):
+        fd, raw_path = tempfile.mkstemp(prefix="claude-settings-", suffix=".json", dir=str(Path.cwd()))
+        os.close(fd)
+        settings_path = Path(raw_path)
+        try:
+            settings_path.write_text(
+                (
+                    '{\n'
+                    '  "env": {\n'
+                    '    "ANTHROPIC_BASE_URL": "http://localhost:8000",\n'
+                    '    "ANTHROPIC_AUTH_TOKEN": "sk-dummy",\n'
+                    '    "CLAUDE_CODE_DISABLE_1M_CONTEXT": "1"\n'
+                    '  },\n'
+                    '  "skipDangerousModePermissionPrompt": true,\n'
+                    '  "model": "opus"\n'
+                    '}\n'
+                ),
+                encoding="utf-8",
+            )
+
+            with mock.patch.object(proxy, "CLAUDE_SETTINGS_FILE", str(settings_path)):
+                status = proxy._write_claude_proxy_settings()
+
+            written = proxy.json.loads(settings_path.read_text(encoding="utf-8"))
+            self.assertTrue(status["configured"])
+            self.assertEqual(
+                written["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"],
+                proxy.CLAUDE_MAX_CONTEXT_TOKENS,
+            )
+            self.assertEqual(
+                written["env"]["CLAUDE_CODE_MAX_OUTPUT_TOKENS"],
+                proxy.CLAUDE_MAX_OUTPUT_TOKENS,
+            )
+            self.assertTrue(written["skipDangerousModePermissionPrompt"])
+            self.assertEqual(written["model"], "opus")
+            self.assertEqual(written["effortLevel"], "medium")
+        finally:
+            settings_path.unlink(missing_ok=True)
+            for backup_path in settings_path.parent.glob(f"{settings_path.name}.ghcp-proxy.bak.*"):
+                backup_path.unlink(missing_ok=True)
+
     def test_month_key_for_source_rows(self):
         self.assertEqual(proxy._month_key_for_source_row("claude", {"month": "2026-04"}), "2026-04")
         self.assertEqual(proxy._month_key_for_source_row("codex", {"month": "Apr 2026"}), "2026-04")
