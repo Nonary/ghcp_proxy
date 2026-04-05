@@ -4244,11 +4244,13 @@ async def dashboard_api(request: Request):
 @app.get("/api/dashboard/stream")
 async def dashboard_stream(request: Request):
     heartbeat_seconds = 20
+    poll_seconds = 1.0
     queue = _register_dashboard_stream_listener()
     last_version = _dashboard_stream_version
 
     async def stream():
         nonlocal last_version
+        last_heartbeat = time.monotonic()
         try:
             initial_payload = await asyncio.to_thread(_build_dashboard_payload, False)
             yield _sse_encode("dashboard", initial_payload)
@@ -4257,9 +4259,12 @@ async def dashboard_stream(request: Request):
                     break
 
                 try:
-                    version = await asyncio.wait_for(queue.get(), timeout=heartbeat_seconds)
+                    version = await asyncio.wait_for(queue.get(), timeout=poll_seconds)
                 except asyncio.TimeoutError:
-                    yield _sse_encode("heartbeat", {"at": _utc_now_iso()})
+                    now = time.monotonic()
+                    if now - last_heartbeat >= heartbeat_seconds:
+                        last_heartbeat = now
+                        yield _sse_encode("heartbeat", {"at": _utc_now_iso()})
                     continue
 
                 if version == last_version:
@@ -4836,4 +4841,4 @@ if __name__ == "__main__":
 
     if sys.platform == "win32":
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    uvicorn.run(app, host="0.0.0.0", port=8000, access_log=False)
+    uvicorn.run(app, host="0.0.0.0", port=8000, access_log=False, timeout_graceful_shutdown=2)
