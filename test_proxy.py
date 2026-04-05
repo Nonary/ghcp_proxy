@@ -29,8 +29,6 @@ class ProxyInitiatorTests(unittest.TestCase):
                 "last_error": None,
                 "last_started_at": None,
             })
-        with proxy._claude_history_cache_lock:
-            proxy._claude_history_cache.update({"mtime": None, "size": None, "entries": []})
 
     def test_parse_json_request_accepts_gzip_encoded_body(self):
         raw = gzip.compress(b'{"model":"gpt-5","input":"hello"}')
@@ -346,7 +344,27 @@ class ProxyInitiatorTests(unittest.TestCase):
         self.assertEqual(event["session_id"], "session-123")
         self.assertEqual(outbound_headers["session_id"], "session-123")
 
-    def test_start_usage_event_infers_claude_session_id_from_local_history(self):
+    def test_start_usage_event_uses_claude_code_session_header(self):
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/messages"),
+            method="POST",
+            headers={"x-claude-code-session-id": "claude-session"},
+        )
+        outbound_headers = {}
+
+        event = proxy._start_usage_event(
+            request,
+            requested_model="claude-sonnet-4.6",
+            resolved_model="claude-sonnet-4.6",
+            initiator="user",
+            outbound_headers=outbound_headers,
+        )
+
+        self.assertEqual(event["session_id"], "claude-session")
+        self.assertEqual(event["session_id_origin"], "request")
+        self.assertEqual(outbound_headers["session_id"], "claude-session")
+
+    def test_start_usage_event_uses_claude_metadata_user_id_session_id(self):
         request = SimpleNamespace(
             url=SimpleNamespace(path="/v1/messages"),
             method="POST",
@@ -354,69 +372,49 @@ class ProxyInitiatorTests(unittest.TestCase):
         )
         outbound_headers = {}
 
-        with mock.patch.object(
-            proxy,
-            "_infer_claude_session_context",
-            return_value={
-                "session_id": "claude-session",
-                "project_path": "D:\\sources\\ghcp_proxy",
-                "session_id_origin": "claude_history",
+        event = proxy._start_usage_event(
+            request,
+            requested_model="claude-sonnet-4.6",
+            resolved_model="claude-sonnet-4.6",
+            initiator="user",
+            request_body={
+                "metadata": {
+                    "user_id": '{"device_id":"device-123","session_id":"claude-session"}'
+                }
             },
-        ):
-            event = proxy._start_usage_event(
-                request,
-                requested_model="claude-sonnet-4.6",
-                resolved_model="claude-sonnet-4.6",
-                initiator="user",
-                outbound_headers=outbound_headers,
-            )
+            outbound_headers=outbound_headers,
+        )
 
         self.assertEqual(event["session_id"], "claude-session")
-        self.assertEqual(event["session_id_origin"], "claude_history")
-        self.assertEqual(event["project_path"], "D:\\sources\\ghcp_proxy")
+        self.assertEqual(event["session_id_origin"], "request")
         self.assertEqual(outbound_headers["session_id"], "claude-session")
 
     def test_start_usage_event_agent_inherits_fallback_claude_session_context(self):
         user_request = SimpleNamespace(
             url=SimpleNamespace(path="/v1/messages"),
             method="POST",
-            headers={},
+            headers={"x-claude-code-session-id": "claude-session"},
         )
-        with mock.patch.object(
-            proxy,
-            "_infer_claude_session_context",
-            return_value={
-                "session_id": "claude-session",
-                "project_path": "D:\\sources\\ghcp_proxy",
-                "session_id_origin": "claude_history",
-            },
-        ):
-            user_event = proxy._start_usage_event(
-                user_request,
-                requested_model="claude-sonnet-4.6",
-                resolved_model="claude-sonnet-4.6",
-                initiator="user",
-            )
+        user_event = proxy._start_usage_event(
+            user_request,
+            requested_model="claude-sonnet-4.6",
+            resolved_model="claude-sonnet-4.6",
+            initiator="user",
+        )
 
         agent_request = SimpleNamespace(
             url=SimpleNamespace(path="/v1/messages"),
             method="POST",
             headers={},
         )
-        with mock.patch.object(
-            proxy,
-            "_infer_claude_session_context",
-            side_effect=AssertionError("agent request should reuse fallback session context"),
-        ):
-            agent_event = proxy._start_usage_event(
-                agent_request,
-                requested_model="claude-haiku-4.5",
-                resolved_model="claude-haiku-4.5",
-                initiator="agent",
-            )
+        agent_event = proxy._start_usage_event(
+            agent_request,
+            requested_model="claude-haiku-4.5",
+            resolved_model="claude-haiku-4.5",
+            initiator="agent",
+        )
 
         self.assertEqual(agent_event["session_id"], "claude-session")
-        self.assertEqual(agent_event["project_path"], "D:\\sources\\ghcp_proxy")
         self.assertEqual(agent_event["prior_server_request_id"], user_event["server_request_id"])
         self.assertEqual(agent_event["server_request_id"], user_event["server_request_id"])
 
@@ -716,33 +714,6 @@ class ProxyInitiatorTests(unittest.TestCase):
             proxy._get_latest_server_request_id_for_request("session-123", None, None),
             "server-abc",
         )
-
-    def test_load_usage_history_backfills_claude_session_from_local_history(self):
-        with (
-            mock.patch.object(proxy.os.path, "exists", return_value=True),
-            mock.patch(
-                "builtins.open",
-                return_value=io.StringIO(
-                    '{"server_request_id":"server-abc","started_at":"2026-04-05T13:39:34+00:00","finished_at":"2026-04-05T13:39:38+00:00","path":"/v1/messages","resolved_model":"claude-opus-4.6","usage":{"input_tokens":20,"output_tokens":4}}\n'
-                ),
-            ),
-            mock.patch.object(proxy, "_recent_usage_events", deque(maxlen=proxy.MAX_STORED_USAGE_EVENTS)),
-            mock.patch.object(
-                proxy,
-                "_infer_claude_session_context",
-                return_value={
-                    "session_id": "claude-session",
-                    "project_path": "D:\\sources\\ghcp_proxy",
-                    "session_id_origin": "claude_history",
-                },
-            ),
-        ):
-            proxy._load_usage_history()
-            events = list(proxy._recent_usage_events)
-
-        self.assertEqual(events[0]["session_id"], "claude-session")
-        self.assertEqual(events[0]["project_path"], "D:\\sources\\ghcp_proxy")
-        self.assertEqual(events[0]["session_id_origin"], "claude_history")
 
     def test_load_usage_history_normalizes_responses_usage_details(self):
         with (

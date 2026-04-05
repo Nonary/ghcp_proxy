@@ -73,7 +73,6 @@ CODEX_CONFIG_DIR    = os.path.expanduser("~/.codex")
 CODEX_CONFIG_FILE   = os.path.join(CODEX_CONFIG_DIR, "config.toml")
 CLAUDE_CONFIG_DIR   = os.path.expanduser("~/.claude")
 CLAUDE_SETTINGS_FILE = os.path.join(CLAUDE_CONFIG_DIR, "settings.json")
-CLAUDE_HISTORY_FILE = os.path.join(CLAUDE_CONFIG_DIR, "history.jsonl")
 CODEX_PROXY_CONFIG = """\
 model_provider = "custom"
 model = "gpt-5.4"
@@ -214,16 +213,7 @@ _premium_cache = {
     "last_error": None,
     "last_started_at": None,
 }
-_claude_history_cache_lock = Lock()
-_claude_history_cache = {
-    "mtime": None,
-    "size": None,
-    "entries": [],
-}
 PREMIUM_CACHE_TTL_SECONDS = 60.0
-CLAUDE_HISTORY_CACHE_MAX_ENTRIES = 400
-CLAUDE_HISTORY_MATCH_MAX_AGE_SECONDS = 300.0
-CLAUDE_HISTORY_FUTURE_SLOP_SECONDS = 15.0
 
 MODEL_PRICING = {
     "claude-haiku-3": {
@@ -578,7 +568,7 @@ def _server_request_chain_key(
 
 
 def _request_session_id(request: Request, request_body: dict | None = None) -> str | None:
-    for header_name in ("session_id", "session-id"):
+    for header_name in ("session_id", "session-id", "x-claude-code-session-id"):
         header_value = request.headers.get(header_name)
         if isinstance(header_value, str):
             normalized = header_value.strip()
@@ -592,6 +582,26 @@ def _request_session_id(request: Request, request_body: dict | None = None) -> s
                 normalized = value.strip()
                 if normalized:
                     return normalized
+        metadata = request_body.get("metadata")
+        if isinstance(metadata, dict):
+            user_id = metadata.get("user_id")
+            user_id_payload = None
+            if isinstance(user_id, str):
+                normalized = user_id.strip()
+                if normalized:
+                    try:
+                        user_id_payload = json.loads(normalized)
+                    except json.JSONDecodeError:
+                        user_id_payload = None
+            elif isinstance(user_id, dict):
+                user_id_payload = user_id
+            if isinstance(user_id_payload, dict):
+                for key in ("session_id", "sessionId"):
+                    value = user_id_payload.get(key)
+                    if isinstance(value, str):
+                        normalized = value.strip()
+                        if normalized:
+                            return normalized
 
     return None
 
@@ -626,115 +636,6 @@ def _get_fallback_session_context(
     with _session_request_id_lock:
         context = _latest_session_contexts_by_fallback_chain.get(fallback_key)
         return dict(context) if isinstance(context, dict) else None
-
-
-def _load_recent_claude_history_entries() -> list[dict]:
-    try:
-        stat = os.stat(CLAUDE_HISTORY_FILE)
-    except OSError:
-        with _claude_history_cache_lock:
-            _claude_history_cache.update({"mtime": None, "size": None, "entries": []})
-        return []
-
-    with _claude_history_cache_lock:
-        cached_mtime = _claude_history_cache.get("mtime")
-        cached_size = _claude_history_cache.get("size")
-        if cached_mtime == stat.st_mtime and cached_size == stat.st_size:
-            cached_entries = _claude_history_cache.get("entries")
-            return list(cached_entries) if isinstance(cached_entries, list) else []
-
-    entries = []
-    try:
-        with open(CLAUDE_HISTORY_FILE, encoding="utf-8") as f:
-            tail_lines = deque(f, maxlen=CLAUDE_HISTORY_CACHE_MAX_ENTRIES)
-    except OSError:
-        return []
-
-    for raw_line in tail_lines:
-        line = raw_line.strip()
-        if not line:
-            continue
-        try:
-            payload = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(payload, dict):
-            continue
-        session_id = payload.get("sessionId") or payload.get("session_id")
-        timestamp_ms = payload.get("timestamp")
-        project_path = payload.get("project")
-        if not isinstance(session_id, str) or not session_id:
-            continue
-        if not isinstance(project_path, str) or not project_path:
-            project_path = None
-        try:
-            timestamp = datetime.fromtimestamp(float(timestamp_ms) / 1000.0, tz=timezone.utc)
-        except (TypeError, ValueError, OSError):
-            continue
-        entries.append(
-            {
-                "session_id": session_id,
-                "project_path": project_path,
-                "timestamp": timestamp,
-                "display": payload.get("display"),
-            }
-        )
-
-    with _claude_history_cache_lock:
-        _claude_history_cache.update(
-            {
-                "mtime": stat.st_mtime,
-                "size": stat.st_size,
-                "entries": list(entries),
-            }
-        )
-    return entries
-
-
-def _infer_claude_session_context(now: datetime | None = None) -> dict[str, str | None] | None:
-    current = now or _utc_now()
-    entries = _load_recent_claude_history_entries()
-    if not entries:
-        return None
-
-    best = None
-    best_delta = None
-    for entry in reversed(entries):
-        timestamp = entry.get("timestamp")
-        if not isinstance(timestamp, datetime):
-            continue
-        delta_seconds = (current - timestamp).total_seconds()
-        if delta_seconds < -CLAUDE_HISTORY_FUTURE_SLOP_SECONDS:
-            continue
-        if delta_seconds > CLAUDE_HISTORY_MATCH_MAX_AGE_SECONDS:
-            break
-        if best is None or delta_seconds < best_delta:
-            best = entry
-            best_delta = delta_seconds
-
-    if best is None:
-        return None
-
-    return {
-        "session_id": best.get("session_id"),
-        "project_path": best.get("project_path"),
-        "session_id_origin": "claude_history",
-    }
-
-
-def _request_looks_like_claude(
-    request: Request,
-    requested_model: str | None,
-    resolved_model: str | None,
-) -> bool:
-    path = str(getattr(getattr(request, "url", None), "path", "") or "")
-    if path.endswith("/messages"):
-        return True
-    for candidate in (resolved_model, requested_model):
-        normalized = _normalize_model_name(candidate)
-        if isinstance(normalized, str) and normalized.startswith("claude-"):
-            return True
-    return False
 
 
 def _remember_server_request_id(event: dict | None):
@@ -928,18 +829,6 @@ def _apply_missing_claude_session_context(event: dict | None) -> dict | None:
     if isinstance(existing_session_id, str) and existing_session_id:
         return event
 
-    event_time = _parse_iso_datetime(event.get("started_at") or event.get("finished_at"))
-    inferred_context = _infer_claude_session_context(now=event_time) if event_time is not None else None
-    if not isinstance(inferred_context, dict):
-        return event
-
-    inferred_session_id = inferred_context.get("session_id")
-    inferred_project_path = inferred_context.get("project_path")
-    if isinstance(inferred_session_id, str) and inferred_session_id:
-        event["session_id"] = inferred_session_id
-        event.setdefault("session_id_origin", str(inferred_context.get("session_id_origin") or "claude_history"))
-    if isinstance(inferred_project_path, str) and inferred_project_path and not event.get("project_path"):
-        event["project_path"] = inferred_project_path
     return event
 
 
@@ -1733,17 +1622,6 @@ def _start_usage_event(
                 session_id_origin = "fallback_chain"
             if isinstance(inherited_project_path, str) and inherited_project_path:
                 project_path = inherited_project_path
-
-    if not session_id and _request_looks_like_claude(request, requested_model, resolved_model):
-        inferred_context = _infer_claude_session_context()
-        if isinstance(inferred_context, dict):
-            inferred_session_id = inferred_context.get("session_id")
-            inferred_project_path = inferred_context.get("project_path")
-            if isinstance(inferred_session_id, str) and inferred_session_id:
-                session_id = inferred_session_id
-                session_id_origin = str(inferred_context.get("session_id_origin") or "claude_history")
-            if isinstance(inferred_project_path, str) and inferred_project_path:
-                project_path = inferred_project_path
 
     server_request_id, prior_server_request_id = _resolve_server_request_id(
         request,
