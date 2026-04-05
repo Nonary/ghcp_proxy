@@ -1,7 +1,9 @@
 import compression.zstd as pyzstd
 import gzip
+import io
 import unittest
 import tempfile
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,6 +17,9 @@ import proxy
 class ProxyInitiatorTests(unittest.TestCase):
     def setUp(self):
         proxy._initiator_policy = initiator_policy.InitiatorPolicy()
+        with proxy._session_request_id_lock:
+            proxy._latest_server_request_ids_by_chain.clear()
+            proxy._active_server_request_ids_by_request.clear()
 
     def test_parse_json_request_accepts_gzip_encoded_body(self):
         raw = gzip.compress(b'{"model":"gpt-5","input":"hello"}')
@@ -234,6 +239,272 @@ class ProxyInitiatorTests(unittest.TestCase):
         outbound = proxy.asyncio.run(proxy.anthropic_request_to_chat(body, "https://example.invalid", "test-key"))
 
         self.assertEqual(outbound["stream_options"], {"include_usage": True})
+
+    def test_start_usage_event_tracks_metadata_only(self):
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/messages"),
+            method="POST",
+            headers={
+                "session_id": "session-123",
+                "x-client-request-id": "client-456",
+            },
+        )
+        outbound_body = {
+            "model": "claude-haiku-4.5",
+            "messages": [
+                {"role": "system", "content": "stay concise"},
+                {"role": "user", "content": [{"type": "text", "text": "inspect file.py"}]},
+            ],
+            "max_tokens": 1024,
+            "requestType": "ChatMessages",
+            "otherOptions": {"intent": "debug"},
+        }
+
+        event = proxy._start_usage_event(
+            request,
+            requested_model="claude-haiku-4-5-20251001",
+            resolved_model="claude-haiku-4.5",
+            initiator="agent",
+            request_id="req-123",
+            request_body=outbound_body,
+            upstream_path="/chat/completions",
+        )
+
+        self.assertEqual(event["request_id"], "req-123")
+        self.assertEqual(event["upstream_path"], "/chat/completions")
+        self.assertEqual(event["session_id"], "session-123")
+        self.assertEqual(event["client_request_id"], "client-456")
+        self.assertIsInstance(event["server_request_id"], str)
+        self.assertNotIn("request_text", event)
+        self.assertNotIn("request_options", event)
+        self.assertNotIn("request_payload", event)
+
+    def test_start_usage_event_agent_inherits_latest_session_server_request_id(self):
+        with proxy._session_request_id_lock:
+            proxy._latest_server_request_ids_by_chain[("session:session-123", "__root__")] = "server-prev"
+
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/responses"),
+            method="POST",
+            headers={"session_id": "session-123"},
+        )
+
+        event = proxy._start_usage_event(
+            request,
+            requested_model="gpt-5.4",
+            resolved_model="gpt-5.4",
+            initiator="agent",
+        )
+
+        self.assertEqual(event["prior_server_request_id"], "server-prev")
+        self.assertEqual(event["server_request_id"], "server-prev")
+
+    def test_start_usage_event_user_request_starts_new_server_request_id(self):
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/responses"),
+            method="POST",
+            headers={},
+        )
+
+        event = proxy._start_usage_event(
+            request,
+            requested_model="gpt-5.4",
+            resolved_model="gpt-5.4",
+            initiator="user",
+        )
+
+        self.assertIsInstance(event["server_request_id"], str)
+        self.assertIsNone(event["prior_server_request_id"])
+
+    def test_start_usage_event_agent_inherits_active_user_server_request_id(self):
+        user_request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/messages"),
+            method="POST",
+            headers={},
+        )
+        user_event = proxy._start_usage_event(
+            user_request,
+            requested_model="claude-sonnet-4.6",
+            resolved_model="claude-sonnet-4.6",
+            initiator="user",
+        )
+
+        agent_request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/messages"),
+            method="POST",
+            headers={},
+        )
+        agent_event = proxy._start_usage_event(
+            agent_request,
+            requested_model="claude-haiku-4.5",
+            resolved_model="claude-haiku-4.5",
+            initiator="agent",
+        )
+
+        self.assertEqual(agent_event["prior_server_request_id"], user_event["server_request_id"])
+        self.assertEqual(agent_event["server_request_id"], user_event["server_request_id"])
+
+    def test_start_usage_event_subagent_request_starts_its_own_server_request_id(self):
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/messages"),
+            method="POST",
+            headers={"x-openai-subagent": "worker-1"},
+        )
+
+        event = proxy._start_usage_event(
+            request,
+            requested_model="claude-haiku-4.5",
+            resolved_model="claude-haiku-4.5",
+            initiator="agent",
+        )
+
+        self.assertIsInstance(event["server_request_id"], str)
+        self.assertIsNone(event["prior_server_request_id"])
+
+    def test_start_usage_event_applies_server_request_id_to_outbound_headers(self):
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/messages"),
+            method="POST",
+            headers={},
+        )
+        outbound_headers = {}
+
+        event = proxy._start_usage_event(
+            request,
+            requested_model="claude-haiku-4.5",
+            resolved_model="claude-haiku-4.5",
+            initiator="user",
+            outbound_headers=outbound_headers,
+        )
+
+        self.assertEqual(outbound_headers["x-request-id"], event["server_request_id"])
+        self.assertEqual(outbound_headers["x-github-request-id"], event["server_request_id"])
+
+    def test_finish_usage_event_tracks_usage_and_timing(self):
+        event = {
+            "request_id": "req-999",
+            "resolved_model": "gpt-5.4",
+            "_started_monotonic": 10.0,
+            "_first_output_monotonic": 10.45,
+        }
+        response_payload = {
+            "id": "resp_123",
+            "model": "gpt-5.4",
+            "output_text": "done",
+            "usage": {"input_tokens": 11, "output_tokens": 7},
+        }
+        upstream = SimpleNamespace(headers={"x-request-id": "server-abc", "content-type": "application/json"})
+
+        with (
+            mock.patch.object(proxy.time, "perf_counter", return_value=12.0),
+            mock.patch.object(proxy, "_record_usage_event") as record_usage,
+            mock.patch.object(proxy._initiator_policy, "note_request_finished"),
+        ):
+            proxy._finish_usage_event(
+                event,
+                200,
+                upstream=upstream,
+                response_payload=response_payload,
+            )
+
+        record_usage.assert_called_once()
+        finished = record_usage.call_args.args[0]
+        self.assertEqual(finished["response_id"], "resp_123")
+        self.assertEqual(finished["upstream_request_id"], "server-abc")
+        self.assertEqual(finished["usage"]["input_tokens"], 11)
+        self.assertEqual(finished["duration_ms"], 2000)
+        self.assertEqual(finished["time_to_first_token_ms"], 450)
+        self.assertEqual(finished["premium_requests"], 1.0)
+        self.assertTrue(finished["success"])
+
+    def test_finish_usage_event_remembers_session_server_request_id(self):
+        event = {
+            "request_id": "req-999",
+            "resolved_model": "gpt-5.4",
+            "session_id": "session-123",
+            "server_request_id": "proxy-chain-123",
+        }
+        upstream = SimpleNamespace(headers={"x-request-id": "server-abc"})
+
+        with (
+            mock.patch.object(proxy, "_record_usage_event"),
+            mock.patch.object(proxy._initiator_policy, "note_request_finished"),
+        ):
+            proxy._finish_usage_event(event, 200, upstream=upstream)
+
+        self.assertEqual(
+            proxy._get_latest_server_request_id_for_request("session-123", None, None),
+            "proxy-chain-123",
+        )
+
+    def test_sse_usage_capture_extracts_token_usage(self):
+        capture = proxy._SSEUsageCapture("responses")
+
+        saw_output = capture.feed(
+            b'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"Hello"}\n\n'
+        )
+        capture.feed(
+            b'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_1","model":"gpt-5.4","usage":{"input_tokens":5,"output_tokens":2},"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hello"}]}]}}\n\n'
+        )
+
+        self.assertTrue(saw_output)
+        self.assertEqual(capture.usage["input_tokens"], 5)
+        self.assertEqual(capture.usage["output_tokens"], 2)
+        self.assertEqual(capture.usage["cached_input_tokens"], 0)
+
+    def test_sse_usage_capture_normalizes_cached_prompt_tokens(self):
+        capture = proxy._SSEUsageCapture("chat")
+        capture.feed(
+            b'event: message\ndata: {"id":"chatcmpl_1","choices":[{"delta":{"content":"Hi"}}],"usage":{"prompt_tokens":20,"completion_tokens":4,"prompt_tokens_details":{"cached_tokens":7}}}\n\n'
+        )
+
+        self.assertEqual(capture.usage["input_tokens"], 20)
+        self.assertEqual(capture.usage["output_tokens"], 4)
+        self.assertEqual(capture.usage["cached_input_tokens"], 7)
+
+    def test_build_responses_headers_for_request_forwards_latest_server_request_id(self):
+        with proxy._session_request_id_lock:
+            proxy._latest_server_request_ids_by_chain[("session:session-123", "__root__")] = "server-prev"
+
+        request = SimpleNamespace(
+            headers={"session_id": "session-123"},
+            url=SimpleNamespace(path="/v1/responses"),
+        )
+        body = {"model": "gpt-5.4", "input": "hello"}
+
+        headers = proxy.build_responses_headers_for_request(request, body, "test-key")
+
+        self.assertNotIn("x-request-id", headers)
+        self.assertNotIn("x-github-request-id", headers)
+
+    def test_build_responses_headers_for_request_preserves_incoming_server_request_id(self):
+        request = SimpleNamespace(
+            headers={"x-request-id": "server-prev"},
+            url=SimpleNamespace(path="/v1/responses"),
+        )
+        body = {"model": "gpt-5.4", "input": "hello"}
+
+        headers = proxy.build_responses_headers_for_request(request, body, "test-key")
+
+        self.assertEqual(headers["x-request-id"], "server-prev")
+        self.assertEqual(headers["x-github-request-id"], "server-prev")
+
+    def test_load_usage_history_normalizes_cached_tokens(self):
+        with (
+            mock.patch.object(proxy.os.path, "exists", return_value=True),
+            mock.patch("builtins.open", return_value=io.StringIO(
+                '{"session_id":"session-123","server_request_id":"server-abc","usage":{"prompt_tokens":20,"completion_tokens":4,"prompt_tokens_details":{"cached_tokens":7}}}\n'
+            )),
+            mock.patch.object(proxy, "_recent_usage_events", deque(maxlen=proxy.MAX_STORED_USAGE_EVENTS)),
+        ):
+            proxy._load_usage_history()
+            events = list(proxy._recent_usage_events)
+
+        self.assertEqual(events[0]["usage"]["cached_input_tokens"], 7)
+        self.assertEqual(
+            proxy._get_latest_server_request_id_for_request("session-123", None, None),
+            "server-abc",
+        )
 
     def test_chat_completion_to_anthropic_maps_cached_usage_tokens(self):
         payload = {
@@ -886,6 +1157,25 @@ class ProxyInitiatorTests(unittest.TestCase):
         self.assertEqual(payload["current_month"]["ccusage"]["total_tokens"], 400)
         self.assertEqual(payload["recent_sessions"][0]["source"], "codex")
         self.assertEqual(payload["recent_sessions"][1]["source"], "claude")
+
+    def test_normalize_session_claude_accepts_cached_input_tokens_shape(self):
+        normalized = proxy._normalize_session(
+            "claude",
+            {
+                "sessionId": "claude-session",
+                "lastActivity": "2026-04-05T01:32:10Z",
+                "inputTokens": 27700,
+                "outputTokens": 212,
+                "cachedInputTokens": 102300,
+                "totalTokens": 27912,
+                "costUSD": 1.25,
+                "models": {"claude-sonnet-4-6": {"inputTokens": 27700}},
+            },
+        )
+
+        self.assertEqual(normalized["cached_input_tokens"], 102300)
+        self.assertEqual(normalized["cost_usd"], 1.25)
+        self.assertEqual(normalized["models"], ["claude-sonnet-4-6"])
 
 
 if __name__ == "__main__":

@@ -100,6 +100,11 @@ FORWARDED_REQUEST_HEADERS = (
     "x-client-request-id",
     "x-openai-subagent",
 )
+FORWARDED_SERVER_REQUEST_ID_HEADERS = (
+    "x-request-id",
+    "request-id",
+    "x-github-request-id",
+)
 FAKE_COMPACTION_PREFIX = "ghcp_proxy_summary_v1:"
 FAKE_COMPACTION_SUMMARY_LABEL = "[Compacted conversation summary]"
 COMPACTION_SUMMARY_PROMPT = """Your task is to create a comprehensive, detailed summary of the entire conversation that captures all essential information needed to seamlessly continue the work without any loss of context. This summary will be used to compact the conversation while preserving critical technical details, decisions, and progress.
@@ -192,6 +197,9 @@ _upstream_rate_limit_lock = asyncio.Lock()
 _upstream_request_timestamps = deque()
 _usage_log_lock = Lock()
 _recent_usage_events = deque(maxlen=MAX_STORED_USAGE_EVENTS)
+_session_request_id_lock = Lock()
+_latest_server_request_ids_by_chain: dict[tuple[str, str], str] = {}
+_active_server_request_ids_by_request: dict[str, dict[str, str | None]] = {}
 _initiator_policy = InitiatorPolicy()
 _ccusage_cache_lock = Lock()
 _sqlite_cache_lock = Lock()
@@ -317,6 +325,189 @@ def _utc_now() -> datetime:
 
 def _utc_now_iso() -> str:
     return _utc_now().isoformat()
+
+
+def _extract_payload_usage(payload: dict | None) -> dict | None:
+    if not isinstance(payload, dict):
+        return None
+
+    usage = payload.get("usage")
+    return _normalize_usage_payload(usage)
+
+
+def _normalize_usage_payload(usage: dict | None) -> dict | None:
+    if not isinstance(usage, dict):
+        return None
+
+    input_tokens = usage.get("input_tokens")
+    if input_tokens is None:
+        input_tokens = usage.get("prompt_tokens")
+
+    output_tokens = usage.get("output_tokens")
+    if output_tokens is None:
+        output_tokens = usage.get("completion_tokens")
+
+    cached_tokens = usage.get("cache_read_input_tokens")
+    if cached_tokens is None:
+        cached_tokens = usage.get("cached_input_tokens")
+    if cached_tokens is None:
+        details = usage.get("prompt_tokens_details")
+        if isinstance(details, dict):
+            cached_tokens = details.get("cached_tokens")
+
+    cache_creation_tokens = usage.get("cache_creation_input_tokens")
+    reasoning_tokens = usage.get("reasoning_output_tokens", 0)
+    total_tokens = usage.get("total_tokens")
+    if total_tokens is None:
+        total_tokens = usage.get("totalTokens")
+
+    normalized_input_tokens = _coerce_int(input_tokens, default=0)
+    normalized_output_tokens = _coerce_int(output_tokens, default=0)
+    normalized_cached_tokens = _coerce_int(cached_tokens, default=0)
+    normalized_cache_creation_tokens = _coerce_int(cache_creation_tokens, default=0)
+    normalized_reasoning_tokens = _coerce_int(reasoning_tokens, default=0)
+    normalized_total_tokens = _coerce_int(total_tokens, default=None)
+    if normalized_total_tokens is None:
+        normalized_total_tokens = normalized_input_tokens + normalized_output_tokens
+
+    return {
+        "input_tokens": normalized_input_tokens,
+        "output_tokens": normalized_output_tokens,
+        "total_tokens": normalized_total_tokens,
+        "cached_input_tokens": normalized_cached_tokens,
+        "cache_creation_input_tokens": normalized_cache_creation_tokens,
+        "reasoning_output_tokens": normalized_reasoning_tokens,
+    }
+
+
+def _server_request_chain_key(
+    session_id: str | None,
+    client_request_id: str | None,
+    subagent: str | None,
+) -> tuple[str, str]:
+    scope = None
+    if isinstance(session_id, str) and session_id:
+        scope = f"session:{session_id}"
+    elif isinstance(client_request_id, str) and client_request_id:
+        scope = f"client:{client_request_id}"
+    else:
+        scope = "global"
+    normalized_subagent = subagent if isinstance(subagent, str) and subagent else "__root__"
+    return (scope, normalized_subagent)
+
+
+def _remember_server_request_id(event: dict | None):
+    if not isinstance(event, dict):
+        return
+    chain_key = _server_request_chain_key(
+        event.get("session_id"),
+        event.get("client_request_id"),
+        event.get("subagent"),
+    )
+    server_request_id = event.get("server_request_id")
+    if not isinstance(server_request_id, str) or not server_request_id:
+        return
+    with _session_request_id_lock:
+        _latest_server_request_ids_by_chain[chain_key] = server_request_id
+
+
+def _remember_active_server_request_id(event: dict | None):
+    if not isinstance(event, dict):
+        return
+    request_id = event.get("request_id")
+    server_request_id = event.get("server_request_id")
+    if not isinstance(request_id, str) or not request_id:
+        return
+    if not isinstance(server_request_id, str) or not server_request_id:
+        return
+    with _session_request_id_lock:
+        _active_server_request_ids_by_request[request_id] = {
+            "session_id": event.get("session_id"),
+            "client_request_id": event.get("client_request_id"),
+            "subagent": event.get("subagent"),
+            "initiator": event.get("initiator"),
+            "server_request_id": server_request_id,
+        }
+
+
+def _forget_active_server_request_id(request_id: str | None):
+    if not isinstance(request_id, str) or not request_id:
+        return
+    with _session_request_id_lock:
+        _active_server_request_ids_by_request.pop(request_id, None)
+
+
+def _get_active_server_request_id_for_request(
+    session_id: str | None,
+    client_request_id: str | None,
+    subagent: str | None,
+    *,
+    initiator: str | None = None,
+) -> str | None:
+    target_scope = _server_request_chain_key(session_id, client_request_id, subagent)
+    with _session_request_id_lock:
+        for context in reversed(list(_active_server_request_ids_by_request.values())):
+            context_scope = _server_request_chain_key(
+                context.get("session_id"),
+                context.get("client_request_id"),
+                context.get("subagent"),
+            )
+            if context_scope != target_scope:
+                continue
+            if initiator is not None and context.get("initiator") != initiator:
+                continue
+            server_request_id = context.get("server_request_id")
+            if isinstance(server_request_id, str) and server_request_id:
+                return server_request_id
+    return None
+
+
+def _get_latest_server_request_id_for_request(
+    session_id: str | None,
+    client_request_id: str | None,
+    subagent: str | None,
+) -> str | None:
+    chain_key = _server_request_chain_key(session_id, client_request_id, subagent)
+    with _session_request_id_lock:
+        return _latest_server_request_ids_by_chain.get(chain_key)
+
+
+def _resolve_server_request_id(
+    request: Request,
+    initiator: str | None,
+) -> tuple[str, str | None]:
+    explicit_server_request_id = (
+        request.headers.get("x-request-id")
+        or request.headers.get("request-id")
+        or request.headers.get("x-github-request-id")
+    )
+    if explicit_server_request_id:
+        return explicit_server_request_id, explicit_server_request_id
+
+    session_id = request.headers.get("session_id")
+    client_request_id = request.headers.get("x-client-request-id")
+    subagent = request.headers.get("x-openai-subagent")
+
+    if initiator == "agent":
+        active_server_request_id = _get_active_server_request_id_for_request(
+            session_id,
+            client_request_id,
+            subagent,
+            initiator="user",
+        )
+        if isinstance(active_server_request_id, str) and active_server_request_id:
+            return active_server_request_id, active_server_request_id
+
+        prior_server_request_id = _get_latest_server_request_id_for_request(
+            session_id,
+            client_request_id,
+            subagent,
+        )
+        if isinstance(prior_server_request_id, str) and prior_server_request_id:
+            return prior_server_request_id, prior_server_request_id
+
+    generated_server_request_id = str(uuid4())
+    return generated_server_request_id, explicit_server_request_id
 
 
 def _normalize_model_name(model_name: str | None) -> str | None:
@@ -824,7 +1015,11 @@ def _load_usage_history():
                 except json.JSONDecodeError:
                     continue
                 if isinstance(payload, dict):
+                    normalized_usage = _normalize_usage_payload(payload.get("usage"))
+                    if isinstance(normalized_usage, dict):
+                        payload["usage"] = normalized_usage
                     _recent_usage_events.append(payload)
+                    _remember_server_request_id(payload)
     except OSError:
         pass
 
@@ -840,6 +1035,7 @@ def _record_usage_event(event: dict):
             f.write(serialized)
             f.write("\n")
         _recent_usage_events.append(event)
+    _remember_server_request_id(event)
 
 
 def _record_request_error(event: dict):
@@ -853,45 +1049,185 @@ def _record_request_error(event: dict):
         f.write("\n")
 
 
+class _SSEUsageCapture:
+    def __init__(self, stream_type: str):
+        self.stream_type = stream_type
+        self.buffer = ""
+        self.usage = None
+
+    def _has_text(self, value) -> bool:
+        if not isinstance(value, str):
+            return False
+        return bool(value.strip())
+
+    def _consume_chat_payload(self, payload: dict) -> bool:
+        if isinstance(payload.get("usage"), dict):
+            self.usage = _normalize_usage_payload(payload["usage"])
+
+        choices = payload.get("choices")
+        first_choice = choices[0] if isinstance(choices, list) and choices else {}
+        delta = first_choice.get("delta") if isinstance(first_choice, dict) else {}
+        return self._has_text(_extract_text_from_chat_delta(delta))
+
+    def _consume_responses_payload(self, payload: dict) -> bool:
+        event_type = str(payload.get("type", "")).strip().lower()
+        response = payload.get("response")
+        if isinstance(response, dict):
+            if isinstance(response.get("usage"), dict):
+                self.usage = _normalize_usage_payload(response["usage"])
+        elif isinstance(payload.get("usage"), dict):
+            self.usage = _normalize_usage_payload(payload["usage"])
+
+        has_output = False
+        if event_type == "response.output_text.delta":
+            has_output = self._has_text(payload.get("delta"))
+        if event_type == "response.output_text.done":
+            has_output = self._has_text(payload.get("text"))
+        if event_type == "response.output_item.added":
+            item = payload.get("item")
+            if isinstance(item, dict):
+                has_output = self._has_text(_extract_item_text(item))
+        if event_type == "response.content_part.added":
+            part = payload.get("part")
+            if isinstance(part, dict):
+                has_output = self._has_text(
+                    part.get("text") or part.get("input_text") or part.get("output_text")
+                )
+        return has_output
+
+    def feed(self, chunk) -> bool:
+        if isinstance(chunk, bytes):
+            text = chunk.decode("utf-8", errors="replace")
+        else:
+            text = str(chunk)
+
+        self.buffer += text
+        normalized = self.buffer.replace("\r\n", "\n")
+        saw_output = False
+
+        while "\n\n" in normalized:
+            raw_block, normalized = normalized.split("\n\n", 1)
+            _event_name, data = _parse_sse_block(raw_block)
+            if not data or data == "[DONE]":
+                continue
+            try:
+                payload = json.loads(data)
+            except json.JSONDecodeError:
+                continue
+            if self.stream_type == "chat":
+                saw_output = self._consume_chat_payload(payload) or saw_output
+            else:
+                saw_output = self._consume_responses_payload(payload) or saw_output
+
+        self.buffer = normalized
+        return saw_output
+
+
 def _start_usage_event(
     request: Request,
     requested_model: str | None,
     resolved_model: str | None,
     initiator: str | None,
     request_id: str | None = None,
+    request_body: dict | None = None,
+    upstream_path: str | None = None,
+    outbound_headers: dict | None = None,
 ) -> dict:
+    server_request_id, prior_server_request_id = _resolve_server_request_id(request, initiator)
+    if isinstance(outbound_headers, dict):
+        outbound_headers["x-request-id"] = server_request_id
+        outbound_headers["x-github-request-id"] = server_request_id
     event = {
         "request_id": request_id or uuid4().hex,
         "started_at": _utc_now_iso(),
         "path": request.url.path,
         "method": request.method,
+        "upstream_path": upstream_path,
         "requested_model": requested_model,
         "resolved_model": resolved_model or requested_model,
         "initiator": initiator,
         "session_id": request.headers.get("session_id"),
         "client_request_id": request.headers.get("x-client-request-id"),
         "subagent": request.headers.get("x-openai-subagent"),
+        "server_request_id": server_request_id,
+        "prior_server_request_id": prior_server_request_id,
+        "_started_monotonic": time.perf_counter(),
     }
+    _remember_server_request_id(event)
+    _remember_active_server_request_id(event)
     return event
 
 
-def _finish_usage_event(event: dict | None, status_code: int):
+def _mark_usage_event_first_output(event: dict | None):
+    if not isinstance(event, dict):
+        return
+    if event.get("_first_output_monotonic") is None:
+        event["_first_output_monotonic"] = time.perf_counter()
+
+
+def _finish_usage_event(
+    event: dict | None,
+    status_code: int,
+    *,
+    upstream: httpx.Response | None = None,
+    response_payload: dict | None = None,
+    response_text: str | None = None,
+    usage: dict | None = None,
+):
     if not isinstance(event, dict):
         return
 
     finished_at = _utc_now()
+    _forget_active_server_request_id(event.get("request_id"))
     _initiator_policy.note_request_finished(event.get("request_id"), finished_at=finished_at)
-
-    if status_code >= 400:
-        return
-
-    model_name = event.get("resolved_model") or event.get("requested_model")
     finished_event = {
-        **event,
+        **{key: value for key, value in event.items() if not str(key).startswith("_")},
         "finished_at": finished_at.isoformat(),
         "status_code": status_code,
-        "premium_requests": _premium_request_multiplier(model_name),
+        "success": status_code < 400,
     }
+
+    started_monotonic = event.get("_started_monotonic")
+    if isinstance(started_monotonic, (int, float)):
+        finished_event["duration_ms"] = max(0, int(round((time.perf_counter() - started_monotonic) * 1000)))
+
+    first_output_monotonic = event.get("_first_output_monotonic")
+    if isinstance(started_monotonic, (int, float)) and isinstance(first_output_monotonic, (int, float)):
+        finished_event["time_to_first_token_ms"] = max(0, int(round((first_output_monotonic - started_monotonic) * 1000)))
+
+    if upstream is not None:
+        for header_name in ("x-request-id", "request-id", "x-github-request-id"):
+            header_value = upstream.headers.get(header_name)
+            if header_value:
+                finished_event["upstream_request_id"] = header_value
+                break
+        content_type = upstream.headers.get("content-type")
+        if content_type:
+            finished_event["response_content_type"] = content_type
+
+    if isinstance(response_payload, dict):
+        payload_response_id = response_payload.get("id")
+        if isinstance(payload_response_id, str):
+            finished_event["response_id"] = payload_response_id
+        payload_model = response_payload.get("model")
+        if isinstance(payload_model, str):
+            finished_event["response_model"] = payload_model
+
+    derived_usage = usage
+    if isinstance(derived_usage, dict):
+        derived_usage = _normalize_usage_payload(derived_usage)
+    if derived_usage is None and isinstance(response_payload, dict):
+        derived_usage = _extract_payload_usage(response_payload)
+    if isinstance(derived_usage, dict):
+        finished_event["usage"] = derived_usage
+
+    model_name = (
+        finished_event.get("response_model")
+        or finished_event.get("resolved_model")
+        or finished_event.get("requested_model")
+    )
+    finished_event["premium_requests"] = _premium_request_multiplier(model_name) if status_code < 400 else 0.0
+    _remember_server_request_id(finished_event)
     _record_usage_event(finished_event)
 
 
@@ -1196,10 +1532,16 @@ def _month_key_for_source_row(source: str, row: dict) -> str | None:
 
 def _normalize_session(source: str, session: dict) -> dict:
     if source == "claude":
-        models = session.get("modelsUsed") or []
+        models = session.get("modelsUsed") or list((session.get("models") or {}).keys())
         cost_usd = _coerce_float(session.get("totalCost"))
+        if cost_usd == 0.0 and session.get("costUSD") is not None:
+            cost_usd = _coerce_float(session.get("costUSD"))
         cached_tokens = _coerce_int(session.get("cacheReadTokens"))
+        if cached_tokens == 0 and session.get("cachedInputTokens") is not None:
+            cached_tokens = _coerce_int(session.get("cachedInputTokens"))
         cache_creation_tokens = _coerce_int(session.get("cacheCreationTokens"))
+        if cache_creation_tokens == 0 and session.get("cacheCreationInputTokens") is not None:
+            cache_creation_tokens = _coerce_int(session.get("cacheCreationInputTokens"))
         reasoning_tokens = 0
     else:
         models = list((session.get("models") or {}).keys())
@@ -1355,7 +1697,7 @@ def _build_dashboard_payload(force_refresh: bool = False) -> dict:
         current_month_events,
         key=lambda item: item.get("finished_at") or item.get("started_at") or "",
         reverse=True,
-    )[:25]
+    )[:100]
 
     return {
         "generated_at": now.isoformat(),
@@ -1939,6 +2281,25 @@ def build_copilot_headers(api_key: str) -> dict:
 
 
 # ─── Responses API helpers ────────────────────────────────────────────────────
+
+
+def _apply_forwarded_request_headers(headers: dict, request: Request):
+    for header_name in FORWARDED_REQUEST_HEADERS:
+        header_value = request.headers.get(header_name)
+        if header_value:
+            headers[header_name] = header_value
+
+    forwarded_server_request_id = None
+    for header_name in FORWARDED_SERVER_REQUEST_ID_HEADERS:
+        header_value = request.headers.get(header_name)
+        if header_value:
+            headers[header_name] = header_value
+            if forwarded_server_request_id is None:
+                forwarded_server_request_id = header_value
+
+    if forwarded_server_request_id is not None:
+        headers.setdefault("x-request-id", forwarded_server_request_id)
+        headers.setdefault("x-github-request-id", forwarded_server_request_id)
 
 
 def _initiator_log_label(initiator: str | None) -> str:
@@ -2719,7 +3080,15 @@ async def proxy_anthropic_streaming_response(
     if upstream.status_code >= 400:
         try:
             await upstream.aread()
-            _finish_usage_event(usage_event, upstream.status_code)
+            fallback_message = _extract_upstream_text(upstream) or f"Upstream request failed with status {upstream.status_code}"
+            error_payload = anthropic_error_payload_from_openai(_extract_upstream_json_payload(upstream), upstream.status_code, fallback_message)
+            _finish_usage_event(
+                usage_event,
+                upstream.status_code,
+                upstream=upstream,
+                response_payload=error_payload,
+                response_text=error_payload.get("error", {}).get("message"),
+            )
             return anthropic_error_response_from_upstream(upstream)
         finally:
             await upstream.aclose()
@@ -2746,6 +3115,7 @@ async def proxy_anthropic_streaming_response(
         tool_blocks = {}
         active_block = None
         stream_closed = False
+        response_text_parts: list[str] = []
 
         async def emit_block_stop(block):
             if not isinstance(block, dict) or block.get("closed") is True:
@@ -2949,6 +3319,8 @@ async def proxy_anthropic_streaming_response(
                 delta = first_choice.get("delta") if isinstance(first_choice, dict) else {}
                 text_delta = _extract_text_from_chat_delta(delta)
                 if text_delta:
+                    response_text_parts.append(text_delta)
+                    _mark_usage_event_first_output(usage_event)
                     async for event in ensure_text_block():
                         yield event
                     yield _sse_encode(
@@ -3029,7 +3401,28 @@ async def proxy_anthropic_streaming_response(
             yield _sse_encode("message_stop", {"type": "message_stop"})
             stream_closed = True
         finally:
-            _finish_usage_event(usage_event, upstream.status_code)
+            response_payload = {
+                "id": message_id,
+                "type": "message",
+                "role": "assistant",
+                "model": model_name,
+                "stop_reason": stop_reason or "end_turn",
+                "content": [{"type": "text", "text": "".join(response_text_parts)}] if response_text_parts else [],
+                "usage": {
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "cache_creation_input_tokens": cache_creation_input_tokens,
+                    "cache_read_input_tokens": cache_read_input_tokens,
+                },
+            }
+            _finish_usage_event(
+                usage_event,
+                upstream.status_code,
+                upstream=upstream,
+                response_payload=response_payload,
+                response_text="".join(response_text_parts) if response_text_parts else None,
+                usage=response_payload["usage"],
+            )
             await upstream.aclose()
             await client.aclose()
 
@@ -3051,10 +3444,7 @@ def build_chat_headers_for_request(
     request_id: str | None = None,
 ) -> dict:
     headers = build_copilot_headers(api_key)
-    for header_name in FORWARDED_REQUEST_HEADERS:
-        header_value = request.headers.get(header_name)
-        if header_value:
-            headers[header_name] = header_value
+    _apply_forwarded_request_headers(headers, request)
 
     initiator = _initiator_policy.resolve_chat_messages(messages, model_name, request_id=request_id)
     headers["X-Initiator"] = initiator
@@ -3105,10 +3495,7 @@ def build_anthropic_headers_for_request(
     request_id: str | None = None,
 ) -> dict:
     headers = build_copilot_headers(api_key)
-    for header_name in FORWARDED_REQUEST_HEADERS:
-        header_value = request.headers.get(header_name)
-        if header_value:
-            headers[header_name] = header_value
+    _apply_forwarded_request_headers(headers, request)
 
     messages = body.get("messages")
     initiator = _initiator_policy.resolve_anthropic_messages(messages, body.get("model"), request_id=request_id)
@@ -3273,10 +3660,7 @@ def build_responses_headers_for_request(
     request_id: str | None = None,
 ) -> dict:
     headers = build_copilot_headers(api_key)
-    for header_name in FORWARDED_REQUEST_HEADERS:
-        header_value = request.headers.get(header_name)
-        if header_value:
-            headers[header_name] = header_value
+    _apply_forwarded_request_headers(headers, request)
 
     had_input = "input" in body
     effective_input, initiator = _initiator_policy.resolve_responses_input(
@@ -3503,6 +3887,30 @@ async def client_proxy_install_api(request: Request):
     )
 
 
+def _extract_upstream_json_payload(upstream: httpx.Response) -> dict | None:
+    content_type = upstream.headers.get("content-type", "").lower()
+    if "application/json" not in content_type:
+        return None
+    try:
+        payload = upstream.json()
+    except json.JSONDecodeError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _extract_upstream_text(upstream: httpx.Response) -> str | None:
+    try:
+        text = upstream.text
+    except Exception:
+        return None
+    if not isinstance(text, str):
+        return None
+    text = text.strip()
+    if not text:
+        return None
+    return text[:4096]
+
+
 def proxy_non_streaming_response(upstream: httpx.Response) -> Response:
     """
     Preserve the upstream status code and body shape.
@@ -3541,6 +3949,7 @@ async def proxy_streaming_response(
     body: dict,
     timeout: int = 300,
     usage_event: dict | None = None,
+    stream_type: str = "responses",
 ) -> Response:
     """
     Relay an upstream SSE response while preserving upstream error statuses.
@@ -3560,7 +3969,13 @@ async def proxy_streaming_response(
     if upstream.status_code >= 400:
         try:
             await upstream.aread()
-            _finish_usage_event(usage_event, upstream.status_code)
+            _finish_usage_event(
+                usage_event,
+                upstream.status_code,
+                upstream=upstream,
+                response_payload=_extract_upstream_json_payload(upstream),
+                response_text=_extract_upstream_text(upstream),
+            )
             return proxy_non_streaming_response(upstream)
         finally:
             await upstream.aclose()
@@ -3572,11 +3987,19 @@ async def proxy_streaming_response(
         response_headers["content-type"] = content_type
 
     async def stream_upstream():
+        capture = _SSEUsageCapture(stream_type)
         try:
             async for chunk in upstream.aiter_bytes():
+                if capture.feed(chunk):
+                    _mark_usage_event_first_output(usage_event)
                 yield chunk
         finally:
-            _finish_usage_event(usage_event, upstream.status_code)
+            _finish_usage_event(
+                usage_event,
+                upstream.status_code,
+                upstream=upstream,
+                usage=capture.usage if isinstance(capture.usage, dict) else None,
+            )
             await upstream.aclose()
             await client.aclose()
 
@@ -3624,15 +4047,31 @@ async def responses(request: Request):
         body.get("model"),
         headers.get("X-Initiator"),
         request_id=request_id,
+        request_body=body,
+        upstream_path="/responses",
+        outbound_headers=headers,
     )
 
     if is_streaming:
-        return await proxy_streaming_response(upstream_url, headers, body, timeout=300, usage_event=usage_event)
+        return await proxy_streaming_response(
+            upstream_url,
+            headers,
+            body,
+            timeout=300,
+            usage_event=usage_event,
+            stream_type="responses",
+        )
     else:
         try:
             async with httpx.AsyncClient(timeout=120) as client:
                 upstream = await throttled_client_post(client, upstream_url, headers=headers, json=body)
-            _finish_usage_event(usage_event, upstream.status_code)
+            _finish_usage_event(
+                usage_event,
+                upstream.status_code,
+                upstream=upstream,
+                response_payload=_extract_upstream_json_payload(upstream),
+                response_text=_extract_upstream_text(upstream),
+            )
             return proxy_non_streaming_response(upstream)
         except Exception:
             _finish_usage_event(usage_event, 599)
@@ -3668,32 +4107,58 @@ async def responses_compact(request: Request):
         summary_request.get("model"),
         headers.get("X-Initiator"),
         request_id=request_id,
+        request_body=summary_request,
+        upstream_path="/responses",
+        outbound_headers=headers,
     )
 
     try:
         async with httpx.AsyncClient(timeout=120) as client:
             upstream = await throttled_client_post(client, upstream_url, headers=headers, json=summary_request)
-        _finish_usage_event(usage_event, upstream.status_code)
     except Exception:
         _finish_usage_event(usage_event, 599)
         raise
 
     if upstream.status_code >= 400:
+        _finish_usage_event(
+            usage_event,
+            upstream.status_code,
+            upstream=upstream,
+            response_payload=_extract_upstream_json_payload(upstream),
+            response_text=_extract_upstream_text(upstream),
+        )
         return proxy_non_streaming_response(upstream)
 
     try:
         upstream_payload = upstream.json()
     except json.JSONDecodeError as e:
+        _finish_usage_event(
+            usage_event,
+            502,
+            upstream=upstream,
+            response_text=f"Invalid JSON from upstream summarization response: {e}",
+        )
         return openai_error_response(502, f"Invalid JSON from upstream summarization response: {e}")
 
     summary_text = extract_response_output_text(upstream_payload)
     if not summary_text:
+        _finish_usage_event(
+            usage_event,
+            502,
+            upstream=upstream,
+            response_payload=upstream_payload,
+            response_text="Upstream summarization response did not include assistant text output",
+        )
         return openai_error_response(502, "Upstream summarization response did not include assistant text output")
 
-    return JSONResponse(
-        content=build_fake_compaction_response(body, summary_text, upstream_payload.get("usage")),
-        status_code=200,
+    compacted_response = build_fake_compaction_response(body, summary_text, upstream_payload.get("usage"))
+    _finish_usage_event(
+        usage_event,
+        upstream.status_code,
+        upstream=upstream,
+        response_payload=compacted_response,
     )
+    return JSONResponse(content=compacted_response, status_code=200)
 
 
 # ─── Route: /v1/chat/completions  (non-Codex models) ─────────────────────────
@@ -3728,15 +4193,31 @@ async def chat_completions(request: Request):
         body.get("model"),
         headers.get("X-Initiator"),
         request_id=request_id,
+        request_body=body,
+        upstream_path="/chat/completions",
+        outbound_headers=headers,
     )
 
     if is_streaming:
-        return await proxy_streaming_response(upstream_url, headers, body, timeout=300, usage_event=usage_event)
+        return await proxy_streaming_response(
+            upstream_url,
+            headers,
+            body,
+            timeout=300,
+            usage_event=usage_event,
+            stream_type="chat",
+        )
     else:
         try:
             async with httpx.AsyncClient(timeout=120) as client:
                 upstream = await throttled_client_post(client, upstream_url, headers=headers, json=body)
-            _finish_usage_event(usage_event, upstream.status_code)
+            _finish_usage_event(
+                usage_event,
+                upstream.status_code,
+                upstream=upstream,
+                response_payload=_extract_upstream_json_payload(upstream),
+                response_text=_extract_upstream_text(upstream),
+            )
             return proxy_non_streaming_response(upstream)
         except Exception:
             _finish_usage_event(usage_event, 599)
@@ -3776,6 +4257,9 @@ async def anthropic_messages(request: Request):
         outbound_body.get("model"),
         headers.get("X-Initiator"),
         request_id=request_id,
+        request_body=outbound_body,
+        upstream_path="/chat/completions",
+        outbound_headers=headers,
     )
 
     if outbound_body.get("stream"):
@@ -3791,10 +4275,29 @@ async def anthropic_messages(request: Request):
     try:
         async with httpx.AsyncClient(timeout=120) as client:
             upstream = await throttled_client_post(client, upstream_url, headers=headers, json=outbound_body)
-        _finish_usage_event(usage_event, upstream.status_code)
         if upstream.status_code >= 400:
-            return anthropic_error_response_from_upstream(upstream)
+            fallback_message = _extract_upstream_text(upstream) or f"Upstream request failed with status {upstream.status_code}"
+            error_payload = anthropic_error_payload_from_openai(_extract_upstream_json_payload(upstream), upstream.status_code, fallback_message)
+            _finish_usage_event(
+                usage_event,
+                upstream.status_code,
+                upstream=upstream,
+                response_payload=error_payload,
+                response_text=error_payload.get("error", {}).get("message"),
+            )
+            return anthropic_error_response(
+                upstream.status_code,
+                error_payload["error"]["message"],
+                error_payload["error"]["type"],
+                {"retry-after": upstream.headers.get("retry-after")} if upstream.headers.get("retry-after") else None,
+            )
         translated = chat_completion_to_anthropic(upstream.json(), fallback_model=outbound_body.get("model"))
+        _finish_usage_event(
+            usage_event,
+            upstream.status_code,
+            upstream=upstream,
+            response_payload=translated,
+        )
         return JSONResponse(content=translated, status_code=upstream.status_code)
     except Exception:
         _finish_usage_event(usage_event, 599)

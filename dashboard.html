@@ -115,9 +115,51 @@
     .status.good { color: var(--accent-2); }
     .status.warn { color: #ffd27f; }
     .proxy-grid { display: grid; gap: 12px; grid-template-columns: 1fr 1fr; }
+    .request-layout { display: grid; gap: 14px; grid-template-columns: minmax(0, .92fr) minmax(320px, .88fr); }
+    .request-list { display: grid; gap: 10px; max-height: 860px; overflow: auto; padding-right: 4px; }
+    .request-row {
+      width: 100%;
+      text-align: left;
+      border-radius: 18px;
+      border: 1px solid var(--line);
+      background: var(--panel-soft);
+      color: var(--text);
+      padding: 14px;
+      cursor: pointer;
+      transition: border-color .18s ease, transform .18s ease, background .18s ease;
+    }
+    .request-row:hover { border-color: rgba(255,255,255,.18); transform: translateY(-1px); }
+    .request-row.active { border-color: rgba(255,135,82,.48); background: rgba(255,135,82,.08); }
+    .request-row-head, .request-meta, .detail-grid { display: grid; gap: 10px; }
+    .request-row-head { grid-template-columns: auto 1fr auto; align-items: center; }
+    .request-title { font-size: 1rem; font-weight: 700; letter-spacing: -.02em; }
+    .request-meta { grid-template-columns: repeat(2, minmax(0, 1fr)); margin-top: 10px; }
+    .request-meta .mono, .detail-grid .mono { word-break: break-all; }
+    .detail-pane { display: grid; gap: 14px; align-content: start; }
+    .detail-block {
+      border-radius: 18px;
+      border: 1px solid var(--line);
+      background: rgba(255,255,255,.03);
+      padding: 14px;
+    }
+    .detail-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .detail-label {
+      color: var(--muted);
+      font-size: .74rem;
+      text-transform: uppercase;
+      letter-spacing: .12em;
+      margin-bottom: 6px;
+    }
+    .detail-value {
+      font-size: .92rem;
+      line-height: 1.45;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
     @media (max-width: 1080px) {
       .content, .metrics { grid-template-columns: 1fr; }
       .proxy-grid { grid-template-columns: 1fr; }
+      .request-layout, .detail-grid, .request-meta { grid-template-columns: 1fr; }
     }
   </style>
 </head>
@@ -202,29 +244,141 @@
         </div>
 
         <div v-else-if="activeTab === 'requests'">
-          <table>
-            <thead>
-              <tr>
-                <th>When</th>
-                <th>Path</th>
-                <th>Model</th>
-                <th>Initiator</th>
-                <th>Session</th>
-                <th>Premium</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr v-for="row in filteredRequests" :key="row.request_id || row.started_at">
-                <td>{{ stamp(row.finished_at || row.started_at) }}</td>
-                <td class="mono">{{ row.path || '-' }}</td>
-                <td>{{ row.resolved_model || row.requested_model || '-' }}</td>
-                <td>{{ row.initiator || '-' }}</td>
-                <td class="mono">{{ shortId(row.session_id || row.client_request_id) }}</td>
-                <td>{{ row.premium_requests ?? '-' }}</td>
-              </tr>
-              <tr v-if="!filteredRequests.length"><td colspan="6" class="empty">No requests match the current filter.</td></tr>
-            </tbody>
-          </table>
+          <div v-if="filteredRequests.length" class="request-layout">
+            <div class="request-list">
+              <button
+                v-for="row in filteredRequests"
+                :key="row.request_id || row.started_at"
+                type="button"
+                class="request-row"
+                :class="{ active: selectedRequestKey === requestKey(row) }"
+                @click="selectedRequestKey = requestKey(row)"
+              >
+                <div class="request-row-head">
+                  <span class="badge">{{ row.initiator || 'unknown' }}</span>
+                  <div class="request-title">{{ row.resolved_model || row.requested_model || '-' }}</div>
+                  <div class="subtle">{{ stamp(row.finished_at || row.started_at) }}</div>
+                </div>
+                <div class="request-meta subtle">
+                  <div><span class="mono">{{ row.path || '-' }}</span></div>
+                  <div>{{ row.success === false ? `HTTP ${row.status_code}` : `${row.duration_ms ?? '-'} ms` }}</div>
+                  <div class="mono">{{ shortId(row.session_id || row.client_request_id || row.request_id) }}</div>
+                  <div>{{ tokenSummary(row) }}</div>
+                  <div>{{ row.time_to_first_token_ms != null ? `${row.time_to_first_token_ms} ms first token` : 'No token timing' }}</div>
+                </div>
+              </button>
+            </div>
+
+            <div class="detail-pane" v-if="selectedRequest">
+              <article class="detail-block">
+                <div class="panel-head">
+                  <div>
+                    <h3>Request Detail</h3>
+                    <div class="subtle">{{ stamp(selectedRequest.finished_at || selectedRequest.started_at) }}</div>
+                  </div>
+                  <span :class="['badge', selectedRequest.success === false ? 'status error' : '']">
+                    {{ selectedRequest.success === false ? `HTTP ${selectedRequest.status_code}` : 'success' }}
+                  </span>
+                </div>
+                <div class="detail-grid">
+                  <div>
+                    <div class="detail-label">Path</div>
+                    <div class="detail-value mono">{{ selectedRequest.path || '-' }}</div>
+                  </div>
+                  <div>
+                    <div class="detail-label">Upstream Path</div>
+                    <div class="detail-value mono">{{ selectedRequest.upstream_path || '-' }}</div>
+                  </div>
+                  <div>
+                    <div class="detail-label">Requested Model</div>
+                    <div class="detail-value">{{ selectedRequest.requested_model || '-' }}</div>
+                  </div>
+                  <div>
+                    <div class="detail-label">Resolved Model</div>
+                    <div class="detail-value">{{ selectedRequest.response_model || selectedRequest.resolved_model || '-' }}</div>
+                  </div>
+                  <div>
+                    <div class="detail-label">Initiator</div>
+                    <div class="detail-value">{{ selectedRequest.initiator || '-' }}</div>
+                  </div>
+                  <div>
+                    <div class="detail-label">Premium</div>
+                    <div class="detail-value">{{ selectedRequest.premium_requests ?? '-' }}</div>
+                  </div>
+                  <div>
+                    <div class="detail-label">Duration</div>
+                    <div class="detail-value">{{ selectedRequest.duration_ms != null ? `${selectedRequest.duration_ms} ms` : '-' }}</div>
+                  </div>
+                  <div>
+                    <div class="detail-label">First Token</div>
+                    <div class="detail-value">{{ selectedRequest.time_to_first_token_ms != null ? `${selectedRequest.time_to_first_token_ms} ms` : '-' }}</div>
+                  </div>
+                  <div>
+                    <div class="detail-label">Request ID</div>
+                    <div class="detail-value mono">{{ selectedRequest.request_id || '-' }}</div>
+                  </div>
+                  <div>
+                    <div class="detail-label">Prior Server Request ID</div>
+                    <div class="detail-value mono">{{ selectedRequest.prior_server_request_id || '-' }}</div>
+                  </div>
+                  <div>
+                    <div class="detail-label">Server Request ID</div>
+                    <div class="detail-value mono">{{ selectedRequest.server_request_id || '-' }}</div>
+                  </div>
+                  <div>
+                    <div class="detail-label">Upstream Request ID</div>
+                    <div class="detail-value mono">{{ selectedRequest.upstream_request_id || '-' }}</div>
+                  </div>
+                </div>
+              </article>
+
+              <article class="detail-block" v-if="selectedRequest.usage">
+                <div class="detail-label">Request Usage</div>
+                <div class="detail-grid">
+                  <div>
+                    <div class="detail-label">Input Tokens</div>
+                    <div class="detail-value">{{ compact(selectedRequest.usage.input_tokens) }}</div>
+                  </div>
+                  <div>
+                    <div class="detail-label">Output Tokens</div>
+                    <div class="detail-value">{{ compact(selectedRequest.usage.output_tokens) }}</div>
+                  </div>
+                  <div>
+                    <div class="detail-label">Cached Input Tokens</div>
+                    <div class="detail-value">{{ compact(cachedInputTokens(selectedRequest)) }}</div>
+                  </div>
+                  <div>
+                    <div class="detail-label">Total Tokens</div>
+                    <div class="detail-value">{{ compact(selectedRequest.usage.total_tokens || 0) }}</div>
+                  </div>
+                </div>
+              </article>
+
+              <article class="detail-block" v-if="requestChainUsage(selectedRequest)">
+                <div class="detail-label">Chain Usage</div>
+                <div class="subtle">{{ requestChainCount(selectedRequest) }} proxied requests in this chain</div>
+                <div class="detail-grid" style="margin-top:10px">
+                  <div>
+                    <div class="detail-label">Input Tokens</div>
+                    <div class="detail-value">{{ compact(requestChainUsage(selectedRequest).input_tokens) }}</div>
+                  </div>
+                  <div>
+                    <div class="detail-label">Output Tokens</div>
+                    <div class="detail-value">{{ compact(requestChainUsage(selectedRequest).output_tokens) }}</div>
+                  </div>
+                  <div>
+                    <div class="detail-label">Cached Input Tokens</div>
+                    <div class="detail-value">{{ compact(requestChainUsage(selectedRequest).cached_input_tokens) }}</div>
+                  </div>
+                  <div>
+                    <div class="detail-label">Total Tokens</div>
+                    <div class="detail-value">{{ compact(requestChainUsage(selectedRequest).total_tokens) }}</div>
+                  </div>
+                </div>
+              </article>
+            </div>
+          </div>
+          <div v-else class="empty">No requests match the current filter.</div>
         </div>
 
         <div v-else class="history">
@@ -393,6 +547,7 @@
           search: '',
           sourceFilter: 'all',
           sortMode: 'recent',
+          selectedRequestKey: '',
           data: {
             premium: {},
             current_month: { ccusage: { sources: {} } },
@@ -467,6 +622,12 @@
           const rows = (this.data.recent_requests || []).map((row) => ({ ...row, source: 'proxy' })).filter((row) => this.allowSource(row.source) && this.matches(row));
           return this.sortRows(rows, 'finished_at');
         },
+        selectedRequest() {
+          const rows = this.filteredRequests;
+          if (!rows.length) return null;
+          if (!this.selectedRequestKey) return rows[0];
+          return rows.find((row) => this.requestKey(row) === this.selectedRequestKey) || rows[0];
+        },
         monthHistory() {
           return (this.data.month_history || []).slice(0, 8);
         },
@@ -511,8 +672,60 @@
           const date = new Date(value);
           return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
         },
+        requestKey(row) {
+          return row?.request_id || row?.client_request_id || row?.started_at || '';
+        },
         shortId(value) { return !value ? '-' : (value.length > 36 ? value.slice(-36) : value); },
         modelLabel(models) { return Array.isArray(models) && models.length ? models.join(', ') : '-'; },
+        tokenSummary(row) {
+          const usage = row?.usage || {};
+          const input = Number(usage.input_tokens || 0);
+          const output = Number(usage.output_tokens || 0);
+          const total = Number(usage.total_tokens || (input + output));
+          if (!Number.isFinite(input) && !Number.isFinite(output) && !Number.isFinite(total)) {
+            return '-';
+          }
+          if (total > 0) {
+            return `${this.compact(input)} in · ${this.compact(output)} out · ${this.compact(total)} total`;
+          }
+          if (input > 0 || output > 0) {
+            return `${this.compact(input)} in · ${this.compact(output)} out`;
+          }
+          return '-';
+        },
+        cachedInputTokens(row) {
+          const usage = row?.usage || {};
+          const direct = usage.cached_input_tokens;
+          if (direct != null) return Number(direct);
+          const cacheRead = usage.cache_read_input_tokens;
+          if (cacheRead != null) return Number(cacheRead);
+          const details = usage.prompt_tokens_details;
+          if (details && details.cached_tokens != null) return Number(details.cached_tokens);
+          return 0;
+        },
+        requestChainRows(row) {
+          const chainId = row?.server_request_id;
+          if (!chainId) return [];
+          return (this.data.recent_requests || []).filter((item) => item?.server_request_id === chainId);
+        },
+        requestChainUsage(row) {
+          const rows = this.requestChainRows(row);
+          if (!rows.length) return null;
+          return rows.reduce((totals, item) => {
+            const usage = item?.usage || {};
+            const input = Number(usage.input_tokens || 0);
+            const output = Number(usage.output_tokens || 0);
+            const total = Number(usage.total_tokens || (input + output));
+            totals.input_tokens += Number.isFinite(input) ? input : 0;
+            totals.output_tokens += Number.isFinite(output) ? output : 0;
+            totals.total_tokens += Number.isFinite(total) ? total : 0;
+            totals.cached_input_tokens += this.cachedInputTokens(item);
+            return totals;
+          }, { input_tokens: 0, output_tokens: 0, total_tokens: 0, cached_input_tokens: 0 });
+        },
+        requestChainCount(row) {
+          return this.requestChainRows(row).length;
+        },
         historyWidth(row) {
           const max = Math.max(...this.monthHistory.map((item) => Number(item.cost_usd || 0)), 1);
           return (Number(row.cost_usd || 0) / max) * 100;
@@ -728,6 +941,10 @@
             const response = await fetch(`/api/dashboard${query ? `?${query}` : ''}`);
             if (!response.ok) throw new Error(`dashboard request failed: ${response.status}`);
             this.data = await response.json();
+            const requestKeys = new Set((this.data.recent_requests || []).map((row) => this.requestKey(row)));
+            if (!requestKeys.has(this.selectedRequestKey)) {
+              this.selectedRequestKey = this.requestKey((this.data.recent_requests || [])[0]);
+            }
           } catch (error) {
             this.data.ccusage = { ...(this.data.ccusage || {}), errors: [{ source: 'dashboard', error: error.message }] };
           } finally {
