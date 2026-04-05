@@ -351,15 +351,27 @@ def _normalize_usage_payload(usage: dict | None) -> dict | None:
         output_tokens = usage.get("completion_tokens")
 
     cached_tokens = usage.get("cache_read_input_tokens")
+    cached_tokens_from_raw_details = False
     if cached_tokens is None:
         cached_tokens = usage.get("cached_input_tokens")
     if cached_tokens is None:
-        details = usage.get("prompt_tokens_details")
-        if isinstance(details, dict):
-            cached_tokens = details.get("cached_tokens")
+        for details_key in ("input_tokens_details", "prompt_tokens_details"):
+            details = usage.get(details_key)
+            if isinstance(details, dict):
+                cached_tokens = details.get("cached_tokens")
+                if cached_tokens is not None:
+                    cached_tokens_from_raw_details = True
+                    break
 
     cache_creation_tokens = usage.get("cache_creation_input_tokens")
-    reasoning_tokens = usage.get("reasoning_output_tokens", 0)
+    reasoning_tokens = usage.get("reasoning_output_tokens")
+    if reasoning_tokens is None:
+        for details_key in ("output_tokens_details", "completion_tokens_details"):
+            details = usage.get(details_key)
+            if isinstance(details, dict):
+                reasoning_tokens = details.get("reasoning_tokens")
+                if reasoning_tokens is not None:
+                    break
     total_tokens = usage.get("total_tokens")
     if total_tokens is None:
         total_tokens = usage.get("totalTokens")
@@ -369,8 +381,13 @@ def _normalize_usage_payload(usage: dict | None) -> dict | None:
     normalized_cached_tokens = _coerce_int(cached_tokens, default=0)
     normalized_cache_creation_tokens = _coerce_int(cache_creation_tokens, default=0)
     normalized_reasoning_tokens = _coerce_int(reasoning_tokens, default=0)
+    if cached_tokens_from_raw_details and normalized_cached_tokens > 0:
+        normalized_input_tokens = max(0, normalized_input_tokens - normalized_cached_tokens)
+
     normalized_total_tokens = _coerce_int(total_tokens, default=None)
-    if normalized_total_tokens is None:
+    if cached_tokens_from_raw_details:
+        normalized_total_tokens = normalized_input_tokens + normalized_output_tokens
+    elif normalized_total_tokens is None:
         normalized_total_tokens = normalized_input_tokens + normalized_output_tokens
 
     return {

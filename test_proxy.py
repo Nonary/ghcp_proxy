@@ -444,13 +444,15 @@ class ProxyInitiatorTests(unittest.TestCase):
             b'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"Hello"}\n\n'
         )
         capture.feed(
-            b'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_1","model":"gpt-5.4","usage":{"input_tokens":5,"output_tokens":2},"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hello"}]}]}}\n\n'
+            b'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_1","model":"gpt-5.4","usage":{"input_tokens":5,"output_tokens":2,"input_tokens_details":{"cached_tokens":3},"output_tokens_details":{"reasoning_tokens":1}},"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hello"}]}]}}\n\n'
         )
 
         self.assertTrue(saw_output)
-        self.assertEqual(capture.usage["input_tokens"], 5)
+        self.assertEqual(capture.usage["input_tokens"], 2)
         self.assertEqual(capture.usage["output_tokens"], 2)
-        self.assertEqual(capture.usage["cached_input_tokens"], 0)
+        self.assertEqual(capture.usage["total_tokens"], 4)
+        self.assertEqual(capture.usage["cached_input_tokens"], 3)
+        self.assertEqual(capture.usage["reasoning_output_tokens"], 1)
 
     def test_sse_usage_capture_normalizes_cached_prompt_tokens(self):
         capture = proxy._SSEUsageCapture("chat")
@@ -458,8 +460,9 @@ class ProxyInitiatorTests(unittest.TestCase):
             b'event: message\ndata: {"id":"chatcmpl_1","choices":[{"delta":{"content":"Hi"}}],"usage":{"prompt_tokens":20,"completion_tokens":4,"prompt_tokens_details":{"cached_tokens":7}}}\n\n'
         )
 
-        self.assertEqual(capture.usage["input_tokens"], 20)
+        self.assertEqual(capture.usage["input_tokens"], 13)
         self.assertEqual(capture.usage["output_tokens"], 4)
+        self.assertEqual(capture.usage["total_tokens"], 17)
         self.assertEqual(capture.usage["cached_input_tokens"], 7)
 
     def test_build_responses_headers_for_request_forwards_latest_server_request_id(self):
@@ -500,11 +503,48 @@ class ProxyInitiatorTests(unittest.TestCase):
             proxy._load_usage_history()
             events = list(proxy._recent_usage_events)
 
+        self.assertEqual(events[0]["usage"]["input_tokens"], 13)
+        self.assertEqual(events[0]["usage"]["total_tokens"], 17)
         self.assertEqual(events[0]["usage"]["cached_input_tokens"], 7)
         self.assertEqual(
             proxy._get_latest_server_request_id_for_request("session-123", None, None),
             "server-abc",
         )
+
+    def test_load_usage_history_normalizes_responses_usage_details(self):
+        with (
+            mock.patch.object(proxy.os.path, "exists", return_value=True),
+            mock.patch("builtins.open", return_value=io.StringIO(
+                '{"session_id":"session-123","server_request_id":"server-def","usage":{"input_tokens":20,"output_tokens":4,"input_tokens_details":{"cached_tokens":7},"output_tokens_details":{"reasoning_tokens":2}}}\n'
+            )),
+            mock.patch.object(proxy, "_recent_usage_events", deque(maxlen=proxy.MAX_STORED_USAGE_EVENTS)),
+        ):
+            proxy._load_usage_history()
+            events = list(proxy._recent_usage_events)
+
+        self.assertEqual(events[0]["usage"]["input_tokens"], 13)
+        self.assertEqual(events[0]["usage"]["total_tokens"], 17)
+        self.assertEqual(events[0]["usage"]["cached_input_tokens"], 7)
+        self.assertEqual(events[0]["usage"]["reasoning_output_tokens"], 2)
+        self.assertEqual(
+            proxy._get_latest_server_request_id_for_request("session-123", None, None),
+            "server-def",
+        )
+
+    def test_normalize_usage_payload_preserves_explicit_cached_input_shape(self):
+        normalized = proxy._normalize_usage_payload(
+            {
+                "input_tokens": 20,
+                "output_tokens": 4,
+                "total_tokens": 24,
+                "cached_input_tokens": 7,
+            }
+        )
+
+        self.assertEqual(normalized["input_tokens"], 20)
+        self.assertEqual(normalized["output_tokens"], 4)
+        self.assertEqual(normalized["total_tokens"], 24)
+        self.assertEqual(normalized["cached_input_tokens"], 7)
 
     def test_chat_completion_to_anthropic_maps_cached_usage_tokens(self):
         payload = {
