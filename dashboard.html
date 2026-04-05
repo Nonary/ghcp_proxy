@@ -116,7 +116,10 @@
     .status.warn { color: #ffd27f; }
     .proxy-grid { display: grid; gap: 12px; grid-template-columns: 1fr 1fr; }
     .request-layout { display: grid; gap: 14px; grid-template-columns: minmax(0, .92fr) minmax(320px, .88fr); }
+    .request-list-wrap { display: grid; gap: 10px; min-height: 0; }
     .request-list { display: grid; gap: 10px; max-height: 860px; overflow: auto; padding-right: 4px; }
+    .request-pager { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+    .request-pager .subtle { flex: 1; }
     .request-row {
       width: 100%;
       text-align: left;
@@ -178,14 +181,14 @@
         <div class="subtle">{{ premiumRemainingMetaLabel }}</div>
       </article>
       <article class="panel metric">
-        <div class="eyebrow">This Month Saved</div>
-        <div class="value">{{ money(currentMonth.cost_usd) }}</div>
-        <div class="subtle">Estimated direct API spend avoided</div>
+        <div class="eyebrow">Saved To Date</div>
+        <div class="value">{{ money(allTime.cost_usd) }}</div>
+        <div class="subtle">{{ money(currentMonth.cost_usd) }} this month · {{ compact(data.all_time?.proxy_requests) }} requests tracked</div>
       </article>
       <article class="panel metric">
-        <div class="eyebrow">This Month Tokens</div>
-        <div class="value">{{ compact(currentMonth.total_tokens) }}</div>
-        <div class="subtle">{{ compact(currentMonth.input_tokens) }} in · {{ compact(currentMonth.output_tokens) }} out</div>
+        <div class="eyebrow">Tokens To Date</div>
+        <div class="value">{{ compact(allTime.total_tokens) }}</div>
+        <div class="subtle">{{ compact(currentMonth.total_tokens) }} this month · {{ compact(currentMonth.input_tokens) }} in · {{ compact(currentMonth.output_tokens) }} out</div>
       </article>
     </section>
 
@@ -247,28 +250,40 @@
 
         <div v-else-if="activeTab === 'requests'">
           <div v-if="filteredRequests.length" class="request-layout">
-            <div class="request-list" ref="requestList">
-              <button
-                v-for="row in filteredRequests"
-                :key="requestKey(row)"
-                type="button"
-                class="request-row"
-                :class="{ active: selectedRequestKey === requestKey(row) }"
-                @click="selectedRequestKey = requestKey(row)"
-              >
-                <div class="request-row-head">
-                  <span class="badge">{{ row.initiator || 'unknown' }}</span>
-                  <div class="request-title">{{ row.resolved_model || row.requested_model || '-' }}</div>
-                  <div class="subtle">{{ stamp(row.finished_at || row.started_at) }}</div>
+            <div class="request-list-wrap">
+              <div class="request-pager">
+                <div class="subtle">
+                  Showing {{ requestPageStart }}-{{ requestPageEnd }} of {{ filteredRequests.length }} recent full requests.
+                  Older requests stay in archived totals.
                 </div>
-                <div class="request-meta subtle">
-                  <div><span class="mono">{{ row.path || '-' }}</span></div>
-                  <div>{{ row.success === false ? `HTTP ${row.status_code}` : `${row.duration_ms ?? '-'} ms` }}</div>
-                  <div class="mono">{{ shortId(row.session_id || row.client_request_id || row.request_id) }}</div>
-                  <div>{{ tokenSummary(row) }}</div>
-                  <div>{{ row.time_to_first_token_ms != null ? `${row.time_to_first_token_ms} ms first token` : 'No token timing' }}</div>
+                <div class="toolbar">
+                  <button @click="changeRequestPage(-1)" :disabled="requestPage <= 1">Previous</button>
+                  <button @click="changeRequestPage(1)" :disabled="requestPage >= requestPageCount">Next</button>
                 </div>
-              </button>
+              </div>
+              <div class="request-list" ref="requestList">
+                <button
+                  v-for="row in pagedRequests"
+                  :key="requestKey(row)"
+                  type="button"
+                  class="request-row"
+                  :class="{ active: selectedRequestKey === requestKey(row) }"
+                  @click="selectedRequestKey = requestKey(row)"
+                >
+                  <div class="request-row-head">
+                    <span class="badge">{{ row.initiator || 'unknown' }}</span>
+                    <div class="request-title">{{ row.resolved_model || row.requested_model || '-' }}</div>
+                    <div class="subtle">{{ stamp(row.finished_at || row.started_at) }}</div>
+                  </div>
+                  <div class="request-meta subtle">
+                    <div><span class="mono">{{ row.path || '-' }}</span></div>
+                    <div>{{ row.success === false ? `HTTP ${row.status_code}` : `${row.duration_ms ?? '-'} ms` }}</div>
+                    <div class="mono">{{ shortId(row.session_id || row.client_request_id || row.request_id) }}</div>
+                    <div>{{ tokenSummary(row) }}</div>
+                    <div>{{ row.time_to_first_token_ms != null ? `${row.time_to_first_token_ms} ms first token` : 'No token timing' }}</div>
+                  </div>
+                </button>
+              </div>
             </div>
 
             <div class="detail-pane" v-if="selectedRequest">
@@ -547,10 +562,12 @@
           search: '',
           sourceFilter: 'all',
           sortMode: 'recent',
+          requestPage: 1,
           selectedRequestKey: '',
           data: {
             premium: {},
             current_month: { usage: { sources: {} } },
+            all_time: { usage: { sources: {} } },
             recent_sessions: [],
             recent_requests: [],
             month_history: [],
@@ -573,6 +590,7 @@
       computed: {
         premium() { return this.data.premium || {}; },
         currentMonth() { return this.data.current_month?.usage || {}; },
+        allTime() { return this.data.all_time?.usage || {}; },
         sourceCards() { return this.currentMonth.sources || {}; },
         premiumRemainingLabel() {
           const remaining = this.premium.official_remaining ?? this.premium.tracked_remaining;
@@ -622,8 +640,25 @@
           const rows = (this.data.recent_requests || []).map((row) => ({ ...row, source: 'proxy' })).filter((row) => this.allowSource(row.source) && this.matches(row));
           return this.sortRows(rows, 'finished_at');
         },
+        requestPageCount() {
+          return Math.max(1, Math.ceil(this.filteredRequests.length / 100));
+        },
+        normalizedRequestPage() {
+          return Math.min(this.requestPageCount, Math.max(1, this.requestPage));
+        },
+        pagedRequests() {
+          const start = (this.normalizedRequestPage - 1) * 100;
+          return this.filteredRequests.slice(start, start + 100);
+        },
+        requestPageStart() {
+          if (!this.filteredRequests.length) return 0;
+          return ((this.normalizedRequestPage - 1) * 100) + 1;
+        },
+        requestPageEnd() {
+          return Math.min(this.normalizedRequestPage * 100, this.filteredRequests.length);
+        },
         selectedRequest() {
-          const rows = this.filteredRequests;
+          const rows = this.pagedRequests;
           if (!rows.length) return null;
           if (!this.selectedRequestKey) return rows[0];
           return rows.find((row) => this.requestKey(row) === this.selectedRequestKey) || rows[0];
@@ -677,9 +712,7 @@
         },
         shortId(value) { return !value ? '-' : (value.length > 36 ? value.slice(-36) : value); },
         sessionKindLabel(kind) {
-          if (kind === 'synthetic_chain') return 'chain fallback';
-          if (kind === 'client_request') return 'client fallback';
-          if (kind === 'request') return 'request fallback';
+          if (kind === 'synthetic_chain' || kind === 'client_request' || kind === 'request') return '';
           return kind || '';
         },
         modelLabel(models) { return Array.isArray(models) && models.length ? models.join(', ') : '-'; },
@@ -731,6 +764,17 @@
         },
         requestChainCount(row) {
           return this.requestChainRows(row).length;
+        },
+        changeRequestPage(delta) {
+          const nextPage = Math.min(this.requestPageCount, Math.max(1, this.requestPage + delta));
+          if (nextPage === this.requestPage) return;
+          this.requestPage = nextPage;
+          this.selectedRequestKey = this.requestKey(this.pagedRequests[0]);
+          this.$nextTick(() => {
+            if (this.$refs.requestList) {
+              this.$refs.requestList.scrollTop = 0;
+            }
+          });
         },
         mergeRecentRequests(currentRows, incomingRows) {
           const previous = Array.isArray(currentRows) ? currentRows : [];
@@ -971,9 +1015,10 @@
           const previousScrollTop = requestList ? requestList.scrollTop : null;
           const mergedRequests = this.mergeRecentRequests(this.data.recent_requests, payload?.recent_requests);
           Object.assign(this.data, { ...payload, recent_requests: mergedRequests });
+          this.requestPage = Math.min(this.requestPageCount, Math.max(1, this.requestPage));
           const requestKeys = new Set((this.data.recent_requests || []).map((row) => this.requestKey(row)));
           if (!requestKeys.has(this.selectedRequestKey)) {
-            this.selectedRequestKey = this.requestKey((this.data.recent_requests || [])[0]);
+            this.selectedRequestKey = this.requestKey((this.pagedRequests || [])[0]);
           }
           if (preserveScroll && requestList && previousScrollTop !== null) {
             this.$nextTick(() => {

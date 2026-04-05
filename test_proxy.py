@@ -1,6 +1,7 @@
 import compression.zstd as pyzstd
 import gzip
 import io
+import os
 import unittest
 import tempfile
 from collections import deque
@@ -17,10 +18,13 @@ import proxy
 class ProxyInitiatorTests(unittest.TestCase):
     def setUp(self):
         proxy._initiator_policy = initiator_policy.InitiatorPolicy()
+        with proxy._usage_log_lock:
+            proxy._recent_usage_events.clear()
+            proxy._archived_usage_events.clear()
         with proxy._session_request_id_lock:
             proxy._latest_server_request_ids_by_chain.clear()
             proxy._active_server_request_ids_by_request.clear()
-            proxy._latest_session_contexts_by_fallback_chain.clear()
+            proxy._latest_claude_user_session_contexts.clear()
         with proxy._premium_cache_lock:
             proxy._premium_cache.update({
                 "loaded_at": 0.0,
@@ -364,6 +368,26 @@ class ProxyInitiatorTests(unittest.TestCase):
         self.assertEqual(event["session_id_origin"], "request")
         self.assertEqual(outbound_headers["session_id"], "claude-session")
 
+    def test_start_usage_event_uses_opencode_session_affinity_header(self):
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/messages"),
+            method="POST",
+            headers={"x-session-affinity": "opencode-session"},
+        )
+        outbound_headers = {}
+
+        event = proxy._start_usage_event(
+            request,
+            requested_model="claude-sonnet-4.6",
+            resolved_model="claude-sonnet-4.6",
+            initiator="user",
+            outbound_headers=outbound_headers,
+        )
+
+        self.assertEqual(event["session_id"], "opencode-session")
+        self.assertEqual(event["session_id_origin"], "request")
+        self.assertEqual(outbound_headers["session_id"], "opencode-session")
+
     def test_start_usage_event_uses_claude_metadata_user_id_session_id(self):
         request = SimpleNamespace(
             url=SimpleNamespace(path="/v1/messages"),
@@ -389,11 +413,66 @@ class ProxyInitiatorTests(unittest.TestCase):
         self.assertEqual(event["session_id_origin"], "request")
         self.assertEqual(outbound_headers["session_id"], "claude-session")
 
-    def test_start_usage_event_agent_inherits_fallback_claude_session_context(self):
+    def test_start_usage_event_user_uses_request_id_session_when_session_missing(self):
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/messages"),
+            method="POST",
+            headers={},
+        )
+        outbound_headers = {}
+        request_id = "user-request-123"
+
+        event = proxy._start_usage_event(
+            request,
+            requested_model="gpt-5.4",
+            resolved_model="gpt-5.4",
+            initiator="user",
+            request_id=request_id,
+            outbound_headers=outbound_headers,
+        )
+
+        self.assertEqual(event["request_id"], request_id)
+        self.assertEqual(event["session_id"], request_id)
+        self.assertEqual(event["session_id_origin"], "request_id")
+        self.assertEqual(outbound_headers["session_id"], request_id)
+        self.assertEqual(outbound_headers["x-request-id"], event["server_request_id"])
+        self.assertEqual(outbound_headers["x-github-request-id"], event["server_request_id"])
+
+    def test_start_usage_event_user_follow_up_attaches_to_active_claude_session(self):
+        first_request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/messages"),
+            method="POST",
+            headers={"x-client-request-id": "client-123"},
+        )
+        first_event = proxy._start_usage_event(
+            first_request,
+            requested_model="claude-sonnet-4.6",
+            resolved_model="claude-sonnet-4.6",
+            initiator="user",
+        )
+
+        follow_up_request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/messages"),
+            method="POST",
+            headers={"x-client-request-id": "client-123"},
+        )
+        follow_up_event = proxy._start_usage_event(
+            follow_up_request,
+            requested_model="claude-haiku-4.5",
+            resolved_model="claude-haiku-4.5",
+            initiator="user",
+        )
+
+        self.assertEqual(follow_up_event["session_id"], first_event["session_id"])
+        self.assertEqual(follow_up_event["session_id_origin"], "request_id")
+        self.assertEqual(follow_up_event["prior_server_request_id"], first_event["server_request_id"])
+        self.assertEqual(follow_up_event["server_request_id"], first_event["server_request_id"])
+
+    def test_start_usage_event_agent_follow_up_attaches_to_active_claude_session(self):
         user_request = SimpleNamespace(
             url=SimpleNamespace(path="/v1/messages"),
             method="POST",
-            headers={"x-claude-code-session-id": "claude-session"},
+            headers={},
         )
         user_event = proxy._start_usage_event(
             user_request,
@@ -414,9 +493,97 @@ class ProxyInitiatorTests(unittest.TestCase):
             initiator="agent",
         )
 
-        self.assertEqual(agent_event["session_id"], "claude-session")
+        self.assertEqual(agent_event["session_id"], user_event["session_id"])
+        self.assertEqual(agent_event["session_id_origin"], "request_id")
         self.assertEqual(agent_event["prior_server_request_id"], user_event["server_request_id"])
         self.assertEqual(agent_event["server_request_id"], user_event["server_request_id"])
+
+    def test_start_usage_event_agent_follow_up_after_user_finish_attaches_to_latest_claude_session(self):
+        user_request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/messages"),
+            method="POST",
+            headers={},
+        )
+        user_event = proxy._start_usage_event(
+            user_request,
+            requested_model="claude-sonnet-4.6",
+            resolved_model="claude-sonnet-4.6",
+            initiator="user",
+        )
+
+        with (
+            mock.patch.object(proxy, "_record_usage_event"),
+            mock.patch.object(proxy._initiator_policy, "note_request_finished"),
+        ):
+            proxy._finish_usage_event(user_event, 200)
+
+        agent_request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/messages"),
+            method="POST",
+            headers={},
+        )
+        agent_event = proxy._start_usage_event(
+            agent_request,
+            requested_model="claude-haiku-4.5",
+            resolved_model="claude-haiku-4.5",
+            initiator="agent",
+        )
+
+        self.assertEqual(agent_event["session_id"], user_event["session_id"])
+        self.assertEqual(agent_event["session_id_origin"], "request_id")
+        self.assertEqual(agent_event["prior_server_request_id"], user_event["server_request_id"])
+        self.assertEqual(agent_event["server_request_id"], user_event["server_request_id"])
+
+    def test_start_usage_event_user_non_claude_request_does_not_generate_implicit_session(self):
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/responses"),
+            method="POST",
+            headers={},
+        )
+
+        event = proxy._start_usage_event(
+            request,
+            requested_model="gpt-5.4",
+            resolved_model="gpt-5.4",
+            initiator="user",
+            outbound_headers={},
+        )
+
+        self.assertIsNone(event["session_id"])
+        self.assertIsNone(event["session_id_origin"])
+        self.assertIsNone(event["prior_server_request_id"])
+
+    def test_start_usage_event_user_without_chain_context_does_not_reuse_unrelated_active_request_id(self):
+        first_request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/messages"),
+            method="POST",
+            headers={},
+        )
+        first_event = proxy._start_usage_event(
+            first_request,
+            requested_model="claude-sonnet-4.6",
+            resolved_model="claude-sonnet-4.6",
+            initiator="user",
+            request_id="first-user-request",
+        )
+
+        second_request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/messages"),
+            method="POST",
+            headers={},
+        )
+        second_event = proxy._start_usage_event(
+            second_request,
+            requested_model="claude-haiku-4.5",
+            resolved_model="claude-haiku-4.5",
+            initiator="user",
+            request_id="second-user-request",
+        )
+
+        self.assertEqual(first_event["session_id"], "first-user-request")
+        self.assertEqual(second_event["session_id"], "second-user-request")
+        self.assertNotEqual(second_event["server_request_id"], first_event["server_request_id"])
+        self.assertIsNone(second_event["prior_server_request_id"])
 
     def test_start_usage_event_agent_inherits_latest_session_server_request_id(self):
         with proxy._session_request_id_lock:
@@ -702,7 +869,7 @@ class ProxyInitiatorTests(unittest.TestCase):
             mock.patch("builtins.open", return_value=io.StringIO(
                 '{"session_id":"session-123","server_request_id":"server-abc","usage":{"prompt_tokens":20,"completion_tokens":4,"prompt_tokens_details":{"cached_tokens":7}}}\n'
             )),
-            mock.patch.object(proxy, "_recent_usage_events", deque(maxlen=proxy.MAX_STORED_USAGE_EVENTS)),
+            mock.patch.object(proxy, "_recent_usage_events", deque()),
         ):
             proxy._load_usage_history()
             events = list(proxy._recent_usage_events)
@@ -721,7 +888,7 @@ class ProxyInitiatorTests(unittest.TestCase):
             mock.patch("builtins.open", return_value=io.StringIO(
                 '{"session_id":"session-123","server_request_id":"server-def","usage":{"input_tokens":20,"output_tokens":4,"input_tokens_details":{"cached_tokens":7},"output_tokens_details":{"reasoning_tokens":2}}}\n'
             )),
-            mock.patch.object(proxy, "_recent_usage_events", deque(maxlen=proxy.MAX_STORED_USAGE_EVENTS)),
+            mock.patch.object(proxy, "_recent_usage_events", deque()),
         ):
             proxy._load_usage_history()
             events = list(proxy._recent_usage_events)
@@ -1377,21 +1544,30 @@ class ProxyInitiatorTests(unittest.TestCase):
             )
 
     def test_enabling_codex_proxy_is_idempotent_when_already_enabled(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            config_path = Path(tmp) / "config.toml"
+        fd, raw_path = tempfile.mkstemp(prefix="codex-config-", suffix=".toml", dir=str(Path.cwd()))
+        os.close(fd)
+        config_path = Path(raw_path)
+        try:
             config_path.write_text(proxy.CODEX_PROXY_CONFIG + "\n", encoding="utf-8")
 
             with mock.patch.object(proxy, "CODEX_CONFIG_FILE", str(config_path)):
                 status = proxy._write_codex_proxy_config()
 
-            backups = list(Path(tmp).glob("config.toml.ghcp-proxy.bak.*"))
+            backups = list(config_path.parent.glob(f"{config_path.name}.ghcp-proxy.bak.*"))
             self.assertTrue(status["configured"])
             self.assertEqual(status["status_message"], "proxy already enabled")
             self.assertEqual(backups, [])
+        finally:
+            config_path.unlink(missing_ok=True)
+            for backup_path in config_path.parent.glob(f"{config_path.name}.ghcp-proxy.bak.*"):
+                backup_path.unlink(missing_ok=True)
 
     def test_disabling_codex_proxy_is_idempotent_when_already_disabled(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            config_path = Path(tmp) / "config.toml"
+        fd, raw_path = tempfile.mkstemp(prefix="codex-config-", suffix=".toml", dir=str(Path.cwd()))
+        os.close(fd)
+        config_path = Path(raw_path)
+        config_path.unlink(missing_ok=True)
+        try:
 
             with mock.patch.object(proxy, "CODEX_CONFIG_FILE", str(config_path)):
                 status = proxy._disable_codex_proxy_config()
@@ -1399,10 +1575,14 @@ class ProxyInitiatorTests(unittest.TestCase):
             self.assertFalse(status["configured"])
             self.assertEqual(status["status_message"], "proxy already disabled")
             self.assertIsNone(status["backup_path"])
+        finally:
+            config_path.unlink(missing_ok=True)
 
     def test_disabling_codex_proxy_restores_latest_backup(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            config_path = Path(tmp) / "config.toml"
+        fd, raw_path = tempfile.mkstemp(prefix="codex-config-", suffix=".toml", dir=str(Path.cwd()))
+        os.close(fd)
+        config_path = Path(raw_path)
+        try:
             backup_path = Path(f"{config_path}.ghcp-proxy.bak.20260404_180000")
             config_path.write_text(proxy.CODEX_PROXY_CONFIG + "\n", encoding="utf-8")
             backup_contents = 'model_provider = "openai"\n'
@@ -1415,6 +1595,9 @@ class ProxyInitiatorTests(unittest.TestCase):
             self.assertTrue(status["restored_from_backup"])
             self.assertFalse(backup_path.exists())
             self.assertEqual(config_path.read_text(encoding="utf-8"), backup_contents)
+        finally:
+            config_path.unlink(missing_ok=True)
+            Path(f"{config_path}.ghcp-proxy.bak.20260404_180000").unlink(missing_ok=True)
 
     def test_month_key_for_source_rows(self):
         self.assertEqual(proxy._month_key_for_source_row("claude", {"month": "2026-04"}), "2026-04")
@@ -1464,6 +1647,7 @@ class ProxyInitiatorTests(unittest.TestCase):
 
         with (
             mock.patch.object(proxy, "_utc_now", return_value=fixed_now),
+            mock.patch.object(proxy, "_snapshot_all_usage_events", return_value=usage_events),
             mock.patch.object(proxy, "_snapshot_usage_events", return_value=usage_events),
             mock.patch.object(proxy, "_load_api_key_payload", return_value={"sku": "plus_monthly_subscriber_quota"}),
             mock.patch.object(
@@ -1491,6 +1675,145 @@ class ProxyInitiatorTests(unittest.TestCase):
         self.assertEqual(payload["current_month"]["usage"]["total_tokens"], 400)
         self.assertEqual(payload["recent_sessions"][0]["source"], "codex")
         self.assertEqual(payload["recent_sessions"][1]["source"], "claude")
+
+    def test_build_dashboard_payload_keeps_archived_totals_and_recent_requests_separate(self):
+        fixed_now = datetime(2026, 4, 4, 18, 0, tzinfo=timezone.utc)
+        archived_event = {
+            "request_id": "archived-req",
+            "session_id": "session-older",
+            "server_request_id": "chain-older",
+            "started_at": "2026-03-30T18:00:00+00:00",
+            "finished_at": "2026-03-30T18:01:00+00:00",
+            "resolved_model": "gpt-5.4",
+            "path": "/v1/responses",
+            "premium_requests": 0.33,
+            "usage": {
+                "input_tokens": 300,
+                "output_tokens": 75,
+                "cached_input_tokens": 25,
+                "total_tokens": 375,
+            },
+            "cost_usd": 3.5,
+        }
+        recent_event = {
+            "request_id": "recent-req",
+            "session_id": "session-newer",
+            "server_request_id": "chain-newer",
+            "started_at": "2026-04-04T17:55:00+00:00",
+            "finished_at": "2026-04-04T17:56:00+00:00",
+            "resolved_model": "gpt-5.4",
+            "path": "/v1/responses",
+            "premium_requests": 0.33,
+            "usage": {
+                "input_tokens": 200,
+                "output_tokens": 40,
+                "cached_input_tokens": 50,
+                "total_tokens": 240,
+            },
+            "cost_usd": 2.75,
+        }
+
+        with (
+            mock.patch.object(proxy, "_utc_now", return_value=fixed_now),
+            mock.patch.object(proxy, "_snapshot_all_usage_events", return_value=[archived_event, recent_event]),
+            mock.patch.object(proxy, "_snapshot_usage_events", return_value=[recent_event]),
+            mock.patch.object(proxy, "_load_api_key_payload", return_value={"sku": "plus_monthly_subscriber_quota"}),
+            mock.patch.object(
+                proxy,
+                "_get_official_premium_payload",
+                return_value={
+                    "available": False,
+                    "remaining": None,
+                    "used": None,
+                    "included": None,
+                    "reset_date": None,
+                    "source": "github-rest-billing-api",
+                    "raw": {},
+                    "refreshing": False,
+                    "error": None,
+                },
+            ),
+        ):
+            payload = proxy._build_dashboard_payload()
+
+        self.assertEqual(payload["all_time"]["proxy_requests"], 2)
+        self.assertEqual(payload["all_time"]["archived_requests"], 1)
+        self.assertEqual(payload["all_time"]["detailed_requests"], 1)
+        self.assertEqual(payload["all_time"]["usage"]["cost_usd"], 6.25)
+        self.assertEqual(payload["all_time"]["usage"]["total_tokens"], 615)
+        self.assertEqual(payload["current_month"]["usage"]["cost_usd"], 2.75)
+        self.assertEqual(len(payload["recent_requests"]), 1)
+        self.assertEqual(payload["recent_requests"][0]["request_id"], "recent-req")
+        self.assertEqual(payload["month_history"][0]["month_key"], "2026-04")
+        self.assertEqual(payload["month_history"][1]["month_key"], "2026-03")
+
+    def test_load_usage_history_compacts_old_requests_into_archive(self):
+        fixed_now = datetime(2026, 4, 4, 18, 0, tzinfo=timezone.utc)
+        events = []
+        for idx in range(proxy.DETAILED_REQUEST_HISTORY_LIMIT + 2):
+            minute = idx % 60
+            events.append({
+                "request_id": f"req-{idx:04d}",
+                "session_id": f"session-{idx:04d}",
+                "server_request_id": f"chain-{idx:04d}",
+                "started_at": f"2026-04-04T18:{minute:02d}:00+00:00",
+                "finished_at": f"2026-04-04T18:{minute:02d}:30+00:00",
+                "resolved_model": "gpt-5.4",
+                "path": "/v1/responses",
+                "premium_requests": 0.33,
+                "usage": {
+                    "input_tokens": 100 + idx,
+                    "output_tokens": 25,
+                    "cached_input_tokens": 10,
+                    "total_tokens": 125 + idx,
+                },
+                "cost_usd": round(0.01 * (idx + 1), 4),
+            })
+
+        serialized_events = "".join(
+            f"{proxy.json.dumps(event, separators=(',', ':'), default=proxy._json_default)}\n"
+            for event in events
+        )
+        db_uri = "file:usage-archive-test?mode=memory&cache=shared"
+        keeper = proxy.sqlite3.connect(db_uri, uri=True)
+        keeper.row_factory = proxy.sqlite3.Row
+        keeper.execute(
+            """
+            CREATE TABLE archived_usage_events (
+                archive_key TEXT PRIMARY KEY,
+                recorded_at TEXT NOT NULL,
+                payload_json TEXT NOT NULL
+            )
+            """
+        )
+        keeper.commit()
+
+        def connect_shared():
+            connection = proxy.sqlite3.connect(db_uri, uri=True)
+            connection.row_factory = proxy.sqlite3.Row
+            return connection
+
+        with (
+            mock.patch.object(proxy.os.path, "exists", return_value=True),
+            mock.patch("builtins.open", return_value=io.StringIO(serialized_events)),
+            mock.patch.object(proxy, "_rewrite_usage_log_locked") as rewrite_usage_log,
+            mock.patch.object(proxy, "_sqlite_cache_enabled", True),
+            mock.patch.object(proxy, "_sqlite_cache_error", None),
+            mock.patch.object(proxy, "_sqlite_connect", side_effect=connect_shared),
+            mock.patch.object(proxy, "_utc_now", return_value=fixed_now),
+        ):
+            proxy._load_usage_history()
+
+        self.assertEqual(len(proxy._recent_usage_events), proxy.DETAILED_REQUEST_HISTORY_LIMIT)
+        self.assertEqual(len(proxy._archived_usage_events), 2)
+        self.assertEqual(proxy._archived_usage_events[0]["request_id"], "req-0000")
+        self.assertEqual(proxy._archived_usage_events[1]["request_id"], "req-0001")
+        self.assertEqual(proxy._recent_usage_events[0]["request_id"], "req-0002")
+        rewrite_usage_log.assert_called_once()
+        self.assertEqual(len(rewrite_usage_log.call_args.args[0]), proxy.DETAILED_REQUEST_HISTORY_LIMIT)
+        archived_count = keeper.execute("SELECT COUNT(*) FROM archived_usage_events").fetchone()[0]
+        self.assertEqual(archived_count, 2)
+        keeper.close()
 
     def test_dashboard_api_refresh_param_forces_refresh_and_disables_http_caching(self):
         request = SimpleNamespace(query_params={"refresh": "1"})
@@ -1560,7 +1883,7 @@ class ProxyInitiatorTests(unittest.TestCase):
         self.assertEqual(normalized["cost_usd"], 1.25)
         self.assertEqual(normalized["models"], ["claude-sonnet-4-6"])
 
-    def test_collect_local_dashboard_usage_marks_synthetic_chain_rows(self):
+    def test_collect_local_dashboard_usage_prefers_request_id_rows_over_chain_rows(self):
         usage = proxy._collect_local_dashboard_usage(
             [
                 {
@@ -1581,8 +1904,8 @@ class ProxyInitiatorTests(unittest.TestCase):
 
         row = usage["recent_sessions"][0]
         self.assertIsNone(row["session_id"])
-        self.assertEqual(row["session_kind"], "synthetic_chain")
-        self.assertEqual(row["session_display_id"], "chain:chain-123")
+        self.assertEqual(row["session_kind"], "session")
+        self.assertEqual(row["session_display_id"], "claude-req")
 
 
 if __name__ == "__main__":

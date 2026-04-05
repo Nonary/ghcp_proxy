@@ -17,15 +17,18 @@ import asyncio
 import base64
 import compression.zstd as pyzstd
 import gzip
+import hashlib
 import json
 import glob
 import os
 import shutil
 import sqlite3
 import sys
+import tempfile
 import time
 import zlib
 from collections import deque
+from contextlib import closing
 from datetime import datetime, timezone
 from threading import Lock, Thread
 from uuid import uuid4
@@ -92,7 +95,7 @@ CLAUDE_PROXY_SETTINGS = {
     },
     "effortLevel": "medium",
 }
-MAX_STORED_USAGE_EVENTS = 400
+DETAILED_REQUEST_HISTORY_LIMIT = 1000
 FORWARDED_REQUEST_HEADERS = (
     "x-client-request-id",
     "x-openai-subagent",
@@ -193,11 +196,12 @@ This summary should serve as a comprehensive handoff document that enables seaml
 _upstream_rate_limit_lock = asyncio.Lock()
 _upstream_request_timestamps = deque()
 _usage_log_lock = Lock()
-_recent_usage_events = deque(maxlen=MAX_STORED_USAGE_EVENTS)
+_recent_usage_events = deque()
+_archived_usage_events: list[dict] = []
 _session_request_id_lock = Lock()
 _latest_server_request_ids_by_chain: dict[tuple[str, str], str] = {}
 _active_server_request_ids_by_request: dict[str, dict[str, str | None]] = {}
-_latest_session_contexts_by_fallback_chain: dict[tuple[str, str], dict[str, str | None]] = {}
+_latest_claude_user_session_contexts: dict[tuple[str, str], dict[str, str | None]] = {}
 _initiator_policy = InitiatorPolicy()
 _sqlite_cache_lock = Lock()
 _sqlite_cache_enabled = True
@@ -567,8 +571,19 @@ def _server_request_chain_key(
     return (scope, normalized_subagent)
 
 
+def _is_claude_request(request: Request | None) -> bool:
+    path = str(request.url.path if request is not None and hasattr(request, "url") else "")
+    return path == "/v1/messages"
+
+
 def _request_session_id(request: Request, request_body: dict | None = None) -> str | None:
-    for header_name in ("session_id", "session-id", "x-claude-code-session-id"):
+    for header_name in (
+        "session_id",
+        "session-id",
+        "x-claude-code-session-id",
+        "x-session-affinity",
+        "x-opencode-session",
+    ):
         header_value = request.headers.get(header_name)
         if isinstance(header_value, str):
             normalized = header_value.strip()
@@ -576,7 +591,7 @@ def _request_session_id(request: Request, request_body: dict | None = None) -> s
                 return normalized
 
     if isinstance(request_body, dict):
-        for key in ("session_id", "sessionId"):
+        for key in ("session_id", "sessionId", "prompt_cache_key", "promptCacheKey"):
             value = request_body.get(key)
             if isinstance(value, str):
                 normalized = value.strip()
@@ -606,35 +621,46 @@ def _request_session_id(request: Request, request_body: dict | None = None) -> s
     return None
 
 
-def _fallback_session_chain_key(client_request_id: str | None, subagent: str | None) -> tuple[str, str]:
-    return _server_request_chain_key(None, client_request_id, subagent)
+def _claude_session_scope_key(
+    client_request_id: str | None,
+    subagent: str | None,
+) -> tuple[str, str]:
+    scope = client_request_id if isinstance(client_request_id, str) and client_request_id else "__global__"
+    normalized_subagent = subagent if isinstance(subagent, str) and subagent else "__root__"
+    return (scope, normalized_subagent)
 
 
-def _remember_fallback_session_context(event: dict | None):
+def _remember_latest_claude_user_session_context(event: dict | None):
     if not isinstance(event, dict):
+        return
+    if _usage_event_source(event) != "claude":
+        return
+    if event.get("initiator") != "user":
         return
     session_id = event.get("session_id")
     if not isinstance(session_id, str) or not session_id:
         return
-    fallback_key = _fallback_session_chain_key(
+    scope_key = _claude_session_scope_key(
         event.get("client_request_id"),
         event.get("subagent"),
     )
     with _session_request_id_lock:
-        _latest_session_contexts_by_fallback_chain[fallback_key] = {
+        _latest_claude_user_session_contexts[scope_key] = {
             "session_id": session_id,
-            "project_path": event.get("project_path"),
+            "session_id_origin": event.get("session_id_origin"),
+            "client_request_id": event.get("client_request_id"),
+            "subagent": event.get("subagent"),
             "server_request_id": event.get("server_request_id"),
         }
 
 
-def _get_fallback_session_context(
+def _get_latest_claude_user_session_context(
     client_request_id: str | None,
     subagent: str | None,
 ) -> dict[str, str | None] | None:
-    fallback_key = _fallback_session_chain_key(client_request_id, subagent)
+    scope_key = _claude_session_scope_key(client_request_id, subagent)
     with _session_request_id_lock:
-        context = _latest_session_contexts_by_fallback_chain.get(fallback_key)
+        context = _latest_claude_user_session_contexts.get(scope_key)
         return dict(context) if isinstance(context, dict) else None
 
 
@@ -665,6 +691,7 @@ def _remember_active_server_request_id(event: dict | None):
     with _session_request_id_lock:
         _active_server_request_ids_by_request[request_id] = {
             "session_id": event.get("session_id"),
+            "session_id_origin": event.get("session_id_origin"),
             "client_request_id": event.get("client_request_id"),
             "subagent": event.get("subagent"),
             "initiator": event.get("initiator"),
@@ -686,21 +713,60 @@ def _get_active_server_request_id_for_request(
     *,
     initiator: str | None = None,
 ) -> str | None:
-    target_scope = _server_request_chain_key(session_id, client_request_id, subagent)
+    target_subagent = subagent if isinstance(subagent, str) and subagent else None
     with _session_request_id_lock:
         for context in reversed(list(_active_server_request_ids_by_request.values())):
-            context_scope = _server_request_chain_key(
-                context.get("session_id"),
-                context.get("client_request_id"),
-                context.get("subagent"),
-            )
-            if context_scope != target_scope:
+            context_subagent = context.get("subagent")
+            if isinstance(context_subagent, str):
+                context_subagent = context_subagent or None
+            else:
+                context_subagent = None
+            if context_subagent != target_subagent:
                 continue
             if initiator is not None and context.get("initiator") != initiator:
+                continue
+            if isinstance(session_id, str) and session_id:
+                if context.get("session_id") != session_id:
+                    continue
+            elif isinstance(client_request_id, str) and client_request_id:
+                if context.get("client_request_id") != client_request_id:
+                    continue
+            elif target_subagent is not None:
                 continue
             server_request_id = context.get("server_request_id")
             if isinstance(server_request_id, str) and server_request_id:
                 return server_request_id
+    return None
+
+
+def _get_active_request_context_for_request(
+    session_id: str | None,
+    client_request_id: str | None,
+    subagent: str | None,
+    *,
+    initiator: str | None = None,
+) -> dict[str, str | None] | None:
+    target_subagent = subagent if isinstance(subagent, str) and subagent else None
+    with _session_request_id_lock:
+        for context in reversed(list(_active_server_request_ids_by_request.values())):
+            context_subagent = context.get("subagent")
+            if isinstance(context_subagent, str):
+                context_subagent = context_subagent or None
+            else:
+                context_subagent = None
+            if context_subagent != target_subagent:
+                continue
+            if initiator is not None and context.get("initiator") != initiator:
+                continue
+            if isinstance(session_id, str) and session_id:
+                if context.get("session_id") != session_id:
+                    continue
+            elif isinstance(client_request_id, str) and client_request_id:
+                if context.get("client_request_id") != client_request_id:
+                    continue
+            elif target_subagent is not None:
+                continue
+            return dict(context)
     return None
 
 
@@ -722,6 +788,7 @@ def _resolve_server_request_id(
     session_id: str | None = None,
     client_request_id: str | None = None,
     subagent: str | None = None,
+    allow_user_active_fallback: bool = False,
 ) -> tuple[str, str | None]:
     explicit_server_request_id = (
         request.headers.get("x-request-id")
@@ -738,6 +805,11 @@ def _resolve_server_request_id(
     if subagent is None:
         subagent = request.headers.get("x-openai-subagent")
 
+    has_chain_context = any(
+        isinstance(value, str) and value
+        for value in (session_id, client_request_id, subagent)
+    )
+
     if initiator == "agent":
         active_server_request_id = _get_active_server_request_id_for_request(
             session_id,
@@ -748,6 +820,17 @@ def _resolve_server_request_id(
         if isinstance(active_server_request_id, str) and active_server_request_id:
             return active_server_request_id, active_server_request_id
 
+    if initiator == "user" and allow_user_active_fallback and has_chain_context:
+        active_server_request_id = _get_active_server_request_id_for_request(
+            session_id,
+            client_request_id,
+            subagent,
+            initiator="user",
+        )
+        if isinstance(active_server_request_id, str) and active_server_request_id:
+            return active_server_request_id, active_server_request_id
+
+    if session_id is not None:
         prior_server_request_id = _get_latest_server_request_id_for_request(
             session_id,
             client_request_id,
@@ -812,19 +895,6 @@ def _apply_missing_claude_session_context(event: dict | None) -> dict | None:
     if _usage_event_source(event) != "claude":
         return event
 
-    fallback_context = _get_fallback_session_context(
-        event.get("client_request_id"),
-        event.get("subagent"),
-    )
-    if isinstance(fallback_context, dict):
-        fallback_session_id = fallback_context.get("session_id")
-        fallback_project_path = fallback_context.get("project_path")
-        if isinstance(fallback_session_id, str) and fallback_session_id:
-            event["session_id"] = fallback_session_id
-            event.setdefault("session_id_origin", "fallback_chain")
-        if isinstance(fallback_project_path, str) and fallback_project_path and not event.get("project_path"):
-            event["project_path"] = fallback_project_path
-
     existing_session_id = event.get("session_id")
     if isinstance(existing_session_id, str) and existing_session_id:
         return event
@@ -838,7 +908,7 @@ def _usage_event_group_key(event: dict | None) -> tuple[str, str]:
 
     source = _usage_event_source(event)
     group_id = None
-    for key in ("session_id", "client_request_id", "server_request_id", "request_id"):
+    for key in ("session_id", "client_request_id", "request_id", "server_request_id"):
         value = event.get(key)
         if isinstance(value, str) and value:
             group_id = value
@@ -868,18 +938,8 @@ def _usage_event_session_descriptor(event: dict | None) -> dict[str, str]:
             "source": source,
             "group_id": group_id,
             "session_id": "",
-            "session_kind": "client_request",
-            "session_display_id": f"client:{client_request_id}",
-        }
-
-    server_request_id = event.get("server_request_id") if isinstance(event, dict) else None
-    if isinstance(server_request_id, str) and server_request_id:
-        return {
-            "source": source,
-            "group_id": group_id,
-            "session_id": "",
-            "session_kind": "synthetic_chain",
-            "session_display_id": f"chain:{server_request_id}",
+            "session_kind": "session",
+            "session_display_id": client_request_id,
         }
 
     request_id = event.get("request_id") if isinstance(event, dict) else None
@@ -888,8 +948,18 @@ def _usage_event_session_descriptor(event: dict | None) -> dict[str, str]:
             "source": source,
             "group_id": group_id,
             "session_id": "",
-            "session_kind": "request",
-            "session_display_id": f"request:{request_id}",
+            "session_kind": "session",
+            "session_display_id": request_id,
+        }
+
+    server_request_id = event.get("server_request_id") if isinstance(event, dict) else None
+    if isinstance(server_request_id, str) and server_request_id:
+        return {
+            "source": source,
+            "group_id": group_id,
+            "session_id": "",
+            "session_kind": "session",
+            "session_display_id": server_request_id,
         }
 
     return {
@@ -980,7 +1050,8 @@ def _set_sqlite_cache_unavailable(error: str):
 def _sqlite_connect() -> sqlite3.Connection:
     if not _sqlite_cache_enabled:
         raise RuntimeError("sqlite cache disabled")
-    os.makedirs(TOKEN_DIR, exist_ok=True)
+    cache_dir = os.path.dirname(SQLITE_CACHE_FILE) or TOKEN_DIR
+    os.makedirs(cache_dir, exist_ok=True)
     connection = sqlite3.connect(SQLITE_CACHE_FILE, timeout=10)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA journal_mode=WAL")
@@ -992,7 +1063,7 @@ def _init_sqlite_cache():
         return False
     try:
         with _sqlite_cache_lock:
-            with _sqlite_connect() as connection:
+            with closing(_sqlite_connect()) as connection:
                 connection.execute(
                     """
                     CREATE TABLE IF NOT EXISTS cache_entries (
@@ -1000,6 +1071,21 @@ def _init_sqlite_cache():
                         payload_json TEXT NOT NULL,
                         updated_at TEXT NOT NULL
                     )
+                    """
+                )
+                connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS archived_usage_events (
+                        archive_key TEXT PRIMARY KEY,
+                        recorded_at TEXT NOT NULL,
+                        payload_json TEXT NOT NULL
+                    )
+                    """
+                )
+                connection.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_archived_usage_events_recorded_at
+                    ON archived_usage_events (recorded_at DESC)
                     """
                 )
                 connection.commit()
@@ -1014,7 +1100,7 @@ def _sqlite_cache_get(cache_key: str) -> dict | None:
         return None
     try:
         with _sqlite_cache_lock:
-            with _sqlite_connect() as connection:
+            with closing(_sqlite_connect()) as connection:
                 row = connection.execute(
                     "SELECT payload_json, updated_at FROM cache_entries WHERE cache_key = ?",
                     (cache_key,),
@@ -1039,7 +1125,7 @@ def _sqlite_cache_get_latest(cache_key_prefix: str) -> dict | None:
         return None
     try:
         with _sqlite_cache_lock:
-            with _sqlite_connect() as connection:
+            with closing(_sqlite_connect()) as connection:
                 row = connection.execute(
                     "SELECT payload_json, updated_at FROM cache_entries WHERE cache_key LIKE ? ORDER BY updated_at DESC LIMIT 1",
                     (f"{cache_key_prefix}%",),
@@ -1068,7 +1154,7 @@ def _sqlite_cache_put(cache_key: str, payload: dict):
     serialized = json.dumps(payload, separators=(",", ":"), default=_json_default)
     try:
         with _sqlite_cache_lock:
-            with _sqlite_connect() as connection:
+            with closing(_sqlite_connect()) as connection:
                 connection.execute(
                     """
                     INSERT INTO cache_entries (cache_key, payload_json, updated_at)
@@ -1433,47 +1519,206 @@ def _parse_iso_datetime(value: str | None) -> datetime | None:
         return None
 
 
+def _normalize_recorded_usage_event(payload: dict | None) -> dict | None:
+    if not isinstance(payload, dict):
+        return None
+
+    normalized_event = dict(payload)
+    normalized_usage = _normalize_usage_payload(normalized_event.get("usage"))
+    if isinstance(normalized_usage, dict):
+        normalized_event["usage"] = normalized_usage
+        if normalized_event.get("cost_usd") is None:
+            normalized_event["cost_usd"] = _usage_event_cost(_usage_event_model_name(normalized_event), normalized_usage)
+    _apply_missing_claude_session_context(normalized_event)
+    return normalized_event
+
+
+def _usage_event_archive_summary(event: dict) -> dict:
+    summary = {
+        "request_id": event.get("request_id"),
+        "started_at": event.get("started_at"),
+        "finished_at": event.get("finished_at"),
+        "path": event.get("path"),
+        "requested_model": event.get("requested_model"),
+        "resolved_model": event.get("resolved_model"),
+        "initiator": event.get("initiator"),
+        "session_id": event.get("session_id"),
+        "project_path": event.get("project_path"),
+        "client_request_id": event.get("client_request_id"),
+        "subagent": event.get("subagent"),
+        "server_request_id": event.get("server_request_id"),
+        "status_code": event.get("status_code"),
+        "success": event.get("success"),
+        "premium_requests": _coerce_float(event.get("premium_requests")),
+        "cost_usd": round(_coerce_float(event.get("cost_usd")), 6),
+    }
+
+    normalized_usage = _normalize_usage_payload(event.get("usage"))
+    if isinstance(normalized_usage, dict):
+        summary["usage"] = normalized_usage
+
+    return summary
+
+
+def _usage_event_archive_key(summary: dict) -> str:
+    request_id = summary.get("request_id")
+    if isinstance(request_id, str) and request_id:
+        return f"request:{request_id}"
+    serialized = json.dumps(summary, sort_keys=True, separators=(",", ":"), default=_json_default)
+    return f"summary:{hashlib.sha1(serialized.encode('utf-8')).hexdigest()}"
+
+
+def _load_archived_usage_history():
+    if not _init_sqlite_cache():
+        return
+
+    try:
+        with _sqlite_cache_lock:
+            with closing(_sqlite_connect()) as connection:
+                rows = connection.execute(
+                    "SELECT payload_json FROM archived_usage_events ORDER BY recorded_at ASC"
+                ).fetchall()
+    except Exception as exc:
+        _set_sqlite_cache_unavailable(str(exc))
+        return
+
+    _archived_usage_events.clear()
+    for row in rows:
+        try:
+            payload = json.loads(row["payload_json"])
+        except json.JSONDecodeError:
+            continue
+        normalized_event = _normalize_recorded_usage_event(payload)
+        if normalized_event is not None:
+            _archived_usage_events.append(normalized_event)
+
+
+def _rewrite_usage_log_locked(events: list[dict]):
+    log_dir = os.path.dirname(USAGE_LOG_FILE) or TOKEN_DIR
+    os.makedirs(log_dir, exist_ok=True)
+    temp_fd, temp_path = tempfile.mkstemp(prefix="usage-log-", suffix=".jsonl", dir=log_dir)
+    try:
+        with os.fdopen(temp_fd, "w", encoding="utf-8") as temp_file:
+            for event in events:
+                temp_file.write(json.dumps(event, separators=(",", ":"), default=_json_default))
+                temp_file.write("\n")
+        os.replace(temp_path, USAGE_LOG_FILE)
+    except Exception:
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+        raise
+
+
+def _delete_archived_usage_events(keys: list[str]):
+    if not keys or not _init_sqlite_cache():
+        return
+    try:
+        with _sqlite_cache_lock:
+            with closing(_sqlite_connect()) as connection:
+                connection.executemany(
+                    "DELETE FROM archived_usage_events WHERE archive_key = ?",
+                    [(key,) for key in keys],
+                )
+                connection.commit()
+    except Exception as exc:
+        _set_sqlite_cache_unavailable(str(exc))
+
+
+def _compact_usage_history_if_needed():
+    with _usage_log_lock:
+        overflow = len(_recent_usage_events) - DETAILED_REQUEST_HISTORY_LIMIT
+        if overflow <= 0:
+            return
+        if not _init_sqlite_cache():
+            return
+
+        detailed_events = list(_recent_usage_events)
+        events_to_archive = detailed_events[:overflow]
+        remaining_events = detailed_events[overflow:]
+        archive_rows = []
+        archived_summaries = []
+        archive_keys = []
+        for event in events_to_archive:
+            summary = _usage_event_archive_summary(event)
+            archive_key = _usage_event_archive_key(summary)
+            recorded_at = summary.get("finished_at") or summary.get("started_at") or _utc_now_iso()
+            archive_rows.append(
+                (
+                    archive_key,
+                    recorded_at,
+                    json.dumps(summary, separators=(",", ":"), default=_json_default),
+                )
+            )
+            archived_summaries.append(summary)
+            archive_keys.append(archive_key)
+
+        try:
+            with _sqlite_cache_lock:
+                with closing(_sqlite_connect()) as connection:
+                    connection.executemany(
+                        """
+                        INSERT INTO archived_usage_events (archive_key, recorded_at, payload_json)
+                        VALUES (?, ?, ?)
+                        ON CONFLICT(archive_key) DO NOTHING
+                        """,
+                        archive_rows,
+                    )
+                    connection.commit()
+            _rewrite_usage_log_locked(remaining_events)
+        except Exception:
+            _delete_archived_usage_events(archive_keys)
+            return
+
+        _recent_usage_events.clear()
+        _recent_usage_events.extend(remaining_events)
+        for summary in archived_summaries:
+            normalized_event = _normalize_recorded_usage_event(summary)
+            if normalized_event is not None:
+                _archived_usage_events.append(normalized_event)
+
+
 def _load_usage_history():
     if not os.path.exists(USAGE_LOG_FILE):
         return
 
     try:
-        with open(USAGE_LOG_FILE, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    payload = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(payload, dict):
-                    normalized_usage = _normalize_usage_payload(payload.get("usage"))
-                    if isinstance(normalized_usage, dict):
-                        payload["usage"] = normalized_usage
-                        if payload.get("cost_usd") is None:
-                            payload["cost_usd"] = _usage_event_cost(_usage_event_model_name(payload), normalized_usage)
-                    _apply_missing_claude_session_context(payload)
-                    _recent_usage_events.append(payload)
-                    _remember_server_request_id(payload)
-                    _remember_fallback_session_context(payload)
+        with _usage_log_lock:
+            with open(USAGE_LOG_FILE, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        payload = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    normalized_event = _normalize_recorded_usage_event(payload)
+                    if normalized_event is None:
+                        continue
+                    _recent_usage_events.append(normalized_event)
+                    _remember_server_request_id(normalized_event)
+                    _remember_latest_claude_user_session_context(normalized_event)
     except OSError:
         pass
+    _compact_usage_history_if_needed()
 
 
 def _record_usage_event(event: dict):
     if not isinstance(event, dict):
         return
 
-    os.makedirs(TOKEN_DIR, exist_ok=True)
+    os.makedirs(os.path.dirname(USAGE_LOG_FILE) or TOKEN_DIR, exist_ok=True)
     serialized = json.dumps(event, separators=(",", ":"), default=_json_default)
     with _usage_log_lock:
         with open(USAGE_LOG_FILE, "a", encoding="utf-8") as f:
             f.write(serialized)
             f.write("\n")
         _recent_usage_events.append(event)
+    _compact_usage_history_if_needed()
     _remember_server_request_id(event)
-    _remember_fallback_session_context(event)
+    _remember_latest_claude_user_session_context(event)
     _notify_dashboard_stream_listeners()
 
 
@@ -1481,7 +1726,7 @@ def _record_request_error(event: dict):
     if not isinstance(event, dict):
         return
 
-    os.makedirs(TOKEN_DIR, exist_ok=True)
+    os.makedirs(os.path.dirname(REQUEST_ERROR_LOG_FILE) or TOKEN_DIR, exist_ok=True)
     serialized = json.dumps(event, separators=(",", ":"), default=_json_default)
     with open(REQUEST_ERROR_LOG_FILE, "a", encoding="utf-8") as f:
         f.write(serialized)
@@ -1606,22 +1851,41 @@ def _start_usage_event(
     upstream_path: str | None = None,
     outbound_headers: dict | None = None,
 ) -> dict:
+    event_request_id = request_id or uuid4().hex
     client_request_id = request.headers.get("x-client-request-id")
     subagent = request.headers.get("x-openai-subagent")
+    is_claude_request = _is_claude_request(request)
+    has_chain_context = any(
+        isinstance(value, str) and value
+        for value in (client_request_id, subagent)
+    )
     session_id = _request_session_id(request, request_body)
     project_path = None
     session_id_origin = "request" if session_id else None
 
-    if not session_id:
-        fallback_context = _get_fallback_session_context(client_request_id, subagent)
-        if isinstance(fallback_context, dict):
-            inherited_session_id = fallback_context.get("session_id")
-            inherited_project_path = fallback_context.get("project_path")
-            if isinstance(inherited_session_id, str) and inherited_session_id:
-                session_id = inherited_session_id
-                session_id_origin = "fallback_chain"
-            if isinstance(inherited_project_path, str) and inherited_project_path:
-                project_path = inherited_project_path
+    if not session_id and is_claude_request:
+        allow_active_session_attach = initiator == "agent" or has_chain_context
+        if allow_active_session_attach:
+            active_user_context = _get_active_request_context_for_request(
+                session_id,
+                client_request_id,
+                subagent,
+                initiator="user",
+            )
+            if not isinstance(active_user_context, dict):
+                active_user_context = _get_latest_claude_user_session_context(
+                    client_request_id,
+                    subagent,
+                )
+            if isinstance(active_user_context, dict):
+                active_session_id = active_user_context.get("session_id")
+                if isinstance(active_session_id, str) and active_session_id:
+                    session_id = active_session_id
+                    session_id_origin = active_user_context.get("session_id_origin") or "request_id"
+
+    if not session_id and initiator == "user" and is_claude_request:
+        session_id = event_request_id
+        session_id_origin = "request_id"
 
     server_request_id, prior_server_request_id = _resolve_server_request_id(
         request,
@@ -1630,6 +1894,7 @@ def _start_usage_event(
         session_id=session_id,
         client_request_id=client_request_id,
         subagent=subagent,
+        allow_user_active_fallback=is_claude_request and initiator == "user",
     )
     if isinstance(outbound_headers, dict):
         if session_id:
@@ -1638,7 +1903,7 @@ def _start_usage_event(
         outbound_headers["x-github-request-id"] = server_request_id
     started_at = _utc_now_iso()
     event = {
-        "request_id": request_id or uuid4().hex,
+        "request_id": event_request_id,
         "started_at": started_at,
         "path": request.url.path,
         "method": request.method,
@@ -1656,7 +1921,6 @@ def _start_usage_event(
         "_started_monotonic": time.perf_counter(),
     }
     _remember_server_request_id(event)
-    _remember_fallback_session_context(event)
     _remember_active_server_request_id(event)
     return event
 
@@ -1732,6 +1996,7 @@ def _finish_usage_event(
     finished_event["cost_usd"] = _usage_event_cost(model_name, derived_usage)
     finished_event["premium_requests"] = _premium_request_multiplier(model_name) if status_code < 400 else 0.0
     _remember_server_request_id(finished_event)
+    _remember_latest_claude_user_session_context(finished_event)
     _record_usage_event(finished_event)
 
 
@@ -1739,6 +2004,10 @@ def _snapshot_usage_events() -> list[dict]:
     with _usage_log_lock:
         return list(_recent_usage_events)
 
+
+def _snapshot_all_usage_events() -> list[dict]:
+    with _usage_log_lock:
+        return [*list(_archived_usage_events), *list(_recent_usage_events)]
 
 
 def _new_usage_aggregate_bucket() -> dict:
@@ -2131,11 +2400,59 @@ def _combine_month_rows(rows: list[dict]) -> list[dict]:
     return [grouped[key] | {"cost_usd": round(grouped[key]["cost_usd"], 4)} for key in sorted(grouped.keys(), reverse=True)]
 
 
+def _combine_usage_rows(rows: list[dict], *, month_key: str | None = None) -> dict:
+    per_source = {}
+    for row in rows:
+        source = row.get("source")
+        if not isinstance(source, str) or not source:
+            continue
+        current = per_source.setdefault(
+            source,
+            {
+                "source": source,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0,
+                "cached_input_tokens": 0,
+                "cache_creation_tokens": 0,
+                "reasoning_output_tokens": 0,
+                "cost_usd": 0.0,
+                "models": [],
+            },
+        )
+        current["input_tokens"] += row.get("input_tokens", 0)
+        current["output_tokens"] += row.get("output_tokens", 0)
+        current["total_tokens"] += row.get("total_tokens", 0)
+        current["cached_input_tokens"] += row.get("cached_input_tokens", 0)
+        current["cache_creation_tokens"] += row.get("cache_creation_tokens", 0)
+        current["reasoning_output_tokens"] += row.get("reasoning_output_tokens", 0)
+        current["cost_usd"] += row.get("cost_usd", 0.0)
+        current["models"] = sorted(set(current["models"]) | set(row.get("models") or []))
+
+    combined = {
+        "input_tokens": sum(item.get("input_tokens", 0) for item in per_source.values()),
+        "output_tokens": sum(item.get("output_tokens", 0) for item in per_source.values()),
+        "total_tokens": sum(item.get("total_tokens", 0) for item in per_source.values()),
+        "cached_input_tokens": sum(item.get("cached_input_tokens", 0) for item in per_source.values()),
+        "cache_creation_tokens": sum(item.get("cache_creation_tokens", 0) for item in per_source.values()),
+        "reasoning_output_tokens": sum(item.get("reasoning_output_tokens", 0) for item in per_source.values()),
+        "cost_usd": round(sum(item.get("cost_usd", 0.0) for item in per_source.values()), 4),
+        "sources": {
+            source: item | {"cost_usd": round(item.get("cost_usd", 0.0), 4)}
+            for source, item in per_source.items()
+        },
+    }
+    if month_key is not None:
+        combined["month_key"] = month_key
+    return combined
+
+
 def _build_dashboard_payload(force_refresh: bool = False) -> dict:
     now = _utc_now()
     month_start, month_end = _current_billing_month_bounds(now)
     current_month_key = _month_key(now)
-    usage_events = _snapshot_usage_events()
+    usage_events = _snapshot_all_usage_events()
+    detailed_usage_events = _snapshot_usage_events()
     current_month_events = []
     for event in usage_events:
         recorded_at = _parse_iso_datetime(event.get("finished_at") or event.get("started_at"))
@@ -2159,29 +2476,19 @@ def _build_dashboard_payload(force_refresh: bool = False) -> dict:
     official_available = bool(official_premium.get("available"))
 
     local_usage = _collect_local_dashboard_usage(usage_events)
-    per_source_month = {}
-    for row in local_usage.get("month_rows") or []:
-        source = row.get("source")
-        if row.get("month_key") == current_month_key and isinstance(source, str) and source:
-            per_source_month[source] = row
-
-    current_month_usage = {
-        "month_key": current_month_key,
-        "input_tokens": sum(item.get("input_tokens", 0) for item in per_source_month.values()),
-        "output_tokens": sum(item.get("output_tokens", 0) for item in per_source_month.values()),
-        "total_tokens": sum(item.get("total_tokens", 0) for item in per_source_month.values()),
-        "cached_input_tokens": sum(item.get("cached_input_tokens", 0) for item in per_source_month.values()),
-        "cache_creation_tokens": sum(item.get("cache_creation_tokens", 0) for item in per_source_month.values()),
-        "reasoning_output_tokens": sum(item.get("reasoning_output_tokens", 0) for item in per_source_month.values()),
-        "cost_usd": round(sum(item.get("cost_usd", 0.0) for item in per_source_month.values()), 4),
-        "sources": per_source_month,
-    }
+    month_rows = list(local_usage.get("month_rows") or [])
+    current_month_usage = _combine_usage_rows(
+        [row for row in month_rows if row.get("month_key") == current_month_key],
+        month_key=current_month_key,
+    )
+    all_time_usage = _combine_usage_rows(month_rows)
+    all_time_usage["months_tracked"] = len(local_usage.get("month_history") or [])
 
     recent_requests = sorted(
-        current_month_events,
+        detailed_usage_events,
         key=lambda item: item.get("finished_at") or item.get("started_at") or "",
         reverse=True,
-    )[:100]
+    )[:DETAILED_REQUEST_HISTORY_LIMIT]
 
     return {
         "generated_at": now.isoformat(),
@@ -2204,12 +2511,20 @@ def _build_dashboard_payload(force_refresh: bool = False) -> dict:
             "sessions": local_usage.get("session_count", 0),
             "usage": current_month_usage,
         },
+        "all_time": {
+            "proxy_requests": len(usage_events),
+            "archived_requests": max(len(usage_events) - len(detailed_usage_events), 0),
+            "detailed_requests": len(detailed_usage_events),
+            "sessions": local_usage.get("session_count", 0),
+            "usage": all_time_usage,
+        },
         "recent_sessions": local_usage.get("recent_sessions") or [],
         "recent_requests": recent_requests,
         "month_history": (local_usage.get("month_history") or [])[:12],
     }
 
 
+_load_archived_usage_history()
 _load_usage_history()
 _initiator_policy.seed_from_usage_events(_snapshot_usage_events())
 _seed_cached_payloads_from_sqlite()
@@ -2283,7 +2598,8 @@ async def parse_json_request(request: Request) -> dict:
 
 def _load_access_token() -> str | None:
     try:
-        tok = open(ACCESS_TOKEN_FILE).read().strip()
+        with open(ACCESS_TOKEN_FILE, encoding="utf-8") as f:
+            tok = f.read().strip()
         return tok or None
     except OSError:
         return None
@@ -2295,7 +2611,8 @@ def _load_billing_token() -> str | None:
         return env_token
 
     try:
-        tok = open(BILLING_TOKEN_FILE, encoding="utf-8").read().strip()
+        with open(BILLING_TOKEN_FILE, encoding="utf-8") as f:
+            tok = f.read().strip()
         return tok or None
     except OSError:
         return None
@@ -2320,7 +2637,8 @@ def _billing_token_status() -> dict[str, bool | str]:
         return {"configured": True, "source": "environment", "readonly": True}
 
     try:
-        tok = open(BILLING_TOKEN_FILE, encoding="utf-8").read().strip()
+        with open(BILLING_TOKEN_FILE, encoding="utf-8") as f:
+            tok = f.read().strip()
     except OSError:
         tok = ""
     return {"configured": bool(tok), "source": "file" if tok else "none", "readonly": False}
@@ -2625,7 +2943,8 @@ def _save_access_token(token: str):
 
 def _load_api_key() -> str | None:
     try:
-        data = json.load(open(API_KEY_FILE))
+        with open(API_KEY_FILE, encoding="utf-8") as f:
+            data = json.load(f)
         if data["expires_at"] > datetime.now().timestamp():
             return data["token"]
     except Exception:
@@ -2636,7 +2955,8 @@ def _load_api_key() -> str | None:
 def _get_api_base() -> str:
     """Use the endpoint embedded in api-key.json if present, else default."""
     try:
-        data = json.load(open(API_KEY_FILE))
+        with open(API_KEY_FILE, encoding="utf-8") as f:
+            data = json.load(f)
         return data.get("endpoints", {}).get("api") or GITHUB_COPILOT_API_BASE
     except Exception:
         return GITHUB_COPILOT_API_BASE
