@@ -245,10 +245,10 @@
 
         <div v-else-if="activeTab === 'requests'">
           <div v-if="filteredRequests.length" class="request-layout">
-            <div class="request-list">
+            <div class="request-list" ref="requestList">
               <button
                 v-for="row in filteredRequests"
-                :key="row.request_id || row.started_at"
+                :key="requestKey(row)"
                 type="button"
                 class="request-row"
                 :class="{ active: selectedRequestKey === requestKey(row) }"
@@ -564,6 +564,11 @@
             error: '',
             statusMessage: '',
           },
+          dashboardStream: null,
+          dashboardStreamConnected: false,
+          dashboardStreamError: '',
+          dashboardStreamReconnectTimer: null,
+          dashboardStreamReconnectDelay: 1000,
         };
       },
       computed: {
@@ -725,6 +730,34 @@
         },
         requestChainCount(row) {
           return this.requestChainRows(row).length;
+        },
+        mergeRecentRequests(currentRows, incomingRows) {
+          const previous = Array.isArray(currentRows) ? currentRows : [];
+          const incoming = Array.isArray(incomingRows) ? incomingRows : [];
+
+          if (!previous.length) {
+            return incoming.map((row) => ({ ...row }));
+          }
+
+          const byKey = new Map();
+          for (const row of previous) {
+            const key = this.requestKey(row);
+            if (key) {
+              byKey.set(key, row);
+            }
+          }
+
+          return incoming.map((row) => {
+            const key = this.requestKey(row);
+            if (!key) return { ...row };
+
+            const existing = byKey.get(key);
+            if (existing) {
+              return Object.assign(existing, row);
+            }
+
+            return { ...row };
+          });
         },
         historyWidth(row) {
           const max = Math.max(...this.monthHistory.map((item) => Number(item.cost_usd || 0)), 1);
@@ -928,6 +961,92 @@
           if (this.sortMode === 'tokens') return sorted.sort((a, b) => Number(b.total_tokens || 0) - Number(a.total_tokens || 0));
           return sorted.sort((a, b) => String(b[dateKey] || b.started_at || '').localeCompare(String(a[dateKey] || a.started_at || '')));
         },
+        _applyDashboardPayload(payload) {
+          if (!payload || typeof payload !== 'object') {
+            return;
+          }
+          const preserveScroll = this.activeTab === 'requests';
+          const requestList = preserveScroll ? this.$refs.requestList : null;
+          const previousScrollTop = requestList ? requestList.scrollTop : null;
+          const mergedRequests = this.mergeRecentRequests(this.data.recent_requests, payload?.recent_requests);
+          Object.assign(this.data, { ...payload, recent_requests: mergedRequests });
+          const requestKeys = new Set((this.data.recent_requests || []).map((row) => this.requestKey(row)));
+          if (!requestKeys.has(this.selectedRequestKey)) {
+            this.selectedRequestKey = this.requestKey((this.data.recent_requests || [])[0]);
+          }
+          if (preserveScroll && requestList && previousScrollTop !== null) {
+            this.$nextTick(() => {
+              if (this.$refs.requestList) {
+                this.$refs.requestList.scrollTop = previousScrollTop;
+              }
+            });
+          }
+        },
+        startDashboardStream() {
+          if (this.dashboardStream) {
+            return;
+          }
+          if (typeof EventSource === 'undefined') {
+            this.dashboardStreamError = 'EventSource is not supported in this browser.';
+            return;
+          }
+
+          this.dashboardStream = new EventSource('/api/dashboard/stream');
+
+          this.dashboardStream.onopen = () => {
+            this.dashboardStreamConnected = true;
+            this.dashboardStreamError = '';
+            this.dashboardStreamReconnectDelay = 1000;
+          };
+
+          this.dashboardStream.onmessage = (event) => {
+            this.dashboardStreamError = '';
+            try {
+              const payload = JSON.parse(event.data || '{}');
+              this._applyDashboardPayload(payload);
+            } catch (error) {
+              this.dashboardStreamError = error?.message || 'Failed to parse dashboard stream payload.';
+              this.stopDashboardStream();
+              this.dashboardStreamReconnectDelay = Math.min(this.dashboardStreamReconnectDelay * 2, 15000);
+            }
+          };
+
+          this.dashboardStream.addEventListener('dashboard', (event) => {
+            this.dashboardStreamError = '';
+            try {
+              const payload = JSON.parse(event.data || '{}');
+              this.dashboardStreamConnected = true;
+              this._applyDashboardPayload(payload);
+            } catch (error) {
+              this.dashboardStreamError = error?.message || 'Failed to parse dashboard stream payload.';
+              this.stopDashboardStream();
+            }
+          });
+
+          this.dashboardStream.addEventListener('heartbeat', () => {
+            this.dashboardStreamConnected = true;
+          });
+
+          this.dashboardStream.onerror = () => {
+            this.dashboardStreamConnected = false;
+            this.stopDashboardStream();
+            this.dashboardStreamReconnectDelay = Math.min(this.dashboardStreamReconnectDelay * 2, 15000);
+            this.dashboardStreamReconnectTimer = window.setTimeout(() => {
+              this.startDashboardStream();
+            }, this.dashboardStreamReconnectDelay);
+          };
+        },
+        stopDashboardStream() {
+          if (this.dashboardStream) {
+            this.dashboardStream.close();
+            this.dashboardStream = null;
+          }
+          this.dashboardStreamConnected = false;
+          if (this.dashboardStreamReconnectTimer) {
+            window.clearTimeout(this.dashboardStreamReconnectTimer);
+            this.dashboardStreamReconnectTimer = null;
+          }
+        },
         async load(forceRefresh = false) {
           if (this.loading) return;
           this.loading = true;
@@ -940,11 +1059,8 @@
             const query = params.toString();
             const response = await fetch(`/api/dashboard${query ? `?${query}` : ''}`);
             if (!response.ok) throw new Error(`dashboard request failed: ${response.status}`);
-            this.data = await response.json();
-            const requestKeys = new Set((this.data.recent_requests || []).map((row) => this.requestKey(row)));
-            if (!requestKeys.has(this.selectedRequestKey)) {
-              this.selectedRequestKey = this.requestKey((this.data.recent_requests || [])[0]);
-            }
+            const payload = await response.json();
+            this._applyDashboardPayload(payload);
           } catch (error) {
             this.data.ccusage = { ...(this.data.ccusage || {}), errors: [{ source: 'dashboard', error: error.message }] };
           } finally {
@@ -956,13 +1072,19 @@
         this.load(true);
         this.loadBillingTokenConfig();
         this.loadClientProxyStatus();
-        this.autoRefreshTimer = window.setInterval(() => this.load(true), 60000);
+        this.startDashboardStream();
+        this.autoRefreshTimer = window.setInterval(() => {
+          if (!this.dashboardStreamConnected) {
+            this.load(true);
+          }
+        }, 60000);
       },
       beforeUnmount() {
         if (this.autoRefreshTimer) {
           window.clearInterval(this.autoRefreshTimer);
           this.autoRefreshTimer = null;
         }
+        this.stopDashboardStream();
       },
     }).mount('#app');
   </script>

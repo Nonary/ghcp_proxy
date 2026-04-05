@@ -206,6 +206,9 @@ _sqlite_cache_lock = Lock()
 _sqlite_cache_enabled = True
 _sqlite_cache_error = None
 _premium_cache_lock = Lock()
+_dashboard_stream_subscribers = set()
+_dashboard_stream_lock = Lock()
+_dashboard_stream_version = 0
 _ccusage_cache = {
     "loaded_at": 0.0,
     "payload": None,
@@ -1036,6 +1039,7 @@ def _record_usage_event(event: dict):
             f.write("\n")
         _recent_usage_events.append(event)
     _remember_server_request_id(event)
+    _notify_dashboard_stream_listeners()
 
 
 def _record_request_error(event: dict):
@@ -1047,6 +1051,40 @@ def _record_request_error(event: dict):
     with open(REQUEST_ERROR_LOG_FILE, "a", encoding="utf-8") as f:
         f.write(serialized)
         f.write("\n")
+
+
+def _register_dashboard_stream_listener() -> asyncio.Queue[int]:
+    queue: asyncio.Queue[int] = asyncio.Queue(maxsize=1)
+    with _dashboard_stream_lock:
+        _dashboard_stream_subscribers.add(queue)
+    return queue
+
+
+def _unregister_dashboard_stream_listener(queue: asyncio.Queue[int]):
+    with _dashboard_stream_lock:
+        _dashboard_stream_subscribers.discard(queue)
+
+
+def _notify_dashboard_stream_listeners():
+    global _dashboard_stream_version
+
+    _dashboard_stream_version += 1
+    with _dashboard_stream_lock:
+        if not _dashboard_stream_subscribers:
+            return
+        subscribers = list(_dashboard_stream_subscribers)
+
+    for queue in subscribers:
+        try:
+            queue.put_nowait(_dashboard_stream_version)
+        except asyncio.QueueFull:
+            try:
+                queue.get_nowait()
+                queue.put_nowait(_dashboard_stream_version)
+            except asyncio.QueueEmpty:
+                pass
+            except RuntimeError:
+                _unregister_dashboard_stream_listener(queue)
 
 
 class _SSEUsageCapture:
@@ -3788,6 +3826,43 @@ async def dashboard():
 async def dashboard_api(request: Request):
     refresh = request.query_params.get("refresh", "").lower() in {"1", "true", "yes"}
     return JSONResponse(content=_build_dashboard_payload(force_refresh=refresh))
+
+
+@app.get("/api/dashboard/stream")
+async def dashboard_stream(request: Request):
+    heartbeat_seconds = 20
+    queue = _register_dashboard_stream_listener()
+    last_version = _dashboard_stream_version
+
+    async def stream():
+        nonlocal last_version
+        try:
+            yield _sse_encode("dashboard", _build_dashboard_payload(force_refresh=False))
+            while True:
+                if await request.is_disconnected():
+                    break
+
+                try:
+                    version = await asyncio.wait_for(queue.get(), timeout=heartbeat_seconds)
+                except asyncio.TimeoutError:
+                    yield _sse_encode("heartbeat", {"at": _utc_now_iso()})
+                    continue
+
+                if version == last_version:
+                    continue
+                last_version = version
+                yield _sse_encode("dashboard", _build_dashboard_payload(force_refresh=False))
+        finally:
+            _unregister_dashboard_stream_listener(queue)
+
+    return StreamingResponse(
+        stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-store",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.get("/api/config/billing-token")
