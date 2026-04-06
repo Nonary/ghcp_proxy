@@ -17,7 +17,6 @@ from constants import (
 # that reference format_translation.build_*_headers_for_request continue to work.
 from request_headers import (  # noqa: F401
     has_vision_input,
-    model_requires_anthropic_beta,
     build_copilot_headers,
     build_responses_headers_for_request,
     build_chat_headers_for_request,

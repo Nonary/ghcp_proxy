@@ -173,6 +173,21 @@ class RequestHeadersTests(unittest.TestCase):
         self.assertEqual(headers["x-client-request-id"], "session-123")
         self.assertEqual(body["prompt_cache_key"], "session-123")
 
+    def test_build_responses_headers_for_request_uses_conversation_agent_intent(self):
+        request = SimpleNamespace(
+            headers={},
+            url=SimpleNamespace(path="/v1/responses"),
+        )
+        body = {"model": "gpt-5.4", "input": "hello"}
+
+        headers = format_translation.build_responses_headers_for_request(
+            request, body, "test-key",
+            initiator_policy=proxy._initiator_policy,
+            session_id_resolver=usage_tracking.request_session_id,
+        )
+
+        self.assertEqual(headers["Openai-Intent"], "conversation-agent")
+
     def test_build_responses_headers_for_request_normalizes_prompt_cache_key_alias(self):
         request = SimpleNamespace(
             headers={},

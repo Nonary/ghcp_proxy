@@ -28,13 +28,6 @@ def has_vision_input(value, depth=0, max_depth=10) -> bool:
     return False
 
 
-def model_requires_anthropic_beta(model_name) -> bool:
-    if not isinstance(model_name, str):
-        return False
-    normalized = model_name.strip().lower()
-    return "claude" in normalized or normalized.startswith("anthropic")
-
-
 def _interaction_type_for_initiator(initiator: str) -> str:
     if initiator == "user":
         return "conversation-user"
@@ -138,9 +131,6 @@ def build_responses_headers_for_request(
     if has_vision_input(effective_input):
         headers["Copilot-Vision-Request"] = "true"
 
-    if model_requires_anthropic_beta(body.get("model")):
-        headers["anthropic-beta"] = "interleaved-thinking-2025-05-14"
-
     return headers
 
 
@@ -175,9 +165,6 @@ def build_chat_headers_for_request(
                         break
                 if headers.get("Copilot-Vision-Request") == "true":
                     break
-
-    if model_requires_anthropic_beta(model_name):
-        headers["anthropic-beta"] = "interleaved-thinking-2025-05-14"
 
     return headers
 
@@ -225,8 +212,5 @@ def build_anthropic_headers_for_request(
 
     if _anthropic_messages_has_vision(messages):
         headers["Copilot-Vision-Request"] = "true"
-
-    if model_requires_anthropic_beta(body.get("model")):
-        headers["anthropic-beta"] = "interleaved-thinking-2025-05-14"
 
     return headers
