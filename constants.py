@@ -29,6 +29,7 @@ API_KEY_FILE      = os.path.join(TOKEN_DIR, "api-key.json")
 MODEL_ROUTING_CONFIG_FILE = os.path.join(TOKEN_DIR, "model-routing.json")
 USAGE_LOG_FILE    = os.path.join(TOKEN_DIR, "usage-log.jsonl")
 REQUEST_ERROR_LOG_FILE = os.path.join(TOKEN_DIR, "request-errors.log")
+REQUEST_TRACE_LOG_FILE = os.path.join(TOKEN_DIR, "request-trace.jsonl")
 PROXY_BASE_URL    = "http://localhost:8000"
 CODEX_PROXY_BASE_URL = f"{PROXY_BASE_URL}/v1"
 DASHBOARD_BASE_URL = "http://localhost:8000"
