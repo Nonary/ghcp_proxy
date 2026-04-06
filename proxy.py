@@ -25,7 +25,8 @@ import time
 import usage_tracking
 import util
 from dataclasses import dataclass
-from threading import Thread
+from threading import Lock, Thread
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 import httpx
@@ -56,6 +57,7 @@ from constants import (
     CLAUDE_MAX_CONTEXT_TOKENS,
     CLAUDE_MAX_OUTPUT_TOKENS,
     DEFAULT_UPSTREAM_TIMEOUT_SECONDS,
+    REQUEST_TRACE_LOG_FILE,
 )
 
 from rate_limiting import (
@@ -68,6 +70,22 @@ from rate_limiting import (
 # ─── App & Global State ──────────────────────────────────────────────────────
 
 app = FastAPI()
+_REQUEST_TRACE_LOCK = Lock()
+_TRACE_HEADER_ALLOWLIST = {
+    "content-type",
+    "user-agent",
+    "openai-intent",
+    "editor-version",
+    "editor-plugin-version",
+    "copilot-integration-id",
+    "x-initiator",
+    "copilot-vision-request",
+    "anthropic-beta",
+    "session_id",
+    "x-client-request-id",
+    "x-request-id",
+    "x-github-request-id",
+}
 
 _initiator_policy = InitiatorPolicy()
 usage_event_bus = EventBus()
@@ -193,12 +211,297 @@ def _extract_upstream_text(upstream: httpx.Response) -> str | None:
 
 @dataclass
 class UpstreamRequestPlan:
+    request_id: str
     upstream_url: str
     headers: dict
     body: dict
     usage_event: dict | None
     requested_model: str | None
     resolved_model: str | None
+    trace_context: dict | None = None
+
+
+def _env_flag(name: str) -> bool:
+    value = str(os.environ.get(name, "")).strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+def request_tracing_enabled() -> bool:
+    return _env_flag("GHCP_TRACE_REQUESTS")
+
+
+def request_trace_log_path() -> str:
+    configured = str(os.environ.get("GHCP_TRACE_LOG_FILE", "")).strip()
+    return os.path.expanduser(configured or REQUEST_TRACE_LOG_FILE)
+
+
+def _header_trace_subset(headers: dict | None) -> dict:
+    if not isinstance(headers, dict):
+        return {}
+    subset = {}
+    for key, value in headers.items():
+        normalized_key = str(key).strip()
+        if not normalized_key or normalized_key.lower() not in _TRACE_HEADER_ALLOWLIST:
+            continue
+        subset[normalized_key] = value
+    return subset
+
+
+def _sorted_counts(values: dict[str, int]) -> dict[str, int]:
+    return {key: values[key] for key in sorted(values)}
+
+
+def _count_trace_items(items) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    if not isinstance(items, list):
+        return counts
+    for item in items:
+        if isinstance(item, dict):
+            item_type = str(item.get("type", "dict")).strip() or "dict"
+        else:
+            item_type = type(item).__name__
+        counts[item_type] = counts.get(item_type, 0) + 1
+    return _sorted_counts(counts)
+
+
+def _count_trace_roles(items) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    if not isinstance(items, list):
+        return counts
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role", "")).strip().lower()
+        if not role:
+            continue
+        counts[role] = counts.get(role, 0) + 1
+    return _sorted_counts(counts)
+
+
+def _trace_messages_summary(messages) -> dict:
+    if isinstance(messages, str):
+        return {"kind": "string", "chars": len(messages)}
+    if not isinstance(messages, list):
+        return {"kind": type(messages).__name__}
+
+    part_counts: dict[str, int] = {}
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict):
+                    part_type = str(part.get("type", "dict")).strip() or "dict"
+                else:
+                    part_type = type(part).__name__
+                part_counts[part_type] = part_counts.get(part_type, 0) + 1
+        elif isinstance(content, str) and content:
+            part_counts["text"] = part_counts.get("text", 0) + 1
+
+    return {
+        "kind": "list",
+        "count": len(messages),
+        "roles": _count_trace_roles(messages),
+        "content_part_types": _sorted_counts(part_counts),
+    }
+
+
+def _trace_input_summary(input_value) -> dict:
+    if isinstance(input_value, str):
+        return {"kind": "string", "chars": len(input_value)}
+    if not isinstance(input_value, list):
+        return {"kind": type(input_value).__name__}
+
+    encrypted_reasoning_items = 0
+    for item in input_value:
+        if isinstance(item, dict) and item.get("type") == "reasoning" and isinstance(item.get("encrypted_content"), str):
+            encrypted_reasoning_items += 1
+
+    return {
+        "kind": "list",
+        "count": len(input_value),
+        "item_types": _count_trace_items(input_value),
+        "roles": _count_trace_roles(input_value),
+        "has_compaction": format_translation.input_contains_compaction(input_value),
+        "encrypted_reasoning_items": encrypted_reasoning_items,
+    }
+
+
+def _trace_body_summary(body: dict | None) -> dict | None:
+    if not isinstance(body, dict):
+        return None
+
+    summary = {
+        "keys": sorted(body.keys()),
+        "model": body.get("model"),
+        "stream": body.get("stream"),
+    }
+
+    for source_key, target_key in (
+        ("session_id", "session_id"),
+        ("sessionId", "session_id"),
+        ("prompt_cache_key", "prompt_cache_key"),
+        ("promptCacheKey", "prompt_cache_key"),
+        ("previous_response_id", "previous_response_id"),
+    ):
+        value = body.get(source_key)
+        if isinstance(value, str) and value.strip():
+            summary[target_key] = value.strip()
+
+    tools = body.get("tools")
+    if isinstance(tools, list):
+        summary["tool_count"] = len(tools)
+
+    if "input" in body:
+        summary["input"] = _trace_input_summary(body.get("input"))
+    if "messages" in body:
+        summary["messages"] = _trace_messages_summary(body.get("messages"))
+
+    metadata = body.get("metadata")
+    if isinstance(metadata, dict):
+        summary["metadata_keys"] = sorted(metadata.keys())
+
+    return summary
+
+
+def _trace_response_summary(
+    upstream: httpx.Response | None = None,
+    response_payload: dict | None = None,
+    usage: dict | None = None,
+) -> dict:
+    summary: dict = {}
+    if upstream is not None:
+        summary["status_code"] = upstream.status_code
+        content_type = upstream.headers.get("content-type")
+        if content_type:
+            summary["content_type"] = content_type
+        for header_name in ("x-request-id", "request-id", "x-github-request-id"):
+            header_value = upstream.headers.get(header_name)
+            if header_value:
+                summary["upstream_request_id"] = header_value
+                break
+
+    if isinstance(response_payload, dict):
+        for key in ("id", "object", "model"):
+            value = response_payload.get(key)
+            if isinstance(value, str) and value:
+                summary[key] = value
+        output = response_payload.get("output")
+        if isinstance(output, list):
+            summary["output_item_types"] = _count_trace_items(output)
+
+    normalized_usage = util.normalize_usage_payload(usage)
+    if normalized_usage is None and isinstance(response_payload, dict):
+        normalized_usage = util.normalize_usage_payload(response_payload.get("usage"))
+    if isinstance(normalized_usage, dict):
+        summary["usage"] = normalized_usage
+
+    error_payload = None
+    if isinstance(response_payload, dict):
+        maybe_error = response_payload.get("error")
+        if isinstance(maybe_error, dict):
+            error_payload = maybe_error
+    if isinstance(error_payload, dict):
+        error_summary = {}
+        for key in ("type", "code", "param"):
+            value = error_payload.get(key)
+            if value is not None:
+                error_summary[key] = value
+        if error_summary:
+            summary["error"] = error_summary
+
+    return summary
+
+
+def _append_request_trace(payload: dict) -> None:
+    if not request_tracing_enabled():
+        return
+    trace_path = request_trace_log_path()
+    try:
+        os.makedirs(os.path.dirname(trace_path), exist_ok=True)
+        with _REQUEST_TRACE_LOCK:
+            with open(trace_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(payload, separators=(",", ":"), default=util._json_default))
+                f.write("\n")
+    except OSError as exc:
+        print(f"Warning: failed to write request trace log: {exc}", file=sys.stderr, flush=True)
+
+
+def _emit_request_trace_start(
+    *,
+    request_id: str,
+    request: Request,
+    upstream_url: str,
+    upstream_path: str | None,
+    requested_model: str | None,
+    resolved_model: str | None,
+    request_body: dict | None,
+    upstream_body: dict | None,
+    outbound_headers: dict | None,
+    trace_metadata: dict | None = None,
+) -> dict:
+    parsed_upstream = urlsplit(upstream_url)
+    context = {
+        "request_id": request_id,
+        "client_path": request.url.path,
+        "upstream_host": parsed_upstream.netloc,
+        "upstream_path": upstream_path or parsed_upstream.path,
+    }
+    _append_request_trace(
+        {
+            "event": "request_started",
+            "time": util.utc_now_iso(),
+            **context,
+            "method": request.method,
+            "requested_model": requested_model,
+            "resolved_model": resolved_model,
+            "request_body": _trace_body_summary(request_body),
+            "upstream_body": _trace_body_summary(upstream_body),
+            "outbound_headers": _header_trace_subset(outbound_headers),
+            "trace": trace_metadata or {},
+        }
+    )
+    return context
+
+
+def _finish_usage_and_trace(
+    plan: UpstreamRequestPlan | None,
+    status_code: int,
+    *,
+    upstream: httpx.Response | None = None,
+    response_payload: dict | None = None,
+    response_text: str | None = None,
+    usage: dict | None = None,
+) -> None:
+    if isinstance(plan, UpstreamRequestPlan):
+        usage_tracker.finish_event(
+            plan.usage_event,
+            status_code,
+            upstream=upstream,
+            response_payload=response_payload,
+            response_text=response_text,
+            usage=usage,
+        )
+        _append_request_trace(
+            {
+                "event": "request_finished",
+                "time": util.utc_now_iso(),
+                **(plan.trace_context or {"request_id": plan.request_id}),
+                "response": _trace_response_summary(upstream=upstream, response_payload=response_payload, usage=usage),
+                "response_text_present": isinstance(response_text, str) and bool(response_text),
+            }
+        )
+        return
+
+    usage_tracker.finish_event(
+        None,
+        status_code,
+        upstream=upstream,
+        response_payload=response_payload,
+        response_text=response_text,
+        usage=usage,
+    )
 
 
 def _prepare_upstream_request(
@@ -235,6 +538,7 @@ def _prepare_upstream_request(
     )
     return (
         UpstreamRequestPlan(
+            request_id=request_id,
             upstream_url=upstream_url,
             headers=headers,
             body=body,
@@ -1045,63 +1349,9 @@ async def responses_compact(request: Request):
     if error_response is not None:
         return error_response
 
-    try:
-        async with httpx.AsyncClient(timeout=configured_upstream_timeout_seconds()) as client:
-            upstream = await throttled_client_post(
-                client,
-                plan.upstream_url,
-                headers=plan.headers,
-                json=plan.body,
-            )
-    except httpx.RequestError as exc:
-        status_code, message = format_translation.upstream_request_error_status_and_message(exc)
-        usage_tracker.finish_event(plan.usage_event, status_code, response_text=message)
-        return format_translation.openai_error_response(status_code, message)
-    except Exception:
-        usage_tracker.finish_event(plan.usage_event, 599)
-        raise
-
-    if upstream.status_code >= 400:
-        usage_tracker.finish_event(
-            plan.usage_event,
-            upstream.status_code,
-            upstream=upstream,
-            response_payload=_extract_upstream_json_payload(upstream),
-            response_text=_extract_upstream_text(upstream),
-        )
-        return proxy_non_streaming_response(upstream)
-
-    try:
-        upstream_payload = upstream.json()
-    except json.JSONDecodeError as e:
-        usage_tracker.finish_event(
-            plan.usage_event,
-            502,
-            upstream=upstream,
-            response_text=f"Invalid JSON from upstream summarization response: {e}",
-        )
-        return format_translation.openai_error_response(502, f"Invalid JSON from upstream summarization response: {e}")
-
-    translated_payload = _translate_bridge_success_payload(bridge_plan, upstream_payload)
-    summary_text = format_translation.extract_response_output_text(translated_payload)
-    if not summary_text:
-        usage_tracker.finish_event(
-            plan.usage_event,
-            502,
-            upstream=upstream,
-            response_payload=translated_payload,
-            response_text="Upstream summarization response did not include assistant text output",
-        )
-        return format_translation.openai_error_response(502, "Upstream summarization response did not include assistant text output")
-
-    compacted_response = format_translation.build_fake_compaction_response(body, summary_text, translated_payload.get("usage"))
-    usage_tracker.finish_event(
-        plan.usage_event,
-        upstream.status_code,
-        upstream=upstream,
-        response_payload=compacted_response,
-    )
-    return JSONResponse(content=compacted_response, status_code=200)
+    if bridge_plan.stream:
+        return await _proxy_bridge_streaming_response(plan, bridge_plan)
+    return await _post_bridge_non_streaming_request(plan, bridge_plan)
 
 
 # ─── Route: /v1/chat/completions  (non-Codex models) ─────────────────────────

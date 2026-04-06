@@ -189,7 +189,7 @@ class FormatTranslationTests(unittest.TestCase):
         self.assertEqual(compact_request["metadata"], body["metadata"])
         self.assertEqual(compact_request["user"], "user-123")
 
-    def test_build_fake_compaction_request_preserves_tool_schema_but_disables_tool_calls(self):
+    def test_build_fake_compaction_request_preserves_request_config(self):
         body = {
             "model": "gpt-5.4",
             "input": "hello",
@@ -203,6 +203,9 @@ class FormatTranslationTests(unittest.TestCase):
             ],
             "include": ["reasoning.encrypted_content"],
             "parallel_tool_calls": True,
+            "tool_choice": "auto",
+            "stream": True,
+            "store": False,
         }
 
         compact_request = format_translation.build_fake_compaction_request(body)
@@ -210,7 +213,9 @@ class FormatTranslationTests(unittest.TestCase):
         self.assertEqual(compact_request["tools"], body["tools"])
         self.assertEqual(compact_request["include"], body["include"])
         self.assertTrue(compact_request["parallel_tool_calls"])
-        self.assertEqual(compact_request["tool_choice"], "none")
+        self.assertEqual(compact_request["tool_choice"], "auto")
+        self.assertTrue(compact_request["stream"])
+        self.assertFalse(compact_request["store"])
 
     def test_build_fake_compaction_request_transcriptizes_tool_history_for_bridging(self):
         body = {

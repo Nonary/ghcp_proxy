@@ -2,8 +2,6 @@
 
 import base64
 import json
-import time
-from uuid import uuid4
 
 import httpx
 from fastapi import HTTPException, Request
@@ -1549,21 +1547,10 @@ def _apply_compaction_request_config(source: dict, target: dict) -> None:
     if not isinstance(source, dict) or not isinstance(target, dict):
         return
 
-    tools = source.get("tools")
-    if isinstance(tools, list):
-        target["tools"] = tools
-        if tools:
-            # Keep the original tool schema in place for cache affinity, but
-            # force summarization to stay in text mode.
-            target["tool_choice"] = "none"
-
-    include = source.get("include")
-    if isinstance(include, list):
-        target["include"] = include
-
-    parallel_tool_calls = source.get("parallel_tool_calls")
-    if isinstance(parallel_tool_calls, bool):
-        target["parallel_tool_calls"] = parallel_tool_calls
+    for key, value in source.items():
+        if key == "input":
+            continue
+        target[key] = value
 
 
 def build_fake_compaction_request(body: dict) -> dict:
@@ -1591,18 +1578,7 @@ def build_fake_compaction_request(body: dict) -> dict:
         "content": [{"type": "input_text", "text": COMPACTION_SUMMARY_PROMPT}],
     })
 
-    compact_request = {
-        "model": body.get("model"),
-        "instructions": body.get("instructions"),
-        "input": input_items,
-        "stream": False,
-        "store": False,
-        "tools": [],
-        "parallel_tool_calls": False,
-        "include": [],
-        "reasoning": body.get("reasoning"),
-        "text": body.get("text"),
-    }
+    compact_request = {"input": input_items}
     _copy_compaction_passthrough_fields(body, compact_request)
     _apply_compaction_request_config(body, compact_request)
     return compact_request
@@ -1637,24 +1613,3 @@ def extract_response_output_text(payload: dict) -> str | None:
     return "\n\n".join(parts)
 
 
-def build_fake_compaction_response(body: dict, summary_text: str, usage=None) -> dict:
-    return {
-        "id": f"resp_{uuid4().hex}",
-        "object": "response.compaction",
-        "created_at": int(time.time()),
-        "status": "completed",
-        "model": body.get("model"),
-        "output": [
-            {
-                "type": "compaction",
-                "encrypted_content": encode_fake_compaction(summary_text),
-            }
-        ],
-        "usage": usage
-        if isinstance(usage, dict)
-        else {
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "total_tokens": 0,
-        },
-    }

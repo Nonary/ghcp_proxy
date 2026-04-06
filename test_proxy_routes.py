@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import unittest
 from types import SimpleNamespace
@@ -53,6 +54,7 @@ class ProxyRoutesTests(unittest.TestCase):
             mock.patch.object(proxy, "parse_json_request", mock.AsyncMock(return_value=body)),
             mock.patch.object(auth, "get_api_key", return_value="test-key"),
             mock.patch.object(auth, "get_api_base", return_value="https://example.invalid"),
+            mock.patch.object(proxy.model_routing_config_service, "resolve_target_model", return_value="claude-sonnet-4.6"),
             mock.patch.object(format_translation, "anthropic_request_to_chat", mock.AsyncMock(return_value=outbound)),
             mock.patch.object(usage_tracking, "log_proxy_request"),
             mock.patch.object(proxy.usage_tracker, "start_event", return_value=None),
@@ -421,6 +423,8 @@ class ProxyRoutesTests(unittest.TestCase):
             ],
             "include": ["reasoning.encrypted_content"],
             "parallel_tool_calls": True,
+            "tool_choice": "auto",
+            "stream": False,
             "input": [
                 {
                     "type": "message",
@@ -473,8 +477,12 @@ class ProxyRoutesTests(unittest.TestCase):
         self.assertEqual(forwarded_body["tools"], body["tools"])
         self.assertEqual(forwarded_body["include"], body["include"])
         self.assertTrue(forwarded_body["parallel_tool_calls"])
-        self.assertEqual(forwarded_body["tool_choice"], "none")
+        self.assertEqual(forwarded_body["tool_choice"], "auto")
+        self.assertFalse(forwarded_body["stream"])
         self.assertEqual(response.status_code, 200)
+        response_payload = json.loads(response.body)
+        self.assertEqual(response_payload["id"], "resp_123")
+        self.assertEqual(response_payload["output"][0]["content"][0]["text"], "summary")
 
     def test_proxy_streaming_response_connect_error_returns_openai_error(self):
         request = httpx.Request("POST", "https://example.invalid/responses")
