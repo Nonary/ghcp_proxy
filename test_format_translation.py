@@ -217,6 +217,21 @@ class FormatTranslationTests(unittest.TestCase):
         self.assertTrue(compact_request["stream"])
         self.assertFalse(compact_request["store"])
 
+    def test_compaction_summary_prompt_matches_captured_copilot_prompt(self):
+        self.assertTrue(
+            format_translation.COMPACTION_SUMMARY_PROMPT.startswith(
+                "Please create a detailed summary of the conversation so far."
+            )
+        )
+        self.assertIn(
+            "7. <checkpoint_title> - 2-6 word description of the main work done",
+            format_translation.COMPACTION_SUMMARY_PROMPT,
+        )
+        self.assertIn(
+            "Please write the summary now, following the structure and guidelines above.",
+            format_translation.COMPACTION_SUMMARY_PROMPT,
+        )
+
     def test_build_fake_compaction_request_transcriptizes_tool_history_for_bridging(self):
         body = {
             "model": "claude-opus-4.6",
@@ -302,7 +317,11 @@ class FormatTranslationTests(unittest.TestCase):
         translated = format_translation.responses_request_to_chat(compact_request)
 
         self.assertEqual([message["role"] for message in translated["messages"]], ["user", "user", "user"])
-        self.assertTrue(translated["messages"][-1]["content"].startswith("Your task is to create"))
+        self.assertTrue(
+            translated["messages"][-1]["content"].startswith(
+                "Please create a detailed summary of the conversation so far."
+            )
+        )
         self.assertNotIn("tool_calls", translated["messages"][0])
 
     def test_build_fake_compaction_request_preserves_native_responses_items_for_codex_models(self):
