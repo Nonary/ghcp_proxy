@@ -1,11 +1,15 @@
 """Build upstream request headers for GitHub Copilot proxy requests."""
 
+import uuid
+
 from fastapi import Request
 
 from constants import (
-    OPENCODE_VERSION, OPENCODE_HEADER_VERSION, OPENCODE_INTEGRATION_ID,
+    OPENCODE_VERSION, OPENCODE_INTEGRATION_ID, GITHUB_API_VERSION,
     FORWARDED_REQUEST_HEADERS, FORWARDED_SERVER_REQUEST_ID_HEADERS,
 )
+
+_CLIENT_SESSION_ID = str(uuid.uuid4())
 
 
 def has_vision_input(value, depth=0, max_depth=10) -> bool:
@@ -31,15 +35,22 @@ def model_requires_anthropic_beta(model_name) -> bool:
     return "claude" in normalized or normalized.startswith("anthropic")
 
 
+def _interaction_type_for_initiator(initiator: str) -> str:
+    if initiator == "user":
+        return "conversation-user"
+    return "conversation-agent"
+
+
 def build_copilot_headers(api_key: str) -> dict:
     return {
         "Authorization": f"Bearer {api_key}",
         "content-type": "application/json",
+        "accept": "application/json",
         "User-Agent": f"opencode/{OPENCODE_VERSION}",
-        "Openai-Intent": "conversation-edits",
-        "Editor-Version": OPENCODE_HEADER_VERSION,
-        "Editor-Plugin-Version": OPENCODE_HEADER_VERSION,
+        "Openai-Intent": "conversation-agent",
         "Copilot-Integration-Id": OPENCODE_INTEGRATION_ID,
+        "x-github-api-version": GITHUB_API_VERSION,
+        "x-client-session-id": _CLIENT_SESSION_ID,
     }
 
 
@@ -120,6 +131,9 @@ def build_responses_headers_for_request(
     if had_input:
         body["input"] = effective_input
     headers["X-Initiator"] = initiator
+    headers["x-interaction-type"] = _interaction_type_for_initiator(initiator)
+    headers["x-interaction-id"] = str(uuid.uuid4())
+    headers["x-agent-task-id"] = str(uuid.uuid4())
 
     if has_vision_input(effective_input):
         headers["Copilot-Vision-Request"] = "true"
@@ -145,6 +159,9 @@ def build_chat_headers_for_request(
 
     initiator = initiator_policy.resolve_chat_messages(messages, model_name, request_id=request_id)
     headers["X-Initiator"] = initiator
+    headers["x-interaction-type"] = _interaction_type_for_initiator(initiator)
+    headers["x-interaction-id"] = str(uuid.uuid4())
+    headers["x-agent-task-id"] = str(uuid.uuid4())
 
     if isinstance(messages, list):
         for msg in messages:
@@ -202,6 +219,9 @@ def build_anthropic_headers_for_request(
     messages = body.get("messages")
     initiator = initiator_policy.resolve_anthropic_messages(messages, body.get("model"), request_id=request_id)
     headers["X-Initiator"] = initiator
+    headers["x-interaction-type"] = _interaction_type_for_initiator(initiator)
+    headers["x-interaction-id"] = str(uuid.uuid4())
+    headers["x-agent-task-id"] = str(uuid.uuid4())
 
     if _anthropic_messages_has_vision(messages):
         headers["Copilot-Vision-Request"] = "true"
