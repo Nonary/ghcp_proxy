@@ -227,6 +227,7 @@
       border-radius: 999px;
       padding: 8px 12px;
       cursor: pointer;
+      text-transform: capitalize;
     }
     .tabs button.active { background: linear-gradient(135deg, var(--accent), #f6ac68); color: #21150f; font-weight: 700; }
     .toolbar button.primary { border: 0; background: linear-gradient(135deg, var(--accent), #f6ac68); color: #21150f; font-weight: 700; cursor: pointer; }
@@ -384,13 +385,145 @@
       white-space: pre-wrap;
       word-break: break-word;
     }
+    .management-grid {
+      display: grid;
+      gap: 12px;
+      grid-template-columns: 1fr;
+      margin-top: 14px;
+      align-items: start;
+    }
+    .control-panel-wide { min-width: 0; }
+    .control-secondary-grid {
+      display: grid;
+      gap: 12px;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+    .control-secondary-grid .panel { height: 100%; }
+    .routing-shell, .mapping-list, .status-stack { display: grid; gap: 8px; }
+    .routing-shell button, .routing-shell select {
+      font: inherit;
+      border-radius: 8px;
+      border: 1px solid var(--line);
+      background: rgba(255,255,255,.04);
+      color: var(--text);
+      padding: 6px 10px;
+      font-size: .82rem;
+    }
+    .routing-shell button.primary {
+      border: 0;
+      background: linear-gradient(135deg, var(--accent), #f6ac68);
+      color: #21150f;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    .routing-shell button.sm { padding: 4px 8px; font-size: .76rem; border-radius: 6px; }
+    .routing-shell button.sm.danger { color: var(--danger); border-color: rgba(255,143,135,.22); }
+    .routing-shell button.sm.danger:hover { background: rgba(255,143,135,.1); }
+    .routing-shell select {
+      background-color: #142230;
+      border-color: rgba(200,220,235,.22);
+      color-scheme: dark;
+    }
+    .routing-shell select:focus {
+      outline: 2px solid rgba(255,135,82,.48);
+      outline-offset: 1px;
+    }
+    .routing-toggle {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 8px 0;
+      border-bottom: 1px solid var(--line);
+      margin-bottom: 6px;
+    }
+    .routing-toggle-label { font-size: .84rem; color: var(--text); }
+    .switch-track {
+      position: relative;
+      width: 36px;
+      height: 20px;
+      border-radius: 999px;
+      background: rgba(255,255,255,.12);
+      cursor: pointer;
+      transition: background .2s ease;
+      flex-shrink: 0;
+    }
+    .switch-track.on { background: var(--accent); }
+    .switch-track input { position: absolute; opacity: 0; width: 0; height: 0; }
+    .switch-knob {
+      position: absolute;
+      top: 2px;
+      left: 2px;
+      width: 16px;
+      height: 16px;
+      border-radius: 50%;
+      background: #fff;
+      transition: transform .2s ease;
+      pointer-events: none;
+    }
+    .switch-track.on .switch-knob { transform: translateX(16px); }
+    .mapping-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      margin-bottom: 2px;
+    }
+    .mapping-header .detail-label { margin: 0; }
+    .mapping-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: .82rem;
+    }
+    .mapping-table th {
+      color: var(--muted);
+      font-size: .68rem;
+      text-transform: uppercase;
+      letter-spacing: .12em;
+      padding: 6px 4px;
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+      font-weight: 500;
+    }
+    .mapping-table th:last-child { text-align: center; width: 56px; }
+    .mapping-table td {
+      padding: 6px 4px;
+      border-bottom: 1px solid rgba(200,220,235,.06);
+      vertical-align: middle;
+    }
+    .mapping-table td:last-child { text-align: center; }
+    .mapping-table select {
+      width: 100%;
+      font-size: .82rem;
+      padding: 5px 8px;
+      border-radius: 6px;
+    }
+    .mapping-table .arrow-cell {
+      text-align: center;
+      color: var(--muted);
+      font-size: .9rem;
+      width: 32px;
+      padding: 6px 2px;
+    }
+    .mapping-table tr:hover td { background: rgba(255,255,255,.02); }
+    .empty-state {
+      border-radius: 10px;
+      border: 1px dashed rgba(200,220,235,.15);
+      background: rgba(255,255,255,.02);
+      color: var(--muted);
+      padding: 14px;
+      font-size: .82rem;
+      text-align: center;
+      line-height: 1.4;
+    }
     @media (max-width: 1080px) {
-      .hero, .content, .metrics, .chart-grid { grid-template-columns: 1fr; }
+      .hero, .content, .metrics, .chart-grid, .management-grid, .control-secondary-grid { grid-template-columns: 1fr; }
       .summary-grid { grid-template-columns: 1fr; }
       .proxy-grid { grid-template-columns: 1fr; }
       .request-layout, .detail-grid, .request-meta { grid-template-columns: 1fr; }
       .chart-summary { text-align: left; justify-items: start; }
       .chart-range-control { justify-items: start; }
+      .mapping-table .arrow-cell { display: none; }
     }
     @media (max-width: 760px) {
       .summary-grid { grid-template-columns: 1fr; }
@@ -670,10 +803,90 @@
           :current-usage="currentMonth"
           :all-time-usage="allTime"
         ></token-breakdown-card>
+      </div>
+    </section>
 
+    <section class="management-grid">
+      <article class="panel control-panel-wide">
+        <div class="panel-head">
+          <div>
+            <div class="eyebrow">Proxy Controls</div>
+            <h3>Model Remapping</h3>
+          </div>
+          <span :class="['chip', modelRouting.enabled ? 'good' : 'warn']">
+            {{ modelRouting.enabled ? 'Active' : 'Off' }}
+            · {{ modelRouting.mappings.length }} {{ modelRouting.mappings.length === 1 ? 'rule' : 'rules' }}
+          </span>
+        </div>
+
+        <div class="routing-shell">
+          <div class="routing-toggle">
+            <span class="routing-toggle-label">Remap model names before forwarding upstream</span>
+            <label :class="['switch-track', modelRouting.enabled ? 'on' : '']" :style="{ opacity: (savingModelRoutingConfig || loadingModelRoutingConfig) ? 0.5 : 1 }">
+              <input type="checkbox" v-model="modelRouting.enabled" :disabled="savingModelRoutingConfig || loadingModelRoutingConfig">
+              <span class="switch-knob"></span>
+            </label>
+          </div>
+
+          <div class="mapping-header">
+            <div class="detail-label">Mappings</div>
+            <button class="primary sm" @click="addModelRoutingMapping" :disabled="savingModelRoutingConfig || loadingModelRoutingConfig || !modelRouting.available_models.length">+ Add</button>
+          </div>
+
+          <table v-if="modelRouting.mappings.length" class="mapping-table">
+            <thead>
+              <tr>
+                <th>Source model</th>
+                <th></th>
+                <th>Target model</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="(mapping, index) in modelRouting.mappings" :key="`${index}-${mapping.source_model}-${mapping.target_model}`">
+                <td>
+                  <select v-model="mapping.source_model" :disabled="savingModelRoutingConfig || loadingModelRoutingConfig">
+                    <option v-for="option in modelRouting.available_models" :key="`source-${index}-${option.model}`" :value="option.model">
+                      {{ option.provider }} · {{ option.model }}
+                    </option>
+                  </select>
+                </td>
+                <td class="arrow-cell">→</td>
+                <td>
+                  <select v-model="mapping.target_model" :disabled="savingModelRoutingConfig || loadingModelRoutingConfig">
+                    <option v-for="option in modelRouting.available_models" :key="`target-${index}-${option.model}`" :value="option.model">
+                      {{ option.provider }} · {{ option.model }}
+                    </option>
+                  </select>
+                </td>
+                <td>
+                  <button class="sm danger" @click="removeModelRoutingMapping(index)" :disabled="savingModelRoutingConfig || loadingModelRoutingConfig">×</button>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+          <div v-else class="empty-state">
+            {{ loadingModelRoutingConfig ? 'Loading...' : 'No mappings yet — add one to remap a model name.' }}
+          </div>
+
+          <div class="toolbar" style="margin-top: 4px;">
+            <button @click="loadModelRoutingConfig" :disabled="savingModelRoutingConfig || loadingModelRoutingConfig">Reload</button>
+            <div class="spacer"></div>
+            <button class="primary" @click="saveModelRoutingConfig" :disabled="savingModelRoutingConfig || loadingModelRoutingConfig">Save</button>
+          </div>
+
+          <div class="status-stack">
+            <div v-if="modelRouting.error" class="status error">{{ modelRouting.error }}</div>
+            <div v-else-if="modelRouting.statusMessage" class="status good">{{ modelRouting.statusMessage }}</div>
+          </div>
+        </div>
+      </article>
+
+      <div class="control-secondary-grid">
         <article class="panel">
           <div class="panel-head">
             <div>
+              <div class="eyebrow">Local Clients</div>
               <h3>Client Proxy Configuration</h3>
               <div class="subtle">Install or verify local proxy settings for Codex and Claude Code.</div>
             </div>
@@ -723,6 +936,7 @@
         <article class="panel">
           <div class="panel-head">
             <div>
+              <div class="eyebrow">Billing</div>
               <h3>Billing Token</h3>
               <div class="subtle">{{ billingTokenStatusLabel }}</div>
             </div>
@@ -1407,6 +1621,8 @@
           savingBillingToken: false,
           loadingClientProxyStatus: false,
           savingProxyConfig: false,
+          loadingModelRoutingConfig: false,
+          savingModelRoutingConfig: false,
           proxyConfigError: '',
           proxyConfigStatusMessage: '',
           clientProxyStatus: {
@@ -1451,6 +1667,14 @@
             source: 'none',
             readonly: false,
             tokenInput: '',
+            error: '',
+            statusMessage: '',
+          },
+          modelRouting: {
+            enabled: false,
+            mappings: [],
+            available_models: [],
+            path: '',
             error: '',
             statusMessage: '',
           },
@@ -1899,6 +2123,93 @@
         async disableAllClientProxy() {
           return this.configureClientProxy('both', 'disable');
         },
+        defaultModelRoutingMapping() {
+          const source = this.modelRouting.available_models.find((option) => option.provider === 'codex')?.model
+            || this.modelRouting.available_models[0]?.model
+            || '';
+          const target = this.modelRouting.available_models.find((option) => option.provider === 'claude')?.model
+            || this.modelRouting.available_models[0]?.model
+            || '';
+          return {
+            source_model: source,
+            target_model: target,
+          };
+        },
+        addModelRoutingMapping() {
+          this.modelRouting.statusMessage = '';
+          this.modelRouting.error = '';
+          this.modelRouting.mappings.push(this.defaultModelRoutingMapping());
+        },
+        removeModelRoutingMapping(index) {
+          this.modelRouting.statusMessage = '';
+          this.modelRouting.error = '';
+          this.modelRouting.mappings.splice(index, 1);
+        },
+        async loadModelRoutingConfig() {
+          this.loadingModelRoutingConfig = true;
+          this.modelRouting.error = '';
+          try {
+            const response = await fetch('/api/config/model-remapping');
+            if (!response.ok) throw new Error(`model remapping config request failed: ${response.status}`);
+            const payload = await response.json();
+            this.modelRouting.enabled = Boolean(payload.enabled);
+            this.modelRouting.mappings = Array.isArray(payload.mappings)
+              ? payload.mappings.map((mapping) => ({
+                  source_model: mapping.source_model || '',
+                  target_model: mapping.target_model || '',
+                }))
+              : [];
+            this.modelRouting.available_models = Array.isArray(payload.available_models) ? payload.available_models : [];
+            this.modelRouting.path = payload.path || '';
+          } catch (error) {
+            this.modelRouting.error = error.message;
+          } finally {
+            this.loadingModelRoutingConfig = false;
+          }
+        },
+        async saveModelRoutingConfig() {
+          if (this.savingModelRoutingConfig) return;
+          this.savingModelRoutingConfig = true;
+          this.modelRouting.statusMessage = '';
+          this.modelRouting.error = '';
+          try {
+            const response = await fetch('/api/config/model-remapping', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                enabled: this.modelRouting.enabled,
+                mappings: this.modelRouting.mappings,
+              }),
+            });
+            if (!response.ok) {
+              let message = `model remapping save request failed: ${response.status}`;
+              try {
+                const data = await response.json();
+                if (data?.detail) {
+                  message = data.detail;
+                } else if (data?.error) {
+                  message = data.error;
+                }
+              } catch (_error) {}
+              throw new Error(message);
+            }
+            const payload = await response.json();
+            this.modelRouting.enabled = Boolean(payload.enabled);
+            this.modelRouting.mappings = Array.isArray(payload.mappings)
+              ? payload.mappings.map((mapping) => ({
+                  source_model: mapping.source_model || '',
+                  target_model: mapping.target_model || '',
+                }))
+              : [];
+            this.modelRouting.available_models = Array.isArray(payload.available_models) ? payload.available_models : [];
+            this.modelRouting.path = payload.path || '';
+            this.modelRouting.statusMessage = 'Model remapping saved.';
+          } catch (error) {
+            this.modelRouting.error = error.message;
+          } finally {
+            this.savingModelRoutingConfig = false;
+          }
+        },
         async loadBillingTokenConfig() {
           try {
             const response = await fetch('/api/config/billing-token');
@@ -2094,6 +2405,7 @@
         this.load(true);
         this.loadBillingTokenConfig();
         this.loadClientProxyStatus();
+        this.loadModelRoutingConfig();
         this.startDashboardStream();
         this.autoRefreshTimer = window.setInterval(() => {
           this.load(true);

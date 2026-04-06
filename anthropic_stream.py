@@ -36,6 +36,7 @@ class AnthropicStreamTranslator:
         mark_first_output: Callable[[], None] | None = None,
     ):
         self._mark_first_output = mark_first_output
+        self._fallback_model = fallback_model
         self._message_id = f"msg_{uuid4().hex}"
         self._model_name = fallback_model
         self._input_tokens = 0
@@ -235,7 +236,7 @@ class AnthropicStreamTranslator:
     def _update_message_metadata(self, payload: dict):
         if isinstance(payload.get("id"), str):
             self._message_id = payload["id"]
-        if isinstance(payload.get("model"), str):
+        if self._fallback_model is None and isinstance(payload.get("model"), str):
             self._model_name = payload["model"]
 
         usage = payload.get("usage")

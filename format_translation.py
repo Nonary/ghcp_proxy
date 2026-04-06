@@ -380,6 +380,394 @@ async def anthropic_request_to_chat(body: dict, api_base: str, api_key: str) -> 
     return payload
 
 
+# ─── Anthropic ↔ Responses translation ───────────────────────────────────────
+
+def _response_content_text_type(item_type: str) -> bool:
+    return item_type in {"text", "input_text", "output_text"}
+
+
+def _response_content_item_to_chat(item: dict) -> dict | None:
+    item_type = str(item.get("type", "")).lower()
+    if _response_content_text_type(item_type):
+        text = item.get("text") or item.get("input_text") or item.get("output_text")
+        if isinstance(text, str):
+            content_item = {"type": "text", "text": text}
+            if isinstance(item.get("copilot_cache_control"), dict):
+                content_item["copilot_cache_control"] = dict(item["copilot_cache_control"])
+            return content_item
+        return None
+
+    if item_type == "input_image":
+        image_url = item.get("image_url")
+        if isinstance(image_url, str) and image_url:
+            return {"type": "image_url", "image_url": {"url": image_url}}
+        if isinstance(image_url, dict) and isinstance(image_url.get("url"), str):
+            return {"type": "image_url", "image_url": {"url": image_url["url"]}}
+        image_base64 = item.get("image_base64")
+        media_type = item.get("media_type")
+        if isinstance(image_base64, str) and isinstance(media_type, str):
+            return {"type": "image_url", "image_url": {"url": f"data:{media_type};base64,{image_base64}"}}
+        raise ValueError("Responses input_image blocks must include image_url or image_base64/media_type")
+
+    return None
+
+
+def _response_message_content_to_chat(content):
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+
+    converted = []
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        content_item = _response_content_item_to_chat(item)
+        if content_item is not None:
+            converted.append(content_item)
+
+    if not converted:
+        return ""
+    if (
+        len(converted) == 1
+        and converted[0].get("type") == "text"
+        and set(converted[0].keys()).issubset({"type", "text"})
+    ):
+        return converted[0]["text"]
+    return converted
+
+
+def _responses_tool_to_chat(tool: dict) -> dict | None:
+    if not isinstance(tool, dict):
+        return None
+    tool_type = str(tool.get("type", "")).lower()
+    if tool_type != "function":
+        return None
+
+    if isinstance(tool.get("function"), dict):
+        function = tool["function"]
+        name = function.get("name")
+        description = function.get("description", "")
+        parameters = function.get("parameters")
+    else:
+        name = tool.get("name")
+        description = tool.get("description", "")
+        parameters = tool.get("parameters")
+
+    if not isinstance(name, str):
+        raise ValueError("Responses function tools must include a name")
+
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": description if isinstance(description, str) else "",
+            "parameters": parameters if isinstance(parameters, dict) else {"type": "object", "properties": {}},
+        },
+    }
+
+
+def responses_tool_choice_to_chat(tool_choice):
+    if tool_choice is None:
+        return None
+    if isinstance(tool_choice, str):
+        normalized = tool_choice.lower()
+        if normalized in {"auto", "none", "required"}:
+            return normalized
+    if isinstance(tool_choice, dict):
+        choice_type = str(tool_choice.get("type", "")).lower()
+        if choice_type in {"auto", "none", "required"}:
+            return choice_type
+        function = tool_choice.get("function") if isinstance(tool_choice.get("function"), dict) else tool_choice
+        name = function.get("name")
+        if isinstance(name, str):
+            return {"type": "function", "function": {"name": name}}
+    raise ValueError("Unsupported Responses tool_choice value")
+
+
+def responses_request_to_chat(body: dict) -> dict:
+    raw_input = body.get("input")
+    chat_messages = []
+
+    instructions = body.get("instructions")
+    if isinstance(instructions, str) and instructions.strip():
+        chat_messages.append({"role": "system", "content": instructions})
+
+    if isinstance(raw_input, str):
+        chat_messages.append({"role": "user", "content": raw_input})
+    elif isinstance(raw_input, list):
+        for item in raw_input:
+            if not isinstance(item, dict):
+                continue
+            item_type = str(item.get("type", "")).lower()
+            if item_type == "message":
+                role = str(item.get("role", "user")).lower()
+                if role not in {"system", "developer", "user", "assistant"}:
+                    raise ValueError(f"Unsupported Responses message role: {role}")
+                normalized_role = "system" if role == "developer" else role
+                chat_messages.append(
+                    {
+                        "role": normalized_role,
+                        "content": _response_message_content_to_chat(item.get("content")),
+                    }
+                )
+                continue
+            if item_type == "function_call":
+                function_name = item.get("name")
+                if not isinstance(function_name, str):
+                    raise ValueError("Responses function_call items must include a name")
+                chat_messages.append(
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": item.get("call_id") or item.get("id") or f"call_{uuid4().hex}",
+                                "type": "function",
+                                "function": {
+                                    "name": function_name,
+                                    "arguments": item.get("arguments")
+                                    if isinstance(item.get("arguments"), str)
+                                    else json.dumps(item.get("arguments", {}), separators=(",", ":")),
+                                },
+                            }
+                        ],
+                    }
+                )
+                continue
+            if item_type == "function_call_output":
+                call_id = item.get("call_id")
+                if not isinstance(call_id, str):
+                    raise ValueError("Responses function_call_output items must include call_id")
+                output_text = item.get("output")
+                if isinstance(output_text, list):
+                    output_text = "".join(util.extract_item_text(part) for part in output_text if isinstance(part, dict))
+                elif not isinstance(output_text, str):
+                    output_text = json.dumps(output_text, separators=(",", ":")) if output_text is not None else ""
+                chat_messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "content": output_text,
+                    }
+                )
+                continue
+            if item_type in {"reasoning", "item_reference", "compaction"}:
+                continue
+            raise ValueError(f"Unsupported Responses input item type: {item_type}")
+
+    payload = {
+        "model": resolve_copilot_model_name(body.get("model")),
+        "messages": chat_messages,
+        "stream": bool(body.get("stream", False)),
+    }
+    if payload["stream"]:
+        payload["stream_options"] = {"include_usage": True}
+
+    for source_key, target_key in (
+        ("max_output_tokens", "max_tokens"),
+        ("temperature", "temperature"),
+        ("top_p", "top_p"),
+    ):
+        value = body.get(source_key)
+        if value is not None:
+            payload[target_key] = value
+
+    tools = body.get("tools")
+    if tools is not None:
+        if not isinstance(tools, list):
+            raise ValueError("Responses tools must be a list")
+        payload["tools"] = [tool for tool in (_responses_tool_to_chat(tool) for tool in tools) if tool is not None]
+
+    mapped_tool_choice = responses_tool_choice_to_chat(body.get("tool_choice"))
+    if mapped_tool_choice is not None:
+        payload["tool_choice"] = mapped_tool_choice
+
+    return payload
+
+
+def _chat_tool_to_responses(tool: dict) -> dict | None:
+    if not isinstance(tool, dict):
+        return None
+    tool_type = str(tool.get("type", "")).lower()
+    if tool_type != "function":
+        return None
+    function = tool.get("function") if isinstance(tool.get("function"), dict) else {}
+    name = function.get("name")
+    if not isinstance(name, str):
+        raise ValueError("Chat function tools must include a name")
+    return {
+        "type": "function",
+        "name": name,
+        "description": function.get("description", "") if isinstance(function.get("description"), str) else "",
+        "parameters": function.get("parameters") if isinstance(function.get("parameters"), dict) else {"type": "object", "properties": {}},
+    }
+
+
+def chat_tool_choice_to_responses(tool_choice):
+    if tool_choice is None:
+        return None
+    if isinstance(tool_choice, str):
+        normalized = tool_choice.lower()
+        if normalized in {"auto", "none", "required"}:
+            return normalized
+    if isinstance(tool_choice, dict):
+        choice_type = str(tool_choice.get("type", "")).lower()
+        if choice_type in {"auto", "none", "required"}:
+            return choice_type
+        function = tool_choice.get("function") if isinstance(tool_choice.get("function"), dict) else tool_choice
+        name = function.get("name")
+        if isinstance(name, str):
+            return {"type": "function", "name": name}
+    raise ValueError("Unsupported chat tool_choice value")
+
+
+def _chat_content_item_to_response_content(item: dict) -> dict | None:
+    item_type = str(item.get("type", "")).lower()
+    if item_type == "text" and isinstance(item.get("text"), str):
+        content_item = {"type": "input_text", "text": item["text"]}
+        if isinstance(item.get("copilot_cache_control"), dict):
+            content_item["copilot_cache_control"] = dict(item["copilot_cache_control"])
+        return content_item
+    if item_type == "image_url":
+        image_url = item.get("image_url")
+        if isinstance(image_url, dict) and isinstance(image_url.get("url"), str):
+            return {"type": "input_image", "image_url": image_url["url"]}
+    return None
+
+
+def anthropic_request_to_responses(body: dict) -> dict:
+    source_messages = body.get("messages")
+    if not isinstance(source_messages, list):
+        raise ValueError("Anthropic request must include a messages array")
+
+    response_input = []
+    system_content = _anthropic_system_to_chat_content(body.get("system"))
+    if isinstance(system_content, str) and system_content:
+        response_input.append(
+            {
+                "type": "message",
+                "role": "developer",
+                "content": [{"type": "input_text", "text": system_content}],
+            }
+        )
+    elif isinstance(system_content, list) and system_content:
+        response_input.append(
+            {
+                "type": "message",
+                "role": "developer",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": item.get("text", ""),
+                        **({"copilot_cache_control": item["copilot_cache_control"]} if isinstance(item.get("copilot_cache_control"), dict) else {}),
+                    }
+                    for item in system_content
+                    if isinstance(item, dict) and isinstance(item.get("text"), str)
+                ],
+            }
+        )
+
+    for message in source_messages:
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role", "")).lower()
+        blocks = _normalize_anthropic_content_blocks(message.get("content"))
+
+        if role == "assistant":
+            content = []
+            for item in blocks:
+                item_type = str(item.get("type", "")).lower()
+                if item_type == "tool_use":
+                    tool_name = item.get("name")
+                    tool_id = item.get("id")
+                    if not isinstance(tool_name, str) or not isinstance(tool_id, str):
+                        raise ValueError("Anthropic tool_use blocks must include string id and name")
+                    response_input.append(
+                        {
+                            "type": "function_call",
+                            "call_id": tool_id,
+                            "name": tool_name,
+                            "arguments": json.dumps(item.get("input") or {}, separators=(",", ":")),
+                        }
+                    )
+                    continue
+                content_item = _anthropic_text_or_image_block_to_chat(item)
+                if content_item is None:
+                    raise ValueError(f"Unsupported Anthropic content block type: {item_type}")
+                response_content_item = _chat_content_item_to_response_content(content_item)
+                if response_content_item is not None:
+                    content.append(response_content_item)
+            if content:
+                response_input.append({"type": "message", "role": "assistant", "content": content})
+            continue
+
+        if role != "user":
+            raise ValueError(f"Unsupported Anthropic role: {role}")
+
+        buffered_user_content = []
+        for item in blocks:
+            item_type = str(item.get("type", "")).lower()
+            if item_type == "tool_result":
+                if buffered_user_content:
+                    response_input.append({"type": "message", "role": "user", "content": buffered_user_content})
+                    buffered_user_content = []
+                tool_use_id = item.get("tool_use_id")
+                if not isinstance(tool_use_id, str):
+                    raise ValueError("Anthropic tool_result blocks must include tool_use_id")
+                response_input.append(
+                    {
+                        "type": "function_call_output",
+                        "call_id": tool_use_id,
+                        "output": _anthropic_tool_result_content_to_text(item.get("content", "")),
+                    }
+                )
+                continue
+            content_item = _anthropic_text_or_image_block_to_chat(item)
+            if content_item is None:
+                raise ValueError(f"Unsupported Anthropic content block type: {item_type}")
+            response_content_item = _chat_content_item_to_response_content(content_item)
+            if response_content_item is not None:
+                buffered_user_content.append(response_content_item)
+
+        if buffered_user_content:
+            response_input.append({"type": "message", "role": "user", "content": buffered_user_content})
+
+    payload = {
+        "model": resolve_copilot_model_name(body.get("model")),
+        "input": response_input,
+        "stream": bool(body.get("stream", False)),
+    }
+
+    for source_key, target_key in (
+        ("max_tokens", "max_output_tokens"),
+        ("temperature", "temperature"),
+        ("top_p", "top_p"),
+        ("metadata", "metadata"),
+    ):
+        value = body.get(source_key)
+        if value is not None:
+            payload[target_key] = value
+
+    tools = body.get("tools")
+    if tools is not None:
+        payload["tools"] = [
+            _chat_tool_to_responses(tool)
+            for tool in anthropic_tools_to_chat(tools)
+        ]
+
+    mapped_tool_choice = anthropic_tool_choice_to_chat(body.get("tool_choice"))
+    if mapped_tool_choice is not None:
+        payload["tool_choice"] = chat_tool_choice_to_responses(mapped_tool_choice)
+
+    thinking = body.get("thinking")
+    if isinstance(thinking, dict):
+        budget_tokens = thinking.get("budget_tokens")
+        if isinstance(budget_tokens, int) and budget_tokens > 0:
+            payload["reasoning"] = {"effort": "high" if budget_tokens >= 8192 else "medium"}
+
+    return payload
+
 # ─── Chat → Anthropic translation ────────────────────────────────────────────
 
 def chat_usage_to_anthropic(usage) -> dict:
@@ -479,11 +867,153 @@ def chat_completion_to_anthropic(payload: dict, fallback_model=None) -> dict:
         "id": payload.get("id") if isinstance(payload, dict) else f"msg_{uuid4().hex}",
         "type": "message",
         "role": "assistant",
-        "model": (payload.get("model") if isinstance(payload, dict) else None) or fallback_model,
+        "model": fallback_model or (payload.get("model") if isinstance(payload, dict) else None),
         "content": _chat_message_to_anthropic_content(message if isinstance(message, dict) else {}),
         "stop_reason": chat_stop_reason_to_anthropic(first_choice.get("finish_reason") if isinstance(first_choice, dict) else None),
         "stop_sequence": None,
         "usage": usage,
+    }
+
+
+def response_usage_to_anthropic(usage) -> dict:
+    normalized = util.normalize_usage_payload(usage if isinstance(usage, dict) else {})
+    if not isinstance(normalized, dict):
+        return {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+        }
+    return {
+        "input_tokens": normalized.get("input_tokens", 0),
+        "output_tokens": normalized.get("output_tokens", 0),
+        "cache_creation_input_tokens": normalized.get("cache_creation_input_tokens", 0),
+        "cache_read_input_tokens": normalized.get("cached_input_tokens", 0),
+    }
+
+
+def _response_output_items_to_anthropic_content(output) -> list[dict]:
+    if not isinstance(output, list):
+        return [{"type": "text", "text": ""}]
+
+    content = []
+    for item in output:
+        if not isinstance(item, dict):
+            continue
+        item_type = str(item.get("type", "")).lower()
+        if item_type == "message" and str(item.get("role", "")).lower() == "assistant":
+            for part in item.get("content", []):
+                if not isinstance(part, dict):
+                    continue
+                text = part.get("text") or part.get("input_text") or part.get("output_text")
+                if isinstance(text, str):
+                    content.append({"type": "text", "text": text})
+        if item_type == "function_call":
+            content.append(
+                {
+                    "type": "tool_use",
+                    "id": item.get("call_id") or item.get("id") or f"toolu_{uuid4().hex}",
+                    "name": item.get("name") if isinstance(item.get("name"), str) else "",
+                    "input": _parse_tool_call_arguments(item.get("arguments")),
+                }
+            )
+    return content or [{"type": "text", "text": ""}]
+
+
+def response_payload_to_anthropic(payload: dict, fallback_model=None) -> dict:
+    output = payload.get("output") if isinstance(payload, dict) else None
+    content = _response_output_items_to_anthropic_content(output)
+    stop_reason = "tool_use" if any(item.get("type") == "tool_use" for item in content if isinstance(item, dict)) else "end_turn"
+
+    return {
+        "id": payload.get("id") if isinstance(payload, dict) else f"msg_{uuid4().hex}",
+        "type": "message",
+        "role": "assistant",
+        "model": fallback_model or (payload.get("model") if isinstance(payload, dict) else None),
+        "content": content,
+        "stop_reason": stop_reason,
+        "stop_sequence": None,
+        "usage": response_usage_to_anthropic(payload.get("usage") if isinstance(payload, dict) else {}),
+    }
+
+
+def chat_usage_to_response(usage) -> dict:
+    if not isinstance(usage, dict):
+        return {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+        }
+
+    prompt_tokens = usage.get("prompt_tokens", 0) or 0
+    completion_tokens = usage.get("completion_tokens", 0) or 0
+    prompt_details = usage.get("prompt_tokens_details") if isinstance(usage.get("prompt_tokens_details"), dict) else {}
+    completion_details = usage.get("completion_tokens_details") if isinstance(usage.get("completion_tokens_details"), dict) else {}
+    reasoning_tokens = usage.get("reasoning_output_tokens")
+    if reasoning_tokens is None:
+        reasoning_tokens = completion_details.get("reasoning_tokens", 0) or 0
+
+    response_usage = {
+        "input_tokens": prompt_tokens,
+        "output_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+    }
+    cached_tokens = prompt_details.get("cached_tokens")
+    if cached_tokens is not None:
+        response_usage["input_tokens_details"] = {"cached_tokens": cached_tokens}
+    if reasoning_tokens:
+        response_usage["output_tokens_details"] = {"reasoning_tokens": reasoning_tokens}
+    return response_usage
+
+
+def chat_completion_to_response(payload: dict, fallback_model=None) -> dict:
+    choices = payload.get("choices") if isinstance(payload, dict) else None
+    first_choice = choices[0] if isinstance(choices, list) and choices else {}
+    message = first_choice.get("message") if isinstance(first_choice, dict) else {}
+
+    output = []
+    text = _extract_chat_message_text(message if isinstance(message, dict) else {})
+    if text:
+        output.append(
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": text}],
+            }
+        )
+
+    tool_calls = message.get("tool_calls") if isinstance(message, dict) else None
+    if isinstance(tool_calls, list):
+        for tool_call in tool_calls:
+            if not isinstance(tool_call, dict):
+                continue
+            function = tool_call.get("function") if isinstance(tool_call.get("function"), dict) else {}
+            output.append(
+                {
+                    "type": "function_call",
+                    "call_id": tool_call.get("id") or f"call_{uuid4().hex}",
+                    "name": function.get("name", ""),
+                    "arguments": function.get("arguments", "") if isinstance(function.get("arguments"), str) else json.dumps(function.get("arguments", {}), separators=(",", ":")),
+                }
+            )
+
+    output_text_parts = []
+    for item in output:
+        if not isinstance(item, dict) or item.get("type") != "message":
+            continue
+        text_content = util.extract_item_text(item).strip()
+        if text_content:
+            output_text_parts.append(text_content)
+
+    return {
+        "id": (payload.get("id") if isinstance(payload, dict) else None) or f"resp_{uuid4().hex}",
+        "object": "response",
+        "created_at": payload.get("created") if isinstance(payload, dict) else int(time.time()),
+        "status": "completed",
+        "model": fallback_model or (payload.get("model") if isinstance(payload, dict) else None),
+        "output": output,
+        "output_text": "\n\n".join(output_text_parts),
+        "usage": chat_usage_to_response(payload.get("usage") if isinstance(payload, dict) else {}),
     }
 
 

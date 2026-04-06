@@ -206,6 +206,128 @@ class ProxyRoutesTests(unittest.TestCase):
             b'{"type":"error","error":{"type":"api_error","message":"Upstream connection failed: All connection attempts failed"}}',
         )
 
+    def test_responses_route_mapped_to_claude_uses_chat_upstream_and_returns_responses_shape(self):
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/responses"),
+            method="POST",
+            headers={},
+        )
+        body = {
+            "model": "gpt-5.3-codex",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "hello"}],
+                }
+            ],
+            "stream": False,
+        }
+        upstream = httpx.Response(
+            200,
+            json={
+                "id": "chatcmpl_123",
+                "model": "gpt-5.4",
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "hello from claude",
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 20,
+                    "completion_tokens": 4,
+                },
+            },
+            headers={"content-type": "application/json"},
+        )
+
+        with (
+            mock.patch.object(proxy, "parse_json_request", mock.AsyncMock(return_value=body)),
+            mock.patch.object(auth, "get_api_key", return_value="test-key"),
+            mock.patch.object(auth, "get_api_base", return_value="https://example.invalid"),
+            mock.patch.object(proxy.model_routing_config_service, "resolve_target_model", return_value="claude-opus-4.6"),
+            mock.patch.object(format_translation, "build_chat_headers_for_request", return_value={"X-Initiator": "user"}) as build_headers,
+            mock.patch.object(format_translation, "build_responses_headers_for_request", side_effect=AssertionError("unexpected responses headers")),
+            mock.patch.object(proxy.usage_tracker, "start_event", return_value=None) as start_event,
+            mock.patch.object(proxy.usage_tracker, "finish_event"),
+            mock.patch.object(proxy, "throttled_client_post", mock.AsyncMock(return_value=upstream)) as post,
+        ):
+            response = proxy.asyncio.run(proxy.responses(request))
+
+        build_headers.assert_called_once()
+        start_event.assert_called_once()
+        self.assertEqual(start_event.call_args.args[1], "gpt-5.3-codex")
+        self.assertEqual(start_event.call_args.args[2], "claude-opus-4.6")
+        self.assertEqual(post.await_args.args[1], "https://example.invalid/chat/completions")
+        self.assertEqual(post.await_args.kwargs["headers"], {"X-Initiator": "user"})
+        self.assertEqual(
+            response.body,
+            b'{"id":"chatcmpl_123","object":"response","created_at":null,"status":"completed","model":"claude-opus-4.6","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello from claude"}]}],"output_text":"hello from claude","usage":{"input_tokens":20,"output_tokens":4,"total_tokens":24}}',
+        )
+
+    def test_anthropic_messages_route_mapped_to_codex_uses_responses_upstream_and_returns_anthropic_shape(self):
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/messages"),
+            method="POST",
+            headers={},
+        )
+        body = {
+            "model": "claude-opus-4.6",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "hello"}],
+                }
+            ],
+            "stream": False,
+        }
+        upstream = httpx.Response(
+            200,
+            json={
+                "id": "resp_123",
+                "model": "gpt-5.4",
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "hello from codex"}],
+                    }
+                ],
+                "usage": {
+                    "input_tokens": 12,
+                    "output_tokens": 3,
+                },
+            },
+            headers={"content-type": "application/json"},
+        )
+
+        with (
+            mock.patch.object(proxy, "parse_json_request", mock.AsyncMock(return_value=body)),
+            mock.patch.object(auth, "get_api_key", return_value="test-key"),
+            mock.patch.object(auth, "get_api_base", return_value="https://example.invalid"),
+            mock.patch.object(proxy.model_routing_config_service, "resolve_target_model", return_value="gpt-5.4"),
+            mock.patch.object(format_translation, "build_responses_headers_for_request", return_value={"X-Initiator": "user"}) as build_headers,
+            mock.patch.object(proxy.usage_tracker, "start_event", return_value=None) as start_event,
+            mock.patch.object(proxy.usage_tracker, "finish_event"),
+            mock.patch.object(proxy, "throttled_client_post", mock.AsyncMock(return_value=upstream)) as post,
+        ):
+            response = proxy.asyncio.run(proxy.anthropic_messages(request))
+
+        build_headers.assert_called_once()
+        start_event.assert_called_once()
+        self.assertEqual(start_event.call_args.args[1], "claude-opus-4.6")
+        self.assertEqual(start_event.call_args.args[2], "gpt-5.4")
+        self.assertEqual(post.await_args.args[1], "https://example.invalid/responses")
+        self.assertEqual(post.await_args.kwargs["headers"], {"X-Initiator": "user"})
+        self.assertEqual(
+            response.body,
+            b'{"id":"resp_123","type":"message","role":"assistant","model":"gpt-5.4","content":[{"type":"text","text":"hello from codex"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":12,"output_tokens":3,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}',
+        )
+
     def test_proxy_streaming_response_connect_error_returns_openai_error(self):
         request = httpx.Request("POST", "https://example.invalid/responses")
 

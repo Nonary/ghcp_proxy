@@ -186,6 +186,192 @@ class FormatTranslationTests(unittest.TestCase):
 
         self.assertEqual(outbound["stream_options"], {"include_usage": True})
 
+    def test_anthropic_request_to_responses_translates_tool_use_and_tool_result(self):
+        body = {
+            "model": "gpt-5.4",
+            "system": "Follow the spec",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "hello"}],
+                },
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "tool_use", "id": "tool_1", "name": "Read", "input": {"file": "main.py"}},
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "tool_result", "tool_use_id": "tool_1", "content": "file contents"},
+                    ],
+                },
+            ],
+            "tools": [
+                {
+                    "name": "Read",
+                    "description": "Read a file",
+                    "input_schema": {"type": "object", "properties": {"file": {"type": "string"}}},
+                }
+            ],
+        }
+
+        translated = format_translation.anthropic_request_to_responses(body)
+
+        self.assertEqual(translated["model"], "gpt-5.4")
+        self.assertEqual(translated["input"][0]["role"], "developer")
+        self.assertEqual(translated["input"][1]["role"], "user")
+        self.assertEqual(translated["input"][1]["content"][0]["text"], "hello")
+        self.assertEqual(translated["input"][2]["type"], "function_call")
+        self.assertEqual(translated["input"][2]["call_id"], "tool_1")
+        self.assertEqual(translated["input"][3]["type"], "function_call_output")
+        self.assertEqual(translated["input"][3]["output"], "file contents")
+        self.assertEqual(translated["tools"][0]["name"], "Read")
+
+    def test_responses_request_to_chat_translates_function_calls_and_outputs(self):
+        body = {
+            "model": "claude-opus-4.6",
+            "instructions": "Be helpful",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "hello"}],
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "Read",
+                    "arguments": '{"file":"main.py"}',
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "file contents",
+                },
+            ],
+            "stream": True,
+        }
+
+        translated = format_translation.responses_request_to_chat(body)
+
+        self.assertEqual(translated["model"], "claude-opus-4.6")
+        self.assertEqual(translated["messages"][0]["role"], "system")
+        self.assertEqual(translated["messages"][1]["role"], "user")
+        self.assertEqual(translated["messages"][1]["content"], "hello")
+        self.assertEqual(translated["messages"][2]["tool_calls"][0]["id"], "call_1")
+        self.assertEqual(translated["messages"][3]["role"], "tool")
+        self.assertEqual(translated["messages"][3]["content"], "file contents")
+        self.assertEqual(translated["stream_options"], {"include_usage": True})
+
+    def test_response_payload_to_anthropic_maps_function_call_and_usage(self):
+        payload = {
+            "id": "resp_123",
+            "model": "gpt-5.4",
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "hello"}],
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "Read",
+                    "arguments": '{"file":"main.py"}',
+                },
+            ],
+            "usage": {
+                "input_tokens": 12,
+                "output_tokens": 3,
+                "input_tokens_details": {"cached_tokens": 5},
+            },
+        }
+
+        translated = format_translation.response_payload_to_anthropic(payload, fallback_model="gpt-5.4")
+
+        self.assertEqual(translated["id"], "resp_123")
+        self.assertEqual(translated["content"][0], {"type": "text", "text": "hello"})
+        self.assertEqual(translated["content"][1]["type"], "tool_use")
+        self.assertEqual(translated["content"][1]["id"], "call_1")
+        self.assertEqual(translated["usage"]["input_tokens"], 7)
+        self.assertEqual(translated["usage"]["cache_read_input_tokens"], 5)
+        self.assertEqual(translated["stop_reason"], "tool_use")
+
+    def test_chat_completion_to_response_maps_tool_calls_and_usage(self):
+        payload = {
+            "id": "chatcmpl_123",
+            "model": "claude-opus-4.6",
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "hello",
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {"name": "Read", "arguments": '{"file":"main.py"}'},
+                            }
+                        ],
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 20,
+                "completion_tokens": 4,
+                "prompt_tokens_details": {"cached_tokens": 6},
+            },
+        }
+
+        translated = format_translation.chat_completion_to_response(payload)
+
+        self.assertEqual(translated["id"], "chatcmpl_123")
+        self.assertEqual(translated["output"][0]["type"], "message")
+        self.assertEqual(translated["output"][1]["type"], "function_call")
+        self.assertEqual(translated["output"][1]["call_id"], "call_1")
+        self.assertEqual(translated["output_text"], "hello")
+        self.assertEqual(translated["usage"]["input_tokens"], 20)
+        self.assertEqual(translated["usage"]["input_tokens_details"], {"cached_tokens": 6})
+
+    def test_chat_completion_to_response_prefers_fallback_model_when_present(self):
+        payload = {
+            "id": "chatcmpl_123",
+            "model": "gpt-5.4",
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "hello",
+                    },
+                    "finish_reason": "stop",
+                }
+            ],
+        }
+
+        translated = format_translation.chat_completion_to_response(payload, fallback_model="claude-sonnet-4.6")
+
+        self.assertEqual(translated["model"], "claude-sonnet-4.6")
+
+    def test_response_payload_to_anthropic_prefers_fallback_model_when_present(self):
+        payload = {
+            "id": "resp_123",
+            "model": "gpt-5.4",
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "hello"}],
+                }
+            ],
+        }
+
+        translated = format_translation.response_payload_to_anthropic(payload, fallback_model="claude-sonnet-4.6")
+
+        self.assertEqual(translated["model"], "claude-sonnet-4.6")
+
     def test_chat_completion_to_anthropic_maps_cached_usage_tokens(self):
         payload = {
             "id": "chatcmpl_123",

@@ -33,8 +33,11 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 from anthropic_stream import AnthropicStreamTranslator
+from bridge_streams import ChatToResponsesStreamTranslator, ResponsesToAnthropicStreamTranslator
 from initiator_policy import InitiatorPolicy
 from event_bus import EventBus
+from model_routing_config import ModelRoutingConfig, ModelRoutingConfigService
+from protocol_bridge import BridgeExecutionPlan, ProtocolBridgePlanner
 from proxy_client_config import (
     ProxyClientConfig,
     ProxyClientConfigService,
@@ -103,6 +106,8 @@ client_proxy_config_service = ProxyClientConfigService(
         claude_max_output_tokens=CLAUDE_MAX_OUTPUT_TOKENS,
     )
 )
+model_routing_config_service = ModelRoutingConfigService(ModelRoutingConfig())
+bridge_planner = ProtocolBridgePlanner(model_routing_config_service)
 
 dashboard_service = dashboard_module.create_dashboard_service(
     dependencies=dashboard_module.DashboardDependencies(
@@ -241,6 +246,99 @@ def _prepare_upstream_request(
     )
 
 
+def _bridge_error_response(plan: BridgeExecutionPlan):
+    if plan.caller_protocol == "anthropic":
+        return format_translation.anthropic_error_response
+    return format_translation.openai_error_response
+
+
+def _build_bridge_headers(
+    request: Request,
+    original_body: dict,
+    bridge_plan: BridgeExecutionPlan,
+    api_key: str,
+    request_id: str | None = None,
+    *,
+    force_initiator: str | None = None,
+) -> dict:
+    if bridge_plan.header_kind == "responses":
+        return format_translation.build_responses_headers_for_request(
+            request,
+            bridge_plan.upstream_body,
+            api_key,
+            force_initiator=force_initiator,
+            request_id=request_id,
+            initiator_policy=_initiator_policy,
+            session_id_resolver=usage_tracking.request_session_id,
+        )
+    if bridge_plan.header_kind == "chat":
+        return format_translation.build_chat_headers_for_request(
+            request,
+            bridge_plan.upstream_body.get("messages", []),
+            bridge_plan.upstream_body.get("model"),
+            api_key,
+            request_id=request_id,
+            initiator_policy=_initiator_policy,
+            session_id_resolver=usage_tracking.request_session_id,
+        )
+    if bridge_plan.header_kind == "anthropic":
+        return format_translation.build_anthropic_headers_for_request(
+            request,
+            original_body,
+            api_key,
+            request_id=request_id,
+            initiator_policy=_initiator_policy,
+            session_id_resolver=usage_tracking.request_session_id,
+        )
+    raise ValueError(f"Unsupported bridge header kind: {bridge_plan.header_kind}")
+
+
+def _prepare_bridge_request(
+    request: Request,
+    *,
+    original_body: dict,
+    bridge_plan: BridgeExecutionPlan,
+    api_base: str,
+    api_key: str | None = None,
+    force_initiator: str | None = None,
+) -> tuple[UpstreamRequestPlan | None, Response | None]:
+    upstream_url = f"{api_base.rstrip('/')}{bridge_plan.upstream_path}"
+    return _prepare_upstream_request(
+        request,
+        body=bridge_plan.upstream_body,
+        requested_model=bridge_plan.requested_model,
+        resolved_model=bridge_plan.resolved_model,
+        upstream_path=bridge_plan.upstream_path,
+        upstream_url=upstream_url,
+        header_builder=lambda resolved_api_key, request_id: _build_bridge_headers(
+            request,
+            original_body,
+            bridge_plan,
+            resolved_api_key,
+            request_id=request_id,
+            force_initiator=force_initiator,
+        ),
+        error_response=_bridge_error_response(bridge_plan),
+        api_key=api_key,
+    )
+
+
+def _translate_bridge_success_payload(bridge_plan: BridgeExecutionPlan, payload: dict) -> dict:
+    if bridge_plan.caller_protocol == "responses" and bridge_plan.upstream_protocol == "chat":
+        return format_translation.chat_completion_to_response(payload, fallback_model=bridge_plan.resolved_model)
+    if bridge_plan.caller_protocol == "anthropic" and bridge_plan.upstream_protocol == "responses":
+        return format_translation.response_payload_to_anthropic(payload, fallback_model=bridge_plan.resolved_model)
+    if bridge_plan.caller_protocol == "anthropic" and bridge_plan.upstream_protocol == "chat":
+        return format_translation.chat_completion_to_anthropic(payload, fallback_model=bridge_plan.resolved_model)
+    return payload
+
+
+def _bridge_error_response_from_upstream(bridge_plan: BridgeExecutionPlan, upstream: httpx.Response) -> Response:
+    if bridge_plan.caller_protocol == "anthropic":
+        return format_translation.anthropic_error_response_from_upstream(upstream)
+    return proxy_non_streaming_response(upstream)
+
+
 async def _post_non_streaming_request(plan: UpstreamRequestPlan, *, error_response) -> Response:
     try:
         async with httpx.AsyncClient(timeout=configured_upstream_timeout_seconds()) as client:
@@ -265,6 +363,67 @@ async def _post_non_streaming_request(plan: UpstreamRequestPlan, *, error_respon
     except Exception:
         usage_tracker.finish_event(plan.usage_event, 599)
         raise
+
+
+async def _post_bridge_non_streaming_request(plan: UpstreamRequestPlan, bridge_plan: BridgeExecutionPlan) -> Response:
+    error_response = _bridge_error_response(bridge_plan)
+    try:
+        async with httpx.AsyncClient(timeout=configured_upstream_timeout_seconds()) as client:
+            upstream = await throttled_client_post(
+                client,
+                plan.upstream_url,
+                headers=plan.headers,
+                json=plan.body,
+            )
+    except httpx.RequestError as exc:
+        status_code, message = format_translation.upstream_request_error_status_and_message(exc)
+        usage_tracker.finish_event(plan.usage_event, status_code, response_text=message)
+        return error_response(status_code, message)
+    except Exception:
+        usage_tracker.finish_event(plan.usage_event, 599)
+        raise
+
+    if upstream.status_code >= 400:
+        response_payload = _extract_upstream_json_payload(upstream)
+        response_text = _extract_upstream_text(upstream)
+        if bridge_plan.caller_protocol == "anthropic":
+            fallback_message = response_text or f"Upstream request failed with status {upstream.status_code}"
+            response_payload = format_translation.anthropic_error_payload_from_openai(
+                response_payload,
+                upstream.status_code,
+                fallback_message,
+            )
+            response_text = response_payload.get("error", {}).get("message")
+        usage_tracker.finish_event(
+            plan.usage_event,
+            upstream.status_code,
+            upstream=upstream,
+            response_payload=response_payload,
+            response_text=response_text,
+        )
+        return _bridge_error_response_from_upstream(bridge_plan, upstream)
+
+    upstream_payload = _extract_upstream_json_payload(upstream)
+    if not isinstance(upstream_payload, dict):
+        message = "Upstream response did not include a JSON object payload"
+        usage_tracker.finish_event(plan.usage_event, 502, upstream=upstream, response_text=message)
+        return error_response(502, message)
+
+    translated_payload = _translate_bridge_success_payload(bridge_plan, upstream_payload)
+    usage_tracker.finish_event(
+        plan.usage_event,
+        upstream.status_code,
+        upstream=upstream,
+        response_payload=translated_payload,
+        response_text=(
+            format_translation.extract_response_output_text(translated_payload)
+            if bridge_plan.caller_protocol == "responses"
+            else util.extract_item_text(translated_payload.get("content", [{}])[0])
+            if isinstance(translated_payload.get("content"), list)
+            else None
+        ),
+    )
+    return JSONResponse(content=translated_payload, status_code=upstream.status_code)
 
 
 def proxy_non_streaming_response(upstream: httpx.Response) -> Response:
@@ -451,6 +610,192 @@ async def proxy_anthropic_streaming_response(
     )
 
 
+async def proxy_responses_from_chat_streaming_response(
+    upstream_url: str,
+    headers: dict,
+    body: dict,
+    fallback_model: str,
+    timeout: int = 300,
+    usage_event: dict | None = None,
+) -> Response:
+    client = httpx.AsyncClient(timeout=timeout)
+    request = client.build_request("POST", upstream_url, headers=headers, json=body)
+    try:
+        upstream = await throttled_client_send(client, request, stream=True)
+    except httpx.RequestError as exc:
+        status_code, message = format_translation.upstream_request_error_status_and_message(exc)
+        usage_tracker.finish_event(usage_event, status_code, response_text=message)
+        await client.aclose()
+        return format_translation.openai_error_response(status_code, message)
+    except Exception:
+        usage_tracker.finish_event(usage_event, 599)
+        await client.aclose()
+        raise
+
+    if upstream.status_code >= 400:
+        try:
+            await upstream.aread()
+            usage_tracker.finish_event(
+                usage_event,
+                upstream.status_code,
+                upstream=upstream,
+                response_payload=_extract_upstream_json_payload(upstream),
+                response_text=_extract_upstream_text(upstream),
+            )
+            return proxy_non_streaming_response(upstream)
+        finally:
+            await upstream.aclose()
+            await client.aclose()
+
+    response_headers = {
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no",
+        "content-type": "text/event-stream; charset=utf-8",
+    }
+
+    async def stream_translated():
+        translator = ChatToResponsesStreamTranslator(
+            fallback_model,
+            mark_first_output=lambda: usage_tracker.mark_first_output(usage_event),
+        )
+        try:
+            async for event in translator.translate(upstream.aiter_bytes()):
+                yield event
+        finally:
+            response_payload = translator.build_response_payload()
+            usage_tracker.finish_event(
+                usage_event,
+                upstream.status_code,
+                upstream=upstream,
+                response_payload=response_payload,
+                response_text=translator.response_text,
+                usage=response_payload["usage"],
+            )
+            await upstream.aclose()
+            await client.aclose()
+
+    return GracefulStreamingResponse(
+        stream_translated(),
+        status_code=upstream.status_code,
+        headers=response_headers,
+    )
+
+
+async def proxy_anthropic_from_responses_streaming_response(
+    upstream_url: str,
+    headers: dict,
+    body: dict,
+    fallback_model: str,
+    timeout: int = 300,
+    usage_event: dict | None = None,
+) -> Response:
+    client = httpx.AsyncClient(timeout=timeout)
+    request = client.build_request("POST", upstream_url, headers=headers, json=body)
+    try:
+        upstream = await throttled_client_send(client, request, stream=True)
+    except httpx.RequestError as exc:
+        status_code, message = format_translation.upstream_request_error_status_and_message(exc)
+        usage_tracker.finish_event(usage_event, status_code, response_text=message)
+        await client.aclose()
+        return format_translation.anthropic_error_response(status_code, message)
+    except Exception:
+        usage_tracker.finish_event(usage_event, 599)
+        await client.aclose()
+        raise
+
+    if upstream.status_code >= 400:
+        try:
+            await upstream.aread()
+            fallback_message = _extract_upstream_text(upstream) or f"Upstream request failed with status {upstream.status_code}"
+            error_payload = format_translation.anthropic_error_payload_from_openai(
+                _extract_upstream_json_payload(upstream),
+                upstream.status_code,
+                fallback_message,
+            )
+            usage_tracker.finish_event(
+                usage_event,
+                upstream.status_code,
+                upstream=upstream,
+                response_payload=error_payload,
+                response_text=error_payload.get("error", {}).get("message"),
+            )
+            return format_translation.anthropic_error_response_from_upstream(upstream)
+        finally:
+            await upstream.aclose()
+            await client.aclose()
+
+    response_headers = {
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no",
+        "content-type": "text/event-stream; charset=utf-8",
+    }
+
+    async def stream_translated():
+        translator = ResponsesToAnthropicStreamTranslator(
+            fallback_model,
+            mark_first_output=lambda: usage_tracker.mark_first_output(usage_event),
+        )
+        try:
+            async for event in translator.translate(upstream.aiter_bytes()):
+                yield event
+        finally:
+            response_payload = translator.build_response_payload()
+            usage_tracker.finish_event(
+                usage_event,
+                upstream.status_code,
+                upstream=upstream,
+                response_payload=response_payload,
+                response_text=translator.response_text,
+                usage=response_payload["usage"],
+            )
+            await upstream.aclose()
+            await client.aclose()
+
+    return GracefulStreamingResponse(
+        stream_translated(),
+        status_code=upstream.status_code,
+        headers=response_headers,
+    )
+
+
+async def _proxy_bridge_streaming_response(plan: UpstreamRequestPlan, bridge_plan: BridgeExecutionPlan) -> Response:
+    if bridge_plan.caller_protocol == "responses" and bridge_plan.upstream_protocol == "responses":
+        return await proxy_streaming_response(
+            plan.upstream_url,
+            plan.headers,
+            plan.body,
+            timeout=300,
+            usage_event=plan.usage_event,
+            stream_type="responses",
+        )
+    if bridge_plan.caller_protocol == "responses" and bridge_plan.upstream_protocol == "chat":
+        return await proxy_responses_from_chat_streaming_response(
+            plan.upstream_url,
+            plan.headers,
+            plan.body,
+            bridge_plan.resolved_model,
+            timeout=300,
+            usage_event=plan.usage_event,
+        )
+    if bridge_plan.caller_protocol == "anthropic" and bridge_plan.upstream_protocol == "chat":
+        return await proxy_anthropic_streaming_response(
+            plan.upstream_url,
+            plan.headers,
+            plan.body,
+            bridge_plan.resolved_model,
+            timeout=300,
+            usage_event=plan.usage_event,
+        )
+    return await proxy_anthropic_from_responses_streaming_response(
+        plan.upstream_url,
+        plan.headers,
+        plan.body,
+        bridge_plan.resolved_model,
+        timeout=300,
+        usage_event=plan.usage_event,
+    )
+
+
 dashboard_service.trigger_official_premium_refresh()
 
 
@@ -560,6 +905,19 @@ async def client_proxy_status_api():
     return JSONResponse(content=client_proxy_config_service.proxy_client_status_payload())
 
 
+@app.get("/api/config/model-remapping")
+@app.get("/api/config/model-routing")
+async def model_routing_status_api():
+    return JSONResponse(content=model_routing_config_service.config_payload())
+
+
+@app.post("/api/config/model-remapping")
+@app.post("/api/config/model-routing")
+async def model_routing_config_api(request: Request):
+    payload = await parse_json_request(request)
+    return JSONResponse(content=model_routing_config_service.save_settings(payload))
+
+
 @app.post("/api/config/client-proxy")
 async def client_proxy_install_api(request: Request):
     payload = await parse_json_request(request)
@@ -627,38 +985,31 @@ async def responses(request: Request):
     if raw_input is not None:
         body["input"] = format_translation.sanitize_input(raw_input)
 
-    upstream_url = f"{auth.get_api_base().rstrip('/')}/responses"
-    plan, error_response = _prepare_upstream_request(
+    try:
+        api_key = auth.get_api_key()
+    except Exception as exc:
+        return format_translation.openai_error_response(401, f"GHCP auth failed: {exc}")
+
+    api_base = auth.get_api_base()
+    try:
+        bridge_plan = await bridge_planner.plan("responses", body, api_base=api_base, api_key=api_key)
+    except ValueError as exc:
+        return format_translation.openai_error_response(400, str(exc))
+
+    plan, error_response = _prepare_bridge_request(
         request,
-        body=body,
-        requested_model=body.get("model"),
-        resolved_model=body.get("model"),
-        upstream_path="/responses",
-        upstream_url=upstream_url,
-        header_builder=lambda api_key, request_id: format_translation.build_responses_headers_for_request(
-            request,
-            body,
-            api_key,
-            force_initiator="agent" if has_compaction_input else None,
-            request_id=request_id,
-            initiator_policy=_initiator_policy,
-            session_id_resolver=usage_tracking.request_session_id,
-        ),
-        error_response=format_translation.openai_error_response,
+        original_body=body,
+        bridge_plan=bridge_plan,
+        api_base=api_base,
+        api_key=api_key,
+        force_initiator="agent" if has_compaction_input else None,
     )
     if error_response is not None:
         return error_response
 
-    if body.get("stream", False):
-        return await proxy_streaming_response(
-            plan.upstream_url,
-            plan.headers,
-            plan.body,
-            timeout=300,
-            usage_event=plan.usage_event,
-            stream_type="responses",
-        )
-    return await _post_non_streaming_request(plan, error_response=format_translation.openai_error_response)
+    if bridge_plan.stream:
+        return await _proxy_bridge_streaming_response(plan, bridge_plan)
+    return await _post_bridge_non_streaming_request(plan, bridge_plan)
 
 
 @app.post("/v1/responses/compact")
@@ -672,24 +1023,24 @@ async def responses_compact(request: Request):
         )
 
     summary_request = format_translation.build_fake_compaction_request(body)
-    upstream_url = f"{auth.get_api_base().rstrip('/')}/responses"
-    plan, error_response = _prepare_upstream_request(
+    try:
+        api_key = auth.get_api_key()
+    except Exception as exc:
+        return format_translation.openai_error_response(401, f"GHCP auth failed: {exc}")
+
+    api_base = auth.get_api_base()
+    try:
+        bridge_plan = await bridge_planner.plan("responses", summary_request, api_base=api_base, api_key=api_key)
+    except ValueError as exc:
+        return format_translation.openai_error_response(400, str(exc))
+
+    plan, error_response = _prepare_bridge_request(
         request,
-        body=summary_request,
-        requested_model=body.get("model"),
-        resolved_model=summary_request.get("model"),
-        upstream_path="/responses",
-        upstream_url=upstream_url,
-        header_builder=lambda api_key, request_id: format_translation.build_responses_headers_for_request(
-            request,
-            summary_request,
-            api_key,
-            force_initiator="agent",
-            request_id=request_id,
-            initiator_policy=_initiator_policy,
-            session_id_resolver=usage_tracking.request_session_id,
-        ),
-        error_response=format_translation.openai_error_response,
+        original_body=summary_request,
+        bridge_plan=bridge_plan,
+        api_base=api_base,
+        api_key=api_key,
+        force_initiator="agent",
     )
     if error_response is not None:
         return error_response
@@ -731,18 +1082,19 @@ async def responses_compact(request: Request):
         )
         return format_translation.openai_error_response(502, f"Invalid JSON from upstream summarization response: {e}")
 
-    summary_text = format_translation.extract_response_output_text(upstream_payload)
+    translated_payload = _translate_bridge_success_payload(bridge_plan, upstream_payload)
+    summary_text = format_translation.extract_response_output_text(translated_payload)
     if not summary_text:
         usage_tracker.finish_event(
             plan.usage_event,
             502,
             upstream=upstream,
-            response_payload=upstream_payload,
+            response_payload=translated_payload,
             response_text="Upstream summarization response did not include assistant text output",
         )
         return format_translation.openai_error_response(502, "Upstream summarization response did not include assistant text output")
 
-    compacted_response = format_translation.build_fake_compaction_response(body, summary_text, upstream_payload.get("usage"))
+    compacted_response = format_translation.build_fake_compaction_response(body, summary_text, translated_payload.get("usage"))
     usage_tracker.finish_event(
         plan.usage_event,
         upstream.status_code,
@@ -826,88 +1178,23 @@ async def anthropic_messages(request: Request):
 
     api_base = auth.get_api_base()
     try:
-        outbound_body = await format_translation.anthropic_request_to_chat(body, api_base, api_key)
+        bridge_plan = await bridge_planner.plan("messages", body, api_base=api_base, api_key=api_key)
     except ValueError as exc:
         return format_translation.anthropic_error_response(400, str(exc))
 
-    upstream_url = f"{api_base.rstrip('/')}/chat/completions"
-    plan, error_response = _prepare_upstream_request(
+    plan, error_response = _prepare_bridge_request(
         request,
-        body=outbound_body,
-        requested_model=body.get("model"),
-        resolved_model=outbound_body.get("model"),
-        upstream_path="/chat/completions",
-        upstream_url=upstream_url,
-        header_builder=lambda resolved_api_key, request_id: format_translation.build_anthropic_headers_for_request(
-            request,
-            body,
-            resolved_api_key,
-            request_id=request_id,
-            initiator_policy=_initiator_policy,
-            session_id_resolver=usage_tracking.request_session_id,
-        ),
-        error_response=format_translation.anthropic_error_response,
+        original_body=body,
+        bridge_plan=bridge_plan,
+        api_base=api_base,
         api_key=api_key,
     )
     if error_response is not None:
         return error_response
 
-    if outbound_body.get("stream"):
-        return await proxy_anthropic_streaming_response(
-            plan.upstream_url,
-            plan.headers,
-            plan.body,
-            outbound_body.get("model"),
-            timeout=300,
-            usage_event=plan.usage_event,
-        )
-
-    try:
-        async with httpx.AsyncClient(timeout=configured_upstream_timeout_seconds()) as client:
-            upstream = await throttled_client_post(
-                client,
-                plan.upstream_url,
-                headers=plan.headers,
-                json=plan.body,
-            )
-        if upstream.status_code >= 400:
-            fallback_message = _extract_upstream_text(upstream) or f"Upstream request failed with status {upstream.status_code}"
-            error_payload = format_translation.anthropic_error_payload_from_openai(
-                _extract_upstream_json_payload(upstream),
-                upstream.status_code,
-                fallback_message,
-            )
-            usage_tracker.finish_event(
-                plan.usage_event,
-                upstream.status_code,
-                upstream=upstream,
-                response_payload=error_payload,
-                response_text=error_payload.get("error", {}).get("message"),
-            )
-            return format_translation.anthropic_error_response(
-                upstream.status_code,
-                error_payload["error"]["message"],
-                error_payload["error"]["type"],
-                {"retry-after": upstream.headers.get("retry-after")} if upstream.headers.get("retry-after") else None,
-            )
-        translated = format_translation.chat_completion_to_anthropic(
-            upstream.json(),
-            fallback_model=outbound_body.get("model"),
-        )
-        usage_tracker.finish_event(
-            plan.usage_event,
-            upstream.status_code,
-            upstream=upstream,
-            response_payload=translated,
-        )
-        return JSONResponse(content=translated, status_code=upstream.status_code)
-    except httpx.RequestError as exc:
-        status_code, message = format_translation.upstream_request_error_status_and_message(exc)
-        usage_tracker.finish_event(plan.usage_event, status_code, response_text=message)
-        return format_translation.anthropic_error_response(status_code, message)
-    except Exception:
-        usage_tracker.finish_event(plan.usage_event, 599)
-        raise
+    if bridge_plan.stream:
+        return await _proxy_bridge_streaming_response(plan, bridge_plan)
+    return await _post_bridge_non_streaming_request(plan, bridge_plan)
 
 
 # ─── Entrypoint ───────────────────────────────────────────────────────────────

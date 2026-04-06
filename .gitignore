@@ -4,3 +4,14 @@ __pycache__/
 .ghcp_proxy-cache*
 .tmp/
 .live-proxy*
+.playwright-mcp/
+.pytest_cache/
+
+# Test / runtime artifacts with unique IDs
+usage-log-*.jsonl
+usage-history-*.jsonl
+model-routing-*.json
+codex-config-*.toml
+claude-settings-*.json
+claude-settings-*.json.ghcp-proxy.bak.*
+codex-config-*.toml.ghcp-proxy.bak.*

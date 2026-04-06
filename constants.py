@@ -26,6 +26,7 @@ TOKEN_DIR         = os.path.expanduser("~/.config/ghcp_proxy")
 ACCESS_TOKEN_FILE = os.path.join(TOKEN_DIR, "access-token")
 BILLING_TOKEN_FILE = os.path.join(TOKEN_DIR, "billing-token")
 API_KEY_FILE      = os.path.join(TOKEN_DIR, "api-key.json")
+MODEL_ROUTING_CONFIG_FILE = os.path.join(TOKEN_DIR, "model-routing.json")
 USAGE_LOG_FILE    = os.path.join(TOKEN_DIR, "usage-log.jsonl")
 REQUEST_ERROR_LOG_FILE = os.path.join(TOKEN_DIR, "request-errors.log")
 PROXY_BASE_URL    = "http://localhost:8000"
