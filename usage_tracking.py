@@ -771,6 +771,12 @@ class UsageTracker:
 
         event_request_id = request_id or uuid4().hex
         client_request_id = request.headers.get("x-client-request-id")
+        if not client_request_id and isinstance(outbound_headers, dict):
+            outbound_client_request_id = outbound_headers.get("x-client-request-id")
+            if isinstance(outbound_client_request_id, str):
+                normalized_outbound_client_request_id = outbound_client_request_id.strip()
+                if normalized_outbound_client_request_id:
+                    client_request_id = normalized_outbound_client_request_id
         subagent = request.headers.get("x-openai-subagent")
         is_claude_request = _is_claude_request(request)
         has_chain_context = any(

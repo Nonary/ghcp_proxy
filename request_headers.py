@@ -53,6 +53,11 @@ def _apply_forwarded_request_headers(headers: dict, request: Request, request_bo
         if header_value:
             headers[header_name] = header_value
 
+    if "x-client-request-id" not in headers and isinstance(session_id, str):
+        normalized_session_id = session_id.strip()
+        if normalized_session_id:
+            headers["x-client-request-id"] = normalized_session_id
+
     forwarded_server_request_id = None
     for header_name in FORWARDED_SERVER_REQUEST_ID_HEADERS:
         header_value = request.headers.get(header_name)
@@ -64,6 +69,31 @@ def _apply_forwarded_request_headers(headers: dict, request: Request, request_bo
     if forwarded_server_request_id is not None:
         headers.setdefault("x-request-id", forwarded_server_request_id)
         headers.setdefault("x-github-request-id", forwarded_server_request_id)
+
+    return session_id
+
+
+def _normalize_responses_prompt_cache_key(body: dict, session_id: str | None) -> None:
+    if not isinstance(body, dict):
+        return
+
+    prompt_cache_key = None
+    for key in ("prompt_cache_key", "promptCacheKey"):
+        value = body.get(key)
+        if isinstance(value, str):
+            normalized = value.strip()
+            if normalized:
+                prompt_cache_key = normalized
+                break
+
+    if prompt_cache_key is None and isinstance(session_id, str):
+        normalized_session_id = session_id.strip()
+        if normalized_session_id:
+            prompt_cache_key = normalized_session_id
+
+    body.pop("promptCacheKey", None)
+    if prompt_cache_key is not None:
+        body["prompt_cache_key"] = prompt_cache_key
 
 
 def build_responses_headers_for_request(
@@ -77,7 +107,8 @@ def build_responses_headers_for_request(
     session_id_resolver=None,
 ) -> dict:
     headers = build_copilot_headers(api_key)
-    _apply_forwarded_request_headers(headers, request, body, session_id_resolver=session_id_resolver)
+    session_id = _apply_forwarded_request_headers(headers, request, body, session_id_resolver=session_id_resolver)
+    _normalize_responses_prompt_cache_key(body, session_id)
 
     had_input = "input" in body
     effective_input, initiator = initiator_policy.resolve_responses_input(

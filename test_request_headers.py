@@ -170,6 +170,42 @@ class RequestHeadersTests(unittest.TestCase):
         )
 
         self.assertEqual(headers["session_id"], "session-123")
+        self.assertEqual(headers["x-client-request-id"], "session-123")
+        self.assertEqual(body["prompt_cache_key"], "session-123")
+
+    def test_build_responses_headers_for_request_normalizes_prompt_cache_key_alias(self):
+        request = SimpleNamespace(
+            headers={},
+            url=SimpleNamespace(path="/v1/responses"),
+        )
+        body = {"model": "gpt-5.4", "input": "hello", "promptCacheKey": "cache-123"}
+
+        headers = format_translation.build_responses_headers_for_request(
+            request, body, "test-key",
+            initiator_policy=proxy._initiator_policy,
+            session_id_resolver=usage_tracking.request_session_id,
+        )
+
+        self.assertEqual(headers["session_id"], "cache-123")
+        self.assertEqual(headers["x-client-request-id"], "cache-123")
+        self.assertEqual(body["prompt_cache_key"], "cache-123")
+        self.assertNotIn("promptCacheKey", body)
+
+    def test_build_responses_headers_for_request_preserves_incoming_client_request_id(self):
+        request = SimpleNamespace(
+            headers={"x-client-request-id": "client-123"},
+            url=SimpleNamespace(path="/v1/responses"),
+        )
+        body = {"model": "gpt-5.4", "input": "hello", "sessionId": "session-123"}
+
+        headers = format_translation.build_responses_headers_for_request(
+            request, body, "test-key",
+            initiator_policy=proxy._initiator_policy,
+            session_id_resolver=usage_tracking.request_session_id,
+        )
+
+        self.assertEqual(headers["session_id"], "session-123")
+        self.assertEqual(headers["x-client-request-id"], "client-123")
 
     def test_build_responses_headers_for_request_preserves_incoming_server_request_id(self):
         request = SimpleNamespace(

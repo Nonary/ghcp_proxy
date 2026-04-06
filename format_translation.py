@@ -1407,31 +1407,194 @@ def sanitize_input(input_items):
     return result
 
 
+def _compaction_message_item(role: str, text: str) -> dict | None:
+    if not isinstance(text, str):
+        return None
+    text = text.strip()
+    if not text:
+        return None
+
+    part_type = "output_text" if role == "assistant" else "input_text"
+    return {
+        "type": "message",
+        "role": role,
+        "content": [{"type": part_type, "text": text}],
+    }
+
+
+def _is_fake_compaction_summary_message(item: dict) -> bool:
+    if not isinstance(item, dict):
+        return False
+    if str(item.get("type", "")).lower() != "message":
+        return False
+    text = util.extract_item_text(item)
+    return text.startswith(f"{FAKE_COMPACTION_SUMMARY_LABEL}\n")
+
+
+def _format_compaction_tool_call(item: dict) -> str | None:
+    name = item.get("name")
+    if not isinstance(name, str) or not name:
+        return None
+
+    arguments = item.get("arguments")
+    if isinstance(arguments, str):
+        arguments_text = arguments.strip() or "{}"
+    elif arguments is None:
+        arguments_text = "{}"
+    else:
+        arguments_text = json.dumps(arguments, separators=(",", ":"))
+
+    call_id = item.get("call_id") or item.get("id")
+    call_suffix = f" ({call_id})" if isinstance(call_id, str) and call_id else ""
+    return f"[Tool call{call_suffix}] {name}\n{arguments_text}"
+
+
+def _format_compaction_tool_output(item: dict) -> str | None:
+    call_id = item.get("call_id")
+    label = f"[Tool result ({call_id})]" if isinstance(call_id, str) and call_id else "[Tool result]"
+
+    output = item.get("output")
+    if isinstance(output, list):
+        output_text = "".join(util.extract_item_text(part) for part in output if isinstance(part, dict))
+    elif isinstance(output, str):
+        output_text = output
+    elif output is None:
+        output_text = ""
+    else:
+        output_text = json.dumps(output, separators=(",", ":"))
+
+    output_text = output_text.strip()
+    return f"{label}\n{output_text}" if output_text else label
+
+
+def _compaction_transcript_input_items(input_items) -> list[dict]:
+    transcript = []
+    if not isinstance(input_items, list):
+        return transcript
+
+    for item in input_items:
+        if not isinstance(item, dict):
+            continue
+
+        item_type = str(item.get("type", "")).lower()
+        if item_type == "message":
+            role = str(item.get("role", "user")).lower()
+            if role not in {"system", "developer", "user", "assistant"}:
+                continue
+            if _is_fake_compaction_summary_message(item):
+                transcript_item = _compaction_message_item("user", util.extract_item_text(item))
+            else:
+                transcript_item = item
+            if transcript_item is not None:
+                transcript.append(transcript_item)
+            continue
+
+        if item_type == "function_call":
+            transcript_item = _compaction_message_item("assistant", _format_compaction_tool_call(item))
+            if transcript_item is not None:
+                transcript.append(transcript_item)
+            continue
+
+        if item_type == "function_call_output":
+            transcript_item = _compaction_message_item("user", _format_compaction_tool_output(item))
+            if transcript_item is not None:
+                transcript.append(transcript_item)
+            continue
+
+        if item_type == "compaction":
+            encrypted_content = item.get("encrypted_content")
+            summary_text = decode_fake_compaction(encrypted_content)
+            if summary_text is not None:
+                transcript_item = _compaction_message_item("user", f"{FAKE_COMPACTION_SUMMARY_LABEL}\n{summary_text}")
+                if transcript_item is not None:
+                    transcript.append(transcript_item)
+            continue
+
+        # reasoning and item_reference do not add useful user-visible
+        # context for summarization and can trigger upstream validation
+        # issues when bridged through tool-aware chat adapters.
+        if item_type in {"reasoning", "item_reference"}:
+            continue
+
+    return transcript
+
+
+def _compaction_requires_chat_transcript(model_name) -> bool:
+    normalized = normalize_upstream_model_name(resolve_copilot_model_name(model_name))
+    if not isinstance(normalized, str):
+        return False
+    return normalized.startswith("claude-") or normalized.startswith("anthropic/")
+
+
+def _copy_compaction_passthrough_fields(source: dict, target: dict) -> None:
+    if not isinstance(source, dict) or not isinstance(target, dict):
+        return
+
+    # Preserve the same cache/session affinity fields as ordinary Responses
+    # traffic so the synthetic summary request can reuse GitHub's prompt state.
+    for key in (
+        "session_id",
+        "sessionId",
+        "prompt_cache_key",
+        "promptCacheKey",
+        "previous_response_id",
+        "metadata",
+        "user",
+    ):
+        if key in source:
+            target[key] = source.get(key)
+
+
+def _apply_compaction_request_config(source: dict, target: dict) -> None:
+    if not isinstance(source, dict) or not isinstance(target, dict):
+        return
+
+    tools = source.get("tools")
+    if isinstance(tools, list):
+        target["tools"] = tools
+        if tools:
+            # Keep the original tool schema in place for cache affinity, but
+            # force summarization to stay in text mode.
+            target["tool_choice"] = "none"
+
+    include = source.get("include")
+    if isinstance(include, list):
+        target["include"] = include
+
+    parallel_tool_calls = source.get("parallel_tool_calls")
+    if isinstance(parallel_tool_calls, bool):
+        target["parallel_tool_calls"] = parallel_tool_calls
+
+
 def build_fake_compaction_request(body: dict) -> dict:
     request_input = body.get("input")
     if isinstance(request_input, list):
         request_input = sanitize_input(request_input)
 
-    instructions = body.get("instructions")
-    if isinstance(instructions, str) and instructions.strip():
-        request_input = [
-            {
-                "type": "message",
-                "role": "developer",
-                "content": [
-                    {
-                        "type": "input_text",
-                        "text": f"Original conversation instructions to preserve:\n{instructions}",
-                    }
-                ],
-            },
-            *(request_input if isinstance(request_input, list) else []),
-        ]
+    # Match opencode's native compaction shape for Responses/GPT models so the
+    # upstream prefix stays byte-stable and can reuse prompt cache / item state.
+    # Only flatten the transcript for Claude-targeted chat bridging, where the
+    # synthetic summary request must avoid tool-role message validation issues.
+    if _compaction_requires_chat_transcript(body.get("model")):
+        input_items = _compaction_transcript_input_items(request_input)
+    elif isinstance(request_input, list):
+        input_items = list(request_input)
+    elif isinstance(request_input, str):
+        input_items = [_compaction_message_item("user", request_input)]
+        input_items = [item for item in input_items if item is not None]
+    else:
+        input_items = []
 
-    return {
+    input_items.append({
+        "type": "message",
+        "role": "user",
+        "content": [{"type": "input_text", "text": COMPACTION_SUMMARY_PROMPT}],
+    })
+
+    compact_request = {
         "model": body.get("model"),
-        "instructions": COMPACTION_SUMMARY_PROMPT,
-        "input": request_input if request_input is not None else [],
+        "instructions": body.get("instructions"),
+        "input": input_items,
         "stream": False,
         "store": False,
         "tools": [],
@@ -1440,6 +1603,9 @@ def build_fake_compaction_request(body: dict) -> dict:
         "reasoning": body.get("reasoning"),
         "text": body.get("text"),
     }
+    _copy_compaction_passthrough_fields(body, compact_request)
+    _apply_compaction_request_config(body, compact_request)
+    return compact_request
 
 
 def extract_response_output_text(payload: dict) -> str | None:

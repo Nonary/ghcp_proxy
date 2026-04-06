@@ -400,6 +400,82 @@ class ProxyRoutesTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 200)
 
+    def test_responses_compact_preserves_cache_affinity_fields(self):
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/responses/compact"),
+            method="POST",
+            headers={},
+        )
+        body = {
+            "model": "gpt-5.4",
+            "sessionId": "session-123",
+            "promptCacheKey": "cache-123",
+            "previous_response_id": "resp_prev",
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "Read",
+                    "description": "Read a file",
+                    "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+                }
+            ],
+            "include": ["reasoning.encrypted_content"],
+            "parallel_tool_calls": True,
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "hello"}],
+                }
+            ],
+        }
+        upstream = httpx.Response(
+            200,
+            json={
+                "id": "resp_123",
+                "model": "gpt-5.4",
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "summary"}],
+                    }
+                ],
+                "usage": {
+                    "input_tokens": 24,
+                    "input_tokens_details": {"cached_tokens": 20},
+                    "output_tokens": 5,
+                    "total_tokens": 29,
+                },
+            },
+            headers={"content-type": "application/json"},
+        )
+
+        with (
+            mock.patch.object(proxy, "parse_json_request", mock.AsyncMock(return_value=body)),
+            mock.patch.object(auth, "get_api_key", return_value="test-key"),
+            mock.patch.object(auth, "get_api_base", return_value="https://example.invalid"),
+            mock.patch.object(proxy.model_routing_config_service, "resolve_target_model", return_value="gpt-5.4"),
+            mock.patch.object(proxy.usage_tracker, "start_event", return_value=None),
+            mock.patch.object(proxy.usage_tracker, "finish_event"),
+            mock.patch.object(proxy, "throttled_client_post", mock.AsyncMock(return_value=upstream)) as post,
+        ):
+            response = proxy.asyncio.run(proxy.responses_compact(request))
+
+        forwarded_headers = post.await_args.kwargs["headers"]
+        forwarded_body = post.await_args.kwargs["json"]
+        self.assertEqual(forwarded_headers["session_id"], "session-123")
+        self.assertEqual(forwarded_headers["x-client-request-id"], "session-123")
+        self.assertEqual(forwarded_body["sessionId"], "session-123")
+        self.assertEqual(forwarded_body["prompt_cache_key"], "cache-123")
+        self.assertNotIn("promptCacheKey", forwarded_body)
+        self.assertEqual(forwarded_body["previous_response_id"], "resp_prev")
+        self.assertEqual(forwarded_body["tools"], body["tools"])
+        self.assertEqual(forwarded_body["include"], body["include"])
+        self.assertTrue(forwarded_body["parallel_tool_calls"])
+        self.assertEqual(forwarded_body["tool_choice"], "none")
+        self.assertEqual(response.status_code, 200)
+
     def test_proxy_streaming_response_connect_error_returns_openai_error(self):
         request = httpx.Request("POST", "https://example.invalid/responses")
 

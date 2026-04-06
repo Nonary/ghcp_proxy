@@ -170,6 +170,214 @@ class FormatTranslationTests(unittest.TestCase):
 
         self.assertEqual(compact_request["reasoning"], {"effort": "max"})
 
+    def test_build_fake_compaction_request_preserves_cache_affinity_fields(self):
+        body = {
+            "model": "gpt-5.4",
+            "input": "hello",
+            "sessionId": "session-123",
+            "promptCacheKey": "cache-123",
+            "previous_response_id": "resp_prev",
+            "metadata": {"user_id": '{"session_id":"metadata-session"}'},
+            "user": "user-123",
+        }
+
+        compact_request = format_translation.build_fake_compaction_request(body)
+
+        self.assertEqual(compact_request["sessionId"], "session-123")
+        self.assertEqual(compact_request["promptCacheKey"], "cache-123")
+        self.assertEqual(compact_request["previous_response_id"], "resp_prev")
+        self.assertEqual(compact_request["metadata"], body["metadata"])
+        self.assertEqual(compact_request["user"], "user-123")
+
+    def test_build_fake_compaction_request_preserves_tool_schema_but_disables_tool_calls(self):
+        body = {
+            "model": "gpt-5.4",
+            "input": "hello",
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "Read",
+                    "description": "Read a file",
+                    "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+                }
+            ],
+            "include": ["reasoning.encrypted_content"],
+            "parallel_tool_calls": True,
+        }
+
+        compact_request = format_translation.build_fake_compaction_request(body)
+
+        self.assertEqual(compact_request["tools"], body["tools"])
+        self.assertEqual(compact_request["include"], body["include"])
+        self.assertTrue(compact_request["parallel_tool_calls"])
+        self.assertEqual(compact_request["tool_choice"], "none")
+
+    def test_build_fake_compaction_request_transcriptizes_tool_history_for_bridging(self):
+        body = {
+            "model": "claude-opus-4.6",
+            "input": [
+                {
+                    "type": "compaction",
+                    "encrypted_content": format_translation.encode_fake_compaction("carry this forward"),
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "Read",
+                    "arguments": '{"file":"main.py"}',
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "file contents",
+                },
+            ],
+        }
+
+        compact_request = format_translation.build_fake_compaction_request(body)
+
+        self.assertEqual(
+            compact_request["input"],
+            [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": "[Compacted conversation summary]\ncarry this forward",
+                        }
+                    ],
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": '[Tool call (call_1)] Read\n{"file":"main.py"}',
+                        }
+                    ],
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": "[Tool result (call_1)]\nfile contents",
+                        }
+                    ],
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": format_translation.COMPACTION_SUMMARY_PROMPT}],
+                },
+            ],
+        )
+
+    def test_build_fake_compaction_request_chat_translation_has_no_tool_role_messages(self):
+        body = {
+            "model": "claude-opus-4.6",
+            "input": [
+                {
+                    "type": "compaction",
+                    "encrypted_content": format_translation.encode_fake_compaction("carry this forward"),
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "file contents",
+                },
+            ],
+        }
+
+        compact_request = format_translation.build_fake_compaction_request(body)
+        translated = format_translation.responses_request_to_chat(compact_request)
+
+        self.assertEqual([message["role"] for message in translated["messages"]], ["user", "user", "user"])
+        self.assertTrue(translated["messages"][-1]["content"].startswith("Your task is to create"))
+        self.assertNotIn("tool_calls", translated["messages"][0])
+
+    def test_build_fake_compaction_request_preserves_native_responses_items_for_codex_models(self):
+        body = {
+            "model": "gpt-5.4",
+            "input": [
+                {
+                    "type": "compaction",
+                    "encrypted_content": format_translation.encode_fake_compaction("carry this forward"),
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "Read",
+                    "arguments": '{"file":"main.py"}',
+                    "id": "fc_1",
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "file contents",
+                },
+                {
+                    "type": "reasoning",
+                    "id": "rs_1",
+                    "encrypted_content": "opaque-reasoning",
+                    "summary": [{"type": "summary_text", "text": "thinking"}],
+                },
+                {
+                    "type": "item_reference",
+                    "id": "rs_1",
+                },
+            ],
+        }
+
+        compact_request = format_translation.build_fake_compaction_request(body)
+
+        self.assertEqual(
+            compact_request["input"],
+            [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": "[Compacted conversation summary]\ncarry this forward",
+                        }
+                    ],
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "Read",
+                    "arguments": '{"file":"main.py"}',
+                    "id": "fc_1",
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "file contents",
+                },
+                {
+                    "type": "reasoning",
+                    "id": "rs_1",
+                    "encrypted_content": "opaque-reasoning",
+                    "summary": [{"type": "summary_text", "text": "thinking"}],
+                },
+                {
+                    "type": "item_reference",
+                    "id": "rs_1",
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": format_translation.COMPACTION_SUMMARY_PROMPT}],
+                },
+            ],
+        )
+
     def test_sanitize_input_uses_latest_local_compaction_as_boundary(self):
         sanitized = format_translation.sanitize_input(
             [

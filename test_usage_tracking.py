@@ -118,6 +118,27 @@ class UsageTrackingTests(unittest.TestCase):
         self.assertEqual(event["session_id"], "session-123")
         self.assertEqual(outbound_headers["session_id"], "session-123")
 
+    def test_start_usage_event_uses_outbound_client_request_id_when_present(self):
+        tracker = self._make_usage_tracker()
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/responses"),
+            method="POST",
+            headers={},
+        )
+        outbound_headers = {"x-client-request-id": "session-123"}
+
+        event = tracker.start_event(
+            request,
+            requested_model="gpt-5.4",
+            resolved_model="gpt-5.4",
+            initiator="agent",
+            request_body={"sessionId": "session-123"},
+            outbound_headers=outbound_headers,
+        )
+
+        self.assertEqual(event["session_id"], "session-123")
+        self.assertEqual(event["client_request_id"], "session-123")
+
     def test_start_usage_event_uses_claude_code_session_header(self):
         tracker = self._make_usage_tracker()
         request = SimpleNamespace(
