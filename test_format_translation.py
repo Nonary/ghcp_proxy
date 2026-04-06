@@ -3,11 +3,11 @@ from types import SimpleNamespace
 from unittest import mock
 
 import gzip
-import compression.zstd as pyzstd
 
 import format_translation
 import proxy
 import usage_tracking
+import util
 
 import httpx
 
@@ -26,7 +26,7 @@ class FormatTranslationTests(unittest.TestCase):
         self.assertEqual(parsed["input"], "hello")
 
     def test_parse_json_request_accepts_zstd_encoded_body(self):
-        raw = pyzstd.compress(b'{"model":"gpt-5","input":"hello"}')
+        raw = util.zstd_compress(b'{"model":"gpt-5","input":"hello"}')
         request = SimpleNamespace(
             headers={"content-encoding": "zstd"},
             body=mock.AsyncMock(return_value=raw),

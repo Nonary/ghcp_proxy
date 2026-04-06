@@ -6,9 +6,18 @@ import os
 import time
 import zlib
 
-import compression.zstd as pyzstd
 from datetime import datetime, timezone
 from fastapi import HTTPException, Request
+
+try:
+    import compression.zstd as _stdlib_zstd
+except ImportError:
+    _stdlib_zstd = None
+
+try:
+    import zstandard as _zstandard
+except ImportError:
+    _zstandard = None
 
 try:
     import brotli
@@ -21,6 +30,27 @@ from constants import MODEL_PRICING_ALIASES, MODEL_PRICING, PREMIUM_REQUEST_MULT
 # ---------------------------------------------------------------------------
 # JSON / coercion helpers
 # ---------------------------------------------------------------------------
+
+
+def zstd_available() -> bool:
+    return _stdlib_zstd is not None or _zstandard is not None
+
+
+def zstd_compress(data: bytes) -> bytes:
+    if _stdlib_zstd is not None:
+        return _stdlib_zstd.compress(data)
+    if _zstandard is not None:
+        return _zstandard.ZstdCompressor().compress(data)
+    raise RuntimeError("zstd support requires Python 3.14+ or the zstandard package")
+
+
+def zstd_decompress(data: bytes) -> bytes:
+    if _stdlib_zstd is not None:
+        return _stdlib_zstd.decompress(data)
+    if _zstandard is not None:
+        return _zstandard.ZstdDecompressor().decompress(data)
+    raise RuntimeError("zstd support requires Python 3.14+ or the zstandard package")
+
 
 def _json_default(value):
     if isinstance(value, datetime):
@@ -357,7 +387,7 @@ async def parse_json_request(request: Request, error_callback=None) -> dict:
         elif content_encoding == "deflate":
             raw_body = zlib.decompress(raw_body)
         elif content_encoding == "zstd":
-            raw_body = pyzstd.decompress(raw_body)
+            raw_body = zstd_decompress(raw_body)
         elif content_encoding == "br":
             if brotli is None:
                 raise HTTPException(status_code=400, detail="Invalid JSON body: unsupported brotli request encoding")
@@ -365,7 +395,7 @@ async def parse_json_request(request: Request, error_callback=None) -> dict:
         elif raw_body.startswith(b"\x1f\x8b"):
             raw_body = gzip.decompress(raw_body)
         elif raw_body.startswith(b"\x28\xb5\x2f\xfd"):
-            raw_body = pyzstd.decompress(raw_body)
+            raw_body = zstd_decompress(raw_body)
 
         return json.loads(raw_body)
     except HTTPException:
