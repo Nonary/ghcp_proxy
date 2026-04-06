@@ -29,56 +29,142 @@
         linear-gradient(180deg, #081015 0%, #0b1218 45%, #101922 100%);
       font-family: "Aptos", "Segoe UI Variable Display", sans-serif;
     }
-    .app { max-width: 1440px; margin: 0 auto; padding: 28px 18px 42px; }
-    .content, .metrics { display: grid; gap: 16px; }
-    .metrics { grid-template-columns: repeat(3, minmax(0, 1fr)); margin-bottom: 18px; }
-    .content { grid-template-columns: 1.35fr .65fr; }
+    .app { max-width: 1520px; margin: 0 auto; padding: 20px 16px 40px; }
+    .content, .metrics, .summary-grid, .chart-grid { display: grid; gap: 12px; }
+    .metrics { grid-template-columns: repeat(3, minmax(0, 1fr)); margin-bottom: 14px; }
+    .summary-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); margin-bottom: 14px; }
+    .chart-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); margin-bottom: 14px; }
+    .content { grid-template-columns: 1.1fr .9fr; align-items: start; }
     .panel {
       border: 1px solid var(--line);
-      border-radius: 24px;
+      border-radius: 16px;
       background: var(--panel);
       backdrop-filter: blur(18px);
       box-shadow: var(--shadow);
-      padding: 18px;
+      padding: 14px;
+      position: relative;
+      overflow: hidden;
+    }
+    .panel::before {
+      content: "";
+      position: absolute;
+      inset: 0;
+      background: linear-gradient(180deg, rgba(255,255,255,.035), transparent 26%);
+      pointer-events: none;
     }
     .eyebrow {
-      font-size: .76rem;
+      font-size: .72rem;
       color: var(--muted);
       text-transform: uppercase;
       letter-spacing: .14em;
-      margin-bottom: 10px;
+      margin-bottom: 6px;
     }
-    h1 { margin: 0 0 12px; font-size: clamp(2rem, 5vw, 4rem); line-height: .92; letter-spacing: -.05em; }
+    h1 { margin: 0 0 8px; font-size: clamp(1.6rem, 4vw, 2.8rem); line-height: .92; letter-spacing: -.05em; }
     h2, h3 { margin: 0; }
     p { margin: 0; color: var(--muted); }
-    .chips, .toolbar, .tabs { display: flex; gap: 10px; flex-wrap: wrap; }
+    .hero {
+      display: grid;
+      grid-template-columns: minmax(0, 1.25fr) minmax(280px, .75fr);
+      gap: 14px;
+      margin-bottom: 14px;
+      padding: 18px;
+    }
+    .hero::after {
+      content: "";
+      position: absolute;
+      width: 360px;
+      height: 360px;
+      top: -180px;
+      right: -140px;
+      border-radius: 50%;
+      background: radial-gradient(circle, rgba(255,135,82,.18), transparent 66%);
+      pointer-events: none;
+    }
+    .hero-copy, .hero-stack { position: relative; z-index: 1; }
+    .hero-copy p { max-width: 720px; font-size: .92rem; line-height: 1.45; }
+    .hero-chips { margin-top: 12px; }
+    .hero-stack { display: grid; gap: 10px; }
+    .hero-mini {
+      border-radius: 14px;
+      border: 1px solid rgba(255,255,255,.08);
+      background: rgba(8, 13, 19, .26);
+      padding: 12px;
+    }
+    .hero-mini .value {
+      font-size: clamp(1.2rem, 2.6vw, 1.8rem);
+      font-weight: 700;
+      letter-spacing: -.05em;
+      margin-bottom: 4px;
+    }
+    .chips, .toolbar, .tabs { display: flex; gap: 8px; flex-wrap: wrap; }
     .chip, .badge {
       display: inline-flex;
       align-items: center;
-      padding: 7px 11px;
+      padding: 5px 9px;
       border-radius: 999px;
       border: 1px solid var(--line);
       background: rgba(255,255,255,.04);
-      font-size: .86rem;
+      font-size: .78rem;
     }
+    .chip.good { color: var(--accent-2); border-color: rgba(110,231,200,.16); background: rgba(110,231,200,.08); }
+    .chip.warn { color: #ffd27f; border-color: rgba(255,210,127,.18); background: rgba(255,210,127,.08); }
     .badge { color: var(--accent-2); border-color: rgba(110,231,200,.16); background: rgba(110,231,200,.08); text-transform: uppercase; letter-spacing: .08em; }
-    .metric .value { font-size: clamp(1.7rem, 3.4vw, 2.8rem); font-weight: 700; letter-spacing: -.06em; margin: 6px 0; }
-    .subtle { color: var(--muted); font-size: .92rem; }
+    .metric .value { font-size: clamp(1.3rem, 2.8vw, 2rem); font-weight: 700; letter-spacing: -.06em; margin: 4px 0; }
+    .metric-card { min-height: 110px; display: grid; gap: 6px; align-content: start; }
+    .metric-card[data-tone="accent"] { background: linear-gradient(160deg, rgba(255,135,82,.11), transparent 38%), var(--panel); }
+    .metric-card[data-tone="mint"] { background: linear-gradient(160deg, rgba(110,231,200,.11), transparent 40%), var(--panel); }
+    .metric-card[data-tone="slate"] { background: linear-gradient(160deg, rgba(173,191,205,.08), transparent 40%), var(--panel); }
+    .metric-card .metric-value { font-size: clamp(1.3rem, 2.8vw, 2rem); font-weight: 700; letter-spacing: -.06em; line-height: .95; }
+    .subtle { color: var(--muted); font-size: .84rem; }
     .panel-head {
       display: flex;
       justify-content: space-between;
-      gap: 12px;
+      gap: 10px;
       align-items: center;
-      margin-bottom: 14px;
+      margin-bottom: 10px;
     }
-    .tabs { padding: 6px; border: 1px solid var(--line); border-radius: 999px; background: rgba(255,255,255,.03); }
+    .chart-card { min-height: 280px; display: grid; gap: 10px; align-content: start; }
+    .chart-summary { text-align: right; max-width: 280px; }
+    .chart-summary .value { font-size: clamp(1.3rem, 2.6vw, 2rem); font-weight: 700; letter-spacing: -.06em; line-height: .95; margin-bottom: 4px; }
+    .chart-shell { display: grid; gap: 8px; }
+    .chart-scale { display: flex; justify-content: space-between; gap: 10px; color: var(--muted); font-size: .76rem; }
+    .chart-bars { display: flex; align-items: flex-end; gap: 6px; min-height: 160px; }
+    .chart-column { flex: 1 1 0; min-width: 0; display: grid; gap: 6px; align-items: end; }
+    .chart-track {
+      height: 148px;
+      border-radius: 12px;
+      border: 1px solid rgba(255,255,255,.08);
+      background: linear-gradient(180deg, rgba(255,255,255,.03), rgba(255,255,255,.01));
+      display: flex;
+      align-items: flex-end;
+      padding: 5px;
+    }
+    .chart-fill {
+      width: 100%;
+      border-radius: 8px;
+      min-height: 0;
+      box-shadow: 0 8px 16px rgba(0,0,0,.18);
+    }
+    .chart-card[data-tone="accent"] .chart-fill { background: linear-gradient(180deg, #f6b16d, var(--accent)); }
+    .chart-card[data-tone="mint"] .chart-fill { background: linear-gradient(180deg, #97f0d7, var(--accent-2)); }
+    .chart-label {
+      text-align: center;
+      font-size: .72rem;
+      color: var(--muted);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .chart-label.muted { opacity: .34; }
+    .tabs { padding: 4px; border: 1px solid var(--line); border-radius: 999px; background: rgba(255,255,255,.03); }
     .tabs button, .toolbar button, .toolbar input, .toolbar select {
       font: inherit;
-      border-radius: 12px;
+      border-radius: 10px;
       border: 1px solid var(--line);
       background: rgba(255,255,255,.04);
       color: var(--text);
-      padding: 10px 12px;
+      padding: 7px 10px;
+      font-size: .84rem;
     }
     .toolbar .spacer {
       flex: 1;
@@ -94,102 +180,251 @@
     }
     .tabs button.active { background: linear-gradient(135deg, var(--accent), #f6ac68); color: #21150f; font-weight: 700; }
     .toolbar button.primary { border: 0; background: linear-gradient(135deg, var(--accent), #f6ac68); color: #21150f; font-weight: 700; cursor: pointer; }
-    .toolbar { margin-bottom: 14px; }
-    table { width: 100%; border-collapse: collapse; font-size: .92rem; }
-    th, td { padding: 11px 8px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
-    th { color: var(--muted); font-size: .75rem; text-transform: uppercase; letter-spacing: .12em; }
+    .toolbar { margin-bottom: 10px; }
+    .toolbar input[type="search"] { flex: 1 1 280px; min-width: 220px; }
+    .toolbar input[type="password"] { flex: 1 1 320px; min-width: 240px; }
+    table { width: 100%; border-collapse: collapse; font-size: .84rem; }
+    th, td { padding: 8px 6px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+    th { color: var(--muted); font-size: .7rem; text-transform: uppercase; letter-spacing: .12em; }
     th:last-child, td:last-child { text-align: right; }
-    .mono { font-family: "Cascadia Code", Consolas, monospace; font-size: .84rem; }
-    .list, .history { display: grid; gap: 12px; }
+    .mono { font-family: "Cascadia Code", Consolas, monospace; font-size: .78rem; }
+    .list, .history, .rail { display: grid; gap: 10px; }
     .mini-card {
-      border-radius: 18px;
+      border-radius: 12px;
       border: 1px solid var(--line);
       background: var(--panel-soft);
-      padding: 14px;
+      padding: 10px;
     }
-    .mini-card strong { display: block; font-size: 1.25rem; letter-spacing: -.04em; margin: 8px 0 6px; }
-    .bar { height: 10px; background: rgba(255,255,255,.06); border-radius: 999px; overflow: hidden; margin: 8px 0; }
+    .mini-card strong { display: block; font-size: 1.1rem; letter-spacing: -.04em; margin: 6px 0 4px; }
+    .source-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 6px; }
+    .bar { height: 8px; background: rgba(255,255,255,.06); border-radius: 999px; overflow: hidden; margin: 6px 0; }
     .bar > span { display: block; height: 100%; background: linear-gradient(90deg, var(--accent), var(--accent-2)); }
+
+    /* Stacked bar chart fills */
+    .stacked-fill {
+      width: 100%;
+      border-radius: 8px;
+      min-height: 0;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      box-shadow: 0 8px 16px rgba(0,0,0,.18);
+    }
+    .stack-segment {
+      display: block;
+      width: 100%;
+      min-height: 0;
+      flex-shrink: 0;
+      transition: flex-basis .3s ease;
+    }
+
+    /* Chart legend row */
+    .chart-legend {
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+      margin-bottom: 4px;
+    }
+    .legend-item {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      font-size: .76rem;
+      color: var(--muted);
+    }
+    .legend-swatch {
+      display: inline-block;
+      width: 8px;
+      height: 8px;
+      border-radius: 2px;
+      flex-shrink: 0;
+    }
+
+    /* Token breakdown card */
+    .breakdown-list { display: grid; gap: 8px; }
+    .breakdown-row { padding: 2px 0; }
+    .breakdown-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 3px;
+    }
+    .breakdown-label {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      font-size: .84rem;
+    }
+    .breakdown-values { text-align: right; white-space: nowrap; }
+    .breakdown-footer {
+      border-top: 1px solid var(--line);
+      margin-top: 10px;
+      padding-top: 6px;
+    }
+
     .empty { color: var(--muted); padding: 18px 0; }
     .status.error { color: var(--danger); }
     .status.good { color: var(--accent-2); }
     .status.warn { color: #ffd27f; }
-    .proxy-grid { display: grid; gap: 12px; grid-template-columns: 1fr 1fr; }
-    .request-layout { display: grid; gap: 14px; grid-template-columns: minmax(0, .92fr) minmax(320px, .88fr); }
-    .request-list-wrap { display: grid; gap: 10px; min-height: 0; }
-    .request-list { display: grid; gap: 10px; max-height: 860px; overflow: auto; padding-right: 4px; }
-    .request-pager { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+    .proxy-grid { display: grid; gap: 10px; grid-template-columns: 1fr 1fr; }
+    .request-layout { display: grid; gap: 10px; grid-template-columns: minmax(0, .92fr) minmax(280px, .88fr); }
+    .request-list-wrap { display: grid; gap: 8px; min-height: 0; }
+    .request-list { display: grid; gap: 8px; max-height: 720px; overflow: auto; padding-right: 4px; }
+    .request-pager { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
     .request-pager .subtle { flex: 1; }
     .request-row {
       width: 100%;
       text-align: left;
-      border-radius: 18px;
+      border-radius: 12px;
       border: 1px solid var(--line);
       background: var(--panel-soft);
       color: var(--text);
-      padding: 14px;
+      padding: 10px;
       cursor: pointer;
       transition: border-color .18s ease, transform .18s ease, background .18s ease;
     }
     .request-row:hover { border-color: rgba(255,255,255,.18); transform: translateY(-1px); }
     .request-row.active { border-color: rgba(255,135,82,.48); background: rgba(255,135,82,.08); }
-    .request-row-head, .request-meta, .detail-grid { display: grid; gap: 10px; }
+    .request-row-head, .request-meta, .detail-grid { display: grid; gap: 8px; }
     .request-row-head { grid-template-columns: auto 1fr auto; align-items: center; }
-    .request-title { font-size: 1rem; font-weight: 700; letter-spacing: -.02em; }
-    .request-meta { grid-template-columns: repeat(2, minmax(0, 1fr)); margin-top: 10px; }
+    .request-title { font-size: .9rem; font-weight: 700; letter-spacing: -.02em; }
+    .request-meta { grid-template-columns: repeat(2, minmax(0, 1fr)); margin-top: 8px; }
     .request-meta .mono, .detail-grid .mono { word-break: break-all; }
-    .detail-pane { display: grid; gap: 14px; align-content: start; }
+    .detail-pane { display: grid; gap: 10px; align-content: start; }
     .detail-block {
-      border-radius: 18px;
+      border-radius: 12px;
       border: 1px solid var(--line);
       background: rgba(255,255,255,.03);
-      padding: 14px;
+      padding: 10px;
     }
     .detail-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .detail-label {
       color: var(--muted);
-      font-size: .74rem;
+      font-size: .7rem;
       text-transform: uppercase;
       letter-spacing: .12em;
-      margin-bottom: 6px;
+      margin-bottom: 4px;
     }
     .detail-value {
-      font-size: .92rem;
-      line-height: 1.45;
+      font-size: .84rem;
+      line-height: 1.4;
       white-space: pre-wrap;
       word-break: break-word;
     }
     @media (max-width: 1080px) {
-      .content, .metrics { grid-template-columns: 1fr; }
+      .hero, .content, .metrics, .chart-grid { grid-template-columns: 1fr; }
+      .summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .proxy-grid { grid-template-columns: 1fr; }
       .request-layout, .detail-grid, .request-meta { grid-template-columns: 1fr; }
+      .chart-summary { text-align: left; }
+    }
+    @media (max-width: 760px) {
+      .summary-grid { grid-template-columns: 1fr; }
     }
   </style>
 </head>
 <body>
   <div id="app" class="app">
-      <div class="chips" style="margin-bottom: 16px;">
-        <span class="chip">{{ updatedLabel }}</span>
-        <span class="chip">{{ liveStatusLabel }}</span>
-        <span class="chip">Costs from proxy request history</span>
+    <section class="hero panel">
+      <div class="hero-copy">
+        <div class="eyebrow">Spend Cockpit</div>
+        <h1>{{ money(allTime.cost_usd) }}</h1>
+        <p>Token spend to date across {{ integer(trackedMonths) }} tracked {{ trackedMonths === 1 ? 'month' : 'months' }} of proxy history, with live request detail and current-month pacing.</p>
+        <div class="chips hero-chips">
+          <span class="chip">{{ updatedLabel }}</span>
+          <span class="chip">{{ premiumSourceLabel }}</span>
+        </div>
       </div>
 
-    <section class="metrics">
-      <article class="panel metric">
-        <div class="eyebrow">Premium Remaining</div>
-        <div class="value">{{ premiumRemainingLabel }}</div>
-        <div class="subtle">{{ premiumRemainingMetaLabel }}</div>
-      </article>
-      <article class="panel metric">
-        <div class="eyebrow">Saved To Date</div>
-        <div class="value">{{ money(allTime.cost_usd) }}</div>
-        <div class="subtle">{{ money(currentMonth.cost_usd) }} this month · {{ compact(data.all_time?.proxy_requests) }} requests tracked</div>
-      </article>
-      <article class="panel metric">
-        <div class="eyebrow">Tokens To Date</div>
-        <div class="value">{{ compact(allTime.total_tokens) }}</div>
-        <div class="subtle">{{ compact(currentMonth.total_tokens) }} this month · {{ compact(currentMonth.input_tokens) }} in · {{ compact(currentMonth.output_tokens) }} out</div>
-      </article>
+      <div class="hero-stack">
+        <article class="hero-mini">
+          <div class="eyebrow">Tokens To Date</div>
+          <div class="value">{{ compact(allTime.total_tokens) }}</div>
+          <div class="subtle">{{ integer(allTime.request_count) }} requests tracked · {{ money(blendedRatePerMillion) }}/1M blended rate</div>
+        </article>
+        <article class="hero-mini">
+          <div class="eyebrow">Month Projection</div>
+          <div class="value">{{ money(monthlySpendProjection) }}</div>
+          <div class="subtle">{{ money(averageDailySpend) }} avg/day · {{ integer(daysElapsedInMonth) }} of {{ integer(daysInCurrentMonth) }} days elapsed</div>
+        </article>
+      </div>
+    </section>
+
+    <section class="summary-grid">
+      <metric-card
+        eyebrow="Spend To Date"
+        :value="money(allTime.cost_usd)"
+        :meta="`${integer(allTime.request_count)} requests · ${compact(allTime.total_tokens)} tokens`"
+        tone="accent"
+      ></metric-card>
+      <metric-card
+        eyebrow="Month To Date"
+        :value="money(currentMonth.cost_usd)"
+        :meta="`${integer(currentMonth.request_count)} requests · ${compact(currentMonth.total_tokens)} tokens`"
+        tone="mint"
+      ></metric-card>
+      <metric-card
+        eyebrow="Today"
+        :value="money(todayUsage.cost_usd)"
+        :meta="`${integer(todayUsage.request_count)} requests · ${compact(todayUsage.total_tokens)} tokens`"
+        tone="slate"
+      ></metric-card>
+      <metric-card
+        eyebrow="Premium Remaining"
+        :value="premiumRemainingLabel"
+        :meta="premiumRemainingMetaLabel"
+        tone="slate"
+      ></metric-card>
+    </section>
+
+    <section class="chart-grid">
+      <trend-chart-card
+        title="Daily Spend"
+        subtitle="Month to date"
+        :headline="money(currentMonth.cost_usd)"
+        :meta="dailySpendMeta"
+        :rows="dailyHistory"
+        metric-key="cost_usd"
+        value-format="money"
+        period="day"
+        tone="accent"
+      ></trend-chart-card>
+      <trend-chart-card
+        title="Monthly Spend"
+        subtitle="Recent history"
+        :headline="money(allTime.cost_usd)"
+        :meta="monthlySpendMeta"
+        :rows="monthHistoryChronological"
+        metric-key="cost_usd"
+        value-format="money"
+        period="month"
+        tone="mint"
+      ></trend-chart-card>
+      <stacked-bar-chart-card
+        title="Daily Token Volume"
+        subtitle="Month to date"
+        :headline="compact(currentMonth.total_tokens)"
+        :meta="dailyTokenMeta"
+        :rows="dailyHistoryEnriched"
+        :segments="tokenSegments"
+        total-key="total_tokens"
+        value-format="compact"
+        period="day"
+        tone="accent"
+      ></stacked-bar-chart-card>
+      <stacked-bar-chart-card
+        title="Monthly Token Volume"
+        subtitle="Recent history"
+        :headline="compact(allTime.total_tokens)"
+        :meta="monthlyTokenMeta"
+        :rows="monthHistoryEnriched"
+        :segments="tokenSegments"
+        total-key="total_tokens"
+        value-format="compact"
+        period="month"
+        tone="mint"
+      ></stacked-bar-chart-card>
     </section>
 
     <section class="content">
@@ -197,7 +432,7 @@
         <div class="panel-head">
           <div>
             <h3>Usage Explorer</h3>
-            <div class="subtle">Client-side tabs, filtering, and sorting.</div>
+            <div class="subtle">Filter sessions or drill into recent proxied requests.</div>
           </div>
           <div class="tabs">
             <button v-for="tab in tabs" :key="tab" :class="{ active: activeTab === tab }" @click="activeTab = tab">{{ tab }}</button>
@@ -205,7 +440,7 @@
         </div>
 
         <div class="toolbar">
-          <input v-model.trim="search" type="search" placeholder="Filter by model, source, path, or session">
+          <input v-model.trim="search" type="search" placeholder="Filter by model, source, path, session, or request id">
           <select v-model="sourceFilter">
             <option value="all">All sources</option>
             <option value="claude">Claude</option>
@@ -227,6 +462,7 @@
                 <th>Session</th>
                 <th>Model</th>
                 <th>Last Activity</th>
+                <th>Requests</th>
                 <th>Tokens</th>
                 <th>Cost</th>
               </tr>
@@ -240,10 +476,11 @@
                 </td>
                 <td>{{ modelLabel(row.models) }}</td>
                 <td>{{ stamp(row.last_activity) }}</td>
+                <td>{{ integer(row.request_count) }}</td>
                 <td>{{ compact(row.total_tokens) }}</td>
                 <td>{{ money(row.cost_usd) }}</td>
               </tr>
-              <tr v-if="!filteredSessions.length"><td colspan="6" class="empty">No sessions match the current filter.</td></tr>
+              <tr v-if="!filteredSessions.length"><td colspan="7" class="empty">No sessions match the current filter.</td></tr>
             </tbody>
           </table>
         </div>
@@ -281,6 +518,7 @@
                     <div class="mono">{{ shortId(row.session_id || row.client_request_id || row.request_id) }}</div>
                     <div>{{ tokenSummary(row) }}</div>
                     <div>{{ row.time_to_first_token_ms != null ? `${row.time_to_first_token_ms} ms first token` : 'No token timing' }}</div>
+                    <div>{{ money(row.cost_usd) }}</div>
                   </div>
                 </button>
               </div>
@@ -331,6 +569,10 @@
                     <div class="detail-value">{{ selectedRequest.time_to_first_token_ms != null ? `${selectedRequest.time_to_first_token_ms} ms` : '-' }}</div>
                   </div>
                   <div>
+                    <div class="detail-label">Estimated Cost</div>
+                    <div class="detail-value">{{ money(selectedRequest.cost_usd) }}</div>
+                  </div>
+                  <div>
                     <div class="detail-label">Request ID</div>
                     <div class="detail-value mono">{{ selectedRequest.request_id || '-' }}</div>
                   </div>
@@ -373,7 +615,7 @@
 
               <article class="detail-block" v-if="requestChainUsage(selectedRequest)">
                 <div class="detail-label">Chain Usage</div>
-                <div class="subtle">{{ requestChainCount(selectedRequest) }} proxied requests in this chain</div>
+                <div class="subtle">{{ requestChainCount(selectedRequest) }} proxied requests in this chain · {{ money(requestChainUsage(selectedRequest).cost_usd) }}</div>
                 <div class="detail-grid" style="margin-top:10px">
                   <div>
                     <div class="detail-label">Input Tokens</div>
@@ -397,51 +639,34 @@
           </div>
           <div v-else class="empty">No requests match the current filter.</div>
         </div>
-
-        <div v-else class="history">
-          <article v-for="row in monthHistory" :key="row.month_key" class="mini-card">
-            <div class="eyebrow">{{ row.month_key }}</div>
-            <strong>{{ money(row.cost_usd) }} · {{ compact(row.total_tokens) }}</strong>
-            <div class="subtle">{{ Object.keys(row.sources || {}).join(' + ') || 'No sources' }}</div>
-            <div class="bar"><span :style="{ width: historyWidth(row) + '%' }"></span></div>
-          </article>
-          <div v-if="!monthHistory.length" class="empty">No monthly history available.</div>
-        </div>
       </article>
 
-      <div class="list">
-        <article class="panel">
-          <div class="panel-head">
-            <div>
-              <h3>Current Source Split</h3>
-              <div class="subtle">{{ filteredSessions.length }} visible rows</div>
-            </div>
-          </div>
-          <div class="list">
-            <article v-for="(row, source) in sourceCards" :key="source" class="mini-card">
-              <span class="badge">{{ source }}</span>
-              <strong>{{ money(row.cost_usd) }}</strong>
-              <div class="subtle">{{ compact(row.total_tokens) }} total tokens</div>
-              <div class="subtle">{{ compact(row.input_tokens) }} in · {{ compact(row.output_tokens) }} out</div>
-            </article>
-            <div v-if="!Object.keys(sourceCards).length" class="empty">No current month source data.</div>
-          </div>
-        </article>
+      <div class="list rail">
+        <source-breakdown-card
+          title="Current Month Mix"
+          :subtitle="`${integer(currentMonth.request_count)} requests · ${compact(currentMonth.total_tokens)} total tokens`"
+          :rows="currentSourceBreakdown"
+          :total-cost="currentMonth.cost_usd"
+        ></source-breakdown-card>
 
-        <article class="panel">
-          <div class="panel-head">
-            <div>
-              <h3>Backend Status</h3>
-              <div class="subtle">Live dashboard stream, billing lookups, and source errors.</div>
-            </div>
-          </div>
-          <div :class="['status', dashboardStreamConnected ? 'good' : 'warn']">{{ liveStatusLabel }}</div>
-          <div v-if="dashboardStreamError" class="status error">{{ dashboardStreamError }}</div>
-          <div v-if="premium.official?.error" class="status error">github-billing: {{ premium.official.error }}</div>
-          <div v-else class="status good">
-            No source errors.
-          </div>
-        </article>
+        <source-breakdown-card
+          title="All-Time Mix"
+          :subtitle="`${integer(allTime.request_count)} requests · ${compact(allTime.total_tokens)} total tokens`"
+          :rows="allTimeSourceBreakdown"
+          :total-cost="allTime.cost_usd"
+        ></source-breakdown-card>
+
+        <token-breakdown-card
+          title="Token Cost Breakdown"
+          subtitle="Current month — estimated cost share by token type"
+          :usage="currentMonthTokenUsage"
+        ></token-breakdown-card>
+
+        <token-breakdown-card
+          title="All-Time Token Breakdown"
+          subtitle="Estimated cost share across all tracked history"
+          :usage="allTimeTokenUsage"
+        ></token-breakdown-card>
 
         <article class="panel">
           <div class="panel-head">
@@ -525,10 +750,420 @@
     </section>
   </div>
 
+  <template id="metric-card-template">
+    <article class="panel metric-card" :data-tone="tone">
+      <div class="eyebrow">{{ eyebrow }}</div>
+      <div class="metric-value">{{ value }}</div>
+      <div class="subtle">{{ meta }}</div>
+    </article>
+  </template>
+
+  <template id="trend-chart-card-template">
+    <article class="panel chart-card" :data-tone="tone">
+      <div class="panel-head">
+        <div>
+          <div class="eyebrow">{{ subtitle }}</div>
+          <h3>{{ title }}</h3>
+        </div>
+        <div class="chart-summary">
+          <div class="value">{{ headline }}</div>
+          <div class="subtle">{{ meta }}</div>
+        </div>
+      </div>
+
+      <div v-if="hasChartData" class="chart-shell">
+        <div class="chart-scale">
+          <span>{{ formatValue(maxValue) }} peak</span>
+          <span>{{ formatValue(averageValue) }} avg</span>
+        </div>
+        <div class="chart-bars">
+          <div v-for="point in chartRows" :key="point.key" class="chart-column" :title="point.tooltip">
+            <div class="chart-track">
+              <span class="chart-fill" :style="{ height: `${point.height}%` }"></span>
+            </div>
+            <div class="chart-label" :class="{ muted: !point.showLabel }">{{ point.shortLabel }}</div>
+          </div>
+        </div>
+      </div>
+      <div v-else class="empty">No {{ emptyLabel }} recorded yet.</div>
+    </article>
+  </template>
+
+  <template id="stacked-bar-chart-card-template">
+    <article class="panel chart-card" :data-tone="tone">
+      <div class="panel-head">
+        <div>
+          <div class="eyebrow">{{ subtitle }}</div>
+          <h3>{{ title }}</h3>
+        </div>
+        <div class="chart-summary">
+          <div class="value">{{ headline }}</div>
+          <div class="subtle">{{ meta }}</div>
+        </div>
+      </div>
+
+      <div v-if="hasChartData" class="chart-shell">
+        <div class="chart-legend">
+          <span v-for="seg in segments" :key="seg.key" class="legend-item">
+            <span class="legend-swatch" :style="{ background: seg.color }"></span>
+            {{ seg.label }}
+          </span>
+        </div>
+        <div class="chart-scale">
+          <span>{{ formatValue(maxValue) }} peak</span>
+          <span>{{ formatValue(averageValue) }} avg</span>
+        </div>
+        <div class="chart-bars">
+          <div v-for="point in chartRows" :key="point.key" class="chart-column" :title="point.tooltip">
+            <div class="chart-track">
+              <div class="stacked-fill" :style="{ height: point.height + '%' }">
+                <span
+                  v-for="seg in point.segments"
+                  :key="seg.key"
+                  class="stack-segment"
+                  :style="{ flexBasis: seg.percent + '%', background: seg.color }"
+                ></span>
+              </div>
+            </div>
+            <div class="chart-label" :class="{ muted: !point.showLabel }">{{ point.shortLabel }}</div>
+          </div>
+        </div>
+      </div>
+      <div v-else class="empty">No {{ period }} data recorded yet.</div>
+    </article>
+  </template>
+
+  <template id="token-breakdown-card-template">
+    <article class="panel">
+      <div class="panel-head">
+        <div>
+          <h3>{{ title }}</h3>
+          <div class="subtle">{{ subtitle }}</div>
+        </div>
+      </div>
+
+      <div class="breakdown-list">
+        <div v-for="row in breakdownRows" :key="row.label" class="breakdown-row">
+          <div class="breakdown-header">
+            <span class="breakdown-label">
+              <span class="legend-swatch" :style="{ background: row.color }"></span>
+              {{ row.label }}
+            </span>
+            <span class="breakdown-values">
+              <span class="mono">{{ compact(row.tokens) }}</span>
+              <span class="subtle" style="margin-left: 8px;">{{ money(row.cost) }}</span>
+            </span>
+          </div>
+          <div class="bar"><span :style="{ width: row.percent + '%', background: row.color }"></span></div>
+        </div>
+        <div v-if="!breakdownRows.length" class="empty">No token data available.</div>
+      </div>
+
+      <div v-if="cacheHitRate != null" class="breakdown-footer">
+        <div class="eyebrow" style="margin-top: 8px;">Cache Efficiency</div>
+        <div class="metric-value" style="font-size: 1.2rem;">{{ formatPercent(cacheHitRate) }}%</div>
+        <div class="subtle">of input tokens served from cache</div>
+      </div>
+    </article>
+  </template>
+
+  <template id="source-breakdown-card-template">
+    <article class="panel">
+      <div class="panel-head">
+        <div>
+          <h3>{{ title }}</h3>
+          <div class="subtle">{{ subtitle }}</div>
+        </div>
+      </div>
+
+      <div class="list">
+        <article v-for="row in rows" :key="row.source" class="mini-card">
+          <div class="source-head">
+            <span class="badge">{{ row.source }}</span>
+            <strong>{{ money(row.cost_usd) }}</strong>
+          </div>
+          <div class="subtle">{{ compact(row.total_tokens) }} tokens · {{ integer(row.request_count) }} requests</div>
+          <div class="subtle">{{ shareLabel(row) }} of spend</div>
+          <div class="bar"><span :style="{ width: `${shareWidth(row)}%` }"></span></div>
+        </article>
+        <div v-if="!rows.length" class="empty">No source usage recorded yet.</div>
+      </div>
+    </article>
+  </template>
+
   <script>
     const { createApp } = Vue;
 
+    const sharedFormatters = {
+      integer(value) {
+        return new Intl.NumberFormat('en-US').format(Number(value || 0));
+      },
+      compact(value) {
+        const numeric = Number(value);
+        return Number.isFinite(numeric)
+          ? new Intl.NumberFormat('en-US', { notation: 'compact', maximumFractionDigits: 1 }).format(numeric)
+          : '-';
+      },
+      money(value) {
+        const numeric = Number(value);
+        return Number.isFinite(numeric)
+          ? new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 2 }).format(numeric)
+          : '-';
+      },
+      stamp(value) {
+        if (!value) return '-';
+        const date = new Date(value);
+        return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
+      },
+      shortId(value) {
+        return !value ? '-' : (value.length > 36 ? value.slice(-36) : value);
+      },
+      modelLabel(models) {
+        return Array.isArray(models) && models.length ? models.join(', ') : '-';
+      },
+    };
+
+    const MetricCard = {
+      template: '#metric-card-template',
+      props: {
+        eyebrow: { type: String, default: '' },
+        value: { type: String, default: '-' },
+        meta: { type: String, default: '' },
+        tone: { type: String, default: 'accent' },
+      },
+    };
+
+    const TrendChartCard = {
+      template: '#trend-chart-card-template',
+      props: {
+        title: { type: String, default: '' },
+        subtitle: { type: String, default: '' },
+        headline: { type: String, default: '-' },
+        meta: { type: String, default: '' },
+        rows: { type: Array, default: () => [] },
+        metricKey: { type: String, default: 'cost_usd' },
+        valueFormat: { type: String, default: 'money' },
+        period: { type: String, default: 'day' },
+        tone: { type: String, default: 'accent' },
+      },
+      computed: {
+        maxValue() {
+          return Math.max(...this.rows.map((row) => Number(row?.[this.metricKey] || 0)), 0);
+        },
+        averageValue() {
+          if (!this.rows.length) return 0;
+          const total = this.rows.reduce((sum, row) => sum + Number(row?.[this.metricKey] || 0), 0);
+          return total / this.rows.length;
+        },
+        hasChartData() {
+          return this.rows.length > 0 && this.maxValue > 0;
+        },
+        emptyLabel() {
+          return this.period === 'month' ? 'monthly spend' : 'daily spend';
+        },
+        chartRows() {
+          const count = this.rows.length;
+          const step = Math.max(1, Math.ceil(count / (this.period === 'month' ? 6 : 8)));
+          const scale = this.maxValue > 0 ? this.maxValue : 1;
+          return this.rows.map((row, index) => {
+            const value = Number(row?.[this.metricKey] || 0);
+            const height = value > 0 ? Math.max(8, (value / scale) * 100) : 0;
+            return {
+              key: row?.day_key || row?.month_key || `${this.period}-${index}`,
+              height,
+              shortLabel: this.shortLabel(row),
+              showLabel: index === 0 || index === count - 1 || index % step === 0,
+              tooltip: `${this.longLabel(row)}: ${this.formatValue(value)} · ${this.integer(row?.request_count)} requests`,
+            };
+          });
+        },
+      },
+      methods: {
+        ...sharedFormatters,
+        formatValue(value) {
+          return this.valueFormat === 'compact' ? this.compact(value) : this.money(value);
+        },
+        shortLabel(row) {
+          const raw = this.period === 'month' ? row?.month_key : row?.day_key;
+          if (!raw) return '-';
+          const date = new Date(this.period === 'month' ? `${raw}-01T00:00:00Z` : `${raw}T00:00:00Z`);
+          if (Number.isNaN(date.getTime())) return raw;
+          return this.period === 'month'
+            ? date.toLocaleDateString([], { month: 'short' })
+            : date.toLocaleDateString([], { day: 'numeric' });
+        },
+        longLabel(row) {
+          const raw = this.period === 'month' ? row?.month_key : row?.day_key;
+          if (!raw) return '-';
+          const date = new Date(this.period === 'month' ? `${raw}-01T00:00:00Z` : `${raw}T00:00:00Z`);
+          if (Number.isNaN(date.getTime())) return raw;
+          return this.period === 'month'
+            ? date.toLocaleDateString([], { month: 'short', year: 'numeric' })
+            : date.toLocaleDateString([], { month: 'short', day: 'numeric' });
+        },
+      },
+    };
+
+    const StackedBarChartCard = {
+      template: '#stacked-bar-chart-card-template',
+      props: {
+        title:       { type: String, default: '' },
+        subtitle:    { type: String, default: '' },
+        headline:    { type: String, default: '-' },
+        meta:        { type: String, default: '' },
+        rows:        { type: Array, default: () => [] },
+        segments:    { type: Array, default: () => [] },
+        totalKey:    { type: String, default: 'total_tokens' },
+        valueFormat: { type: String, default: 'compact' },
+        period:      { type: String, default: 'day' },
+        tone:        { type: String, default: 'accent' },
+      },
+      computed: {
+        maxValue() {
+          return Math.max(...this.rows.map(r => Number(r?.[this.totalKey] || 0)), 0);
+        },
+        averageValue() {
+          if (!this.rows.length) return 0;
+          const total = this.rows.reduce((sum, r) => sum + Number(r?.[this.totalKey] || 0), 0);
+          return total / this.rows.length;
+        },
+        hasChartData() {
+          return this.rows.length > 0 && this.maxValue > 0;
+        },
+        chartRows() {
+          const count = this.rows.length;
+          const step = Math.max(1, Math.ceil(count / (this.period === 'month' ? 6 : 8)));
+          const scale = this.maxValue > 0 ? this.maxValue : 1;
+          return this.rows.map((row, index) => {
+            const total = Number(row?.[this.totalKey] || 0);
+            const height = total > 0 ? Math.max(8, (total / scale) * 100) : 0;
+            const segs = this.segments.map(seg => {
+              const val = Number(row?.[seg.field] || 0);
+              return {
+                key: seg.key,
+                color: seg.color,
+                percent: total > 0 ? (val / total) * 100 : 0,
+              };
+            });
+            return {
+              key: row?.day_key || row?.month_key || `${this.period}-${index}`,
+              height,
+              segments: segs,
+              shortLabel: this.shortLabel(row),
+              showLabel: index === 0 || index === count - 1 || index % step === 0,
+              tooltip: this.buildTooltip(row),
+            };
+          });
+        },
+      },
+      methods: {
+        ...sharedFormatters,
+        formatValue(value) {
+          return this.valueFormat === 'money' ? this.money(value) : this.compact(value);
+        },
+        shortLabel(row) {
+          const raw = this.period === 'month' ? row?.month_key : row?.day_key;
+          if (!raw) return '-';
+          const date = new Date(this.period === 'month' ? `${raw}-01T00:00:00Z` : `${raw}T00:00:00Z`);
+          if (Number.isNaN(date.getTime())) return raw;
+          return this.period === 'month'
+            ? date.toLocaleDateString([], { month: 'short' })
+            : date.toLocaleDateString([], { day: 'numeric' });
+        },
+        buildTooltip(row) {
+          const dateKey = this.period === 'month' ? row?.month_key : row?.day_key;
+          const parts = this.segments.map(seg =>
+            `${seg.label}: ${this.compact(row?.[seg.field] || 0)}`
+          );
+          return `${dateKey || '-'}\n${parts.join(' · ')}`;
+        },
+      },
+    };
+
+    const TokenBreakdownCard = {
+      template: '#token-breakdown-card-template',
+      props: {
+        title:    { type: String, default: 'Token Cost Breakdown' },
+        subtitle: { type: String, default: '' },
+        usage:    { type: Object, default: () => ({}) },
+      },
+      computed: {
+        breakdownRows() {
+          const u = this.usage || {};
+          const freshInput = Number(u.input_tokens || 0);
+          const rows = [
+            { label: 'Input (fresh)',    tokens: freshInput,                                     field: 'input_fresh',             color: '#ff8752' },
+            { label: 'Input (cached)',   tokens: Number(u.cached_input_tokens || 0),             field: 'cached_input_tokens',     color: '#6ee7c8' },
+            { label: 'Cache Creation',   tokens: Number(u.cache_creation_tokens || 0),           field: 'cache_creation_tokens',   color: '#f6b16d' },
+            { label: 'Output',           tokens: Number(u.output_tokens || 0),                   field: 'output_tokens',           color: '#7eaaff' },
+            { label: 'Reasoning Output', tokens: Number(u.reasoning_output_tokens || 0),         field: 'reasoning_output_tokens', color: '#c89eff' },
+          ].filter(r => r.tokens > 0);
+
+          const maxTokens = Math.max(...rows.map(r => r.tokens), 1);
+          const totalCost = Number(u.cost_usd || 0);
+
+          const weights = {
+            input_fresh: 1, cached_input_tokens: 0.1, cache_creation_tokens: 1.25,
+            output_tokens: 5, reasoning_output_tokens: 5,
+          };
+          const totalWeighted = rows.reduce((sum, r) => sum + r.tokens * (weights[r.field] || 1), 0);
+
+          return rows.map(r => ({
+            ...r,
+            cost: totalWeighted > 0 ? (r.tokens * (weights[r.field] || 1) / totalWeighted) * totalCost : 0,
+            percent: Math.max(4, (r.tokens / maxTokens) * 100),
+          }));
+        },
+        cacheHitRate() {
+          const u = this.usage || {};
+          const freshInput = Number(u.input_tokens || 0);
+          const cached = Number(u.cached_input_tokens || 0);
+          const totalInput = freshInput + cached;
+          if (totalInput <= 0) return null;
+          return (cached / totalInput) * 100;
+        },
+      },
+      methods: {
+        ...sharedFormatters,
+        formatPercent(value) {
+          return new Intl.NumberFormat('en-US', { maximumFractionDigits: 1 }).format(value);
+        },
+      },
+    };
+
+    const SourceBreakdownCard = {
+      template: '#source-breakdown-card-template',
+      props: {
+        title: { type: String, default: '' },
+        subtitle: { type: String, default: '' },
+        rows: { type: Array, default: () => [] },
+        totalCost: { type: Number, default: 0 },
+      },
+      methods: {
+        ...sharedFormatters,
+        shareWidth(row) {
+          const total = Number(this.totalCost || 0);
+          const cost = Number(row?.cost_usd || 0);
+          if (!Number.isFinite(total) || total <= 0 || !Number.isFinite(cost) || cost <= 0) return 0;
+          return Math.max(4, Math.min(100, (cost / total) * 100));
+        },
+        shareLabel(row) {
+          const total = Number(this.totalCost || 0);
+          const cost = Number(row?.cost_usd || 0);
+          if (!Number.isFinite(total) || total <= 0 || !Number.isFinite(cost)) return '0%';
+          return `${new Intl.NumberFormat('en-US', { maximumFractionDigits: 1 }).format((cost / total) * 100)}%`;
+        },
+      },
+    };
+
     createApp({
+      components: {
+        MetricCard,
+        TrendChartCard,
+        StackedBarChartCard,
+        SourceBreakdownCard,
+        TokenBreakdownCard,
+      },
       data() {
         return {
           autoRefreshTimer: null,
@@ -558,7 +1193,7 @@
             },
           },
           activeTab: 'sessions',
-          tabs: ['sessions', 'requests', 'history'],
+          tabs: ['sessions', 'requests'],
           search: '',
           sourceFilter: 'all',
           sortMode: 'recent',
@@ -566,7 +1201,7 @@
           selectedRequestKey: '',
           data: {
             premium: {},
-            current_month: { usage: { sources: {} } },
+            current_month: { usage: { sources: {} }, daily_history: [] },
             all_time: { usage: { sources: {} } },
             recent_sessions: [],
             recent_requests: [],
@@ -591,7 +1226,88 @@
         premium() { return this.data.premium || {}; },
         currentMonth() { return this.data.current_month?.usage || {}; },
         allTime() { return this.data.all_time?.usage || {}; },
-        sourceCards() { return this.currentMonth.sources || {}; },
+        dailyHistory() { return this.data.current_month?.daily_history || []; },
+        monthHistoryChronological() { return [...((this.data.month_history || []).slice(0, 12))].reverse(); },
+        todayUsage() { return this.dailyHistory[this.dailyHistory.length - 1] || {}; },
+        trackedMonths() { return Number(this.allTime.months_tracked || (this.data.month_history || []).length || 0); },
+        daysElapsedInMonth() { return Math.max(1, this.dailyHistory.length || 0); },
+        daysInCurrentMonth() {
+          const start = new Date(this.data.current_month?.start_at || '');
+          const end = new Date(this.data.current_month?.end_at || '');
+          const delta = end.getTime() - start.getTime();
+          if (!Number.isFinite(delta) || delta <= 0) return this.daysElapsedInMonth;
+          return Math.max(1, Math.round(delta / 86400000));
+        },
+        averageDailySpend() {
+          const total = Number(this.currentMonth.cost_usd || 0);
+          return total > 0 ? total / this.daysElapsedInMonth : NaN;
+        },
+        monthlySpendProjection() {
+          return Number.isFinite(this.averageDailySpend) ? this.averageDailySpend * this.daysInCurrentMonth : NaN;
+        },
+        blendedRatePerMillion() {
+          const tokens = Number(this.allTime.total_tokens || 0);
+          const cost = Number(this.allTime.cost_usd || 0);
+          if (!Number.isFinite(tokens) || tokens <= 0 || !Number.isFinite(cost)) return NaN;
+          return (cost / tokens) * 1000000;
+        },
+        currentSourceBreakdown() { return this.sortedSourceRows(this.currentMonth.sources); },
+        allTimeSourceBreakdown() { return this.sortedSourceRows(this.allTime.sources); },
+        dailySpendMeta() {
+          return `${this.money(this.todayUsage.cost_usd)} today · ${this.money(this.averageDailySpend)} avg/day · ${this.money(this.monthlySpendProjection)} projected`;
+        },
+        monthlySpendMeta() {
+          return `${this.integer(this.trackedMonths)} months tracked · ${this.integer(this.allTime.request_count)} requests overall`;
+        },
+        dailyHistoryEnriched() {
+          return (this.dailyHistory || []).map(row => ({
+            ...row,
+            fresh_input_tokens: Number(row.input_tokens || 0),
+          }));
+        },
+        monthHistoryEnriched() {
+          return (this.monthHistoryChronological || []).map(row => ({
+            ...row,
+            fresh_input_tokens: Number(row.input_tokens || 0),
+          }));
+        },
+        tokenSegments() {
+          return [
+            { key: 'cached', label: 'Cached Input', color: '#6ee7c8', field: 'cached_input_tokens' },
+            { key: 'input',  label: 'Fresh Input',  color: '#ff8752', field: 'fresh_input_tokens' },
+            { key: 'output', label: 'Output',       color: '#7eaaff', field: 'output_tokens' },
+          ];
+        },
+        dailyTokenMeta() {
+          return `${this.compact(this.todayUsage.total_tokens)} today · ${this.compact(this.todayUsage.input_tokens)} in · ${this.compact(this.todayUsage.output_tokens)} out`;
+        },
+        monthlyTokenMeta() {
+          return `${this.compact(this.allTime.total_tokens)} total · ${this.compact(this.allTime.input_tokens)} in · ${this.compact(this.allTime.output_tokens)} out`;
+        },
+        currentMonthTokenUsage() {
+          const u = this.currentMonth;
+          return {
+            input_tokens: u.input_tokens, output_tokens: u.output_tokens,
+            cached_input_tokens: u.cached_input_tokens, cache_creation_tokens: u.cache_creation_tokens,
+            reasoning_output_tokens: u.reasoning_output_tokens, total_tokens: u.total_tokens,
+            cost_usd: u.cost_usd,
+          };
+        },
+        allTimeTokenUsage() {
+          const u = this.allTime;
+          return {
+            input_tokens: u.input_tokens, output_tokens: u.output_tokens,
+            cached_input_tokens: u.cached_input_tokens, cache_creation_tokens: u.cache_creation_tokens,
+            reasoning_output_tokens: u.reasoning_output_tokens, total_tokens: u.total_tokens,
+            cost_usd: u.cost_usd,
+          };
+        },
+        premiumSourceLabel() {
+          const source = String(this.premium.source || '').trim();
+          if (source === 'github-rest-billing-api') return 'Premium from official GitHub billing';
+          if (source) return 'Premium from proxy request log';
+          return 'Premium source pending';
+        },
         premiumRemainingLabel() {
           const remaining = this.premium.official_remaining ?? this.premium.tracked_remaining;
           return this._formatPremiumValue(remaining);
@@ -619,11 +1335,6 @@
           return parts.join(' · ') || 'No premium quota data yet';
         },
         updatedLabel() { return `Updated ${this.stamp(this.data.generated_at)}`; },
-        liveStatusLabel() {
-          if (this.dashboardStreamConnected) return 'Live updates connected';
-          if (this.dashboardStreamError) return 'Polling fallback active';
-          return 'Loading live updates';
-        },
         billingTokenStatusLabel() {
           if (!this.billingToken.configured) {
             return 'No billing token configured';
@@ -637,7 +1348,11 @@
           return this.sortRows(rows, 'last_activity');
         },
         filteredRequests() {
-          const rows = (this.data.recent_requests || []).map((row) => ({ ...row, source: 'proxy' })).filter((row) => this.allowSource(row.source) && this.matches(row));
+          const rows = (this.data.recent_requests || []).map((row) => ({
+            ...row,
+            source: 'proxy',
+            total_tokens: Number(row?.usage?.total_tokens || row?.total_tokens || 0),
+          })).filter((row) => this.allowSource(row.source) && this.matches(row));
           return this.sortRows(rows, 'finished_at');
         },
         requestPageCount() {
@@ -663,9 +1378,6 @@
           if (!this.selectedRequestKey) return rows[0];
           return rows.find((row) => this.requestKey(row) === this.selectedRequestKey) || rows[0];
         },
-        monthHistory() {
-          return (this.data.month_history || []).slice(0, 8);
-        },
         anyClientProxyError() {
           return Boolean(this.clientProxyStatus.codex?.error || this.clientProxyStatus.claude?.error);
         },
@@ -678,8 +1390,14 @@
       },
       methods: {
         integer(value) { return new Intl.NumberFormat('en-US').format(Number(value || 0)); },
-        compact(value) { return Number.isFinite(value) ? new Intl.NumberFormat('en-US', { notation: 'compact', maximumFractionDigits: 1 }).format(value) : '-'; },
-        money(value) { return Number.isFinite(value) ? new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 2 }).format(value) : '-'; },
+        compact(value) {
+          const numeric = Number(value);
+          return Number.isFinite(numeric) ? new Intl.NumberFormat('en-US', { notation: 'compact', maximumFractionDigits: 1 }).format(numeric) : '-';
+        },
+        money(value) {
+          const numeric = Number(value);
+          return Number.isFinite(numeric) ? new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 2 }).format(numeric) : '-';
+        },
         _asPremiumNumber(value) {
           const numeric = Number(value);
           return Number.isFinite(numeric) ? numeric : NaN;
@@ -755,12 +1473,14 @@
             const input = Number(usage.input_tokens || 0);
             const output = Number(usage.output_tokens || 0);
             const total = Number(usage.total_tokens || (input + output));
+            const cost = Number(item?.cost_usd || 0);
             totals.input_tokens += Number.isFinite(input) ? input : 0;
             totals.output_tokens += Number.isFinite(output) ? output : 0;
             totals.total_tokens += Number.isFinite(total) ? total : 0;
             totals.cached_input_tokens += this.cachedInputTokens(item);
+            totals.cost_usd += Number.isFinite(cost) ? cost : 0;
             return totals;
-          }, { input_tokens: 0, output_tokens: 0, total_tokens: 0, cached_input_tokens: 0 });
+          }, { input_tokens: 0, output_tokens: 0, total_tokens: 0, cached_input_tokens: 0, cost_usd: 0 });
         },
         requestChainCount(row) {
           return this.requestChainRows(row).length;
@@ -804,9 +1524,12 @@
             return { ...row };
           });
         },
-        historyWidth(row) {
-          const max = Math.max(...this.monthHistory.map((item) => Number(item.cost_usd || 0)), 1);
-          return (Number(row.cost_usd || 0) / max) * 100;
+        sortedSourceRows(sourceMap) {
+          return Object.values(sourceMap || {}).sort((a, b) => {
+            const costDelta = Number(b?.cost_usd || 0) - Number(a?.cost_usd || 0);
+            if (costDelta !== 0) return costDelta;
+            return Number(b?.total_tokens || 0) - Number(a?.total_tokens || 0);
+          });
         },
         codexProxyStatusClass(client) {
           const state = this.clientProxyStatus[client] || {};
@@ -1003,7 +1726,7 @@
         sortRows(rows, dateKey) {
           const sorted = [...rows];
           if (this.sortMode === 'cost') return sorted.sort((a, b) => Number(b.cost_usd || 0) - Number(a.cost_usd || 0));
-          if (this.sortMode === 'tokens') return sorted.sort((a, b) => Number(b.total_tokens || 0) - Number(a.total_tokens || 0));
+          if (this.sortMode === 'tokens') return sorted.sort((a, b) => Number(b.total_tokens || b?.usage?.total_tokens || 0) - Number(a.total_tokens || a?.usage?.total_tokens || 0));
           return sorted.sort((a, b) => String(b[dateKey] || b.started_at || '').localeCompare(String(a[dateKey] || a.started_at || '')));
         },
         _applyDashboardPayload(payload) {

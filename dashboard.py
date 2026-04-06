@@ -9,7 +9,7 @@ import time
 from collections import deque
 from contextlib import closing
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from threading import Lock, Thread
 from typing import Callable
 
@@ -831,50 +831,18 @@ def collect_local_dashboard_usage(
     }
 
 
-def normalize_session(source: str, session: dict) -> dict:
+def _normalize_usage_rollup(source: str, row: dict) -> dict:
     if source == "claude":
-        models = session.get("modelsUsed") or list((session.get("models") or {}).keys())
-        cost_usd = _coerce_float(session.get("totalCost"))
-        if cost_usd == 0.0 and session.get("costUSD") is not None:
-            cost_usd = _coerce_float(session.get("costUSD"))
-        cached_tokens = _coerce_int(session.get("cacheReadTokens"))
-        if cached_tokens == 0 and session.get("cachedInputTokens") is not None:
-            cached_tokens = _coerce_int(session.get("cachedInputTokens"))
-        cache_creation_tokens = _coerce_int(session.get("cacheCreationTokens"))
-        if cache_creation_tokens == 0 and session.get("cacheCreationInputTokens") is not None:
-            cache_creation_tokens = _coerce_int(session.get("cacheCreationInputTokens"))
-        reasoning_tokens = 0
-    else:
-        models = list((session.get("models") or {}).keys())
-        cost_usd = _coerce_float(session.get("costUSD"))
-        cached_tokens = _coerce_int(session.get("cachedInputTokens"))
-        cache_creation_tokens = 0
-        reasoning_tokens = _coerce_int(session.get("reasoningOutputTokens"))
-
-    return {
-        "source": source,
-        "session_id": session.get("sessionId"),
-        "session_kind": session.get("sessionKind") or "unknown",
-        "session_display_id": session.get("sessionDisplayId") or session.get("sessionId"),
-        "last_activity": session.get("lastActivity"),
-        "project_path": session.get("projectPath"),
-        "input_tokens": _coerce_int(session.get("inputTokens")),
-        "output_tokens": _coerce_int(session.get("outputTokens")),
-        "total_tokens": _coerce_int(session.get("totalTokens")),
-        "cached_input_tokens": cached_tokens,
-        "cache_creation_tokens": cache_creation_tokens,
-        "reasoning_output_tokens": reasoning_tokens,
-        "cost_usd": cost_usd,
-        "models": models,
-    }
-
-
-def _normalize_month_row(source: str, row: dict) -> dict:
-    if source == "claude":
-        models = row.get("modelsUsed") or []
+        models = row.get("modelsUsed") or list((row.get("models") or {}).keys())
         cost_usd = _coerce_float(row.get("totalCost"))
+        if cost_usd == 0.0 and row.get("costUSD") is not None:
+            cost_usd = _coerce_float(row.get("costUSD"))
         cached_tokens = _coerce_int(row.get("cacheReadTokens"))
+        if cached_tokens == 0 and row.get("cachedInputTokens") is not None:
+            cached_tokens = _coerce_int(row.get("cachedInputTokens"))
         cache_creation_tokens = _coerce_int(row.get("cacheCreationTokens"))
+        if cache_creation_tokens == 0 and row.get("cacheCreationInputTokens") is not None:
+            cache_creation_tokens = _coerce_int(row.get("cacheCreationInputTokens"))
         reasoning_tokens = 0
     else:
         models = list((row.get("models") or {}).keys())
@@ -885,16 +853,42 @@ def _normalize_month_row(source: str, row: dict) -> dict:
 
     return {
         "source": source,
-        "month_key": month_key_for_source_row(source, row),
-        "month_label": row.get("month"),
         "input_tokens": _coerce_int(row.get("inputTokens")),
         "output_tokens": _coerce_int(row.get("outputTokens")),
         "total_tokens": _coerce_int(row.get("totalTokens")),
         "cached_input_tokens": cached_tokens,
         "cache_creation_tokens": cache_creation_tokens,
         "reasoning_output_tokens": reasoning_tokens,
+        "request_count": _coerce_int(row.get("requestCount")),
         "cost_usd": cost_usd,
         "models": models,
+    }
+
+
+def normalize_session(source: str, session: dict) -> dict:
+    return {
+        **_normalize_usage_rollup(source, session),
+        "session_id": session.get("sessionId"),
+        "session_kind": session.get("sessionKind") or "unknown",
+        "session_display_id": session.get("sessionDisplayId") or session.get("sessionId"),
+        "last_activity": session.get("lastActivity"),
+        "project_path": session.get("projectPath"),
+    }
+
+
+def _normalize_month_row(source: str, row: dict) -> dict:
+    return {
+        **_normalize_usage_rollup(source, row),
+        "month_key": month_key_for_source_row(source, row),
+        "month_label": row.get("month"),
+    }
+
+
+def _normalize_day_row(source: str, row: dict, day_key: str) -> dict:
+    return {
+        **_normalize_usage_rollup(source, row),
+        "day_key": day_key,
+        "day_label": day_key,
     }
 
 
@@ -914,6 +908,7 @@ def _combine_month_rows(rows: list[dict]) -> list[dict]:
                 "cached_input_tokens": 0,
                 "cache_creation_tokens": 0,
                 "reasoning_output_tokens": 0,
+                "request_count": 0,
                 "cost_usd": 0.0,
                 "sources": {},
             },
@@ -924,10 +919,46 @@ def _combine_month_rows(rows: list[dict]) -> list[dict]:
         current["cached_input_tokens"] += row.get("cached_input_tokens", 0)
         current["cache_creation_tokens"] += row.get("cache_creation_tokens", 0)
         current["reasoning_output_tokens"] += row.get("reasoning_output_tokens", 0)
+        current["request_count"] += row.get("request_count", 0)
         current["cost_usd"] += row.get("cost_usd", 0.0)
         current["sources"][row["source"]] = row
 
     return [grouped[key] | {"cost_usd": round(grouped[key]["cost_usd"], 4)} for key in sorted(grouped.keys(), reverse=True)]
+
+
+def _combine_day_rows(rows: list[dict]) -> list[dict]:
+    grouped = {}
+    for row in rows:
+        day_key = row.get("day_key")
+        if not day_key:
+            continue
+        current = grouped.setdefault(
+            day_key,
+            {
+                "day_key": day_key,
+                "day_label": row.get("day_label") or day_key,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0,
+                "cached_input_tokens": 0,
+                "cache_creation_tokens": 0,
+                "reasoning_output_tokens": 0,
+                "request_count": 0,
+                "cost_usd": 0.0,
+                "sources": {},
+            },
+        )
+        current["input_tokens"] += row.get("input_tokens", 0)
+        current["output_tokens"] += row.get("output_tokens", 0)
+        current["total_tokens"] += row.get("total_tokens", 0)
+        current["cached_input_tokens"] += row.get("cached_input_tokens", 0)
+        current["cache_creation_tokens"] += row.get("cache_creation_tokens", 0)
+        current["reasoning_output_tokens"] += row.get("reasoning_output_tokens", 0)
+        current["request_count"] += row.get("request_count", 0)
+        current["cost_usd"] += row.get("cost_usd", 0.0)
+        current["sources"][row["source"]] = row
+
+    return [grouped[key] | {"cost_usd": round(grouped[key]["cost_usd"], 4)} for key in sorted(grouped.keys())]
 
 
 def _combine_usage_rows(rows: list[dict], *, month_key: str | None = None) -> dict:
@@ -946,6 +977,7 @@ def _combine_usage_rows(rows: list[dict], *, month_key: str | None = None) -> di
                 "cached_input_tokens": 0,
                 "cache_creation_tokens": 0,
                 "reasoning_output_tokens": 0,
+                "request_count": 0,
                 "cost_usd": 0.0,
                 "models": [],
             },
@@ -956,6 +988,7 @@ def _combine_usage_rows(rows: list[dict], *, month_key: str | None = None) -> di
         current["cached_input_tokens"] += row.get("cached_input_tokens", 0)
         current["cache_creation_tokens"] += row.get("cache_creation_tokens", 0)
         current["reasoning_output_tokens"] += row.get("reasoning_output_tokens", 0)
+        current["request_count"] += row.get("request_count", 0)
         current["cost_usd"] += row.get("cost_usd", 0.0)
         current["models"] = sorted(set(current["models"]) | set(row.get("models") or []))
 
@@ -966,6 +999,7 @@ def _combine_usage_rows(rows: list[dict], *, month_key: str | None = None) -> di
         "cached_input_tokens": sum(item.get("cached_input_tokens", 0) for item in per_source.values()),
         "cache_creation_tokens": sum(item.get("cache_creation_tokens", 0) for item in per_source.values()),
         "reasoning_output_tokens": sum(item.get("reasoning_output_tokens", 0) for item in per_source.values()),
+        "request_count": sum(item.get("request_count", 0) for item in per_source.values()),
         "cost_usd": round(sum(item.get("cost_usd", 0.0) for item in per_source.values()), 4),
         "sources": {
             source: item | {"cost_usd": round(item.get("cost_usd", 0.0), 4)}
@@ -975,6 +1009,59 @@ def _combine_usage_rows(rows: list[dict], *, month_key: str | None = None) -> di
     if month_key is not None:
         combined["month_key"] = month_key
     return combined
+
+
+def collect_daily_dashboard_usage(
+    usage_events: list[dict] | None = None,
+    *,
+    snapshot_usage_events: Callable[[], list[dict]] | None = None,
+    start_at: datetime | None = None,
+    end_at: datetime | None = None,
+) -> list[dict]:
+    if usage_events is None:
+        usage_events = snapshot_usage_events() if snapshot_usage_events is not None else []
+    else:
+        usage_events = list(usage_events)
+
+    source_day_buckets: dict[str, dict[str, dict]] = {}
+    for event in usage_events:
+        event_time = _parse_iso_datetime(event.get("finished_at") or event.get("started_at"))
+        if event_time is None:
+            continue
+        if start_at is not None and event_time < start_at:
+            continue
+        if end_at is not None and event_time >= end_at:
+            continue
+
+        source = _usage_event_source(event)
+        day_key = event_time.astimezone(timezone.utc).strftime("%Y-%m-%d")
+        source_bucket = source_day_buckets.setdefault(source, {})
+        day_bucket = source_bucket.setdefault(day_key, _new_usage_aggregate_bucket())
+        _ingest_usage_event(day_bucket, event)
+
+    normalized_days = []
+    for source in sorted(source_day_buckets):
+        for day_key, bucket in source_day_buckets[source].items():
+            normalized_days.append(
+                _normalize_day_row(source, _finalize_usage_bucket(bucket, source), day_key)
+            )
+    return _combine_day_rows(normalized_days)
+
+
+def _empty_day_history_row(day_key: str) -> dict:
+    return {
+        "day_key": day_key,
+        "day_label": day_key,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "cached_input_tokens": 0,
+        "cache_creation_tokens": 0,
+        "reasoning_output_tokens": 0,
+        "request_count": 0,
+        "cost_usd": 0.0,
+        "sources": {},
+    }
 
 
 class DashboardService:
@@ -1197,6 +1284,7 @@ class DashboardService:
         now = self.utc_now()
         month_start, month_end = _current_billing_month_bounds(now)
         current_month_key = _month_key(now)
+        current_day_start = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
         usage_events = self.dependencies.snapshot_all_usage_events()
         detailed_usage_events = self.dependencies.snapshot_usage_events()
         current_month_events = []
@@ -1232,6 +1320,18 @@ class DashboardService:
         )
         all_time_usage = _combine_usage_rows(month_rows)
         all_time_usage["months_tracked"] = len(local_usage.get("month_history") or [])
+        daily_history = collect_daily_dashboard_usage(
+            usage_events,
+            start_at=month_start,
+            end_at=month_end,
+        )
+        daily_history_by_key = {row["day_key"]: row for row in daily_history if isinstance(row.get("day_key"), str)}
+        filled_daily_history = []
+        day_cursor = month_start
+        while day_cursor <= current_day_start:
+            day_key = day_cursor.strftime("%Y-%m-%d")
+            filled_daily_history.append(daily_history_by_key.get(day_key) or _empty_day_history_row(day_key))
+            day_cursor += timedelta(days=1)
 
         recent_requests = sorted(
             detailed_usage_events,
@@ -1259,6 +1359,7 @@ class DashboardService:
                 "proxy_requests": len(current_month_events),
                 "sessions": local_usage.get("session_count", 0),
                 "usage": current_month_usage,
+                "daily_history": filled_daily_history,
             },
             "all_time": {
                 "proxy_requests": len(usage_events),

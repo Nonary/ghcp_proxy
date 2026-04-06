@@ -90,6 +90,11 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(payload["premium"]["official_remaining"], 1420)
         self.assertEqual(payload["current_month"]["usage"]["cost_usd"], 4.0)
         self.assertEqual(payload["current_month"]["usage"]["total_tokens"], 400)
+        self.assertEqual(payload["current_month"]["usage"]["request_count"], 2)
+        self.assertEqual(payload["all_time"]["usage"]["request_count"], 2)
+        self.assertEqual(len(payload["current_month"]["daily_history"]), 4)
+        self.assertEqual(payload["current_month"]["daily_history"][-1]["day_key"], "2026-04-04")
+        self.assertEqual(payload["current_month"]["daily_history"][-1]["cost_usd"], 4.0)
         self.assertEqual(payload["recent_sessions"][0]["source"], "codex")
         self.assertEqual(payload["recent_sessions"][1]["source"], "claude")
 
@@ -161,11 +166,63 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(payload["all_time"]["detailed_requests"], 1)
         self.assertEqual(payload["all_time"]["usage"]["cost_usd"], 6.25)
         self.assertEqual(payload["all_time"]["usage"]["total_tokens"], 615)
+        self.assertEqual(payload["all_time"]["usage"]["request_count"], 2)
         self.assertEqual(payload["current_month"]["usage"]["cost_usd"], 2.75)
+        self.assertEqual(payload["current_month"]["daily_history"][-1]["day_key"], "2026-04-04")
+        self.assertEqual(payload["current_month"]["daily_history"][-1]["request_count"], 1)
         self.assertEqual(len(payload["recent_requests"]), 1)
         self.assertEqual(payload["recent_requests"][0]["request_id"], "recent-req")
         self.assertEqual(payload["month_history"][0]["month_key"], "2026-04")
         self.assertEqual(payload["month_history"][1]["month_key"], "2026-03")
+
+    def test_build_dashboard_payload_zero_fills_daily_history_for_current_month(self):
+        fixed_now = datetime(2026, 4, 4, 18, 0, tzinfo=timezone.utc)
+        usage_events = [
+            {
+                "request_id": "day-two",
+                "started_at": "2026-04-02T10:00:00+00:00",
+                "finished_at": "2026-04-02T10:01:00+00:00",
+                "resolved_model": "gpt-5.4",
+                "path": "/v1/responses",
+                "usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "total_tokens": 150,
+                },
+                "cost_usd": 1.5,
+            }
+        ]
+
+        proxy.usage_tracker.replace_history(recent_events=usage_events)
+
+        with (
+            mock.patch.object(proxy.dashboard_service, "utc_now", return_value=fixed_now),
+            mock.patch.object(auth, "load_api_key_payload", return_value={}),
+            mock.patch.object(
+                proxy.dashboard_service,
+                "get_official_premium_payload",
+                return_value={
+                    "available": False,
+                    "remaining": None,
+                    "used": None,
+                    "included": None,
+                    "reset_date": None,
+                    "source": "github-rest-billing-api",
+                    "raw": {},
+                    "refreshing": False,
+                    "error": None,
+                },
+            ),
+        ):
+            payload = proxy.dashboard_service.build_payload()
+
+        self.assertEqual(
+            [row["day_key"] for row in payload["current_month"]["daily_history"]],
+            ["2026-04-01", "2026-04-02", "2026-04-03", "2026-04-04"],
+        )
+        self.assertEqual(payload["current_month"]["daily_history"][0]["cost_usd"], 0.0)
+        self.assertEqual(payload["current_month"]["daily_history"][1]["cost_usd"], 1.5)
+        self.assertEqual(payload["current_month"]["daily_history"][2]["request_count"], 0)
 
     def test_dashboard_api_refresh_param_forces_refresh_and_disables_http_caching(self):
         request = SimpleNamespace(query_params={"refresh": "1"})
