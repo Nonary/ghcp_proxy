@@ -1338,9 +1338,25 @@ def input_contains_compaction(input_items) -> bool:
     return any(isinstance(item, dict) and item.get("type") == "compaction" for item in input_items)
 
 
+def _latest_compaction_window(input_items):
+    if not isinstance(input_items, list):
+        return input_items
+
+    latest_compaction_index = None
+    for index, item in enumerate(input_items):
+        if isinstance(item, dict) and item.get("type") == "compaction":
+            latest_compaction_index = index
+
+    if latest_compaction_index is None:
+        return input_items
+    return input_items[latest_compaction_index:]
+
+
 def sanitize_input(input_items):
     """
     Preserve encrypted_content in reasoning items for multi-turn correctness.
+    Treat the latest compaction item as the active handoff boundary so older
+    pre-compaction prompt items are not replayed upstream.
     Expand locally synthesized compaction items into a readable summary message.
     Convert other compaction items into reasoning items for GHCP compatibility.
     Strip status=None which GHCP rejects.
@@ -1350,7 +1366,7 @@ def sanitize_input(input_items):
         return input_items  # plain string — pass through untouched
 
     result = []
-    for item in input_items:
+    for item in _latest_compaction_window(input_items):
         if not isinstance(item, dict):
             result.append(item)
             continue

@@ -170,6 +170,79 @@ class FormatTranslationTests(unittest.TestCase):
 
         self.assertEqual(compact_request["reasoning"], {"effort": "max"})
 
+    def test_sanitize_input_uses_latest_local_compaction_as_boundary(self):
+        sanitized = format_translation.sanitize_input(
+            [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "old context"}],
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "old reply"}],
+                },
+                {
+                    "type": "compaction",
+                    "encrypted_content": format_translation.encode_fake_compaction("carry this forward"),
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "continue from here"}],
+                },
+            ]
+        )
+
+        self.assertEqual(len(sanitized), 2)
+        self.assertEqual(sanitized[0]["type"], "message")
+        self.assertEqual(sanitized[0]["role"], "assistant")
+        self.assertIn("carry this forward", sanitized[0]["content"][0]["text"])
+        self.assertEqual(
+            sanitized[1],
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "continue from here"}],
+            },
+        )
+
+    def test_sanitize_input_uses_latest_opaque_compaction_as_boundary(self):
+        sanitized = format_translation.sanitize_input(
+            [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "old context"}],
+                },
+                {
+                    "type": "compaction",
+                    "encrypted_content": "opaque-upstream-token",
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "continue from here"}],
+                },
+            ]
+        )
+
+        self.assertEqual(
+            sanitized,
+            [
+                {
+                    "type": "reasoning",
+                    "encrypted_content": "opaque-upstream-token",
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "continue from here"}],
+                },
+            ],
+        )
+
     def test_anthropic_request_to_chat_stream_requests_usage_chunks(self):
         body = {
             "model": "claude-sonnet-4.6",

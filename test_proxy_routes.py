@@ -328,6 +328,78 @@ class ProxyRoutesTests(unittest.TestCase):
             b'{"id":"resp_123","type":"message","role":"assistant","model":"gpt-5.4","content":[{"type":"text","text":"hello from codex"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":12,"output_tokens":3,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}',
         )
 
+    def test_responses_route_treats_local_compaction_as_handoff_boundary(self):
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/responses"),
+            method="POST",
+            headers={},
+        )
+        body = {
+            "model": "gpt-5.4",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "old context"}],
+                },
+                {
+                    "type": "compaction",
+                    "encrypted_content": format_translation.encode_fake_compaction("carry this forward"),
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "continue from here"}],
+                },
+            ],
+            "stream": False,
+        }
+        upstream = httpx.Response(
+            200,
+            json={
+                "id": "resp_123",
+                "model": "gpt-5.4",
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "done"}],
+                    }
+                ],
+                "usage": {
+                    "input_tokens": 10,
+                    "output_tokens": 2,
+                },
+            },
+            headers={"content-type": "application/json"},
+        )
+
+        with (
+            mock.patch.object(proxy, "parse_json_request", mock.AsyncMock(return_value=body)),
+            mock.patch.object(auth, "get_api_key", return_value="test-key"),
+            mock.patch.object(auth, "get_api_base", return_value="https://example.invalid"),
+            mock.patch.object(format_translation, "build_responses_headers_for_request", return_value={"X-Initiator": "agent"}),
+            mock.patch.object(proxy.usage_tracker, "start_event", return_value=None),
+            mock.patch.object(proxy.usage_tracker, "finish_event"),
+            mock.patch.object(proxy, "throttled_client_post", mock.AsyncMock(return_value=upstream)) as post,
+        ):
+            response = proxy.asyncio.run(proxy.responses(request))
+
+        forwarded_input = post.await_args.kwargs["json"]["input"]
+        self.assertEqual(len(forwarded_input), 2)
+        self.assertEqual(forwarded_input[0]["type"], "message")
+        self.assertEqual(forwarded_input[0]["role"], "assistant")
+        self.assertIn("carry this forward", forwarded_input[0]["content"][0]["text"])
+        self.assertEqual(
+            forwarded_input[1],
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "continue from here"}],
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+
     def test_proxy_streaming_response_connect_error_returns_openai_error(self):
         request = httpx.Request("POST", "https://example.invalid/responses")
 
