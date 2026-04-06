@@ -622,10 +622,11 @@ def chat_tool_choice_to_responses(tool_choice):
     raise ValueError("Unsupported chat tool_choice value")
 
 
-def _chat_content_item_to_response_content(item: dict) -> dict | None:
+def _chat_content_item_to_response_content(item: dict, *, role: str = "user") -> dict | None:
     item_type = str(item.get("type", "")).lower()
     if item_type == "text" and isinstance(item.get("text"), str):
-        content_item = {"type": "input_text", "text": item["text"]}
+        text_type = "output_text" if role == "assistant" else "input_text"
+        content_item = {"type": text_type, "text": item["text"]}
         if isinstance(item.get("copilot_cache_control"), dict):
             content_item["copilot_cache_control"] = dict(item["copilot_cache_control"])
         return content_item
@@ -695,7 +696,7 @@ def anthropic_request_to_responses(body: dict) -> dict:
                 content_item = _anthropic_text_or_image_block_to_chat(item)
                 if content_item is None:
                     raise ValueError(f"Unsupported Anthropic content block type: {item_type}")
-                response_content_item = _chat_content_item_to_response_content(content_item)
+                response_content_item = _chat_content_item_to_response_content(content_item, role="assistant")
                 if response_content_item is not None:
                     content.append(response_content_item)
             if content:
@@ -765,6 +766,9 @@ def anthropic_request_to_responses(body: dict) -> dict:
         budget_tokens = thinking.get("budget_tokens")
         if isinstance(budget_tokens, int) and budget_tokens > 0:
             payload["reasoning"] = {"effort": "high" if budget_tokens >= 8192 else "medium"}
+
+    # copilot_cache_control is only valid for Chat Completions; strip for Responses API.
+    payload["input"] = _strip_copilot_cache_control(payload["input"])
 
     return payload
 
@@ -1237,6 +1241,23 @@ def _strip_anthropic_cache_control(value):
                 continue
             sanitized[key] = _strip_anthropic_cache_control(item)
         return sanitized
+
+    return value
+
+
+
+def _strip_copilot_cache_control(value):
+    """Recursively remove copilot_cache_control from a structure.
+
+    copilot_cache_control is a Copilot Chat API extension. When bridging
+    to the Responses API the field is not recognised by the upstream endpoint
+    and must be stripped before the payload is sent.
+    """
+    if isinstance(value, list):
+        return [_strip_copilot_cache_control(item) for item in value]
+
+    if isinstance(value, dict):
+        return {k: _strip_copilot_cache_control(v) for k, v in value.items() if k != "copilot_cache_control"}
 
     return value
 

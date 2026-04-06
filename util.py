@@ -211,6 +211,16 @@ def _usage_event_source(event: dict | None) -> str:
     if not isinstance(event, dict):
         return "codex"
 
+    # Derive source from the originally requested model so that remapped
+    # requests (e.g. Codex -> Claude) keep their original source identity.
+    requested = _normalize_model_name(event.get("requested_model"))
+    if isinstance(requested, str):
+        if requested.startswith("claude-"):
+            return "claude"
+        if requested.startswith("gpt-"):
+            return "codex"
+
+    # Fall back to the resolved/response model when no requested_model exists.
     model_name = _usage_event_model_name(event)
     if isinstance(model_name, str):
         if model_name.startswith("claude-"):
@@ -224,7 +234,6 @@ def _usage_event_source(event: dict | None) -> str:
     if path.endswith("/responses") or path.endswith("/responses/compact") or path.endswith("/chat/completions"):
         return "codex"
     return "codex"
-
 
 # ---------------------------------------------------------------------------
 # Pricing helpers

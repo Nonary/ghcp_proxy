@@ -544,5 +544,122 @@ class FormatTranslationTests(unittest.TestCase):
         )
 
 
+    def test_anthropic_request_to_responses_uses_output_text_for_assistant(self):
+        """Assistant content must use output_text, not input_text, in Responses API payloads."""
+        body = {
+            "model": "gpt-5.4",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "hello"}],
+                },
+                {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "hi there"}],
+                },
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "thanks"}],
+                },
+            ],
+        }
+
+        translated = format_translation.anthropic_request_to_responses(body)
+
+        # Find the assistant message in input
+        assistant_msgs = [item for item in translated["input"]
+                          if isinstance(item, dict) and item.get("role") == "assistant"]
+        self.assertEqual(len(assistant_msgs), 1)
+        ast_content = assistant_msgs[0]["content"]
+        self.assertEqual(ast_content[0]["type"], "output_text")
+        self.assertEqual(ast_content[0]["text"], "hi there")
+
+        # User messages should still use input_text
+        user_msgs = [item for item in translated["input"]
+                     if isinstance(item, dict) and item.get("role") == "user"]
+        for user_msg in user_msgs:
+            for part in user_msg.get("content", []):
+                self.assertEqual(part["type"], "input_text")
+
+    def test_anthropic_request_to_responses_strips_copilot_cache_control(self):
+        """copilot_cache_control is a Chat API extension and must not leak into Responses API payloads."""
+        body = {
+            "model": "gpt-5.4",
+            "system": [
+                {"type": "text", "text": "first"},
+                {
+                    "type": "text",
+                    "text": "cached system",
+                    "cache_control": {"type": "ephemeral"},
+                },
+            ],
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "hello",
+                            "cache_control": {"type": "ephemeral"},
+                        }
+                    ],
+                },
+            ],
+        }
+
+        translated = format_translation.anthropic_request_to_responses(body)
+
+        # The payload must not contain copilot_cache_control anywhere.
+        import json
+        raw = json.dumps(translated)
+        self.assertNotIn("copilot_cache_control", raw)
+
+        # Content should still be present (only the cache hint is stripped).
+        dev_msg = translated["input"][0]
+        self.assertEqual(dev_msg["role"], "developer")
+        self.assertTrue(any("cached system" in item.get("text", "") for item in dev_msg["content"]))
+        user_msg = translated["input"][1]
+        self.assertEqual(user_msg["content"][0]["text"], "hello")
+
+    def test_anthropic_request_to_chat_keeps_copilot_cache_control(self):
+        """copilot_cache_control must survive in the Chat API path so GHCP caching works."""
+        body = {
+            "model": "claude-sonnet-4.6",
+            "system": [
+                {
+                    "type": "text",
+                    "text": "cached system",
+                    "cache_control": {"type": "ephemeral"},
+                },
+            ],
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "hello",
+                            "cache_control": {"type": "ephemeral"},
+                        }
+                    ],
+                },
+            ],
+        }
+
+        outbound = proxy.asyncio.run(format_translation.anthropic_request_to_chat(body, "https://example.invalid", "k"))
+
+        import json
+        raw = json.dumps(outbound)
+        self.assertIn("copilot_cache_control", raw)
+        # System message content list should carry the cache hint
+        sys_content = outbound["messages"][0]["content"]
+        self.assertIsInstance(sys_content, list)
+        self.assertEqual(sys_content[0]["copilot_cache_control"], {"type": "ephemeral"})
+        # User message content should carry the cache hint
+        user_content = outbound["messages"][1]["content"]
+        self.assertIsInstance(user_content, list)
+        self.assertEqual(user_content[0]["copilot_cache_control"], {"type": "ephemeral"})
+
+
 if __name__ == "__main__":
     unittest.main()
