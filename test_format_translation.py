@@ -217,7 +217,7 @@ class FormatTranslationTests(unittest.TestCase):
         self.assertTrue(compact_request["stream"])
         self.assertFalse(compact_request["store"])
 
-    def test_build_fake_compaction_request_strips_tool_config_for_claude_models(self):
+    def test_build_fake_compaction_request_keeps_tools_with_none_choice_for_claude_models(self):
         body = {
             "model": "claude-opus-4.6",
             "input": "hello",
@@ -238,8 +238,8 @@ class FormatTranslationTests(unittest.TestCase):
 
         compact_request = format_translation.build_fake_compaction_request(body)
 
-        self.assertNotIn("tools", compact_request)
-        self.assertNotIn("tool_choice", compact_request)
+        self.assertEqual(compact_request["tools"], body["tools"])
+        self.assertEqual(compact_request["tool_choice"], "none")
         self.assertNotIn("parallel_tool_calls", compact_request)
         self.assertEqual(compact_request["include"], body["include"])
         self.assertTrue(compact_request["stream"])
@@ -325,7 +325,7 @@ class FormatTranslationTests(unittest.TestCase):
             ],
         )
 
-    def test_build_fake_compaction_request_chat_translation_has_no_tool_role_messages(self):
+    def test_build_fake_compaction_request_chat_translation_keeps_tools_with_none_choice(self):
         body = {
             "model": "claude-opus-4.6",
             "input": [
@@ -360,8 +360,8 @@ class FormatTranslationTests(unittest.TestCase):
             )
         )
         self.assertNotIn("tool_calls", translated["messages"][0])
-        self.assertNotIn("tools", translated)
-        self.assertNotIn("tool_choice", translated)
+        self.assertEqual(len(translated["tools"]), 1)
+        self.assertEqual(translated["tool_choice"], "none")
 
     def test_build_fake_compaction_request_preserves_native_responses_items_for_codex_models(self):
         body = {
@@ -403,10 +403,10 @@ class FormatTranslationTests(unittest.TestCase):
             [
                 {
                     "type": "message",
-                    "role": "assistant",
+                    "role": "user",
                     "content": [
                         {
-                            "type": "output_text",
+                            "type": "input_text",
                             "text": "[Compacted conversation summary]\ncarry this forward",
                         }
                     ],
@@ -468,7 +468,7 @@ class FormatTranslationTests(unittest.TestCase):
 
         self.assertEqual(len(sanitized), 2)
         self.assertEqual(sanitized[0]["type"], "message")
-        self.assertEqual(sanitized[0]["role"], "assistant")
+        self.assertEqual(sanitized[0]["role"], "user")
         self.assertIn("carry this forward", sanitized[0]["content"][0]["text"])
         self.assertEqual(
             sanitized[1],

@@ -291,16 +291,18 @@ def anthropic_tools_to_chat(tools) -> list[dict]:
             raise ValueError("Anthropic tools must include a string name")
         raw_desc = tool.get("description", "")
         desc = raw_desc if isinstance(raw_desc, str) and raw_desc else " "
-        converted.append(
-            {
-                "type": "function",
-                "function": {
-                    "name": name,
-                    "description": desc,
-                    "parameters": tool.get("input_schema") if isinstance(tool.get("input_schema"), dict) else {"type": "object", "properties": {}},
-                },
-            }
-        )
+        chat_tool = {
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": desc,
+                "parameters": tool.get("input_schema") if isinstance(tool.get("input_schema"), dict) else {"type": "object", "properties": {}},
+            },
+        }
+        cache_control = _normalize_anthropic_cache_control(tool.get("cache_control"))
+        if cache_control is not None:
+            chat_tool["copilot_cache_control"] = cache_control
+        converted.append(chat_tool)
     return converted
 
 
@@ -490,7 +492,7 @@ def _responses_tool_to_chat(tool: dict) -> dict | None:
         raise ValueError("Responses function tools must include a name")
 
     desc = description if isinstance(description, str) and description else " "
-    return {
+    chat_tool = {
         "type": "function",
         "function": {
             "name": name,
@@ -498,6 +500,14 @@ def _responses_tool_to_chat(tool: dict) -> dict | None:
             "parameters": parameters if isinstance(parameters, dict) else {"type": "object", "properties": {}},
         },
     }
+    # Forward cache_control from the source tool definition (Responses API
+    # or flat format) so GHCP can set prompt-cache breakpoints on tools.
+    for source in (tool, tool.get("function") or {}):
+        cache_control = _normalize_anthropic_cache_control(source.get("cache_control"))
+        if cache_control is not None:
+            chat_tool["copilot_cache_control"] = cache_control
+            break
+    return chat_tool
 
 
 def responses_tool_choice_to_chat(tool_choice):
@@ -1367,10 +1377,10 @@ def decode_fake_compaction(encrypted_content: str) -> str | None:
 def _summary_message_item(summary_text: str) -> dict:
     return {
         "type": "message",
-        "role": "assistant",
+        "role": "user",
         "content": [
             {
-                "type": "output_text",
+                "type": "input_text",
                 "text": f"{FAKE_COMPACTION_SUMMARY_LABEL}\n{summary_text}",
             }
         ],
@@ -1604,11 +1614,15 @@ def _strip_chat_transcript_compaction_fields(target: dict) -> None:
     if not isinstance(target, dict):
         return
 
-    # Claude-targeted compaction already renders prior tool activity into
-    # plain-text transcript items, so forwarding live tool config can change
-    # the summarization turn instead of just summarizing it.
-    for key in ("tools", "tool_choice", "parallel_tool_calls"):
-        target.pop(key, None)
+    # GHCP keeps tools in compact requests for cache affinity but sets
+    # tool_choice to "none" so the model cannot invoke them during
+    # summarization.  Match that behaviour here.
+    if isinstance(target.get("tools"), list) and target["tools"]:
+        target["tool_choice"] = "none"
+    else:
+        for key in ("tools", "tool_choice"):
+            target.pop(key, None)
+    target.pop("parallel_tool_calls", None)
 
 
 def build_fake_compaction_request(body: dict) -> dict:
