@@ -390,7 +390,7 @@ class ProxyRoutesTests(unittest.TestCase):
         forwarded_input = post.await_args.kwargs["json"]["input"]
         self.assertEqual(len(forwarded_input), 2)
         self.assertEqual(forwarded_input[0]["type"], "message")
-        self.assertEqual(forwarded_input[0]["role"], "assistant")
+        self.assertEqual(forwarded_input[0]["role"], "user")
         self.assertIn("carry this forward", forwarded_input[0]["content"][0]["text"])
         self.assertEqual(
             forwarded_input[1],
