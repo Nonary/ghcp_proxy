@@ -218,6 +218,7 @@ class UpstreamRequestPlan:
     usage_event: dict | None
     requested_model: str | None
     resolved_model: str | None
+    source_body: dict | None = None
     trace_context: dict | None = None
 
 
@@ -414,8 +415,8 @@ def _trace_response_summary(
     return summary
 
 
-def _append_request_trace(payload: dict) -> None:
-    if not request_tracing_enabled():
+def _append_request_trace(payload: dict, *, force: bool = False) -> None:
+    if not force and not request_tracing_enabled():
         return
     trace_path = request_trace_log_path()
     try:
@@ -465,6 +466,13 @@ def _emit_request_trace_start(
     return context
 
 
+def _should_force_failure_trace(plan: UpstreamRequestPlan | None, status_code: int) -> bool:
+    if not isinstance(plan, UpstreamRequestPlan) or status_code < 400:
+        return False
+    trace = plan.trace_context if isinstance(plan.trace_context, dict) else {}
+    return trace.get("bridge") is True
+
+
 def _finish_usage_and_trace(
     plan: UpstreamRequestPlan | None,
     status_code: int,
@@ -483,15 +491,26 @@ def _finish_usage_and_trace(
             response_text=response_text,
             usage=usage,
         )
-        _append_request_trace(
-            {
+        force_trace = _should_force_failure_trace(plan, status_code)
+        if request_tracing_enabled() or force_trace:
+            trace_payload = {
                 "event": "request_finished",
                 "time": util.utc_now_iso(),
                 **(plan.trace_context or {"request_id": plan.request_id}),
+                "requested_model": plan.requested_model,
+                "resolved_model": plan.resolved_model,
                 "response": _trace_response_summary(upstream=upstream, response_payload=response_payload, usage=usage),
                 "response_text_present": isinstance(response_text, str) and bool(response_text),
             }
-        )
+            if status_code >= 400:
+                trace_payload["source_body"] = plan.source_body if isinstance(plan.source_body, dict) else plan.body
+                trace_payload["upstream_body"] = plan.body
+                trace_payload["outbound_headers"] = _header_trace_subset(plan.headers)
+                if isinstance(response_payload, dict):
+                    trace_payload["response_payload"] = response_payload
+                if isinstance(response_text, str) and response_text:
+                    trace_payload["response_text"] = response_text
+            _append_request_trace(trace_payload, force=force_trace)
         return
 
     usage_tracker.finish_event(
@@ -515,6 +534,8 @@ def _prepare_upstream_request(
     header_builder,
     error_response,
     api_key: str | None = None,
+    source_body: dict | None = None,
+    trace_metadata: dict | None = None,
 ) -> tuple[UpstreamRequestPlan | None, Response | None]:
     request_id = uuid4().hex
 
@@ -536,6 +557,25 @@ def _prepare_upstream_request(
         upstream_path=upstream_path,
         outbound_headers=headers,
     )
+    trace_context = {
+        "request_id": request_id,
+        "client_path": request.url.path,
+        "upstream_path": upstream_path,
+        **(trace_metadata or {}),
+    }
+    if request_tracing_enabled():
+        trace_context = _emit_request_trace_start(
+            request_id=request_id,
+            request=request,
+            upstream_url=upstream_url,
+            upstream_path=upstream_path,
+            requested_model=requested_model,
+            resolved_model=resolved_model,
+            request_body=source_body if isinstance(source_body, dict) else body,
+            upstream_body=body,
+            outbound_headers=headers,
+            trace_metadata=trace_metadata,
+        )
     return (
         UpstreamRequestPlan(
             request_id=request_id,
@@ -545,6 +585,8 @@ def _prepare_upstream_request(
             usage_event=usage_event,
             requested_model=requested_model,
             resolved_model=resolved_model,
+            source_body=source_body if isinstance(source_body, dict) else body,
+            trace_context=trace_context,
         ),
         None,
     )
@@ -624,6 +666,14 @@ def _prepare_bridge_request(
         ),
         error_response=_bridge_error_response(bridge_plan),
         api_key=api_key,
+        source_body=original_body,
+        trace_metadata={
+            "bridge": True,
+            "strategy_name": bridge_plan.strategy_name,
+            "caller_protocol": bridge_plan.caller_protocol,
+            "upstream_protocol": bridge_plan.upstream_protocol,
+            "header_kind": bridge_plan.header_kind,
+        },
     )
 
 
@@ -652,8 +702,8 @@ async def _post_non_streaming_request(plan: UpstreamRequestPlan, *, error_respon
                 headers=plan.headers,
                 json=plan.body,
             )
-        usage_tracker.finish_event(
-            plan.usage_event,
+        _finish_usage_and_trace(
+            plan,
             upstream.status_code,
             upstream=upstream,
             response_payload=_extract_upstream_json_payload(upstream),
@@ -662,10 +712,10 @@ async def _post_non_streaming_request(plan: UpstreamRequestPlan, *, error_respon
         return proxy_non_streaming_response(upstream)
     except httpx.RequestError as exc:
         status_code, message = format_translation.upstream_request_error_status_and_message(exc)
-        usage_tracker.finish_event(plan.usage_event, status_code, response_text=message)
+        _finish_usage_and_trace(plan, status_code, response_text=message)
         return error_response(status_code, message)
     except Exception:
-        usage_tracker.finish_event(plan.usage_event, 599)
+        _finish_usage_and_trace(plan, 599)
         raise
 
 
@@ -681,10 +731,10 @@ async def _post_bridge_non_streaming_request(plan: UpstreamRequestPlan, bridge_p
             )
     except httpx.RequestError as exc:
         status_code, message = format_translation.upstream_request_error_status_and_message(exc)
-        usage_tracker.finish_event(plan.usage_event, status_code, response_text=message)
+        _finish_usage_and_trace(plan, status_code, response_text=message)
         return error_response(status_code, message)
     except Exception:
-        usage_tracker.finish_event(plan.usage_event, 599)
+        _finish_usage_and_trace(plan, 599)
         raise
 
     if upstream.status_code >= 400:
@@ -698,8 +748,8 @@ async def _post_bridge_non_streaming_request(plan: UpstreamRequestPlan, bridge_p
                 fallback_message,
             )
             response_text = response_payload.get("error", {}).get("message")
-        usage_tracker.finish_event(
-            plan.usage_event,
+        _finish_usage_and_trace(
+            plan,
             upstream.status_code,
             upstream=upstream,
             response_payload=response_payload,
@@ -710,12 +760,12 @@ async def _post_bridge_non_streaming_request(plan: UpstreamRequestPlan, bridge_p
     upstream_payload = _extract_upstream_json_payload(upstream)
     if not isinstance(upstream_payload, dict):
         message = "Upstream response did not include a JSON object payload"
-        usage_tracker.finish_event(plan.usage_event, 502, upstream=upstream, response_text=message)
+        _finish_usage_and_trace(plan, 502, upstream=upstream, response_text=message)
         return error_response(502, message)
 
     translated_payload = _translate_bridge_success_payload(bridge_plan, upstream_payload)
-    usage_tracker.finish_event(
-        plan.usage_event,
+    _finish_usage_and_trace(
+        plan,
         upstream.status_code,
         upstream=upstream,
         response_payload=translated_payload,
@@ -769,6 +819,7 @@ async def proxy_streaming_response(
     timeout: int = 300,
     usage_event: dict | None = None,
     stream_type: str = "responses",
+    trace_plan: UpstreamRequestPlan | None = None,
 ) -> Response:
     """
     Relay an upstream SSE response while preserving upstream error statuses.
@@ -782,19 +833,19 @@ async def proxy_streaming_response(
         upstream = await throttled_client_send(client, request, stream=True)
     except httpx.RequestError as exc:
         status_code, message = format_translation.upstream_request_error_status_and_message(exc)
-        usage_tracker.finish_event(usage_event, status_code, response_text=message)
+        _finish_usage_and_trace(trace_plan, status_code, response_text=message)
         await client.aclose()
         return format_translation.openai_error_response(status_code, message)
     except Exception:
-        usage_tracker.finish_event(usage_event, 599)
+        _finish_usage_and_trace(trace_plan, 599)
         await client.aclose()
         raise
 
     if upstream.status_code >= 400:
         try:
             await upstream.aread()
-            usage_tracker.finish_event(
-                usage_event,
+            _finish_usage_and_trace(
+                trace_plan,
                 upstream.status_code,
                 upstream=upstream,
                 response_payload=_extract_upstream_json_payload(upstream),
@@ -818,8 +869,8 @@ async def proxy_streaming_response(
                     usage_tracker.mark_first_output(usage_event)
                 yield chunk
         finally:
-            usage_tracker.finish_event(
-                usage_event,
+            _finish_usage_and_trace(
+                trace_plan,
                 upstream.status_code,
                 upstream=upstream,
                 usage=capture.usage if isinstance(capture.usage, dict) else None,
@@ -841,6 +892,7 @@ async def proxy_anthropic_streaming_response(
     fallback_model: str,
     timeout: int = 300,
     usage_event: dict | None = None,
+    trace_plan: UpstreamRequestPlan | None = None,
 ) -> Response:
     """
     Translate upstream chat-completions SSE into Anthropic Messages SSE.
@@ -851,11 +903,11 @@ async def proxy_anthropic_streaming_response(
         upstream = await throttled_client_send(client, request, stream=True)
     except httpx.RequestError as exc:
         status_code, message = format_translation.upstream_request_error_status_and_message(exc)
-        usage_tracker.finish_event(usage_event, status_code, response_text=message)
+        _finish_usage_and_trace(trace_plan, status_code, response_text=message)
         await client.aclose()
         return format_translation.anthropic_error_response(status_code, message)
     except Exception:
-        usage_tracker.finish_event(usage_event, 599)
+        _finish_usage_and_trace(trace_plan, 599)
         await client.aclose()
         raise
 
@@ -868,8 +920,8 @@ async def proxy_anthropic_streaming_response(
                 upstream.status_code,
                 fallback_message,
             )
-            usage_tracker.finish_event(
-                usage_event,
+            _finish_usage_and_trace(
+                trace_plan,
                 upstream.status_code,
                 upstream=upstream,
                 response_payload=error_payload,
@@ -896,8 +948,8 @@ async def proxy_anthropic_streaming_response(
                 yield event
         finally:
             response_payload = translator.build_response_payload()
-            usage_tracker.finish_event(
-                usage_event,
+            _finish_usage_and_trace(
+                trace_plan,
                 upstream.status_code,
                 upstream=upstream,
                 response_payload=response_payload,
@@ -921,6 +973,7 @@ async def proxy_responses_from_chat_streaming_response(
     fallback_model: str,
     timeout: int = 300,
     usage_event: dict | None = None,
+    trace_plan: UpstreamRequestPlan | None = None,
 ) -> Response:
     client = httpx.AsyncClient(timeout=timeout)
     request = client.build_request("POST", upstream_url, headers=headers, json=body)
@@ -928,19 +981,19 @@ async def proxy_responses_from_chat_streaming_response(
         upstream = await throttled_client_send(client, request, stream=True)
     except httpx.RequestError as exc:
         status_code, message = format_translation.upstream_request_error_status_and_message(exc)
-        usage_tracker.finish_event(usage_event, status_code, response_text=message)
+        _finish_usage_and_trace(trace_plan, status_code, response_text=message)
         await client.aclose()
         return format_translation.openai_error_response(status_code, message)
     except Exception:
-        usage_tracker.finish_event(usage_event, 599)
+        _finish_usage_and_trace(trace_plan, 599)
         await client.aclose()
         raise
 
     if upstream.status_code >= 400:
         try:
             await upstream.aread()
-            usage_tracker.finish_event(
-                usage_event,
+            _finish_usage_and_trace(
+                trace_plan,
                 upstream.status_code,
                 upstream=upstream,
                 response_payload=_extract_upstream_json_payload(upstream),
@@ -967,8 +1020,8 @@ async def proxy_responses_from_chat_streaming_response(
                 yield event
         finally:
             response_payload = translator.build_response_payload()
-            usage_tracker.finish_event(
-                usage_event,
+            _finish_usage_and_trace(
+                trace_plan,
                 upstream.status_code,
                 upstream=upstream,
                 response_payload=response_payload,
@@ -992,6 +1045,7 @@ async def proxy_anthropic_from_responses_streaming_response(
     fallback_model: str,
     timeout: int = 300,
     usage_event: dict | None = None,
+    trace_plan: UpstreamRequestPlan | None = None,
 ) -> Response:
     client = httpx.AsyncClient(timeout=timeout)
     request = client.build_request("POST", upstream_url, headers=headers, json=body)
@@ -999,11 +1053,11 @@ async def proxy_anthropic_from_responses_streaming_response(
         upstream = await throttled_client_send(client, request, stream=True)
     except httpx.RequestError as exc:
         status_code, message = format_translation.upstream_request_error_status_and_message(exc)
-        usage_tracker.finish_event(usage_event, status_code, response_text=message)
+        _finish_usage_and_trace(trace_plan, status_code, response_text=message)
         await client.aclose()
         return format_translation.anthropic_error_response(status_code, message)
     except Exception:
-        usage_tracker.finish_event(usage_event, 599)
+        _finish_usage_and_trace(trace_plan, 599)
         await client.aclose()
         raise
 
@@ -1016,8 +1070,8 @@ async def proxy_anthropic_from_responses_streaming_response(
                 upstream.status_code,
                 fallback_message,
             )
-            usage_tracker.finish_event(
-                usage_event,
+            _finish_usage_and_trace(
+                trace_plan,
                 upstream.status_code,
                 upstream=upstream,
                 response_payload=error_payload,
@@ -1044,8 +1098,8 @@ async def proxy_anthropic_from_responses_streaming_response(
                 yield event
         finally:
             response_payload = translator.build_response_payload()
-            usage_tracker.finish_event(
-                usage_event,
+            _finish_usage_and_trace(
+                trace_plan,
                 upstream.status_code,
                 upstream=upstream,
                 response_payload=response_payload,
@@ -1071,6 +1125,7 @@ async def _proxy_bridge_streaming_response(plan: UpstreamRequestPlan, bridge_pla
             timeout=300,
             usage_event=plan.usage_event,
             stream_type="responses",
+            trace_plan=plan,
         )
     if bridge_plan.caller_protocol == "responses" and bridge_plan.upstream_protocol == "chat":
         return await proxy_responses_from_chat_streaming_response(
@@ -1080,6 +1135,7 @@ async def _proxy_bridge_streaming_response(plan: UpstreamRequestPlan, bridge_pla
             bridge_plan.resolved_model,
             timeout=300,
             usage_event=plan.usage_event,
+            trace_plan=plan,
         )
     if bridge_plan.caller_protocol == "anthropic" and bridge_plan.upstream_protocol == "chat":
         return await proxy_anthropic_streaming_response(
@@ -1089,6 +1145,7 @@ async def _proxy_bridge_streaming_response(plan: UpstreamRequestPlan, bridge_pla
             bridge_plan.resolved_model,
             timeout=300,
             usage_event=plan.usage_event,
+            trace_plan=plan,
         )
     return await proxy_anthropic_from_responses_streaming_response(
         plan.upstream_url,
@@ -1097,6 +1154,7 @@ async def _proxy_bridge_streaming_response(plan: UpstreamRequestPlan, bridge_pla
         bridge_plan.resolved_model,
         timeout=300,
         usage_event=plan.usage_event,
+        trace_plan=plan,
     )
 
 
@@ -1402,6 +1460,7 @@ async def chat_completions(request: Request):
             timeout=300,
             usage_event=plan.usage_event,
             stream_type="chat",
+            trace_plan=plan,
         )
     return await _post_non_streaming_request(plan, error_response=format_translation.openai_error_response)
 

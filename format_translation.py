@@ -289,12 +289,14 @@ def anthropic_tools_to_chat(tools) -> list[dict]:
         name = tool.get("name")
         if not isinstance(name, str):
             raise ValueError("Anthropic tools must include a string name")
+        raw_desc = tool.get("description", "")
+        desc = raw_desc if isinstance(raw_desc, str) and raw_desc else " "
         converted.append(
             {
                 "type": "function",
                 "function": {
                     "name": name,
-                    "description": tool.get("description", "") if isinstance(tool.get("description"), str) else "",
+                    "description": desc,
                     "parameters": tool.get("input_schema") if isinstance(tool.get("input_schema"), dict) else {"type": "object", "properties": {}},
                 },
             }
@@ -434,6 +436,39 @@ def _response_message_content_to_chat(content):
     return converted
 
 
+def _merge_chat_system_prompt_parts(parts) -> str | list[dict]:
+    merged = []
+    for part in parts:
+        if isinstance(part, str):
+            if not part:
+                continue
+            part_items = [{"type": "text", "text": part}]
+        elif isinstance(part, list):
+            part_items = [dict(item) for item in part if isinstance(item, dict)]
+            if not part_items:
+                continue
+        else:
+            continue
+
+        if merged:
+            merged.append({"type": "text", "text": "\n\n"})
+        merged.extend(part_items)
+
+    if not merged:
+        return ""
+    # If every item is a plain {"type": "text", "text": "..."} with no extra
+    # keys (e.g. copilot_cache_control), join into a single string.  The Chat
+    # Completions API does not accept list-type content for system messages,
+    # so we must flatten when possible.
+    if all(
+        item.get("type") == "text"
+        and set(item.keys()).issubset({"type", "text"})
+        for item in merged
+    ):
+        return "".join(item.get("text", "") for item in merged)
+    return merged
+
+
 def _responses_tool_to_chat(tool: dict) -> dict | None:
     if not isinstance(tool, dict):
         return None
@@ -454,11 +489,12 @@ def _responses_tool_to_chat(tool: dict) -> dict | None:
     if not isinstance(name, str):
         raise ValueError("Responses function tools must include a name")
 
+    desc = description if isinstance(description, str) and description else " "
     return {
         "type": "function",
         "function": {
             "name": name,
-            "description": description if isinstance(description, str) else "",
+            "description": desc,
             "parameters": parameters if isinstance(parameters, dict) else {"type": "object", "properties": {}},
         },
     }
@@ -485,10 +521,11 @@ def responses_tool_choice_to_chat(tool_choice):
 def responses_request_to_chat(body: dict) -> dict:
     raw_input = body.get("input")
     chat_messages = []
+    system_prompt_parts = []
 
     instructions = body.get("instructions")
     if isinstance(instructions, str) and instructions.strip():
-        chat_messages.append({"role": "system", "content": instructions})
+        system_prompt_parts.append(instructions)
 
     if isinstance(raw_input, str):
         chat_messages.append({"role": "user", "content": raw_input})
@@ -502,10 +539,15 @@ def responses_request_to_chat(body: dict) -> dict:
                 if role not in {"system", "developer", "user", "assistant"}:
                     raise ValueError(f"Unsupported Responses message role: {role}")
                 normalized_role = "system" if role == "developer" else role
+                message_content = _response_message_content_to_chat(item.get("content"))
+                if normalized_role == "system":
+                    if message_content:
+                        system_prompt_parts.append(message_content)
+                    continue
                 chat_messages.append(
                     {
                         "role": normalized_role,
-                        "content": _response_message_content_to_chat(item.get("content")),
+                        "content": message_content,
                     }
                 )
                 continue
@@ -553,6 +595,10 @@ def responses_request_to_chat(body: dict) -> dict:
                 continue
             raise ValueError(f"Unsupported Responses input item type: {item_type}")
 
+    system_prompt = _merge_chat_system_prompt_parts(system_prompt_parts)
+    if system_prompt:
+        chat_messages.insert(0, {"role": "system", "content": system_prompt})
+
     payload = {
         "model": resolve_copilot_model_name(body.get("model")),
         "messages": chat_messages,
@@ -574,10 +620,12 @@ def responses_request_to_chat(body: dict) -> dict:
     if tools is not None:
         if not isinstance(tools, list):
             raise ValueError("Responses tools must be a list")
-        payload["tools"] = [tool for tool in (_responses_tool_to_chat(tool) for tool in tools) if tool is not None]
+        translated_tools = [tool for tool in (_responses_tool_to_chat(tool) for tool in tools) if tool is not None]
+        if translated_tools:
+            payload["tools"] = translated_tools
 
     mapped_tool_choice = responses_tool_choice_to_chat(body.get("tool_choice"))
-    if mapped_tool_choice is not None:
+    if mapped_tool_choice is not None and payload.get("tools"):
         payload["tool_choice"] = mapped_tool_choice
 
     return payload
@@ -1552,6 +1600,17 @@ def _apply_compaction_request_config(source: dict, target: dict) -> None:
         target[key] = value
 
 
+def _strip_chat_transcript_compaction_fields(target: dict) -> None:
+    if not isinstance(target, dict):
+        return
+
+    # Claude-targeted compaction already renders prior tool activity into
+    # plain-text transcript items, so forwarding live tool config can change
+    # the summarization turn instead of just summarizing it.
+    for key in ("tools", "tool_choice", "parallel_tool_calls"):
+        target.pop(key, None)
+
+
 def build_fake_compaction_request(body: dict) -> dict:
     request_input = body.get("input")
     if isinstance(request_input, list):
@@ -1580,6 +1639,8 @@ def build_fake_compaction_request(body: dict) -> dict:
     compact_request = {"input": input_items}
     _copy_compaction_passthrough_fields(body, compact_request)
     _apply_compaction_request_config(body, compact_request)
+    if _compaction_requires_chat_transcript(body.get("model")):
+        _strip_chat_transcript_compaction_fields(compact_request)
     return compact_request
 
 

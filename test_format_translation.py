@@ -189,7 +189,7 @@ class FormatTranslationTests(unittest.TestCase):
         self.assertEqual(compact_request["metadata"], body["metadata"])
         self.assertEqual(compact_request["user"], "user-123")
 
-    def test_build_fake_compaction_request_preserves_request_config(self):
+    def test_build_fake_compaction_request_preserves_request_config_for_codex_models(self):
         body = {
             "model": "gpt-5.4",
             "input": "hello",
@@ -214,6 +214,34 @@ class FormatTranslationTests(unittest.TestCase):
         self.assertEqual(compact_request["include"], body["include"])
         self.assertTrue(compact_request["parallel_tool_calls"])
         self.assertEqual(compact_request["tool_choice"], "auto")
+        self.assertTrue(compact_request["stream"])
+        self.assertFalse(compact_request["store"])
+
+    def test_build_fake_compaction_request_strips_tool_config_for_claude_models(self):
+        body = {
+            "model": "claude-opus-4.6",
+            "input": "hello",
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "Read",
+                    "description": "Read a file",
+                    "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+                }
+            ],
+            "include": ["reasoning.encrypted_content"],
+            "parallel_tool_calls": True,
+            "tool_choice": "auto",
+            "stream": True,
+            "store": False,
+        }
+
+        compact_request = format_translation.build_fake_compaction_request(body)
+
+        self.assertNotIn("tools", compact_request)
+        self.assertNotIn("tool_choice", compact_request)
+        self.assertNotIn("parallel_tool_calls", compact_request)
+        self.assertEqual(compact_request["include"], body["include"])
         self.assertTrue(compact_request["stream"])
         self.assertFalse(compact_request["store"])
 
@@ -311,6 +339,15 @@ class FormatTranslationTests(unittest.TestCase):
                     "output": "file contents",
                 },
             ],
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "Read",
+                    "description": "Read a file",
+                    "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+                }
+            ],
+            "tool_choice": "auto",
         }
 
         compact_request = format_translation.build_fake_compaction_request(body)
@@ -323,6 +360,8 @@ class FormatTranslationTests(unittest.TestCase):
             )
         )
         self.assertNotIn("tool_calls", translated["messages"][0])
+        self.assertNotIn("tools", translated)
+        self.assertNotIn("tool_choice", translated)
 
     def test_build_fake_compaction_request_preserves_native_responses_items_for_codex_models(self):
         body = {
@@ -569,6 +608,54 @@ class FormatTranslationTests(unittest.TestCase):
         self.assertEqual(translated["messages"][3]["role"], "tool")
         self.assertEqual(translated["messages"][3]["content"], "file contents")
         self.assertEqual(translated["stream_options"], {"include_usage": True})
+
+    def test_responses_request_to_chat_omits_empty_tool_config(self):
+        body = {
+            "model": "claude-opus-4.6",
+            "input": "hello",
+            "tools": [],
+            "tool_choice": "auto",
+        }
+
+        translated = format_translation.responses_request_to_chat(body)
+
+        self.assertNotIn("tools", translated)
+        self.assertNotIn("tool_choice", translated)
+        self.assertEqual(translated["messages"][0]["content"], "hello")
+
+    def test_responses_request_to_chat_merges_instructions_and_developer_messages(self):
+        body = {
+            "model": "claude-sonnet-4.6",
+            "instructions": "Base instructions",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "developer",
+                    "content": [{"type": "input_text", "text": "Extra developer guidance"}],
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "hello"}],
+                },
+            ],
+        }
+
+        translated = format_translation.responses_request_to_chat(body)
+
+        self.assertEqual([message["role"] for message in translated["messages"]], ["system", "user"])
+        system_content = translated["messages"][0]["content"]
+        if isinstance(system_content, str):
+            system_text = system_content
+        else:
+            system_text = "".join(
+                item.get("text", "")
+                for item in system_content
+                if isinstance(item, dict) and item.get("type") == "text"
+            )
+        self.assertIn("Base instructions", system_text)
+        self.assertIn("Extra developer guidance", system_text)
+        self.assertEqual(translated["messages"][1]["content"], "hello")
 
     def test_response_payload_to_anthropic_maps_function_call_and_usage(self):
         payload = {
