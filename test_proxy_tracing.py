@@ -1,0 +1,92 @@
+import unittest
+from types import SimpleNamespace
+from unittest import mock
+
+import httpx
+
+import proxy
+
+
+class ProxyTracingTests(unittest.TestCase):
+    def test_prepare_upstream_request_keeps_source_body_for_bridge_traces(self):
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/responses"),
+            method="POST",
+            headers={},
+        )
+        source_body = {"model": "gpt-5.4-mini", "input": "hello"}
+        upstream_body = {"model": "claude-sonnet-4.6", "messages": [{"role": "user", "content": "hello"}]}
+
+        with (
+            mock.patch.object(proxy, "request_tracing_enabled", return_value=False),
+            mock.patch.object(proxy.usage_tracker, "start_event", return_value={"request_id": "req_123"}),
+        ):
+            plan, error_response = proxy._prepare_upstream_request(
+                request,
+                body=upstream_body,
+                source_body=source_body,
+                requested_model="gpt-5.4-mini",
+                resolved_model="claude-sonnet-4.6",
+                upstream_path="/chat/completions",
+                upstream_url="https://example.invalid/chat/completions",
+                header_builder=lambda _api_key, _request_id: {"X-Initiator": "user"},
+                error_response=proxy.format_translation.openai_error_response,
+                api_key="test-key",
+                trace_metadata={"bridge": True, "strategy_name": "responses_to_chat"},
+            )
+
+        self.assertIsNone(error_response)
+        self.assertEqual(plan.source_body, source_body)
+        self.assertEqual(plan.body, upstream_body)
+        self.assertTrue(plan.trace_context["bridge"])
+        self.assertEqual(plan.trace_context["strategy_name"], "responses_to_chat")
+
+    def test_finish_usage_and_trace_emits_failure_diagnostic_for_bridge_request(self):
+        plan = proxy.UpstreamRequestPlan(
+            request_id="req_123",
+            upstream_url="https://example.invalid/chat/completions",
+            headers={"X-Initiator": "user", "Authorization": "Bearer hidden"},
+            body={"model": "claude-sonnet-4.6", "messages": [{"role": "user", "content": "hello"}]},
+            usage_event={"request_id": "req_123"},
+            requested_model="gpt-5.4-mini",
+            resolved_model="claude-sonnet-4.6",
+            source_body={"model": "gpt-5.4-mini", "input": "hello"},
+            trace_context={
+                "request_id": "req_123",
+                "client_path": "/v1/responses",
+                "upstream_path": "/chat/completions",
+                "bridge": True,
+                "strategy_name": "responses_to_chat",
+            },
+        )
+        upstream = httpx.Response(400, text="unsupported field: tool_choice")
+        response_payload = {"error": {"type": "invalid_request_error", "message": "unsupported field: tool_choice"}}
+
+        with (
+            mock.patch.object(proxy.usage_tracker, "finish_event"),
+            mock.patch.object(proxy, "request_tracing_enabled", return_value=False),
+            mock.patch.object(proxy, "_append_request_trace") as append_trace,
+        ):
+            proxy._finish_usage_and_trace(
+                plan,
+                400,
+                upstream=upstream,
+                response_payload=response_payload,
+                response_text="unsupported field: tool_choice",
+            )
+
+        append_trace.assert_called_once()
+        trace_payload = append_trace.call_args.args[0]
+        trace_kwargs = append_trace.call_args.kwargs
+
+        self.assertTrue(trace_kwargs["force"])
+        self.assertEqual(trace_payload["requested_model"], "gpt-5.4-mini")
+        self.assertEqual(trace_payload["resolved_model"], "claude-sonnet-4.6")
+        self.assertEqual(trace_payload["source_body"], {"model": "gpt-5.4-mini", "input": "hello"})
+        self.assertEqual(trace_payload["upstream_body"]["model"], "claude-sonnet-4.6")
+        self.assertEqual(trace_payload["outbound_headers"], {"X-Initiator": "user"})
+        self.assertEqual(trace_payload["response_text"], "unsupported field: tool_choice")
+
+
+if __name__ == "__main__":
+    unittest.main()
