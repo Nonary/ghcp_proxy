@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import time
 from collections import deque
@@ -332,6 +333,27 @@ def _github_rest_get_json(access_token: str, url: str, params: dict | None = Non
             raise RuntimeError(f"GitHub REST response from {url} had non-dict payload")
         return payload, scheme
     raise RuntimeError(last_error or f"GitHub REST request to {url} failed with unsupported authentication scheme")
+
+
+def _github_rest_error_status(error: Exception | str | None) -> int | None:
+    message = str(error or "")
+    match = re.search(r" failed: (\d{3})\b", message)
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return None
+
+
+def _is_inapplicable_user_billing_error(scope: str, error: Exception | str | None) -> bool:
+    if scope != "user":
+        return False
+    message = str(error or "")
+    return (
+        _github_rest_error_status(message) == 400
+        and "Unable to get billing usage data." in message
+    )
 
 
 def _load_cached_github_identity() -> dict | None:
@@ -1115,12 +1137,12 @@ class DashboardService:
         skip_cache: bool = False,
     ) -> dict:
         current = now or self.utc_now()
-        access_token = self.dependencies.load_billing_token() or self.dependencies.load_access_token()
+        access_token = self.dependencies.load_billing_token()
         if not access_token:
-            raise RuntimeError(
-                "No GitHub OAuth token is available for billing API requests. "
-                "Set GHCP_GITHUB_BILLING_TOKEN, set a billing token via /api/config/billing-token (UI), or run proxy auth."
-            )
+            result = _empty_official_premium_payload()
+            result["loaded_at"] = self.utc_now_iso()
+            result["error"] = None
+            return result
 
         identity = _fetch_github_identity(access_token)
         scope, target = _billing_target_from_env_or_identity(identity)
@@ -1143,6 +1165,7 @@ class DashboardService:
         payload = None
         cache_key = None
         last_error = None
+        saw_inapplicable_user_billing_error = False
         for attempt_scope, attempt_target in candidates:
             cache_key = _official_premium_cache_key(attempt_scope, attempt_target, current.year, current.month)
             if not skip_cache:
@@ -1162,6 +1185,14 @@ class DashboardService:
                     break
                 except Exception as exc:
                     last_error = str(exc)
+                    if _is_inapplicable_user_billing_error(attempt_scope, exc):
+                        saw_inapplicable_user_billing_error = True
+                        print(
+                            f"Billing API user-scoped usage unavailable for {attempt_scope}:{attempt_target}; "
+                            "trying alternate billing owners if available.",
+                            flush=True,
+                        )
+                        break
                     if "without month filter" in attempt_label:
                         print(
                             f"Billing API fallback attempt failed for {attempt_scope}:{attempt_target} "
@@ -1174,6 +1205,14 @@ class DashboardService:
                 break
 
         if payload is None or cache_key is None:
+            if saw_inapplicable_user_billing_error:
+                raise RuntimeError(
+                    "GitHub user-scoped billing usage is unavailable for this account. "
+                    "This usually means the Copilot plan is billed through an organization or enterprise instead of "
+                    "the personal account. Set GHCP_GITHUB_BILLING_SCOPE and GHCP_GITHUB_BILLING_TARGET to the "
+                    "billing owner, or use a billing token that can read that billing account. "
+                    f"Last error: {last_error}"
+                )
             raise RuntimeError(f"GitHub billing API failed after probing identities: {last_error}")
 
         endpoint_included = _extract_included_from_billing_payload(payload if isinstance(payload, dict) else {})

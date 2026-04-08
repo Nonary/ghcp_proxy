@@ -169,7 +169,6 @@ class FormatTranslationTests(unittest.TestCase):
         compact_request = format_translation.build_fake_compaction_request(body)
 
         self.assertEqual(compact_request["reasoning"], {"effort": "max"})
-
     def test_build_fake_compaction_request_preserves_cache_affinity_fields(self):
         body = {
             "model": "gpt-5.4",

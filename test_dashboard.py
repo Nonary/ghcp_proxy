@@ -1,3 +1,5 @@
+import contextlib
+import io
 import unittest
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -274,6 +276,91 @@ class DashboardTests(unittest.TestCase):
         self.assertFalse(cache_state["refreshing"])
         self.assertIsNone(cache_state["last_error"])
         self.assertGreater(cache_state["loaded_at"], 0.0)
+
+    def test_collect_official_premium_payload_skips_github_when_no_billing_token(self):
+        service = dashboard.DashboardService(
+            dependencies=dashboard.DashboardDependencies(
+                load_billing_token=lambda: None,
+                load_access_token=lambda: "access-token",
+                load_api_key_payload=lambda: {},
+            ),
+            sqlite_cache_put=lambda *args, **kwargs: None,
+        )
+
+        with mock.patch.object(dashboard, "_fetch_github_identity") as fetch_identity:
+            payload = service.collect_official_premium_payload(skip_cache=True)
+
+        fetch_identity.assert_not_called()
+        self.assertFalse(payload["available"])
+        self.assertIsNone(payload["error"])
+
+    def test_collect_official_premium_payload_falls_back_to_org_after_user_scope_400(self):
+        fixed_now = datetime(2026, 4, 4, 18, 0, tzinfo=timezone.utc)
+        org_payload = {
+            "included": 1500,
+            "usageItems": [{"grossQuantity": 80, "discountQuantity": 80, "netQuantity": 0}],
+        }
+        service = dashboard.DashboardService(
+            dependencies=dashboard.DashboardDependencies(
+                load_billing_token=lambda: "token",
+                load_access_token=lambda: None,
+                load_api_key_payload=lambda: {},
+            ),
+            sqlite_cache_put=lambda *args, **kwargs: None,
+        )
+
+        def fake_rest_get(access_token, url, params=None):
+            if "/users/" in url:
+                raise RuntimeError(
+                    f"GitHub REST request to {url} failed: 400 "
+                    '{"message":"Unable to get billing usage data.","status":"400"}'
+                )
+            if "/organizations/" in url:
+                return org_payload, "Bearer"
+            raise AssertionError(f"unexpected url {url}")
+
+        stdout = io.StringIO()
+        with (
+            mock.patch.object(dashboard, "_fetch_github_identity", return_value={"login": "user-login"}),
+            mock.patch.object(dashboard, "_load_billing_org_candidates", return_value=["acme-inc"]),
+            mock.patch.object(dashboard, "_github_rest_get_json", side_effect=fake_rest_get),
+            contextlib.redirect_stdout(stdout),
+        ):
+            payload = service.collect_official_premium_payload(now=fixed_now, skip_cache=True)
+
+        self.assertTrue(payload["available"])
+        self.assertEqual(payload["scope"], "org")
+        self.assertEqual(payload["target"], "acme-inc")
+        self.assertEqual(payload["used"], 80.0)
+        self.assertNotIn("Billing API fallback attempt failed", stdout.getvalue())
+
+    def test_collect_official_premium_payload_raises_actionable_error_for_user_scope_400(self):
+        fixed_now = datetime(2026, 4, 4, 18, 0, tzinfo=timezone.utc)
+        service = dashboard.DashboardService(
+            dependencies=dashboard.DashboardDependencies(
+                load_billing_token=lambda: "token",
+                load_access_token=lambda: None,
+                load_api_key_payload=lambda: {},
+            ),
+            sqlite_cache_put=lambda *args, **kwargs: None,
+        )
+
+        def fake_rest_get(access_token, url, params=None):
+            raise RuntimeError(
+                f"GitHub REST request to {url} failed: 400 "
+                '{"message":"Unable to get billing usage data.","status":"400"}'
+            )
+
+        with (
+            mock.patch.object(dashboard, "_fetch_github_identity", return_value={"login": "user-login"}),
+            mock.patch.object(dashboard, "_load_billing_org_candidates", return_value=[]),
+            mock.patch.object(dashboard, "_github_rest_get_json", side_effect=fake_rest_get),
+        ):
+            with self.assertRaises(RuntimeError) as ctx:
+                service.collect_official_premium_payload(now=fixed_now, skip_cache=True)
+
+        self.assertIn("GHCP_GITHUB_BILLING_SCOPE", str(ctx.exception))
+        self.assertIn("organization or enterprise", str(ctx.exception))
 
     def test_normalize_session_claude_accepts_cached_input_tokens_shape(self):
         normalized = dashboard.normalize_session(
