@@ -171,7 +171,7 @@ The local cost estimates use the common model rates configured in `proxy.py`, in
 
 If GitHub does not expose an official remaining premium-request count in the Copilot token payload, the dashboard shows a tracked remaining value based on successful proxied requests for the current month.
 
-You can force official Copilot billing lookups with a token in one of two ways:
+Official Copilot billing lookups are only attempted when a dedicated billing token is configured:
 
 ```bash
 export GHCP_GITHUB_BILLING_TOKEN="gho_xxx"
@@ -179,16 +179,21 @@ export GHCP_GITHUB_BILLING_TOKEN="gho_xxx"
 
 You can also configure it from the dashboard at `http://localhost:8000/ui` under **GitHub Billing Token**.
 
-If you are billed through an organization or enterprise account, set:
+If no billing token is configured, the dashboard skips GitHub billing API calls and only shows tracked local usage.
+
+If you are billed through an organization or enterprise account, the personal user billing endpoint may return `400 Unable to get billing usage data.` In that case, set the billing owner explicitly:
 
 ```bash
 export GHCP_GITHUB_BILLING_SCOPE=org
 export GHCP_GITHUB_BILLING_TARGET=my-org-slug
 ```
 
+Use `enterprise` instead of `org` when the seat is billed to an enterprise account.
+
+Auto-discovery of organization billing owners depends on the token being able to enumerate the user's org memberships. A token that is sufficient for personal-account billing can still fail org discovery, so explicit `GHCP_GITHUB_BILLING_SCOPE` and `GHCP_GITHUB_BILLING_TARGET` are the most reliable configuration for org-managed seats.
+
 The dashboard cache is also persisted in SQLite for fast startup/refreshes:
 
 ```bash
 export GHCP_CACHE_DB_PATH="~/.config/ghcp_proxy/ghcp-dashboard-cache.sqlite3"
 ```
-

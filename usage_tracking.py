@@ -184,7 +184,7 @@ def _usage_event_archive_key(summary: dict) -> str:
     if isinstance(request_id, str) and request_id:
         return f"request:{request_id}"
     serialized = json.dumps(summary, sort_keys=True, separators=(",", ":"), default=_json_default)
-    return f"summary:{hashlib.sha1(serialized.encode('utf-8')).hexdigest()}"
+    return f"summary:{hashlib.sha256(serialized.encode('utf-8')).hexdigest()}"
 
 
 def _initiator_log_label(initiator: str | None) -> str:

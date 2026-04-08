@@ -1573,7 +1573,6 @@ def _compaction_transcript_input_items(input_items) -> list[dict]:
 
     return transcript
 
-
 def _compaction_requires_chat_transcript(model_name) -> bool:
     normalized = normalize_upstream_model_name(resolve_copilot_model_name(model_name))
     if not isinstance(normalized, str):
@@ -1623,8 +1622,6 @@ def _strip_chat_transcript_compaction_fields(target: dict) -> None:
         for key in ("tools", "tool_choice"):
             target.pop(key, None)
     target.pop("parallel_tool_calls", None)
-
-
 def build_fake_compaction_request(body: dict) -> dict:
     request_input = body.get("input")
     if isinstance(request_input, list):
@@ -1685,5 +1682,4 @@ def extract_response_output_text(payload: dict) -> str | None:
     if not parts:
         return None
     return "\n\n".join(parts)
-
 
