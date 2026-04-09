@@ -110,6 +110,68 @@ def _determine_responses_candidate(input_param) -> tuple[object, str]:
     return input_param, AGENT_INITIATOR
 
 
+def _responses_item_text(item) -> str:
+    if not isinstance(item, dict):
+        return ""
+
+    content = item.get("content")
+    if isinstance(content, str):
+        return content
+
+    if isinstance(content, list):
+        parts: list[str] = []
+        for entry in content:
+            if not isinstance(entry, dict):
+                continue
+            for key in ("text", "input_text"):
+                value = entry.get(key)
+                if isinstance(value, str):
+                    parts.append(value)
+                    break
+        return "".join(parts)
+
+    for key in ("text", "input_text"):
+        value = item.get(key)
+        if isinstance(value, str):
+            return value
+    return ""
+
+
+def _is_environment_context_message(item) -> bool:
+    if not isinstance(item, dict):
+        return False
+    if str(item.get("role", "")).lower() != "user":
+        return False
+    text = _responses_item_text(item).lstrip()
+    return text.startswith("<environment_context>") and "</environment_context>" in text
+
+
+def _is_codex_bootstrap_mini_request(input_param, model_name: str | None) -> bool:
+    if _normalize_model_name(model_name) != "gpt-5.4-mini":
+        return False
+    if not isinstance(input_param, list):
+        return False
+
+    message_items: list[dict] = []
+    for item in input_param:
+        if not isinstance(item, dict):
+            continue
+        item_type = str(item.get("type", "")).lower()
+        role = str(item.get("role", "")).lower()
+        if item_type == "message" or role:
+            message_items.append(item)
+
+    if len(message_items) < 2:
+        return False
+
+    for item in message_items[:-1]:
+        role = str(item.get("role", "")).lower()
+        if role not in {"developer", "system"}:
+            return False
+
+    return _is_environment_context_message(message_items[-1])
+
+
 def _determine_chat_candidate(messages) -> str:
     if not isinstance(messages, list):
         return AGENT_INITIATOR
@@ -238,6 +300,8 @@ class InitiatorPolicy:
         request_id: str | None = None,
     ) -> tuple[object, str]:
         normalized_input, candidate = _determine_responses_candidate(input_param)
+        if _is_codex_bootstrap_mini_request(normalized_input, model_name):
+            candidate = AGENT_INITIATOR
         initiator = self.resolve_initiator(
             candidate,
             model_name,

@@ -52,6 +52,42 @@ class InitiatorPolicyTests(unittest.TestCase):
 
         self.assertEqual(headers["X-Initiator"], "agent")
 
+    def test_codex_bootstrap_mini_does_not_activate_safeguard(self):
+        policy = initiator_policy.InitiatorPolicy()
+        bootstrap_input = [
+            {
+                "type": "message",
+                "role": "developer",
+                "content": [{"type": "input_text", "text": "developer instructions"}],
+            },
+            {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": "<environment_context>\n  <cwd>D:\\sources\\ghcp_proxy</cwd>\n</environment_context>",
+                    }
+                ],
+            },
+        ]
+        start = datetime(2026, 4, 4, 18, 0, tzinfo=timezone.utc)
+
+        with mock.patch.object(initiator_policy, "utc_now", return_value=start):
+            _normalized, initiator = policy.resolve_responses_input(
+                bootstrap_input,
+                "gpt-5.4-mini",
+                request_id="bootstrap-1",
+            )
+
+        self.assertEqual(initiator, "agent")
+
+        with mock.patch.object(initiator_policy, "utc_now", return_value=start.replace(second=1)):
+            self.assertEqual(
+                policy.resolve_initiator("user", "gpt-5.4", request_id="user-1"),
+                "user",
+            )
+
     def test_active_request_forces_following_user_request_to_agent(self):
         policy = initiator_policy.InitiatorPolicy()
         start = datetime(2026, 4, 4, 18, 0, tzinfo=timezone.utc)
