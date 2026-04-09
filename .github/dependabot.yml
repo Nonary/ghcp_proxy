@@ -1,0 +1,48 @@
+# Dependabot Configuration Summary:
+# ---------------------------------
+# Please do not delete this file. In case of any issues, questions, or feedback,
+# please reach out to the DevSecOps team via CORPDLDevSecOpsEnablementTeam@HCAHealthcare.com
+#
+# This file enables automated dependency updates for this repository.
+# It ensures dependencies remain up-to-date and helps prevent security vulnerabilities.
+# Dependabot monitors package ecosystems (e.g., npm, pip, maven, GitHub Actions)
+# and submits pull requests when updates are available.
+#
+# Key Benefits:
+# - Improves security by patching known vulnerabilities in dependencies.
+# - Automates maintenance to reduce manual updates.
+# - Enhances stability by keeping software versions current.
+# - Supports multiple ecosystems for comprehensive dependency management.
+#
+# Modify this file to adjust update frequency, assign reviewers, add labels,
+# or ignore specific dependencies based on project requirements.
+
+version: 2
+updates:
+- package-ecosystem: github-actions
+  directory: /
+  schedule:
+    interval: weekly
+    day: wednesday
+    time: "07:00"
+  open-pull-requests-limit: 10
+  commit-message:
+    prefix: dependabot
+  groups:
+    all-dependencies:
+      patterns:
+      - '*'
+- package-ecosystem: pip
+  directories:
+  - /**
+  schedule:
+    interval: weekly
+    day: wednesday
+    time: "07:00"
+  open-pull-requests-limit: 10
+  commit-message:
+    prefix: dependabot
+  groups:
+    all-dependencies:
+      patterns:
+      - '*'
