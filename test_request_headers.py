@@ -29,6 +29,73 @@ class RequestHeadersTests(unittest.TestCase):
         self.assertEqual(headers["X-Initiator"], "user")
         self.assertEqual(body["input"], "hello")
 
+    def test_gpt_5_4_mini_environment_bootstrap_is_agent(self):
+        request = SimpleNamespace(url=SimpleNamespace(path="/v1/responses"), headers={})
+        body = {
+            "model": "gpt-5.4-mini",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "developer",
+                    "content": [{"type": "input_text", "text": "developer instructions"}],
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": "<environment_context>\n  <cwd>D:\\sources\\ghcp_proxy</cwd>\n</environment_context>",
+                        }
+                    ],
+                },
+            ],
+        }
+
+        headers = format_translation.build_responses_headers_for_request(
+            request, body, "test-key",
+            initiator_policy=proxy._initiator_policy,
+            session_id_resolver=usage_tracking.request_session_id,
+        )
+
+        self.assertEqual(headers["X-Initiator"], "agent")
+
+    def test_gpt_5_4_mini_real_user_prompt_stays_user(self):
+        request = SimpleNamespace(url=SimpleNamespace(path="/v1/responses"), headers={})
+        body = {
+            "model": "gpt-5.4-mini",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "developer",
+                    "content": [{"type": "input_text", "text": "developer instructions"}],
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": "<environment_context>\n  <cwd>D:\\sources\\ghcp_proxy</cwd>\n</environment_context>",
+                        }
+                    ],
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Fix the safeguard bug"}],
+                },
+            ],
+        }
+
+        headers = format_translation.build_responses_headers_for_request(
+            request, body, "test-key",
+            initiator_policy=proxy._initiator_policy,
+            session_id_resolver=usage_tracking.request_session_id,
+        )
+
+        self.assertEqual(headers["X-Initiator"], "user")
+
     def test_underscore_prefixed_responses_string_is_agent_and_stripped(self):
         request = SimpleNamespace(url=SimpleNamespace(path="/v1/responses"), headers={})
         body = {
