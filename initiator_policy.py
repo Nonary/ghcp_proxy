@@ -99,8 +99,13 @@ def _determine_responses_candidate(input_param) -> tuple[object, str]:
         for item in reversed(input_param):
             if not isinstance(item, dict):
                 continue
-            if str(item.get("role", "")).lower() == "user":
-                return input_param, _strip_agent_initiator_prefix_from_item(item)
+            item_type = str(item.get("type", "")).lower()
+            role = str(item.get("role", "")).lower()
+            if item_type == "message" or role:
+                if role == "user":
+                    return input_param, _strip_agent_initiator_prefix_from_item(item)
+                return input_param, AGENT_INITIATOR
+            return input_param, AGENT_INITIATOR
 
     return input_param, AGENT_INITIATOR
 
@@ -110,8 +115,13 @@ def _determine_chat_candidate(messages) -> str:
         return AGENT_INITIATOR
 
     for message in reversed(messages):
-        if isinstance(message, dict) and str(message.get("role", "")).lower() == "user":
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role", "")).lower()
+        if role == "user":
             return _strip_agent_initiator_prefix_from_item(message)
+        if role:
+            return AGENT_INITIATOR
     return AGENT_INITIATOR
 
 
@@ -130,10 +140,18 @@ def _strip_agent_initiator_prefix_from_anthropic_message(message) -> str:
     if not isinstance(content, list):
         return USER_INITIATOR
 
+    saw_tool_result = False
+    saw_non_tool_result = False
     for item in content:
         if not isinstance(item, dict):
+            saw_non_tool_result = True
             continue
-        if str(item.get("type", "")).lower() != "text":
+        item_type = str(item.get("type", "")).lower()
+        if item_type == "tool_result":
+            saw_tool_result = True
+            continue
+        saw_non_tool_result = True
+        if item_type != "text":
             continue
         text = item.get("text")
         if not isinstance(text, str):
@@ -142,6 +160,8 @@ def _strip_agent_initiator_prefix_from_anthropic_message(message) -> str:
         if explicit_agent:
             item["text"] = updated_text
             return AGENT_INITIATOR
+    if saw_tool_result and not saw_non_tool_result:
+        return AGENT_INITIATOR
     return USER_INITIATOR
 
 
@@ -150,8 +170,13 @@ def _determine_anthropic_candidate(messages) -> str:
         return AGENT_INITIATOR
 
     for message in reversed(messages):
-        if isinstance(message, dict) and str(message.get("role", "")).lower() == "user":
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role", "")).lower()
+        if role == "user":
             return _strip_agent_initiator_prefix_from_anthropic_message(message)
+        if role:
+            return AGENT_INITIATOR
     return AGENT_INITIATOR
 
 

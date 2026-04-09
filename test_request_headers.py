@@ -81,6 +81,65 @@ class RequestHeadersTests(unittest.TestCase):
         self.assertEqual(headers["X-Initiator"], "agent")
         self.assertEqual(messages[-1]["content"], "finish the task")
 
+    def test_responses_function_call_output_follow_up_stays_agent(self):
+        request = SimpleNamespace(url=SimpleNamespace(path="/v1/responses"), headers={})
+        body = {
+            "model": "gpt-5",
+            "input": [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "read main.py"}]},
+                {"type": "function_call", "call_id": "call_1", "name": "Read", "arguments": "{\"file\":\"main.py\"}"},
+                {"type": "function_call_output", "call_id": "call_1", "output": "file contents"},
+            ],
+        }
+
+        headers = format_translation.build_responses_headers_for_request(
+            request, body, "test-key",
+            initiator_policy=proxy._initiator_policy,
+            session_id_resolver=usage_tracking.request_session_id,
+        )
+
+        self.assertEqual(headers["X-Initiator"], "agent")
+
+    def test_responses_mcp_approval_response_follow_up_stays_agent(self):
+        request = SimpleNamespace(url=SimpleNamespace(path="/v1/responses"), headers={})
+        body = {
+            "model": "gpt-5",
+            "input": [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "run the command"}]},
+                {"type": "mcp_approval_response", "approval_request_id": "apr_1", "approve": True},
+            ],
+        }
+
+        headers = format_translation.build_responses_headers_for_request(
+            request, body, "test-key",
+            initiator_policy=proxy._initiator_policy,
+            session_id_resolver=usage_tracking.request_session_id,
+        )
+
+        self.assertEqual(headers["X-Initiator"], "agent")
+
+    def test_chat_tool_message_follow_up_stays_agent(self):
+        request = SimpleNamespace(url=SimpleNamespace(path="/v1/chat/completions"), headers={})
+        messages = [
+            {"role": "user", "content": "read main.py"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "call_1", "type": "function", "function": {"name": "Read", "arguments": "{\"file\":\"main.py\"}"}}
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "file contents"},
+        ]
+
+        headers = format_translation.build_chat_headers_for_request(
+            request, messages, "gpt-4.1", "test-key",
+            initiator_policy=proxy._initiator_policy,
+            session_id_resolver=usage_tracking.request_session_id,
+        )
+
+        self.assertEqual(headers["X-Initiator"], "agent")
+
     def test_anthropic_underscore_prefixed_user_message_is_agent_and_stripped(self):
         request = SimpleNamespace(url=SimpleNamespace(path="/v1/messages"), headers={})
         body = {
@@ -101,6 +160,61 @@ class RequestHeadersTests(unittest.TestCase):
 
         self.assertEqual(headers["X-Initiator"], "agent")
         self.assertEqual(body["messages"][0]["content"][0]["text"], "hello")
+
+    def test_anthropic_tool_result_follow_up_stays_agent(self):
+        request = SimpleNamespace(url=SimpleNamespace(path="/v1/messages"), headers={})
+        body = {
+            "model": "claude-sonnet-4.6",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "read main.py"}],
+                },
+                {
+                    "role": "assistant",
+                    "content": [{"type": "tool_use", "id": "toolu_1", "name": "Read", "input": {"file": "main.py"}}],
+                },
+                {
+                    "role": "user",
+                    "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "file contents"}],
+                },
+            ],
+        }
+
+        headers = format_translation.build_anthropic_headers_for_request(
+            request, body, "test-key",
+            initiator_policy=proxy._initiator_policy,
+            session_id_resolver=usage_tracking.request_session_id,
+        )
+
+        self.assertEqual(headers["X-Initiator"], "agent")
+
+    def test_anthropic_user_text_after_tool_result_is_user(self):
+        request = SimpleNamespace(url=SimpleNamespace(path="/v1/messages"), headers={})
+        body = {
+            "model": "claude-sonnet-4.6",
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [{"type": "tool_use", "id": "toolu_1", "name": "Read", "input": {"file": "main.py"}}],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "tool_result", "tool_use_id": "toolu_1", "content": "file contents"},
+                        {"type": "text", "text": "now summarize it"},
+                    ],
+                },
+            ],
+        }
+
+        headers = format_translation.build_anthropic_headers_for_request(
+            request, body, "test-key",
+            initiator_policy=proxy._initiator_policy,
+            session_id_resolver=usage_tracking.request_session_id,
+        )
+
+        self.assertEqual(headers["X-Initiator"], "user")
 
     def test_build_anthropic_headers_for_request_uses_body_session_id(self):
         request = SimpleNamespace(url=SimpleNamespace(path="/v1/messages"), headers={})
