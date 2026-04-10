@@ -271,6 +271,76 @@ class ProxyRoutesTests(unittest.TestCase):
             b'{"id":"chatcmpl_123","object":"response","created_at":null,"status":"completed","model":"claude-opus-4.6","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello from claude"}]}],"output_text":"hello from claude","usage":{"input_tokens":20,"output_tokens":4,"total_tokens":24}}',
         )
 
+    def test_responses_route_mapped_to_claude_accepts_custom_tool_history(self):
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/responses"),
+            method="POST",
+            headers={},
+        )
+        body = {
+            "model": "gpt-5.2",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "continue"}],
+                },
+                {
+                    "type": "custom_tool_call",
+                    "call_id": "call_1",
+                    "name": "apply_patch",
+                    "input": "*** Begin Patch\n*** End Patch",
+                },
+                {
+                    "type": "custom_tool_call_output",
+                    "call_id": "call_1",
+                    "output": "Exit code: 0\nSuccess.",
+                },
+            ],
+            "stream": False,
+        }
+        upstream = httpx.Response(
+            200,
+            json={
+                "id": "chatcmpl_123",
+                "model": "claude-opus-4.6",
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "bridged ok",
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 20,
+                    "completion_tokens": 4,
+                },
+            },
+            headers={"content-type": "application/json"},
+        )
+
+        with (
+            mock.patch.object(proxy, "parse_json_request", mock.AsyncMock(return_value=body)),
+            mock.patch.object(auth, "get_api_key", return_value="test-key"),
+            mock.patch.object(auth, "get_api_base", return_value="https://example.invalid"),
+            mock.patch.object(proxy.model_routing_config_service, "resolve_target_model", return_value="claude-opus-4.6"),
+            mock.patch.object(format_translation, "build_chat_headers_for_request", return_value={"X-Initiator": "user"}),
+            mock.patch.object(proxy.usage_tracker, "start_event", return_value=None),
+            mock.patch.object(proxy.usage_tracker, "finish_event"),
+            mock.patch.object(proxy, "throttled_client_post", mock.AsyncMock(return_value=upstream)) as post,
+        ):
+            response = proxy.asyncio.run(proxy.responses(request))
+
+        outbound = post.await_args.kwargs["json"]
+        self.assertEqual(outbound["messages"][0]["role"], "user")
+        self.assertEqual(outbound["messages"][1]["role"], "assistant")
+        self.assertIn("[Custom tool call (call_1)] apply_patch", outbound["messages"][1]["content"])
+        self.assertEqual(outbound["messages"][2]["role"], "user")
+        self.assertIn("[Custom tool result (call_1)]", outbound["messages"][2]["content"])
+        self.assertEqual(response.status_code, 200)
+
     def test_anthropic_messages_route_mapped_to_codex_uses_responses_upstream_and_returns_anthropic_shape(self):
         request = SimpleNamespace(
             url=SimpleNamespace(path="/v1/messages"),

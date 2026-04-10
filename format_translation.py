@@ -528,6 +528,42 @@ def responses_tool_choice_to_chat(tool_choice):
     raise ValueError("Unsupported Responses tool_choice value")
 
 
+def _format_custom_tool_call_for_chat(item: dict) -> str | None:
+    name = item.get("name")
+    if not isinstance(name, str) or not name:
+        return None
+
+    tool_input = item.get("input")
+    if isinstance(tool_input, str):
+        input_text = tool_input.strip() or "[no input]"
+    elif tool_input is None:
+        input_text = "[no input]"
+    else:
+        input_text = json.dumps(tool_input, separators=(",", ":"))
+
+    call_id = item.get("call_id") or item.get("id")
+    call_suffix = f" ({call_id})" if isinstance(call_id, str) and call_id else ""
+    return f"[Custom tool call{call_suffix}] {name}\n{input_text}"
+
+
+def _format_custom_tool_output_for_chat(item: dict) -> str:
+    call_id = item.get("call_id")
+    label = f"[Custom tool result ({call_id})]" if isinstance(call_id, str) and call_id else "[Custom tool result]"
+
+    output = item.get("output")
+    if isinstance(output, list):
+        output_text = "".join(util.extract_item_text(part) for part in output if isinstance(part, dict))
+    elif isinstance(output, str):
+        output_text = output
+    elif output is None:
+        output_text = ""
+    else:
+        output_text = json.dumps(output, separators=(",", ":"))
+
+    output_text = output_text.strip()
+    return f"{label}\n{output_text}" if output_text else label
+
+
 def responses_request_to_chat(body: dict) -> dict:
     raw_input = body.get("input")
     chat_messages = []
@@ -598,6 +634,25 @@ def responses_request_to_chat(body: dict) -> dict:
                         "role": "tool",
                         "tool_call_id": call_id,
                         "content": output_text,
+                    }
+                )
+                continue
+            if item_type == "custom_tool_call":
+                custom_tool_text = _format_custom_tool_call_for_chat(item)
+                if custom_tool_text is None:
+                    raise ValueError("Responses custom_tool_call items must include a name")
+                chat_messages.append(
+                    {
+                        "role": "assistant",
+                        "content": custom_tool_text,
+                    }
+                )
+                continue
+            if item_type == "custom_tool_call_output":
+                chat_messages.append(
+                    {
+                        "role": "user",
+                        "content": _format_custom_tool_output_for_chat(item),
                     }
                 )
                 continue
@@ -1407,6 +1462,58 @@ def _latest_compaction_window(input_items):
     return input_items[latest_compaction_index:]
 
 
+def _summarize_inline_data_image(image_url: str, *, detail=None) -> str | None:
+    if not isinstance(image_url, str) or not image_url.startswith("data:"):
+        return None
+
+    media_type = "inline image"
+    if ";" in image_url and image_url.startswith("data:"):
+        media_type = image_url[5:].split(";", 1)[0] or media_type
+
+    summary = f"[inline tool image omitted: {media_type}, {len(image_url)} chars]"
+    if isinstance(detail, str) and detail.strip():
+        summary = f"{summary[:-1]}, detail={detail.strip()}]"
+    return summary
+
+
+def _sanitize_function_call_output_item(item: dict) -> dict:
+    if not isinstance(item, dict) or item.get("type") != "function_call_output":
+        return item
+
+    output = item.get("output")
+    if not isinstance(output, list):
+        return item
+
+    changed = False
+    sanitized_output = []
+    for part in output:
+        if not isinstance(part, dict):
+            sanitized_output.append(part)
+            continue
+
+        if str(part.get("type", "")).lower() != "input_image":
+            sanitized_output.append(part)
+            continue
+
+        image_url = part.get("image_url")
+        if isinstance(image_url, dict):
+            image_url = image_url.get("url")
+        summary_text = _summarize_inline_data_image(image_url, detail=part.get("detail"))
+        if summary_text is None:
+            sanitized_output.append(part)
+            continue
+
+        changed = True
+        sanitized_output.append({"type": "input_text", "text": summary_text})
+
+    if not changed:
+        return item
+    return {
+        **item,
+        "output": sanitized_output,
+    }
+
+
 def sanitize_input(input_items):
     """
     Preserve encrypted_content in reasoning items for multi-turn correctness.
@@ -1442,6 +1549,10 @@ def sanitize_input(input_items):
                 )
                 continue
             result.append(item)
+            continue
+
+        if item_type == "function_call_output":
+            result.append(_sanitize_function_call_output_item(item))
             continue
 
         if item_type != "reasoning":
