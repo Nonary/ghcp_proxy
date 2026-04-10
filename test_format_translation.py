@@ -362,6 +362,41 @@ class FormatTranslationTests(unittest.TestCase):
         self.assertEqual(len(translated["tools"]), 1)
         self.assertEqual(translated["tool_choice"], "none")
 
+    def test_responses_request_to_chat_transcriptizes_custom_tool_history(self):
+        body = {
+            "model": "claude-opus-4.6",
+            "input": [
+                {
+                    "type": "custom_tool_call",
+                    "call_id": "call_1",
+                    "name": "apply_patch",
+                    "status": "completed",
+                    "input": "*** Begin Patch\n*** Update File: a.txt\n+hello\n*** End Patch",
+                },
+                {
+                    "type": "custom_tool_call_output",
+                    "call_id": "call_1",
+                    "output": "Exit code: 0\nOutput:\nSuccess.",
+                },
+            ],
+        }
+
+        translated = format_translation.responses_request_to_chat(body)
+
+        self.assertEqual(
+            translated["messages"],
+            [
+                {
+                    "role": "assistant",
+                    "content": "[Custom tool call (call_1)] apply_patch\n*** Begin Patch\n*** Update File: a.txt\n+hello\n*** End Patch",
+                },
+                {
+                    "role": "user",
+                    "content": "[Custom tool result (call_1)]\nExit code: 0\nOutput:\nSuccess.",
+                },
+            ],
+        )
+
     def test_build_fake_compaction_request_preserves_native_responses_items_for_codex_models(self):
         body = {
             "model": "gpt-5.4",
@@ -510,6 +545,39 @@ class FormatTranslationTests(unittest.TestCase):
                     "role": "user",
                     "content": [{"type": "input_text", "text": "continue from here"}],
                 },
+            ],
+        )
+
+    def test_sanitize_input_replaces_inline_tool_images_with_text_summary(self):
+        sanitized = format_translation.sanitize_input(
+            [
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_123",
+                    "output": [
+                        {
+                            "type": "input_image",
+                            "image_url": "data:image/png;base64,AAAA",
+                            "detail": "original",
+                        }
+                    ],
+                }
+            ]
+        )
+
+        self.assertEqual(
+            sanitized,
+            [
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_123",
+                    "output": [
+                        {
+                            "type": "input_text",
+                            "text": "[inline tool image omitted: image/png, 26 chars, detail=original]",
+                        }
+                    ],
+                }
             ],
         )
 
