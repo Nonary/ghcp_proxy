@@ -112,7 +112,7 @@ class RequestHeadersTests(unittest.TestCase):
         self.assertEqual(headers["X-Initiator"], "agent")
         self.assertEqual(body["input"], "hello")
 
-    def test_only_latest_responses_user_item_controls_agent_prefix(self):
+    def test_responses_history_with_assistant_item_and_trailing_user_is_user(self):
         request = SimpleNamespace(url=SimpleNamespace(path="/v1/responses"), headers={})
         body = {
             "model": "gpt-5",
@@ -130,7 +130,54 @@ class RequestHeadersTests(unittest.TestCase):
         )
 
         self.assertEqual(headers["X-Initiator"], "user")
+        self.assertEqual(body["input"][0]["content"], "old request")
         self.assertEqual(body["input"][-1]["content"], "new request")
+
+    def test_responses_underscore_prefixed_user_before_tool_history_is_agent(self):
+        request = SimpleNamespace(url=SimpleNamespace(path="/v1/responses"), headers={})
+        body = {
+            "model": "gpt-5.4",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "developer",
+                    "content": [{"type": "input_text", "text": "developer instructions"}],
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "_open the codeql csv for me"}],
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "I’m checking the file now."}],
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "Read",
+                    "arguments": "{\"file\":\"alerts.csv\"}",
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "csv contents",
+                },
+            ],
+        }
+
+        headers = format_translation.build_responses_headers_for_request(
+            request, body, "test-key",
+            initiator_policy=proxy._initiator_policy,
+            session_id_resolver=usage_tracking.request_session_id,
+        )
+
+        self.assertEqual(headers["X-Initiator"], "agent")
+        self.assertEqual(
+            body["input"][1]["content"][0]["text"],
+            "open the codeql csv for me",
+        )
 
     def test_chat_underscore_prefixed_user_message_is_agent_and_stripped(self):
         request = SimpleNamespace(url=SimpleNamespace(path="/v1/chat/completions"), headers={})

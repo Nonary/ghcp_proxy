@@ -88,6 +88,126 @@ class InitiatorPolicyTests(unittest.TestCase):
                 "user",
             )
 
+    def test_responses_latest_user_message_wins_over_prior_assistant_history(self):
+        policy = initiator_policy.InitiatorPolicy()
+        input_items = [
+            {"type": "message", "role": "assistant", "content": "previous answer"},
+            {"type": "message", "role": "user", "content": "new prompt"},
+        ]
+
+        normalized_input, initiator = policy.resolve_responses_input(input_items, "gpt-5.4")
+
+        self.assertIs(normalized_input, input_items)
+        self.assertEqual(initiator, "user")
+
+    def test_responses_latest_user_message_wins_over_prior_tool_history(self):
+        policy = initiator_policy.InitiatorPolicy()
+        input_items = [
+            {"type": "message", "role": "assistant", "content": "calling tool"},
+            {"type": "function_call", "call_id": "call-1", "name": "search", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call-1", "output": "result"},
+            {"type": "message", "role": "user", "content": "continue with this"},
+        ]
+
+        normalized_input, initiator = policy.resolve_responses_input(input_items, "gpt-5.4")
+
+        self.assertIs(normalized_input, input_items)
+        self.assertEqual(initiator, "user")
+
+    def test_responses_function_call_output_tail_stays_agent(self):
+        policy = initiator_policy.InitiatorPolicy()
+        input_items = [
+            {"type": "message", "role": "user", "content": "find it"},
+            {"type": "function_call", "call_id": "call-1", "name": "search", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call-1", "output": "result"},
+        ]
+
+        _normalized_input, initiator = policy.resolve_responses_input(input_items, "gpt-5.4")
+
+        self.assertEqual(initiator, "agent")
+
+    def test_plus_prefix_forces_user_for_plain_responses_input(self):
+        policy = initiator_policy.InitiatorPolicy()
+
+        normalized_input, initiator = policy.resolve_responses_input("+ hello", "gpt-5.4")
+
+        self.assertEqual(normalized_input, "hello")
+        self.assertEqual(initiator, "user")
+
+    def test_plus_prefix_forces_user_for_latest_responses_user_message(self):
+        policy = initiator_policy.InitiatorPolicy()
+        input_items = [
+            {"type": "message", "role": "assistant", "content": "previous answer"},
+            {"type": "message", "role": "user", "content": "+ new prompt"},
+        ]
+
+        normalized_input, initiator = policy.resolve_responses_input(input_items, "gpt-5.4")
+
+        self.assertIs(normalized_input, input_items)
+        self.assertEqual(input_items[-1]["content"], "new prompt")
+        self.assertEqual(initiator, "user")
+
+    def test_plus_prefix_forces_user_for_chat_messages(self):
+        policy = initiator_policy.InitiatorPolicy()
+        messages = [
+            {"role": "assistant", "content": "previous answer"},
+            {"role": "user", "content": "+ new prompt"},
+        ]
+
+        initiator = policy.resolve_chat_messages(messages, "gpt-5.4")
+
+        self.assertEqual(messages[-1]["content"], "new prompt")
+        self.assertEqual(initiator, "user")
+
+    def test_plus_prefix_forces_user_for_anthropic_messages(self):
+        policy = initiator_policy.InitiatorPolicy()
+        messages = [
+            {"role": "assistant", "content": [{"type": "text", "text": "previous answer"}]},
+            {"role": "user", "content": [{"type": "text", "text": "+ new prompt"}]},
+        ]
+
+        initiator = policy.resolve_anthropic_messages(messages, "claude-sonnet-4.6")
+
+        self.assertEqual(messages[-1]["content"][-1]["text"], "new prompt")
+        self.assertEqual(initiator, "user")
+
+    def test_plus_prefix_does_not_override_haiku(self):
+        policy = initiator_policy.InitiatorPolicy()
+
+        normalized_input, initiator = policy.resolve_responses_input("+ hello", "claude-haiku-4.5")
+
+        self.assertEqual(normalized_input, "hello")
+        self.assertEqual(initiator, "agent")
+
+    def test_plus_prefix_does_not_override_codex_bootstrap_mini(self):
+        policy = initiator_policy.InitiatorPolicy()
+        bootstrap_input = [
+            {
+                "type": "message",
+                "role": "developer",
+                "content": [{"type": "input_text", "text": "developer instructions"}],
+            },
+            {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": "+ <environment_context>\n  <cwd>D:\\sources\\ghcp_proxy</cwd>\n</environment_context>",
+                    }
+                ],
+            },
+        ]
+
+        normalized_input, initiator = policy.resolve_responses_input(bootstrap_input, "gpt-5.4-mini")
+
+        self.assertIs(normalized_input, bootstrap_input)
+        self.assertEqual(
+            normalized_input[-1]["content"][0]["text"],
+            "<environment_context>\n  <cwd>D:\\sources\\ghcp_proxy</cwd>\n</environment_context>",
+        )
+        self.assertEqual(initiator, "agent")
+
     def test_active_request_forces_following_user_request_to_agent(self):
         policy = initiator_policy.InitiatorPolicy()
         start = datetime(2026, 4, 4, 18, 0, tzinfo=timezone.utc)
