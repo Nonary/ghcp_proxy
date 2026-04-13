@@ -114,6 +114,41 @@ class InitiatorPolicyTests(unittest.TestCase):
         self.assertIs(normalized_input, input_items)
         self.assertEqual(initiator, "user")
 
+    def test_codex_title_generation_mini_request_is_agent(self):
+        policy = initiator_policy.InitiatorPolicy()
+        input_items = [
+            {
+                "type": "message",
+                "role": "developer",
+                "content": [{"type": "input_text", "text": "developer instructions"}],
+            },
+            {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": "# AGENTS.md instructions\n<environment_context>\n  <cwd>/tmp/worktree</cwd>\n</environment_context>",
+                    }
+                ],
+            },
+            {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": "You are a helpful assistant. You will be presented with a user prompt, and your job is to provide a short title for a task that will be created from that prompt.\nGenerate a concise UI title (18-36 characters) for this task.\nUser prompt:\nFix the stale patch dashboard",
+                    }
+                ],
+            },
+        ]
+
+        normalized_input, initiator = policy.resolve_responses_input(input_items, "gpt-5.4-mini")
+
+        self.assertIs(normalized_input, input_items)
+        self.assertEqual(initiator, "agent")
+
     def test_responses_function_call_output_tail_stays_agent(self):
         policy = initiator_policy.InitiatorPolicy()
         input_items = [

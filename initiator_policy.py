@@ -192,7 +192,20 @@ def _is_environment_context_message(item) -> bool:
     if str(item.get("role", "")).lower() != "user":
         return False
     text = _responses_item_text(item).lstrip()
-    return text.startswith("<environment_context>") and "</environment_context>" in text
+    return "<environment_context>" in text and "</environment_context>" in text
+
+
+def _is_task_title_generation_message(item) -> bool:
+    if not isinstance(item, dict):
+        return False
+    if str(item.get("role", "")).lower() != "user":
+        return False
+    text = _responses_item_text(item).lstrip()
+    return (
+        "You are a helpful assistant. You will be presented with a user prompt" in text
+        and "Generate a concise UI title" in text
+        and "User prompt:" in text
+    )
 
 
 def _is_codex_bootstrap_mini_request(input_param, model_name: str | None) -> bool:
@@ -219,6 +232,39 @@ def _is_codex_bootstrap_mini_request(input_param, model_name: str | None) -> boo
             return False
 
     return _is_environment_context_message(message_items[-1])
+
+
+def _is_codex_title_generation_mini_request(input_param, model_name: str | None) -> bool:
+    normalized_model = _normalize_model_name(model_name)
+    if normalized_model not in {"gpt-5.4-mini", "gpt-5.1-codex-mini"}:
+        return False
+    if not isinstance(input_param, list):
+        return False
+
+    message_items: list[dict] = []
+    for item in input_param:
+        if not isinstance(item, dict):
+            continue
+        item_type = str(item.get("type", "")).lower()
+        role = str(item.get("role", "")).lower()
+        if item_type == "message" or role:
+            message_items.append(item)
+
+    if len(message_items) < 3:
+        return False
+    if not _is_task_title_generation_message(message_items[-1]):
+        return False
+
+    saw_developer_or_system = False
+    saw_environment_context = False
+    for item in message_items[:-1]:
+        role = str(item.get("role", "")).lower()
+        if role in {"developer", "system"}:
+            saw_developer_or_system = True
+        if _is_environment_context_message(item):
+            saw_environment_context = True
+
+    return saw_developer_or_system and saw_environment_context
 
 
 def _determine_chat_candidate(messages) -> str:
@@ -376,7 +422,10 @@ class InitiatorPolicy:
         request_id: str | None = None,
     ) -> tuple[object, str]:
         normalized_input, candidate = _determine_responses_candidate(input_param)
-        if _is_codex_bootstrap_mini_request(normalized_input, model_name):
+        if (
+            _is_codex_bootstrap_mini_request(normalized_input, model_name)
+            or _is_codex_title_generation_mini_request(normalized_input, model_name)
+        ):
             candidate = AGENT_INITIATOR
         initiator = self.resolve_initiator(
             candidate,
