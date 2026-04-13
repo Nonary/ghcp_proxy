@@ -1515,7 +1515,7 @@ if __name__ == "__main__":
     auth.ensure_authenticated()
 
     # Step 2: Start the server in the foreground on this terminal.
-    print("Starting GHCP proxy on http://localhost:8000", flush=True)
+    print("Starting GHCP proxy on http://localhost:8000 (loopback only)", flush=True)
     print("  Responses API : POST /v1/responses", flush=True)
     print("  Compaction    : POST /v1/responses/compact", flush=True)
     print("  Chat API      : POST /v1/chat/completions", flush=True)
@@ -1525,4 +1525,4 @@ if __name__ == "__main__":
     print("    export OPENAI_API_KEY=anything", flush=True)
     print("", flush=True)
 
-    uvicorn.run(app, host="0.0.0.0", port=8000, access_log=False, timeout_graceful_shutdown=2)
+    uvicorn.run(app, host="127.0.0.1", port=8000, access_log=False, timeout_graceful_shutdown=2)

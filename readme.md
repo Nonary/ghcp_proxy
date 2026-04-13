@@ -39,7 +39,7 @@ python3 proxy.py
 
 On first run, if no valid Copilot token is cached, the proxy will automatically start the GitHub device-flow login and prompt you in the terminal. After authorization, it caches the token and continues serving.
 
-When running correctly, the proxy listens on:
+When running correctly, the proxy binds only to loopback and listens on:
 
 ```bash
 http://localhost:8000/v1
