@@ -86,6 +86,8 @@ _TRACE_HEADER_ALLOWLIST = {
     "x-request-id",
     "x-github-request-id",
 }
+AUTH_FAILURE_MESSAGE = "GHCP auth failed"
+INVALID_BRIDGE_REQUEST_MESSAGE = "Invalid request"
 
 _initiator_policy = InitiatorPolicy()
 usage_event_bus = EventBus()
@@ -543,8 +545,8 @@ def _prepare_upstream_request(
     if effective_api_key is None:
         try:
             effective_api_key = auth.get_api_key()
-        except Exception as exc:
-            return None, error_response(401, f"GHCP auth failed: {exc}")
+        except Exception:
+            return None, error_response(401, AUTH_FAILURE_MESSAGE)
 
     headers = header_builder(effective_api_key, request_id)
     usage_event = usage_tracker.start_event(
@@ -1349,14 +1351,14 @@ async def responses(request: Request):
 
     try:
         api_key = auth.get_api_key()
-    except Exception as exc:
-        return format_translation.openai_error_response(401, f"GHCP auth failed: {exc}")
+    except Exception:
+        return format_translation.openai_error_response(401, AUTH_FAILURE_MESSAGE)
 
     api_base = auth.get_api_base()
     try:
         bridge_plan = await bridge_planner.plan("responses", body, api_base=api_base, api_key=api_key)
-    except ValueError as exc:
-        return format_translation.openai_error_response(400, str(exc))
+    except ValueError:
+        return format_translation.openai_error_response(400, INVALID_BRIDGE_REQUEST_MESSAGE)
 
     plan, error_response = _prepare_bridge_request(
         request,
@@ -1387,14 +1389,14 @@ async def responses_compact(request: Request):
     summary_request = format_translation.build_fake_compaction_request(body)
     try:
         api_key = auth.get_api_key()
-    except Exception as exc:
-        return format_translation.openai_error_response(401, f"GHCP auth failed: {exc}")
+    except Exception:
+        return format_translation.openai_error_response(401, AUTH_FAILURE_MESSAGE)
 
     api_base = auth.get_api_base()
     try:
         bridge_plan = await bridge_planner.plan("responses", summary_request, api_base=api_base, api_key=api_key)
-    except ValueError as exc:
-        return format_translation.openai_error_response(400, str(exc))
+    except ValueError:
+        return format_translation.openai_error_response(400, INVALID_BRIDGE_REQUEST_MESSAGE)
 
     plan, error_response = _prepare_bridge_request(
         request,
@@ -1482,14 +1484,14 @@ async def anthropic_messages(request: Request):
 
     try:
         api_key = auth.get_api_key()
-    except Exception as exc:
-        return format_translation.anthropic_error_response(401, f"GHCP auth failed: {exc}")
+    except Exception:
+        return format_translation.anthropic_error_response(401, AUTH_FAILURE_MESSAGE)
 
     api_base = auth.get_api_base()
     try:
         bridge_plan = await bridge_planner.plan("messages", body, api_base=api_base, api_key=api_key)
-    except ValueError as exc:
-        return format_translation.anthropic_error_response(400, str(exc))
+    except ValueError:
+        return format_translation.anthropic_error_response(400, INVALID_BRIDGE_REQUEST_MESSAGE)
 
     plan, error_response = _prepare_bridge_request(
         request,

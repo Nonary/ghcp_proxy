@@ -1247,17 +1247,10 @@ def openai_error_response(status_code: int, message: str, error_type: str | None
 
 def upstream_request_error_status_and_message(exc: httpx.RequestError) -> tuple[int, str]:
     if isinstance(exc, httpx.TimeoutException):
-        prefix = "Upstream request timed out"
-        status_code = 504
-    elif isinstance(exc, httpx.ConnectError):
-        prefix = "Upstream connection failed"
-        status_code = 502
-    else:
-        prefix = "Upstream request failed"
-        status_code = 502
-
-    detail = str(exc).strip()
-    return status_code, f"{prefix}: {detail}" if detail else prefix
+        return 504, "Upstream request timed out"
+    if isinstance(exc, httpx.ConnectError):
+        return 502, "Upstream connection failed"
+    return 502, "Upstream request failed"
 
 
 def http_exception_detail_to_message(detail) -> str:
@@ -1793,4 +1786,3 @@ def extract_response_output_text(payload: dict) -> str | None:
     if not parts:
         return None
     return "\n\n".join(parts)
-

@@ -952,7 +952,7 @@ class FormatTranslationTests(unittest.TestCase):
 
         self.assertEqual(
             format_translation.upstream_request_error_status_and_message(timeout_error),
-            (504, "Upstream request timed out: Timed out"),
+            (504, "Upstream request timed out"),
         )
 
     def test_anthropic_error_payload_from_openai_uses_anthropic_shape(self):

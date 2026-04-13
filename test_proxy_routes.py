@@ -131,12 +131,15 @@ class ProxyRoutesTests(unittest.TestCase):
         finish_usage.assert_called_once_with(
             None,
             502,
-            response_text="Upstream connection failed: All connection attempts failed",
+            upstream=None,
+            response_payload=None,
+            response_text="Upstream connection failed",
+            usage=None,
         )
         self.assertEqual(response.status_code, 502)
         self.assertEqual(
             response.body,
-            b'{"error":{"message":"Upstream connection failed: All connection attempts failed","type":"server_error","param":null,"code":null}}',
+            b'{"error":{"message":"Upstream connection failed","type":"server_error","param":null,"code":null}}',
         )
 
     def test_anthropic_messages_invalid_json_returns_anthropic_error_shape(self):
@@ -200,12 +203,15 @@ class ProxyRoutesTests(unittest.TestCase):
         finish_usage.assert_called_once_with(
             None,
             502,
-            response_text="Upstream connection failed: All connection attempts failed",
+            upstream=None,
+            response_payload=None,
+            response_text="Upstream connection failed",
+            usage=None,
         )
         self.assertEqual(response.status_code, 502)
         self.assertEqual(
             response.body,
-            b'{"type":"error","error":{"type":"api_error","message":"Upstream connection failed: All connection attempts failed"}}',
+            b'{"type":"error","error":{"type":"api_error","message":"Upstream connection failed"}}',
         )
 
     def test_responses_route_mapped_to_claude_uses_chat_upstream_and_returns_responses_shape(self):
@@ -665,15 +671,18 @@ class ProxyRoutesTests(unittest.TestCase):
             )
 
         finish_usage.assert_called_once_with(
-            usage_event,
+            None,
             502,
-            response_text="Upstream connection failed: All connection attempts failed",
+            upstream=None,
+            response_payload=None,
+            response_text="Upstream connection failed",
+            usage=None,
         )
         fake_client.aclose.assert_awaited_once()
         self.assertEqual(response.status_code, 502)
         self.assertEqual(
             response.body,
-            b'{"error":{"message":"Upstream connection failed: All connection attempts failed","type":"server_error","param":null,"code":null}}',
+            b'{"error":{"message":"Upstream connection failed","type":"server_error","param":null,"code":null}}',
         )
 
     def test_graceful_streaming_response_swallows_cancelled_error(self):

@@ -1188,19 +1188,17 @@ class DashboardService:
                     if _is_inapplicable_user_billing_error(attempt_scope, exc):
                         saw_inapplicable_user_billing_error = True
                         print(
-                            f"Billing API user-scoped usage unavailable for {attempt_scope}:{attempt_target}; "
-                            "trying alternate billing owners if available.",
+                            "Billing API user-scoped usage unavailable; trying alternate billing owners if available.",
                             flush=True,
                         )
                         break
                     if "without month filter" in attempt_label:
                         print(
-                            f"Billing API fallback attempt failed for {attempt_scope}:{attempt_target} "
-                            f"({attempt_label}): {exc}",
+                            "Billing API fallback attempt failed while probing alternate billing owners.",
                             flush=True,
                         )
                         continue
-                    print(f"Billing API month-filtered call failed ({attempt_label}): {exc}", flush=True)
+                    print("Billing API month-filtered call failed.", flush=True)
             if payload is not None:
                 break
 

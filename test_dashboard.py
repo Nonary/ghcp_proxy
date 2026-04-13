@@ -333,6 +333,8 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(payload["target"], "acme-inc")
         self.assertEqual(payload["used"], 80.0)
         self.assertNotIn("Billing API fallback attempt failed", stdout.getvalue())
+        self.assertNotIn("user-login", stdout.getvalue())
+        self.assertNotIn("acme-inc", stdout.getvalue())
 
     def test_collect_official_premium_payload_raises_actionable_error_for_user_scope_400(self):
         fixed_now = datetime(2026, 4, 4, 18, 0, tzinfo=timezone.utc)
