@@ -656,7 +656,12 @@ def responses_request_to_chat(body: dict) -> dict:
                     }
                 )
                 continue
-            if item_type in {"reasoning", "item_reference", "compaction"}:
+            if item_type in {"reasoning", "item_reference", "compaction", "web_search_call"}:
+                # Native Responses web search history is represented by a paired
+                # assistant message item containing the user-visible answer and
+                # citations. Chat-targeted bridges cannot replay the built-in
+                # tool call itself, so keep the answer message and skip the
+                # internal tool-call record.
                 continue
             raise ValueError(f"Unsupported Responses input item type: {item_type}")
 

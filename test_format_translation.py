@@ -676,6 +676,38 @@ class FormatTranslationTests(unittest.TestCase):
         self.assertEqual(translated["messages"][3]["content"], "file contents")
         self.assertEqual(translated["stream_options"], {"include_usage": True})
 
+    def test_responses_request_to_chat_skips_web_search_call_items(self):
+        body = {
+            "model": "claude-opus-4.6",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "latest launch news"}],
+                },
+                {
+                    "type": "web_search_call",
+                    "id": "ws_123",
+                    "status": "completed",
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Here is the summary."}],
+                },
+            ],
+        }
+
+        translated = format_translation.responses_request_to_chat(body)
+
+        self.assertEqual(
+            translated["messages"],
+            [
+                {"role": "user", "content": "latest launch news"},
+                {"role": "assistant", "content": "Here is the summary."},
+            ],
+        )
+
     def test_responses_request_to_chat_omits_empty_tool_config(self):
         body = {
             "model": "claude-opus-4.6",
