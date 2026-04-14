@@ -1,0 +1,64 @@
+# CodeQL Multi-Language Workflow Configuration Summary:
+# ---------------------------------
+# This workflow enables automated CodeQL analysis for multiple languages in this repository.
+# It ensures that the codebase is continuously scanned for security vulnerabilities 
+# and quality issues across all supported programming languages using GitHub's CodeQL engine.
+#
+# Supported Languages in this repository: Python, actions
+#
+# Key Benefits:
+# - Identifies potential security vulnerabilities across all languages in the codebase.
+# - Improves code quality by detecting common coding issues for each language.
+# - Uses matrix strategy for parallel analysis of multiple languages.
+# - Integrates seamlessly with GitHub Actions for automated scanning.
+#
+# Workflow Details:
+# - The schedule is randomized to distribute workflow runs and avoid overloading the system
+# - Analyzes all supported languages found in the repository
+# - C# uses build-free mode (no build required)
+# - Includes build steps for Go and Kotlin only
+# - Uses GHAS runner group for all languages
+#
+# In case of any issues, questions or feedback, please reach out to the DevSecOps team via CORPDLDevSecOpsEnablementTeam@HCAHealthcare.com
+
+name: "CodeQL Multi-Language Analysis"
+
+on:
+  schedule:
+    - cron: '10 6 * * 5'  # Randomized weekly schedule
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+  security-events: write
+
+jobs:
+  codeql-analysis:
+    name: CodeQL Analysis
+    runs-on: 
+      group: GHAS
+      labels: [ghas]
+    
+    strategy:
+      fail-fast: false
+      matrix:
+        language: ["python", "actions"]
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: ${{ matrix.language }}
+          queries: security-and-quality
+          build-mode: ${{ contains(fromJSON('["swift", "c++", "c"]'), matrix.language) && 'autobuild' || contains(fromJSON('["go", "kotlin"]'), matrix.language) && 'manual' || 'none' }}
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: "/language:${{ matrix.language }}"
+        continue-on-error: true
+    

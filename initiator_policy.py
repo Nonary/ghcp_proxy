@@ -7,6 +7,7 @@ from threading import Lock
 AGENT_INITIATOR = "agent"
 USER_INITIATOR = "user"
 AGENT_INITIATOR_PREFIX = "_"
+USER_INITIATOR_PREFIX = "+"
 REQUEST_FINISH_GUARD_SECONDS = 15.0
 
 
@@ -38,31 +39,35 @@ def _parse_event_time(value: str | None) -> datetime | None:
         return None
 
 
-def _strip_agent_initiator_prefix(text: str) -> tuple[str, bool]:
+def _strip_explicit_initiator_prefix(text: str) -> tuple[str, str | None]:
     if not isinstance(text, str):
-        return text, False
+        return text, None
 
     stripped = text.lstrip()
-    if not stripped.startswith(AGENT_INITIATOR_PREFIX):
-        return text, False
+    if stripped.startswith(AGENT_INITIATOR_PREFIX):
+        initiator = AGENT_INITIATOR
+    elif stripped.startswith(USER_INITIATOR_PREFIX):
+        initiator = USER_INITIATOR
+    else:
+        return text, None
 
-    normalized = stripped[len(AGENT_INITIATOR_PREFIX) :]
+    normalized = stripped[1:]
     if normalized.startswith(" "):
         normalized = normalized[1:]
-    return normalized, True
+    return normalized, initiator
 
 
-def _strip_agent_initiator_prefix_from_item(item) -> str:
+def _strip_explicit_initiator_prefix_from_item(item, *, default_initiator: str | None = USER_INITIATOR) -> str | None:
     if not isinstance(item, dict):
         return AGENT_INITIATOR
 
     content = item.get("content")
     if isinstance(content, str):
-        updated_text, explicit_agent = _strip_agent_initiator_prefix(content)
-        if explicit_agent:
+        updated_text, explicit_initiator = _strip_explicit_initiator_prefix(content)
+        if explicit_initiator is not None:
             item["content"] = updated_text
-            return AGENT_INITIATOR
-        return USER_INITIATOR
+            return explicit_initiator
+        return default_initiator
 
     if isinstance(content, list):
         for entry in content:
@@ -72,40 +77,84 @@ def _strip_agent_initiator_prefix_from_item(item) -> str:
                 value = entry.get(key)
                 if not isinstance(value, str):
                     continue
-                updated_text, explicit_agent = _strip_agent_initiator_prefix(value)
-                if explicit_agent:
+                updated_text, explicit_initiator = _strip_explicit_initiator_prefix(value)
+                if explicit_initiator is not None:
                     entry[key] = updated_text
-                    return AGENT_INITIATOR
-        return USER_INITIATOR
+                    return explicit_initiator
+        return default_initiator
 
     for key in ("text", "input_text"):
         value = item.get(key)
         if not isinstance(value, str):
             continue
-        updated_text, explicit_agent = _strip_agent_initiator_prefix(value)
-        if explicit_agent:
+        updated_text, explicit_initiator = _strip_explicit_initiator_prefix(value)
+        if explicit_initiator is not None:
             item[key] = updated_text
+            return explicit_initiator
+        return default_initiator
+    return default_initiator
+
+
+def _explicit_initiators_for_responses_input(input_param) -> dict[int, str]:
+    explicit_initiators: dict[int, str] = {}
+    if not isinstance(input_param, list):
+        return explicit_initiators
+
+    for item in input_param:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("role", "")).lower() != "user":
+            continue
+        explicit_initiator = _strip_explicit_initiator_prefix_from_item(item, default_initiator=None)
+        if explicit_initiator is not None:
+            explicit_initiators[id(item)] = explicit_initiator
+    return explicit_initiators
+
+
+def _responses_item_candidate(item, *, explicit_initiators: dict[int, str] | None = None) -> str | None:
+    if not isinstance(item, dict):
+        return AGENT_INITIATOR
+
+    item_type = str(item.get("type", "")).lower()
+    role = str(item.get("role", "")).lower()
+
+    if item_type in {"reasoning", "item_reference", "compaction"}:
+        return None
+
+    if item_type in {"", "message"}:
+        if role in {"system", "developer"}:
+            return None
+        if role == "user":
+            if explicit_initiators is not None and id(item) in explicit_initiators:
+                return explicit_initiators[id(item)]
+            return USER_INITIATOR
+        if role:
             return AGENT_INITIATOR
+        return AGENT_INITIATOR
+
+    if item_type in {"function_call", "function_call_output", "custom_tool_call", "custom_tool_call_output"}:
+        return AGENT_INITIATOR
+
+    if role == "user":
+        if explicit_initiators is not None and id(item) in explicit_initiators:
+            return explicit_initiators[id(item)]
         return USER_INITIATOR
-    return USER_INITIATOR
+    if role in {"system", "developer"}:
+        return None
+    return AGENT_INITIATOR
 
 
 def _determine_responses_candidate(input_param) -> tuple[object, str]:
     if isinstance(input_param, str):
-        normalized_input, explicit_agent = _strip_agent_initiator_prefix(input_param)
-        return normalized_input, AGENT_INITIATOR if explicit_agent else USER_INITIATOR
+        normalized_input, explicit_initiator = _strip_explicit_initiator_prefix(input_param)
+        return normalized_input, explicit_initiator or USER_INITIATOR
 
     if isinstance(input_param, list):
+        explicit_initiators = _explicit_initiators_for_responses_input(input_param)
         for item in reversed(input_param):
-            if not isinstance(item, dict):
-                continue
-            item_type = str(item.get("type", "")).lower()
-            role = str(item.get("role", "")).lower()
-            if item_type == "message" or role:
-                if role == "user":
-                    return input_param, _strip_agent_initiator_prefix_from_item(item)
-                return input_param, AGENT_INITIATOR
-            return input_param, AGENT_INITIATOR
+            candidate = _responses_item_candidate(item, explicit_initiators=explicit_initiators)
+            if candidate is not None:
+                return input_param, candidate
 
     return input_param, AGENT_INITIATOR
 
@@ -143,7 +192,20 @@ def _is_environment_context_message(item) -> bool:
     if str(item.get("role", "")).lower() != "user":
         return False
     text = _responses_item_text(item).lstrip()
-    return text.startswith("<environment_context>") and "</environment_context>" in text
+    return "<environment_context>" in text and "</environment_context>" in text
+
+
+def _is_task_title_generation_message(item) -> bool:
+    if not isinstance(item, dict):
+        return False
+    if str(item.get("role", "")).lower() != "user":
+        return False
+    text = _responses_item_text(item).lstrip()
+    return (
+        "You are a helpful assistant. You will be presented with a user prompt" in text
+        and "Generate a concise UI title" in text
+        and "User prompt:" in text
+    )
 
 
 def _is_codex_bootstrap_mini_request(input_param, model_name: str | None) -> bool:
@@ -172,35 +234,82 @@ def _is_codex_bootstrap_mini_request(input_param, model_name: str | None) -> boo
     return _is_environment_context_message(message_items[-1])
 
 
+def _is_codex_title_generation_mini_request(input_param, model_name: str | None) -> bool:
+    normalized_model = _normalize_model_name(model_name)
+    if normalized_model not in {"gpt-5.4-mini", "gpt-5.1-codex-mini"}:
+        return False
+    if not isinstance(input_param, list):
+        return False
+
+    message_items: list[dict] = []
+    for item in input_param:
+        if not isinstance(item, dict):
+            continue
+        item_type = str(item.get("type", "")).lower()
+        role = str(item.get("role", "")).lower()
+        if item_type == "message" or role:
+            message_items.append(item)
+
+    if len(message_items) < 3:
+        return False
+    if not _is_task_title_generation_message(message_items[-1]):
+        return False
+
+    saw_developer_or_system = False
+    saw_environment_context = False
+    for item in message_items[:-1]:
+        role = str(item.get("role", "")).lower()
+        if role in {"developer", "system"}:
+            saw_developer_or_system = True
+        if _is_environment_context_message(item):
+            saw_environment_context = True
+
+    return saw_developer_or_system and saw_environment_context
+
+
 def _determine_chat_candidate(messages) -> str:
     if not isinstance(messages, list):
         return AGENT_INITIATOR
+
+    explicit_initiators: dict[int, str] = {}
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        if str(message.get("role", "")).lower() != "user":
+            continue
+        explicit_initiator = _strip_explicit_initiator_prefix_from_item(message, default_initiator=None)
+        if explicit_initiator is not None:
+            explicit_initiators[id(message)] = explicit_initiator
 
     for message in reversed(messages):
         if not isinstance(message, dict):
             continue
         role = str(message.get("role", "")).lower()
         if role == "user":
-            return _strip_agent_initiator_prefix_from_item(message)
+            return explicit_initiators.get(id(message), USER_INITIATOR)
         if role:
             return AGENT_INITIATOR
     return AGENT_INITIATOR
 
 
-def _strip_agent_initiator_prefix_from_anthropic_message(message) -> str:
+def _strip_explicit_initiator_prefix_from_anthropic_message(
+    message,
+    *,
+    default_initiator: str | None = USER_INITIATOR,
+) -> str | None:
     if not isinstance(message, dict):
         return AGENT_INITIATOR
 
     content = message.get("content")
     if isinstance(content, str):
-        updated_text, explicit_agent = _strip_agent_initiator_prefix(content)
-        if explicit_agent:
+        updated_text, explicit_initiator = _strip_explicit_initiator_prefix(content)
+        if explicit_initiator is not None:
             message["content"] = updated_text
-            return AGENT_INITIATOR
-        return USER_INITIATOR
+            return explicit_initiator
+        return default_initiator
 
     if not isinstance(content, list):
-        return USER_INITIATOR
+        return default_initiator
 
     saw_tool_result = False
     saw_non_tool_result = False
@@ -218,25 +327,38 @@ def _strip_agent_initiator_prefix_from_anthropic_message(message) -> str:
         text = item.get("text")
         if not isinstance(text, str):
             continue
-        updated_text, explicit_agent = _strip_agent_initiator_prefix(text)
-        if explicit_agent:
+        updated_text, explicit_initiator = _strip_explicit_initiator_prefix(text)
+        if explicit_initiator is not None:
             item["text"] = updated_text
-            return AGENT_INITIATOR
+            return explicit_initiator
     if saw_tool_result and not saw_non_tool_result:
         return AGENT_INITIATOR
-    return USER_INITIATOR
+    return default_initiator
 
 
 def _determine_anthropic_candidate(messages) -> str:
     if not isinstance(messages, list):
         return AGENT_INITIATOR
 
+    explicit_initiators: dict[int, str] = {}
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        if str(message.get("role", "")).lower() != "user":
+            continue
+        explicit_initiator = _strip_explicit_initiator_prefix_from_anthropic_message(
+            message,
+            default_initiator=None,
+        )
+        if explicit_initiator is not None:
+            explicit_initiators[id(message)] = explicit_initiator
+
     for message in reversed(messages):
         if not isinstance(message, dict):
             continue
         role = str(message.get("role", "")).lower()
         if role == "user":
-            return _strip_agent_initiator_prefix_from_anthropic_message(message)
+            return explicit_initiators.get(id(message), USER_INITIATOR)
         if role:
             return AGENT_INITIATOR
     return AGENT_INITIATOR
@@ -300,7 +422,10 @@ class InitiatorPolicy:
         request_id: str | None = None,
     ) -> tuple[object, str]:
         normalized_input, candidate = _determine_responses_candidate(input_param)
-        if _is_codex_bootstrap_mini_request(normalized_input, model_name):
+        if (
+            _is_codex_bootstrap_mini_request(normalized_input, model_name)
+            or _is_codex_title_generation_mini_request(normalized_input, model_name)
+        ):
             candidate = AGENT_INITIATOR
         initiator = self.resolve_initiator(
             candidate,
