@@ -268,6 +268,321 @@
     .source-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 6px; }
     .bar { height: 8px; background: rgba(255,255,255,.06); border-radius: 999px; overflow: hidden; margin: 6px 0; }
     .bar > span { display: block; height: 100%; background: linear-gradient(90deg, var(--accent), var(--accent-2)); }
+    .source-mix-card { display: grid; gap: 12px; }
+    .source-context-pill {
+      display: inline-grid;
+      gap: 3px;
+      min-width: 150px;
+      justify-items: end;
+      padding: 10px 12px;
+      border-radius: 8px;
+      border: 1px solid rgba(200,220,235,.14);
+      background: rgba(255,255,255,.03);
+      color: var(--text);
+      cursor: pointer;
+      transition: border-color .18s ease, transform .18s ease, background .18s ease;
+    }
+    .source-context-pill:hover { border-color: rgba(255,255,255,.22); transform: translateY(-1px); }
+    .source-context-pill.active {
+      border-color: rgba(255,135,82,.28);
+      background: linear-gradient(180deg, rgba(255,135,82,.14), rgba(255,255,255,.03));
+    }
+    .source-context-pill strong { font-size: 1rem; letter-spacing: -.04em; }
+    .source-period-grid {
+      display: grid;
+      gap: 10px;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+    .source-period-card {
+      display: grid;
+      gap: 10px;
+      padding: 12px;
+      border-radius: 8px;
+      border: 1px solid rgba(200,220,235,.12);
+      background:
+        linear-gradient(180deg, rgba(255,255,255,.03), rgba(255,255,255,.015)),
+        rgba(13, 21, 29, .76);
+      color: var(--text);
+      cursor: pointer;
+      text-align: left;
+      transition: border-color .18s ease, transform .18s ease, background .18s ease, box-shadow .18s ease;
+    }
+    .source-period-card:hover {
+      border-color: rgba(255,255,255,.22);
+      transform: translateY(-1px);
+    }
+    .source-period-card.active {
+      border-color: rgba(255,135,82,.36);
+      background:
+        linear-gradient(180deg, rgba(255,135,82,.16), rgba(255,255,255,.02)),
+        rgba(13, 21, 29, .88);
+      box-shadow: inset 0 0 0 1px rgba(255,135,82,.08);
+    }
+    .source-period-top {
+      display: flex;
+      align-items: start;
+      justify-content: space-between;
+      gap: 10px;
+    }
+    .source-period-kicker {
+      color: var(--muted);
+      font-size: .72rem;
+      text-transform: uppercase;
+      letter-spacing: .12em;
+      margin-bottom: 4px;
+    }
+    .source-period-label {
+      font-size: .96rem;
+      font-weight: 650;
+      letter-spacing: -.02em;
+    }
+    .source-period-card .badge {
+      padding-inline: 8px;
+      font-size: .68rem;
+      align-self: start;
+      white-space: nowrap;
+    }
+    .source-period-value {
+      font-size: clamp(1.35rem, 3vw, 2rem);
+      font-weight: 760;
+      letter-spacing: -.05em;
+      line-height: .92;
+    }
+    .source-period-meta {
+      color: var(--muted);
+      font-size: .8rem;
+    }
+    .source-period-track,
+    .source-share-bar,
+    .source-metric-track {
+      display: flex;
+      gap: 3px;
+      overflow: hidden;
+    }
+    .source-period-track,
+    .source-share-bar {
+      height: 10px;
+      border-radius: 999px;
+      background: rgba(255,255,255,.05);
+      padding: 2px;
+    }
+    .source-metric-track {
+      height: 8px;
+      border-radius: 999px;
+      background: rgba(255,255,255,.05);
+      padding: 1px;
+    }
+    .source-period-segment,
+    .source-share-segment,
+    .source-metric-fill {
+      display: block;
+      min-width: 0;
+      height: 100%;
+      border-radius: 999px;
+    }
+    .source-period-segment.tone-codex,
+    .source-share-segment.tone-codex,
+    .source-metric-fill.tone-codex {
+      background: linear-gradient(90deg, #ffb279, var(--accent));
+    }
+    .source-period-segment.tone-claude,
+    .source-share-segment.tone-claude,
+    .source-metric-fill.tone-claude {
+      background: linear-gradient(90deg, #baf6e8, var(--accent-2));
+    }
+    .source-period-segment.tone-other,
+    .source-share-segment.tone-other,
+    .source-metric-fill.tone-other {
+      background: linear-gradient(90deg, #d3dde7, #8ea3b5);
+    }
+    .source-spotlight {
+      display: grid;
+      gap: 12px;
+      padding: 14px;
+      border-radius: 8px;
+      border: 1px solid rgba(200,220,235,.12);
+      background:
+        linear-gradient(180deg, rgba(255,255,255,.03), rgba(255,255,255,.015)),
+        rgba(12, 18, 25, .84);
+    }
+    .source-spotlight-head {
+      display: flex;
+      align-items: start;
+      justify-content: space-between;
+      gap: 10px;
+    }
+    .source-lead-note {
+      max-width: 360px;
+      color: var(--muted);
+      font-size: .82rem;
+      line-height: 1.45;
+      text-align: right;
+    }
+    .source-share-legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .source-share-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      padding: 6px 9px;
+      border-radius: 999px;
+      border: 1px solid rgba(200,220,235,.12);
+      background: rgba(255,255,255,.03);
+      font-size: .78rem;
+    }
+    .source-share-pill strong { font-size: .82rem; }
+    .source-dot {
+      width: 9px;
+      height: 9px;
+      border-radius: 999px;
+      flex-shrink: 0;
+    }
+    .source-dot.tone-codex { background: var(--accent); box-shadow: 0 0 0 3px rgba(255,135,82,.16); }
+    .source-dot.tone-claude { background: var(--accent-2); box-shadow: 0 0 0 3px rgba(110,231,200,.16); }
+    .source-dot.tone-other { background: #b9c9d6; box-shadow: 0 0 0 3px rgba(185,201,214,.16); }
+    .source-duel-grid {
+      display: grid;
+      gap: 10px;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+    .source-detail-card {
+      display: grid;
+      gap: 12px;
+      min-height: 0;
+      padding: 12px;
+      border-radius: 8px;
+      border: 1px solid rgba(200,220,235,.12);
+      background: rgba(255,255,255,.03);
+    }
+    .source-detail-card.tone-codex { background: linear-gradient(180deg, rgba(255,135,82,.13), rgba(255,255,255,.025)); }
+    .source-detail-card.tone-claude { background: linear-gradient(180deg, rgba(110,231,200,.11), rgba(255,255,255,.025)); }
+    .source-detail-card.tone-other { background: linear-gradient(180deg, rgba(173,191,205,.1), rgba(255,255,255,.025)); }
+    .source-detail-head,
+    .source-metric-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+    }
+    .source-detail-label {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      font-size: .9rem;
+      font-weight: 650;
+      letter-spacing: -.02em;
+    }
+    .source-detail-share {
+      color: var(--muted);
+      font-size: .78rem;
+    }
+    .source-detail-value {
+      font-size: clamp(1.55rem, 3.8vw, 2.35rem);
+      font-weight: 780;
+      letter-spacing: -.06em;
+      line-height: .92;
+    }
+    .source-detail-meta {
+      color: var(--muted);
+      font-size: .82rem;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+    .source-detail-metrics {
+      display: grid;
+      gap: 10px;
+    }
+    .source-metric {
+      display: grid;
+      gap: 5px;
+    }
+    .source-metric-head span {
+      color: var(--muted);
+      font-size: .74rem;
+      text-transform: uppercase;
+      letter-spacing: .12em;
+    }
+    .source-metric-head strong {
+      font-size: .82rem;
+      font-weight: 650;
+    }
+    .day-focus-strip {
+      display: grid;
+      gap: 10px;
+      padding: 12px;
+      border-radius: 8px;
+      border: 1px solid rgba(200,220,235,.12);
+      background: rgba(255,255,255,.03);
+    }
+    .day-focus-head {
+      display: flex;
+      align-items: start;
+      justify-content: space-between;
+      gap: 10px;
+    }
+    .day-focus-nav {
+      display: inline-flex;
+      gap: 6px;
+      flex-shrink: 0;
+    }
+    .day-focus-nav button,
+    .day-focus-chip {
+      font: inherit;
+      color: var(--text);
+      border: 1px solid rgba(200,220,235,.14);
+      background: rgba(255,255,255,.03);
+    }
+    .day-focus-nav button {
+      padding: 7px 10px;
+      border-radius: 8px;
+      cursor: pointer;
+    }
+    .day-focus-nav button:disabled {
+      opacity: .45;
+      cursor: default;
+    }
+    .day-focus-scroller {
+      display: flex;
+      gap: 8px;
+      overflow-x: auto;
+      padding-bottom: 2px;
+      scrollbar-width: thin;
+    }
+    .day-focus-chip {
+      display: grid;
+      gap: 4px;
+      min-width: 88px;
+      padding: 9px 10px;
+      border-radius: 8px;
+      text-align: left;
+      cursor: pointer;
+      transition: border-color .18s ease, transform .18s ease, background .18s ease;
+    }
+    .day-focus-chip:hover {
+      border-color: rgba(255,255,255,.22);
+      transform: translateY(-1px);
+    }
+    .day-focus-chip.active {
+      border-color: rgba(255,135,82,.34);
+      background: linear-gradient(180deg, rgba(255,135,82,.16), rgba(255,255,255,.03));
+    }
+    .day-focus-chip-day {
+      font-size: .82rem;
+      font-weight: 650;
+      letter-spacing: -.01em;
+    }
+    .day-focus-chip-date {
+      color: var(--muted);
+      font-size: .74rem;
+    }
+    .day-focus-chip-meta {
+      font-size: .78rem;
+      letter-spacing: -.01em;
+    }
 
     /* Stacked bar chart fills */
     .stacked-fill {
@@ -521,12 +836,18 @@
       .summary-grid { grid-template-columns: 1fr; }
       .proxy-grid { grid-template-columns: 1fr; }
       .request-layout, .detail-grid, .request-meta { grid-template-columns: 1fr; }
+      .source-period-grid, .source-duel-grid { grid-template-columns: 1fr; }
+      .source-spotlight-head { flex-direction: column; }
+      .source-lead-note { max-width: none; text-align: left; }
+      .day-focus-head { flex-direction: column; }
       .chart-summary { text-align: left; justify-items: start; }
       .chart-range-control { justify-items: start; }
       .mapping-table .arrow-cell { display: none; }
     }
     @media (max-width: 760px) {
       .summary-grid { grid-template-columns: 1fr; }
+      .source-context-pill { width: 100%; justify-items: start; }
+      .panel-head { align-items: start; }
     }
   </style>
 </head>
@@ -796,13 +1117,23 @@
 
       <div class="list rail">
         <source-breakdown-card
+          :daily-history="dailyHistory"
           :current-usage="currentMonth"
           :all-time-usage="allTime"
+          :scope="analysisScope"
+          :selected-day-key="selectedDayKey"
+          @update:scope="analysisScope = $event"
+          @update:selectedDayKey="selectedDayKey = $event"
         ></source-breakdown-card>
 
         <token-breakdown-card
+          :daily-history="dailyHistory"
           :current-usage="currentMonth"
           :all-time-usage="allTime"
+          :scope="analysisScope"
+          :selected-day-key="selectedDayKey"
+          @update:scope="analysisScope = $event"
+          @update:selectedDayKey="selectedDayKey = $event"
         ></token-breakdown-card>
       </div>
     </section>
@@ -1072,11 +1403,21 @@
         </div>
       </div>
 
+      <day-focus-strip
+        :daily-history="dailyHistory"
+        :selected-day-key="selectedDayKey"
+        label="Focused Day"
+        meta-mode="tokens"
+        @update:selectedDayKey="$emit('update:selectedDayKey', $event)"
+      ></day-focus-strip>
+
       <div class="toolbar breakdown-controls">
         <label class="control">
-          <span class="subtle">Range</span>
-          <select v-model="scope">
-            <option value="current">Current month</option>
+          <span class="subtle">Window</span>
+          <select :value="scope" @change="$emit('update:scope', $event.target.value)">
+            <option value="day">Focused day</option>
+            <option value="week">Last 7 days</option>
+            <option value="month">This month</option>
             <option value="all">All time</option>
           </select>
         </label>
@@ -1130,54 +1471,175 @@
     </article>
   </template>
 
+  <template id="day-focus-strip-template">
+    <div v-if="dayOptions.length" class="day-focus-strip">
+      <div class="day-focus-head">
+        <div>
+          <div class="eyebrow">{{ label }}</div>
+          <div class="subtle">{{ selectedDaySummary }}</div>
+        </div>
+        <div class="day-focus-nav">
+          <button type="button" @click="stepDay(-1)" :disabled="selectedIndex <= 0">Prev</button>
+          <button type="button" @click="stepDay(1)" :disabled="selectedIndex >= dayOptions.length - 1">Next</button>
+        </div>
+      </div>
+      <div class="day-focus-scroller">
+        <button
+          v-for="row in dayOptions"
+          :key="row.day_key"
+          type="button"
+          :class="['day-focus-chip', { active: row.day_key === resolvedSelectedDayKey }]"
+          @click="$emit('update:selectedDayKey', row.day_key)"
+        >
+          <span class="day-focus-chip-day">{{ weekdayLabel(row.day_key) }}</span>
+          <span class="day-focus-chip-date">{{ shortDayLabel(row.day_key) }}</span>
+          <span class="day-focus-chip-meta">{{ chipMeta(row) }}</span>
+        </button>
+      </div>
+    </div>
+  </template>
+
   <template id="source-breakdown-card-template">
-    <article class="panel">
+    <article class="panel source-mix-card">
       <div class="panel-head">
         <div>
           <h3>Source Mix</h3>
           <div class="subtle">{{ activeSubtitle }}</div>
         </div>
+        <button
+          type="button"
+          :class="['source-context-pill', { active: scope === 'all' }]"
+          @click="$emit('update:scope', 'all')"
+        >
+          <span class="subtle">All-time context</span>
+          <strong>{{ money(allTimeUsage.cost_usd) }}</strong>
+          <span class="subtle">{{ integer(allTimeUsage.request_count) }} requests · {{ compact(allTimeUsage.total_tokens) }} tokens</span>
+        </button>
       </div>
 
-      <div class="toolbar breakdown-controls">
-        <label class="control">
-          <span class="subtle">Range</span>
-          <select v-model="scope">
-            <option value="current">Current month</option>
-            <option value="all">All time</option>
-          </select>
-        </label>
-        <label class="control">
-          <span class="subtle">Sort rows by</span>
-          <select v-model="sortMode">
-            <option value="cost">Highest cost</option>
-            <option value="tokens">Most tokens</option>
-            <option value="requests">Most requests</option>
-            <option value="source">Source name</option>
-          </select>
-        </label>
-        <label class="control">
-          <span class="subtle">Min spend (USD)</span>
-          <input v-model.number="minCostUsd" type="number" min="0" step="0.1" />
-        </label>
-      </div>
-      <div class="subtle" style="margin-bottom: 8px;">
-        Showing {{ integer(displayRows.length) }} of {{ integer(rawRows.length) }} sources.
-      </div>
-
-      <div class="list">
-        <article v-for="row in displayRows" :key="row.source" class="mini-card">
-          <div class="source-head">
-            <span class="badge">{{ row.source }}</span>
-            <strong>{{ money(row.cost_usd) }}</strong>
+      <div class="source-period-grid">
+        <button
+          v-for="card in periodCards"
+          :key="card.key"
+          type="button"
+          :class="['source-period-card', { active: scope === card.key }]"
+          @click="$emit('update:scope', card.key)"
+        >
+          <div class="source-period-top">
+            <div>
+              <div class="source-period-kicker">{{ card.kicker }}</div>
+              <div class="source-period-label">{{ card.label }}</div>
+            </div>
+            <span class="badge">{{ dominantSourceLabel(card.usage) }}</span>
           </div>
-          <div class="subtle">{{ compact(row.total_tokens) }} tokens · {{ integer(row.request_count) }} requests</div>
-          <div class="subtle">{{ shareLabel(row) }} of spend</div>
-          <div class="bar"><span :style="{ width: `${shareWidth(row)}%` }"></span></div>
-        </article>
-        <div v-if="!rawRows.length" class="empty">No source usage recorded yet.</div>
-        <div v-else-if="!displayRows.length" class="empty">No sources match the minimum spend filter.</div>
+          <div class="source-period-value">{{ money(card.usage.cost_usd) }}</div>
+          <div class="source-period-meta">{{ integer(card.usage.request_count) }} requests · {{ compact(card.usage.total_tokens) }} tokens</div>
+          <div class="source-period-track">
+            <span
+              v-for="segment in periodSegments(card.usage)"
+              :key="`${card.key}-${segment.source}`"
+              :class="['source-period-segment', sourceToneClass(segment.source)]"
+              :style="{ width: `${segment.width}%` }"
+            ></span>
+          </div>
+        </button>
       </div>
+
+      <day-focus-strip
+        :daily-history="dailyHistory"
+        :selected-day-key="selectedDayKey"
+        label="Day-to-Day"
+        meta-mode="money"
+        @update:selectedDayKey="$emit('update:selectedDayKey', $event)"
+      ></day-focus-strip>
+
+      <div v-if="displayRows.length" class="source-spotlight">
+        <div class="source-spotlight-head">
+          <div>
+            <div class="eyebrow">Selected Window</div>
+            <h3>{{ spotlightTitle }}</h3>
+          </div>
+          <div class="source-lead-note">{{ leadNarrative }}</div>
+        </div>
+
+        <div class="source-share-bar">
+          <span
+            v-for="segment in periodSegments(activeUsage)"
+            :key="`active-${segment.source}`"
+            :class="['source-share-segment', sourceToneClass(segment.source)]"
+            :style="{ width: `${segment.width}%` }"
+          ></span>
+        </div>
+
+        <div class="source-share-legend">
+          <div v-for="row in displayRows" :key="`legend-${row.source}`" class="source-share-pill">
+            <span :class="['source-dot', sourceToneClass(row.source)]"></span>
+            <span>{{ sourceLabel(row.source) }}</span>
+            <strong>{{ shareLabel(row) }}</strong>
+          </div>
+        </div>
+
+        <div class="source-duel-grid">
+          <article
+            v-for="row in displayRows"
+            :key="row.source"
+            :class="['source-detail-card', sourceToneClass(row.source)]"
+          >
+            <div class="source-detail-head">
+              <div class="source-detail-label">
+                <span :class="['source-dot', sourceToneClass(row.source)]"></span>
+                <span>{{ sourceLabel(row.source) }}</span>
+              </div>
+              <div class="source-detail-share">{{ shareLabel(row) }} of spend</div>
+            </div>
+            <div class="source-detail-value">{{ money(row.cost_usd) }}</div>
+            <div class="source-detail-meta">
+              <span>{{ integer(row.request_count) }} requests</span>
+              <span>{{ compact(row.total_tokens) }} tokens</span>
+              <span>{{ money(row.request_count ? row.cost_usd / row.request_count : 0) }}/request</span>
+            </div>
+            <div class="source-detail-metrics">
+              <div class="source-metric">
+                <div class="source-metric-head">
+                  <span>Spend</span>
+                  <strong>{{ money(row.cost_usd) }}</strong>
+                </div>
+                <div class="source-metric-track">
+                  <span
+                    :class="['source-metric-fill', sourceToneClass(row.source)]"
+                    :style="{ width: `${metricWidth(row, 'cost_usd')}%` }"
+                  ></span>
+                </div>
+              </div>
+              <div class="source-metric">
+                <div class="source-metric-head">
+                  <span>Tokens</span>
+                  <strong>{{ compact(row.total_tokens) }}</strong>
+                </div>
+                <div class="source-metric-track">
+                  <span
+                    :class="['source-metric-fill', sourceToneClass(row.source)]"
+                    :style="{ width: `${metricWidth(row, 'total_tokens')}%` }"
+                  ></span>
+                </div>
+              </div>
+              <div class="source-metric">
+                <div class="source-metric-head">
+                  <span>Requests</span>
+                  <strong>{{ integer(row.request_count) }}</strong>
+                </div>
+                <div class="source-metric-track">
+                  <span
+                    :class="['source-metric-fill', sourceToneClass(row.source)]"
+                    :style="{ width: `${metricWidth(row, 'request_count')}%` }"
+                  ></span>
+                </div>
+              </div>
+            </div>
+          </article>
+        </div>
+      </div>
+      <div v-else class="empty">No source usage recorded yet.</div>
     </article>
   </template>
 
@@ -1264,6 +1726,82 @@
       },
     };
 
+    function parseDayKey(dayKey) {
+      if (!dayKey) return null;
+      const date = new Date(`${dayKey}T00:00:00Z`);
+      return Number.isNaN(date.getTime()) ? null : date;
+    }
+
+    function formatDayKey(dayKey, options) {
+      const date = parseDayKey(dayKey);
+      return date ? date.toLocaleDateString([], options) : (dayKey || '-');
+    }
+
+    function latestDailyRow(dailyHistory) {
+      const rows = Array.isArray(dailyHistory) ? dailyHistory : [];
+      return rows.length ? (rows[rows.length - 1] || {}) : {};
+    }
+
+    function findDailyRowByKey(dailyHistory, selectedDayKey) {
+      const rows = Array.isArray(dailyHistory) ? dailyHistory : [];
+      if (!rows.length) return {};
+      if (selectedDayKey) {
+        const match = rows.find((row) => row?.day_key === selectedDayKey);
+        if (match) return match;
+      }
+      return latestDailyRow(rows);
+    }
+
+    function mergeUsageRows(rows) {
+      const sourceMap = {};
+      let requestCount = 0;
+      let totalTokens = 0;
+      let costUsd = 0;
+      let inputTokens = 0;
+      let cachedInputTokens = 0;
+      let cacheCreationTokens = 0;
+      let outputTokens = 0;
+      let reasoningOutputTokens = 0;
+
+      for (const row of rows || []) {
+        if (!row || typeof row !== 'object') continue;
+        requestCount += Number(row.request_count || 0);
+        totalTokens += Number(row.total_tokens || 0);
+        costUsd += Number(row.cost_usd || 0);
+        inputTokens += Number(row.input_tokens || 0);
+        cachedInputTokens += Number(row.cached_input_tokens || 0);
+        cacheCreationTokens += Number(row.cache_creation_tokens || 0);
+        outputTokens += Number(row.output_tokens || 0);
+        reasoningOutputTokens += Number(row.reasoning_output_tokens || 0);
+
+        const sources = row.sources || {};
+        for (const [sourceName, sourceRow] of Object.entries(sources)) {
+          const current = sourceMap[sourceName] || {
+            source: String(sourceRow?.source || sourceName || 'unknown'),
+            cost_usd: 0,
+            total_tokens: 0,
+            request_count: 0,
+          };
+          current.cost_usd += Number(sourceRow?.cost_usd || 0);
+          current.total_tokens += Number(sourceRow?.total_tokens || 0);
+          current.request_count += Number(sourceRow?.request_count || 0);
+          sourceMap[sourceName] = current;
+        }
+      }
+
+      return {
+        request_count: requestCount,
+        total_tokens: totalTokens,
+        cost_usd: Number(costUsd.toFixed(4)),
+        input_tokens: inputTokens,
+        cached_input_tokens: cachedInputTokens,
+        cache_creation_tokens: cacheCreationTokens,
+        output_tokens: outputTokens,
+        reasoning_output_tokens: reasoningOutputTokens,
+        sources: sourceMap,
+      };
+    }
+
     const MetricCard = {
       template: '#metric-card-template',
       props: {
@@ -1289,6 +1827,62 @@
       },
       methods: {
         ...sharedFormatters,
+      },
+    };
+
+    const DayFocusStrip = {
+      template: '#day-focus-strip-template',
+      emits: ['update:selectedDayKey'],
+      props: {
+        dailyHistory: { type: Array, default: () => [] },
+        selectedDayKey: { type: String, default: '' },
+        label: { type: String, default: 'Focused Day' },
+        metaMode: { type: String, default: 'money' },
+      },
+      computed: {
+        dayOptions() {
+          return Array.isArray(this.dailyHistory) ? this.dailyHistory : [];
+        },
+        selectedRow() {
+          return findDailyRowByKey(this.dayOptions, this.selectedDayKey);
+        },
+        resolvedSelectedDayKey() {
+          return String(this.selectedRow?.day_key || '');
+        },
+        selectedIndex() {
+          return this.dayOptions.findIndex((row) => row?.day_key === this.resolvedSelectedDayKey);
+        },
+        selectedDaySummary() {
+          if (!this.resolvedSelectedDayKey) return 'No daily history available yet.';
+          return `${this.longDayLabel(this.resolvedSelectedDayKey)} · ${this.money(this.selectedRow.cost_usd)} · ${this.compact(this.selectedRow.total_tokens)} tokens · ${this.integer(this.selectedRow.request_count)} requests`;
+        },
+      },
+      methods: {
+        ...sharedFormatters,
+        shortDayLabel(dayKey) {
+          return formatDayKey(dayKey, { month: 'short', day: 'numeric' });
+        },
+        longDayLabel(dayKey) {
+          return formatDayKey(dayKey, { weekday: 'long', month: 'short', day: 'numeric' });
+        },
+        weekdayLabel(dayKey) {
+          return formatDayKey(dayKey, { weekday: 'short' });
+        },
+        chipMeta(row) {
+          if (this.metaMode === 'tokens') {
+            return this.compact(row?.total_tokens);
+          }
+          return this.money(row?.cost_usd);
+        },
+        stepDay(delta) {
+          if (!this.dayOptions.length) return;
+          const currentIndex = this.selectedIndex >= 0 ? this.selectedIndex : this.dayOptions.length - 1;
+          const nextIndex = Math.min(this.dayOptions.length - 1, Math.max(0, currentIndex + delta));
+          const row = this.dayOptions[nextIndex];
+          if (row?.day_key) {
+            this.$emit('update:selectedDayKey', row.day_key);
+          }
+        },
       },
     };
 
@@ -1449,25 +2043,44 @@
 
     const TokenBreakdownCard = {
       template: '#token-breakdown-card-template',
+      emits: ['update:scope', 'update:selectedDayKey'],
       props: {
+        dailyHistory: { type: Array, default: () => [] },
         currentUsage: { type: Object, default: () => ({}) },
         allTimeUsage: { type: Object, default: () => ({}) },
+        scope: { type: String, default: 'week' },
+        selectedDayKey: { type: String, default: '' },
       },
       data() {
         return {
-          scope: 'current',
           barMetric: 'cost',
           sortMode: 'cost',
           minTokens: 0,
         };
       },
       computed: {
+        dailyUsage() {
+          return findDailyRowByKey(this.dailyHistory, this.selectedDayKey);
+        },
+        weeklyUsage() {
+          const rows = (this.dailyHistory || []).slice(-7);
+          return mergeUsageRows(rows);
+        },
         activeUsage() {
-          return this.scope === 'all' ? (this.allTimeUsage || {}) : (this.currentUsage || {});
+          if (this.scope === 'all') return this.allTimeUsage || {};
+          if (this.scope === 'week') return this.weeklyUsage || {};
+          if (this.scope === 'day') return this.dailyUsage || {};
+          return this.currentUsage || {};
         },
         activeUsageSubtitle() {
           const u = this.activeUsage || {};
-          const range = this.scope === 'all' ? 'All time' : 'Current month';
+          const range = this.scope === 'all'
+            ? 'All time'
+            : (this.scope === 'week'
+              ? 'Last 7 days'
+              : (this.scope === 'day'
+                ? formatDayKey(this.dailyUsage?.day_key, { month: 'short', day: 'numeric' })
+                : 'This month'));
           return `${range} · ${this.integer(u.request_count)} requests · ${this.compact(u.total_tokens)} tokens · ${this.money(u.cost_usd)}`;
         },
         rawRows() {
@@ -1550,25 +2163,47 @@
 
     const SourceBreakdownCard = {
       template: '#source-breakdown-card-template',
+      emits: ['update:scope', 'update:selectedDayKey'],
       props: {
+        dailyHistory: { type: Array, default: () => [] },
         currentUsage: { type: Object, default: () => ({}) },
         allTimeUsage: { type: Object, default: () => ({}) },
-      },
-      data() {
-        return {
-          scope: 'current',
-          sortMode: 'cost',
-          minCostUsd: 0,
-        };
+        scope: { type: String, default: 'week' },
+        selectedDayKey: { type: String, default: '' },
       },
       computed: {
+        dailyUsage() {
+          return findDailyRowByKey(this.dailyHistory, this.selectedDayKey);
+        },
+        weeklyUsage() {
+          const rows = (this.dailyHistory || []).slice(-7);
+          return mergeUsageRows(rows);
+        },
+        periodCards() {
+          return [
+            { key: 'day', label: this.focusedDayShortLabel, kicker: 'Focused day', usage: this.dailyUsage || {} },
+            { key: 'week', label: 'Last 7 Days', kicker: 'Weekly split', usage: this.weeklyUsage || {} },
+            { key: 'month', label: 'This Month', kicker: 'Monthly split', usage: this.currentUsage || {} },
+          ];
+        },
         activeUsage() {
-          return this.scope === 'all' ? (this.allTimeUsage || {}) : (this.currentUsage || {});
+          if (this.scope === 'all') return this.allTimeUsage || {};
+          if (this.scope === 'week') return this.weeklyUsage || {};
+          if (this.scope === 'day') return this.dailyUsage || {};
+          return this.currentUsage || {};
         },
         activeSubtitle() {
           const u = this.activeUsage || {};
-          const range = this.scope === 'all' ? 'All time' : 'Current month';
-          return `${range} · ${this.integer(u.request_count)} requests · ${this.compact(u.total_tokens)} total tokens · ${this.money(u.cost_usd)}`;
+          return `${this.spotlightTitle} · ${this.integer(u.request_count)} requests · ${this.compact(u.total_tokens)} total tokens · ${this.money(u.cost_usd)}`;
+        },
+        focusedDayShortLabel() {
+          return formatDayKey(this.dailyUsage?.day_key, { month: 'short', day: 'numeric' });
+        },
+        spotlightTitle() {
+          if (this.scope === 'all') return 'All-Time Split';
+          if (this.scope === 'week') return 'Last 7 Days';
+          if (this.scope === 'day') return formatDayKey(this.dailyUsage?.day_key, { weekday: 'long', month: 'short', day: 'numeric' });
+          return 'This Month';
         },
         rawRows() {
           const sourceMap = this.activeUsage?.sources || {};
@@ -1580,36 +2215,87 @@
           }));
         },
         displayRows() {
-          const threshold = Number(this.minCostUsd || 0);
-          const minCost = Number.isFinite(threshold) && threshold > 0 ? threshold : 0;
-          const filtered = this.rawRows.filter((row) => row.cost_usd >= minCost);
-          const sorted = [...filtered];
-
-          if (this.sortMode === 'tokens') {
-            sorted.sort((a, b) => (b.total_tokens - a.total_tokens) || (b.cost_usd - a.cost_usd));
-          } else if (this.sortMode === 'requests') {
-            sorted.sort((a, b) => (b.request_count - a.request_count) || (b.cost_usd - a.cost_usd));
-          } else if (this.sortMode === 'source') {
-            sorted.sort((a, b) => a.source.localeCompare(b.source));
-          } else {
-            sorted.sort((a, b) => (b.cost_usd - a.cost_usd) || (b.total_tokens - a.total_tokens));
+          return [...this.rawRows]
+            .filter((row) => row.cost_usd > 0 || row.total_tokens > 0 || row.request_count > 0)
+            .sort((a, b) => (b.cost_usd - a.cost_usd) || (b.total_tokens - a.total_tokens) || (b.request_count - a.request_count));
+        },
+        leadNarrative() {
+          if (!this.displayRows.length) return 'No source usage recorded in this window yet.';
+          if (this.displayRows.length === 1) {
+            return `${this.sourceLabel(this.displayRows[0].source)} accounts for all recorded spend in this window.`;
           }
-          return sorted;
+
+          const [leader, runnerUp] = this.displayRows;
+          const costDelta = Number(leader.cost_usd || 0) - Number(runnerUp.cost_usd || 0);
+          const shareDelta = this.shareValue(leader) - this.shareValue(runnerUp);
+          if (Math.abs(costDelta) < 0.005 && Math.abs(shareDelta) < 0.2) {
+            return `${this.sourceLabel(leader.source)} and ${this.sourceLabel(runnerUp.source)} are essentially even right now.`;
+          }
+          return `${this.sourceLabel(leader.source)} leads ${this.sourceLabel(runnerUp.source)} by ${this.money(costDelta)} and ${this.percent(shareDelta)} of spend.`;
         },
       },
       methods: {
         ...sharedFormatters,
-        shareWidth(row) {
+        sourceLabel(source) {
+          const normalized = String(source || 'unknown').trim().toLowerCase();
+          if (normalized === 'claude') return 'Claude';
+          if (normalized === 'codex') return 'Codex';
+          if (!normalized) return 'Unknown';
+          return normalized.charAt(0).toUpperCase() + normalized.slice(1);
+        },
+        sourceToneClass(source) {
+          const normalized = String(source || 'unknown').trim().toLowerCase();
+          if (normalized === 'claude') return 'tone-claude';
+          if (normalized === 'codex') return 'tone-codex';
+          return 'tone-other';
+        },
+        shareValue(row) {
           const total = Number(this.activeUsage?.cost_usd || 0);
           const cost = Number(row?.cost_usd || 0);
-          if (!Number.isFinite(total) || total <= 0 || !Number.isFinite(cost) || cost <= 0) return 0;
-          return Math.max(4, Math.min(100, (cost / total) * 100));
+          if (!Number.isFinite(total) || total <= 0 || !Number.isFinite(cost)) return 0;
+          return (cost / total) * 100;
         },
         shareLabel(row) {
-          const total = Number(this.activeUsage?.cost_usd || 0);
-          const cost = Number(row?.cost_usd || 0);
-          if (!Number.isFinite(total) || total <= 0 || !Number.isFinite(cost)) return '0%';
-          return `${new Intl.NumberFormat('en-US', { maximumFractionDigits: 1 }).format((cost / total) * 100)}%`;
+          return this.percent(this.shareValue(row));
+        },
+        percent(value) {
+          const amount = Number(value || 0);
+          if (!Number.isFinite(amount) || amount <= 0) return '0%';
+          return `${new Intl.NumberFormat('en-US', { maximumFractionDigits: 1 }).format(amount)}%`;
+        },
+        dominantSourceLabel(usage) {
+          const rows = Object.values(usage?.sources || {})
+            .map((row) => ({
+              source: String(row?.source || 'unknown'),
+              cost_usd: Number(row?.cost_usd || 0),
+            }))
+            .sort((a, b) => b.cost_usd - a.cost_usd);
+          if (!rows.length || rows[0].cost_usd <= 0) return 'No spend';
+          return `${this.sourceLabel(rows[0].source)} lead`;
+        },
+        periodSegments(usage) {
+          const total = Number(usage?.cost_usd || 0);
+          const rows = Object.values(usage?.sources || {})
+            .map((row) => ({
+              source: String(row?.source || 'unknown'),
+              cost_usd: Number(row?.cost_usd || 0),
+            }))
+            .filter((row) => row.cost_usd > 0)
+            .sort((a, b) => b.cost_usd - a.cost_usd);
+          if (!rows.length) {
+            return [{ source: 'unknown', width: 100 }];
+          }
+          return rows.map((row) => ({
+            source: row.source,
+            width: total > 0 ? Math.max(6, (row.cost_usd / total) * 100) : 0,
+          }));
+        },
+        metricWidth(row, key) {
+          const values = this.displayRows.map((entry) => Number(entry?.[key] || 0)).filter((value) => Number.isFinite(value) && value > 0);
+          const maxValue = values.length ? Math.max(...values) : 0;
+          const current = Number(row?.[key] || 0);
+          if (!Number.isFinite(maxValue) || maxValue <= 0 || !Number.isFinite(current) || current <= 0) return 0;
+          return Math.max(10, (current / maxValue) * 100);
         },
       },
     };
@@ -1620,6 +2306,7 @@
         SummaryExplorerCard,
         TrendChartCard,
         StackedBarChartCard,
+        DayFocusStrip,
         SourceBreakdownCard,
         TokenBreakdownCard,
       },
@@ -1657,9 +2344,11 @@
           tabs: ['sessions', 'requests'],
           spendTrendRange: 'day',
           tokenVolumeRange: 'day',
+          analysisScope: 'week',
           search: '',
           sourceFilter: 'all',
           sortMode: 'recent',
+          selectedDayKey: '',
           requestPage: 1,
           selectedRequestKey: '',
           data: {
@@ -1700,6 +2389,7 @@
         currentMonth() { return this.data.current_month?.usage || {}; },
         allTime() { return this.data.all_time?.usage || {}; },
         dailyHistory() { return this.data.current_month?.daily_history || []; },
+        selectedDayUsage() { return findDailyRowByKey(this.dailyHistory, this.selectedDayKey); },
         monthHistoryChronological() { return [...((this.data.month_history || []).slice(0, 12))].reverse(); },
         todayUsage() { return this.dailyHistory[this.dailyHistory.length - 1] || {}; },
         trackedMonths() { return Number(this.allTime.months_tracked || (this.data.month_history || []).length || 0); },
@@ -2312,6 +3002,17 @@
           if (this.sortMode === 'tokens') return sorted.sort((a, b) => Number(b.total_tokens || b?.usage?.total_tokens || 0) - Number(a.total_tokens || a?.usage?.total_tokens || 0));
           return sorted.sort((a, b) => String(b[dateKey] || b.started_at || '').localeCompare(String(a[dateKey] || a.started_at || '')));
         },
+        syncSelectedDayKey() {
+          const rows = this.dailyHistory || [];
+          if (!rows.length) {
+            this.selectedDayKey = '';
+            return;
+          }
+          const dayKeys = new Set(rows.map((row) => row?.day_key).filter(Boolean));
+          if (!this.selectedDayKey || !dayKeys.has(this.selectedDayKey)) {
+            this.selectedDayKey = String(rows[rows.length - 1]?.day_key || '');
+          }
+        },
         _applyDashboardPayload(payload) {
           if (!payload || typeof payload !== 'object') {
             return;
@@ -2321,6 +3022,7 @@
           const previousScrollTop = requestList ? requestList.scrollTop : null;
           const mergedRequests = this.mergeRecentRequests(this.data.recent_requests, payload?.recent_requests);
           Object.assign(this.data, { ...payload, recent_requests: mergedRequests });
+          this.syncSelectedDayKey();
           this.requestPage = Math.min(this.requestPageCount, Math.max(1, this.requestPage));
           const requestKeys = new Set((this.data.recent_requests || []).map((row) => this.requestKey(row)));
           if (!requestKeys.has(this.selectedRequestKey)) {
