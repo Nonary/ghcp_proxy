@@ -10,6 +10,22 @@ class InitiatorPolicyTests(unittest.TestCase):
     def setUp(self):
         proxy.set_initiator_policy(initiator_policy.InitiatorPolicy())
 
+    def test_safeguard_trigger_callback_records_reason(self):
+        recorded = []
+        policy = initiator_policy.InitiatorPolicy(on_safeguard_triggered=recorded.append)
+        start = datetime(2026, 4, 4, 18, 0, tzinfo=timezone.utc)
+
+        policy.note_request_started("req-1", "user", started_at=start)
+
+        with mock.patch.object(initiator_policy, "utc_now", return_value=start.replace(second=5)):
+            initiator = policy.resolve_initiator("user", "gpt-5.4", request_id="req-2")
+
+        self.assertEqual(initiator, "agent")
+        self.assertEqual(len(recorded), 1)
+        self.assertEqual(recorded[0]["trigger_reason"], "active_request")
+        self.assertEqual(recorded[0]["resolved_initiator"], "agent")
+        self.assertEqual(recorded[0]["request_id"], "req-2")
+
     def test_forced_agent_responses_requests_stay_agent(self):
         from types import SimpleNamespace
         import format_translation

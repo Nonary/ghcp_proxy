@@ -89,7 +89,17 @@ _TRACE_HEADER_ALLOWLIST = {
 AUTH_FAILURE_MESSAGE = "GHCP auth failed"
 INVALID_BRIDGE_REQUEST_MESSAGE = "Invalid request"
 
-_initiator_policy = InitiatorPolicy()
+safeguard_event_store = dashboard_module.create_safeguard_event_store()
+
+
+def _record_safeguard_trigger(event: dict):
+    safeguard_event_store.record_event(event)
+    try:
+        dashboard_service.notify_dashboard_stream_listeners()
+    except NameError:
+        pass
+
+_initiator_policy = InitiatorPolicy(on_safeguard_triggered=_record_safeguard_trigger)
 usage_event_bus = EventBus()
 
 
@@ -105,7 +115,9 @@ class GracefulStreamingResponse(StreamingResponse):
 
 def set_initiator_policy(policy: InitiatorPolicy):
     global _initiator_policy
+    policy.on_safeguard_triggered = _record_safeguard_trigger
     _initiator_policy = policy
+    usage_tracker.on_request_finished = policy.note_request_finished
 
 
 usage_tracker = usage_tracking.UsageTracker(
@@ -136,6 +148,7 @@ dashboard_service = dashboard_module.create_dashboard_service(
         load_api_key_payload=auth.load_api_key_payload,
         snapshot_all_usage_events=usage_tracker.snapshot_all_usage_events,
         snapshot_usage_events=usage_tracker.snapshot_usage_events,
+        load_safeguard_trigger_stats=safeguard_event_store.load_stats,
     ),
     utc_now=util.utc_now,
     utc_now_iso=util.utc_now_iso,

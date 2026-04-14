@@ -65,6 +65,7 @@ class DashboardDependencies:
     load_api_key_payload: Callable[[], dict] = lambda: {}
     snapshot_all_usage_events: Callable[[], list[dict]] = lambda: []
     snapshot_usage_events: Callable[[], list[dict]] = lambda: []
+    load_safeguard_trigger_stats: Callable[[datetime], dict] = lambda _now: {}
 
 
 # ─── SQLite cache functions ──────────────────────────────────────────────────
@@ -121,6 +122,25 @@ class DashboardCacheStore:
                         """
                         CREATE INDEX IF NOT EXISTS idx_archived_usage_events_recorded_at
                         ON archived_usage_events (recorded_at DESC)
+                        """
+                    )
+                    connection.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS safeguard_trigger_events (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            triggered_at TEXT NOT NULL,
+                            trigger_reason TEXT NOT NULL,
+                            candidate_initiator TEXT,
+                            resolved_initiator TEXT,
+                            model_name TEXT,
+                            request_id TEXT
+                        )
+                        """
+                    )
+                    connection.execute(
+                        """
+                        CREATE INDEX IF NOT EXISTS idx_safeguard_trigger_events_triggered_at
+                        ON safeguard_trigger_events (triggered_at DESC)
                         """
                     )
                     connection.commit()
@@ -211,6 +231,116 @@ class DashboardCacheStore:
             mark_unavailable=self.mark_unavailable,
         )
 
+    def safeguard_event_store(self):
+        return SafeguardEventStore(
+            init_storage=self.initialize,
+            lock=self.lock,
+            connect=self.connect,
+            mark_unavailable=self.mark_unavailable,
+        )
+
+
+class SafeguardEventStore:
+    def __init__(self, *, init_storage, lock, connect, mark_unavailable):
+        self.init_storage = init_storage
+        self.lock = lock
+        self.connect = connect
+        self.mark_unavailable = mark_unavailable
+
+    def clear(self):
+        if not self.init_storage():
+            return
+        try:
+            with self.lock:
+                with closing(self.connect()) as connection:
+                    connection.execute("DELETE FROM safeguard_trigger_events")
+                    connection.commit()
+        except Exception as exc:
+            self.mark_unavailable(f"failed to clear safeguard trigger events: {exc}")
+
+    def record_event(self, event: dict | None):
+        if not isinstance(event, dict):
+            return
+        triggered_at = event.get("triggered_at") or utc_now_iso()
+        trigger_reason = str(event.get("trigger_reason") or "").strip().lower() or "unknown"
+        candidate_initiator = event.get("candidate_initiator")
+        resolved_initiator = event.get("resolved_initiator")
+        model_name = event.get("model_name")
+        request_id = event.get("request_id")
+        if not self.init_storage():
+            return
+        try:
+            with self.lock:
+                with closing(self.connect()) as connection:
+                    connection.execute(
+                        """
+                        INSERT INTO safeguard_trigger_events (
+                            triggered_at,
+                            trigger_reason,
+                            candidate_initiator,
+                            resolved_initiator,
+                            model_name,
+                            request_id
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            str(triggered_at),
+                            trigger_reason,
+                            candidate_initiator,
+                            resolved_initiator,
+                            model_name,
+                            request_id,
+                        ),
+                    )
+                    connection.commit()
+        except Exception as exc:
+            self.mark_unavailable(f"failed to record safeguard trigger event: {exc}")
+
+    def load_stats(self, now: datetime | None = None) -> dict:
+        reference_now = now or utc_now()
+        month_start, month_end = _current_billing_month_bounds(reference_now)
+        day_start = datetime(reference_now.year, reference_now.month, reference_now.day, tzinfo=timezone.utc)
+        day_end = day_start + timedelta(days=1)
+        default_payload = {
+            "today_count": 0,
+            "current_month_count": 0,
+            "all_time_count": 0,
+            "latest_triggered_at": None,
+        }
+        if not self.init_storage():
+            return default_payload
+        try:
+            with self.lock:
+                with closing(self.connect()) as connection:
+                    row = connection.execute(
+                        """
+                        SELECT
+                            COUNT(*) AS all_time_count,
+                            COALESCE(SUM(CASE WHEN triggered_at >= ? AND triggered_at < ? THEN 1 ELSE 0 END), 0) AS current_month_count,
+                            COALESCE(SUM(CASE WHEN triggered_at >= ? AND triggered_at < ? THEN 1 ELSE 0 END), 0) AS today_count,
+                            MAX(triggered_at) AS latest_triggered_at
+                        FROM safeguard_trigger_events
+                        """,
+                        (
+                            month_start.isoformat(),
+                            month_end.isoformat(),
+                            day_start.isoformat(),
+                            day_end.isoformat(),
+                        ),
+                    ).fetchone()
+        except Exception as exc:
+            self.mark_unavailable(f"failed to load safeguard trigger stats: {exc}")
+            return default_payload
+        if row is None:
+            return default_payload
+        return {
+            "today_count": int(row["today_count"] or 0),
+            "current_month_count": int(row["current_month_count"] or 0),
+            "all_time_count": int(row["all_time_count"] or 0),
+            "latest_triggered_at": row["latest_triggered_at"],
+        }
+
 
 dashboard_cache_store = DashboardCacheStore()
 
@@ -237,6 +367,10 @@ def _sqlite_cache_get_latest(cache_key_prefix: str) -> dict | None:
 
 def _sqlite_cache_put(cache_key: str, payload: dict):
     dashboard_cache_store.put(cache_key, payload)
+
+
+def create_safeguard_event_store():
+    return dashboard_cache_store.safeguard_event_store()
 
 
 # ─── GitHub billing API ──────────────────────────────────────────────────────
@@ -1362,6 +1496,9 @@ class DashboardService:
             start_at=month_start,
             end_at=month_end,
         )
+        safeguard_stats = self.dependencies.load_safeguard_trigger_stats(now)
+        if not isinstance(safeguard_stats, dict):
+            safeguard_stats = {}
         daily_history_by_key = {row["day_key"]: row for row in daily_history if isinstance(row.get("day_key"), str)}
         filled_daily_history = []
         day_cursor = month_start
@@ -1388,6 +1525,12 @@ class DashboardService:
                 "reset_date": official_reset_date if official_reset_date is not None else quota_summary.get("reset_date"),
                 "source": official_premium.get("source") if official_available else "proxy-request-log",
                 "official": official_premium,
+            },
+            "safeguard": {
+                "today_count": int(safeguard_stats.get("today_count") or 0),
+                "current_month_count": int(safeguard_stats.get("current_month_count") or 0),
+                "all_time_count": int(safeguard_stats.get("all_time_count") or 0),
+                "latest_triggered_at": safeguard_stats.get("latest_triggered_at"),
             },
             "current_month": {
                 "label": current_month_key,

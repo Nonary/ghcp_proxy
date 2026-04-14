@@ -226,6 +226,47 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(payload["current_month"]["daily_history"][1]["cost_usd"], 1.5)
         self.assertEqual(payload["current_month"]["daily_history"][2]["request_count"], 0)
 
+    def test_build_dashboard_payload_includes_safeguard_trigger_counts(self):
+        fixed_now = datetime(2026, 4, 4, 18, 0, tzinfo=timezone.utc)
+        service = dashboard.DashboardService(
+            dependencies=dashboard.DashboardDependencies(
+                load_api_key_payload=lambda: {},
+                snapshot_all_usage_events=lambda: [],
+                snapshot_usage_events=lambda: [],
+                load_safeguard_trigger_stats=lambda _now: {
+                    "today_count": 1,
+                    "current_month_count": 2,
+                    "all_time_count": 3,
+                    "latest_triggered_at": "2026-04-04T17:30:00+00:00",
+                },
+            ),
+            utc_now=lambda: fixed_now,
+        )
+
+        with (
+            mock.patch.object(
+                service,
+                "get_official_premium_payload",
+                return_value={
+                    "available": False,
+                    "remaining": None,
+                    "used": None,
+                    "included": None,
+                    "reset_date": None,
+                    "source": "github-rest-billing-api",
+                    "raw": {},
+                    "refreshing": False,
+                    "error": None,
+                },
+            ),
+        ):
+            payload = service.build_payload()
+
+        self.assertEqual(payload["safeguard"]["today_count"], 1)
+        self.assertEqual(payload["safeguard"]["current_month_count"], 2)
+        self.assertEqual(payload["safeguard"]["all_time_count"], 3)
+        self.assertEqual(payload["safeguard"]["latest_triggered_at"], "2026-04-04T17:30:00+00:00")
+
     def test_dashboard_api_refresh_param_forces_refresh_and_disables_http_caching(self):
         request = SimpleNamespace(query_params={"refresh": "1"})
         mocked_to_thread = mock.AsyncMock(return_value={"ok": True})

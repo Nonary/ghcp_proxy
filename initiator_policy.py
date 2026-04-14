@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import deque
 from datetime import datetime, timezone
 from threading import Lock
+from typing import Callable
 
 AGENT_INITIATOR = "agent"
 USER_INITIATOR = "user"
@@ -370,8 +371,10 @@ class InitiatorPolicy:
         *,
         request_finish_guard_seconds: float = REQUEST_FINISH_GUARD_SECONDS,
         max_events: int = 512,
+        on_safeguard_triggered: Callable[[dict], None] | None = None,
     ):
         self.request_finish_guard_seconds = request_finish_guard_seconds
+        self.on_safeguard_triggered = on_safeguard_triggered
         self._events = deque(maxlen=max_events)
         self._lock = Lock()
         self._active_requests: dict[str, dict[str, str | None]] = {}
@@ -483,10 +486,26 @@ class InitiatorPolicy:
     ) -> str:
         resolved_now = now or utc_now()
         with self._lock:
-            initiator = self._resolve_locked(candidate_initiator, model_name, resolved_now, force_initiator)
+            initiator, safeguard_reason = self._resolve_locked(
+                candidate_initiator,
+                model_name,
+                resolved_now,
+                force_initiator,
+            )
             if isinstance(request_id, str) and request_id:
                 self._record_request_started_locked(request_id, initiator, resolved_now)
-            return initiator
+        if safeguard_reason is not None and self.on_safeguard_triggered is not None:
+            self.on_safeguard_triggered(
+                {
+                    "triggered_at": resolved_now.isoformat(),
+                    "trigger_reason": safeguard_reason,
+                    "candidate_initiator": candidate_initiator,
+                    "resolved_initiator": initiator,
+                    "model_name": _normalize_model_name(model_name),
+                    "request_id": request_id,
+                }
+            )
+        return initiator
 
     def note_request_started(
         self,
@@ -532,27 +551,30 @@ class InitiatorPolicy:
         model_name: str | None,
         now: datetime,
         force_initiator: str | None,
-    ) -> str:
+    ) -> tuple[str, str | None]:
         if force_initiator in {AGENT_INITIATOR, USER_INITIATOR}:
-            return force_initiator
+            return force_initiator, None
 
         if _is_haiku_model(model_name):
-            return AGENT_INITIATOR
+            return AGENT_INITIATOR, None
 
         initiator = USER_INITIATOR if candidate_initiator == USER_INITIATOR else AGENT_INITIATOR
-        if initiator == USER_INITIATOR and self._safeguard_active_locked(now):
-            return AGENT_INITIATOR
-        return initiator
+        safeguard_reason = self._safeguard_reason_locked(now)
+        if initiator == USER_INITIATOR and safeguard_reason is not None:
+            return AGENT_INITIATOR, safeguard_reason
+        return initiator, None
 
-    def _safeguard_active_locked(self, now: datetime) -> bool:
+    def _safeguard_reason_locked(self, now: datetime) -> str | None:
         if not self._seen_user_request:
-            return False
+            return None
         if self._active_requests:
-            return True
+            return "active_request"
         if self._last_activity_at is None:
-            return False
+            return None
         elapsed_seconds = (now - self._last_activity_at).total_seconds()
-        return elapsed_seconds < self.request_finish_guard_seconds
+        if elapsed_seconds < self.request_finish_guard_seconds:
+            return "cooldown"
+        return None
 
     def _record_request_started_locked(self, request_id: str, initiator: str, event_time: datetime):
         if initiator == USER_INITIATOR:

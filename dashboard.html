@@ -537,6 +537,7 @@
         :all-time="allTime"
         :current-month="currentMonth"
         :today-usage="todayUsage"
+        :safeguard="safeguardStats"
         :premium-value="premiumRemainingLabel"
         :premium-meta="premiumRemainingMetaLabel"
         :tracked-months="trackedMonths"
@@ -1217,6 +1218,12 @@
           <span class="summary-chip"><span class="chip-k">All-Time</span>{{ integer(allTime.request_count) }}</span>
         </div>
         <div class="summary-badge-row">
+          <span class="summary-label">Safeguard</span>
+          <span class="summary-chip"><span class="chip-k">Today</span>{{ integer(safeguard.today_count) }}</span>
+          <span class="summary-chip"><span class="chip-k">Month</span>{{ integer(safeguard.current_month_count) }}</span>
+          <span class="summary-chip"><span class="chip-k">All-Time</span>{{ integer(safeguard.all_time_count) }}</span>
+        </div>
+        <div class="summary-badge-row">
           <span class="summary-label">Premium</span>
           <span class="summary-chip"><span class="chip-k">Remaining</span>{{ premiumValue }}</span>
         </div>
@@ -1273,6 +1280,7 @@
         allTime: { type: Object, default: () => ({}) },
         currentMonth: { type: Object, default: () => ({}) },
         todayUsage: { type: Object, default: () => ({}) },
+        safeguard: { type: Object, default: () => ({}) },
         premiumValue: { type: String, default: '-' },
         premiumMeta: { type: String, default: '' },
         trackedMonths: { type: Number, default: 0 },
@@ -1656,6 +1664,7 @@
           selectedRequestKey: '',
           data: {
             premium: {},
+            safeguard: {},
             current_month: { usage: { sources: {} }, daily_history: [] },
             all_time: { usage: { sources: {} } },
             recent_sessions: [],
@@ -1687,6 +1696,7 @@
       },
       computed: {
         premium() { return this.data.premium || {}; },
+        safeguardStats() { return this.data.safeguard || {}; },
         currentMonth() { return this.data.current_month?.usage || {}; },
         allTime() { return this.data.all_time?.usage || {}; },
         dailyHistory() { return this.data.current_month?.daily_history || []; },
