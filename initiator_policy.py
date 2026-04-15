@@ -83,6 +83,7 @@ def _is_claude_meta_user_text(text: str) -> bool:
         "<local-command-stdout>",
         "<local-command-stderr>",
         "<task-notification>",
+        "<transcript>",
     )):
         return True
     if (
@@ -329,6 +330,27 @@ def _determine_chat_candidate(messages) -> str:
     return AGENT_INITIATOR
 
 
+def _is_claude_transcript_container(content) -> bool:
+    """Detect Claude Code approval agent transcript messages.
+
+    Approval agents send a user message whose content list starts with a
+    ``<transcript>`` text block followed by the conversation transcript.
+    The entire message is agent-generated, not user-typed.
+    """
+    if not isinstance(content, list):
+        return False
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("type", "")).lower() != "text":
+            continue
+        text = item.get("text")
+        if isinstance(text, str) and text.lstrip().startswith("<transcript>"):
+            return True
+        return False
+    return False
+
+
 def _strip_explicit_initiator_prefix_from_anthropic_message(
     message,
     *,
@@ -350,6 +372,9 @@ def _strip_explicit_initiator_prefix_from_anthropic_message(
 
     if not isinstance(content, list):
         return default_initiator
+
+    if _is_claude_transcript_container(content):
+        return AGENT_INITIATOR
 
     saw_tool_result = False
     saw_non_tool_result = False

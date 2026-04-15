@@ -303,6 +303,25 @@ class InitiatorPolicyTests(unittest.TestCase):
 
         self.assertEqual(initiator, "agent")
 
+    def test_anthropic_approval_agent_transcript_is_agent(self):
+        """Claude Code approval agents send a <transcript> block as a user message."""
+        policy = initiator_policy.InitiatorPolicy()
+        messages = [
+            {"role": "user", "content": [{"type": "text", "text": "System context"}]},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "<transcript>\n"},
+                    {"type": "text", "text": "User: help me with code"},
+                    {"type": "text", "text": "Agent: I will run bash"},
+                ],
+            },
+        ]
+
+        initiator = policy.resolve_anthropic_messages(messages, "claude-sonnet-4.6")
+
+        self.assertEqual(initiator, "agent")
+
     def test_anthropic_tool_result_with_real_user_text_stays_user(self):
         policy = initiator_policy.InitiatorPolicy()
         messages = [
