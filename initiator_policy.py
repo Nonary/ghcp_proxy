@@ -7,6 +7,7 @@ from typing import Callable
 
 AGENT_INITIATOR = "agent"
 USER_INITIATOR = "user"
+EXPLICIT_USER_INITIATOR = "user!"
 AGENT_INITIATOR_PREFIX = "_"
 USER_INITIATOR_PREFIX = "+"
 REQUEST_FINISH_GUARD_SECONDS = 15.0
@@ -52,7 +53,7 @@ def _strip_explicit_initiator_prefix(text: str) -> tuple[str, str | None]:
     if stripped.startswith(AGENT_INITIATOR_PREFIX):
         initiator = AGENT_INITIATOR
     elif stripped.startswith(USER_INITIATOR_PREFIX):
-        initiator = USER_INITIATOR
+        initiator = EXPLICIT_USER_INITIATOR
     else:
         return text, None
 
@@ -617,7 +618,9 @@ class InitiatorPolicy:
         if _is_haiku_model(model_name):
             return AGENT_INITIATOR, None
 
-        initiator = USER_INITIATOR if candidate_initiator == USER_INITIATOR else AGENT_INITIATOR
+        initiator = USER_INITIATOR if candidate_initiator in {USER_INITIATOR, EXPLICIT_USER_INITIATOR} else AGENT_INITIATOR
+        if initiator == USER_INITIATOR and candidate_initiator == EXPLICIT_USER_INITIATOR:
+            return initiator, None
         safeguard_reason = self._safeguard_reason_locked(now)
         if initiator == USER_INITIATOR and safeguard_reason is not None:
             return AGENT_INITIATOR, safeguard_reason

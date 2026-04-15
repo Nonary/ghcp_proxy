@@ -240,6 +240,17 @@ class InitiatorPolicyTests(unittest.TestCase):
         self.assertEqual(messages[-1]["content"][-1]["text"], "new prompt")
         self.assertEqual(initiator, "user")
 
+    def test_plus_prefix_bypasses_active_safeguard(self):
+        policy = initiator_policy.InitiatorPolicy()
+        start = datetime(2026, 4, 4, 18, 0, tzinfo=timezone.utc)
+
+        policy.note_request_started("req-1", "user", started_at=start)
+
+        with mock.patch.object(initiator_policy, "utc_now", return_value=start.replace(second=5)):
+            initiator = policy.resolve_initiator("user!", "gpt-5.4", request_id="req-2")
+
+        self.assertEqual(initiator, "user")
+
     def test_anthropic_tool_result_with_empty_text_tail_is_agent(self):
         policy = initiator_policy.InitiatorPolicy()
         messages = [
