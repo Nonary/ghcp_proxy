@@ -118,6 +118,7 @@ def build_responses_headers_for_request(
     effective_input, initiator = initiator_policy.resolve_responses_input(
         body.get("input"),
         body.get("model"),
+        subagent=request.headers.get("x-openai-subagent"),
         force_initiator=force_initiator,
         request_id=request_id,
     )
@@ -147,7 +148,12 @@ def build_chat_headers_for_request(
     headers = build_copilot_headers(api_key)
     _apply_forwarded_request_headers(headers, request, session_id_resolver=session_id_resolver)
 
-    initiator = initiator_policy.resolve_chat_messages(messages, model_name, request_id=request_id)
+    initiator = initiator_policy.resolve_chat_messages(
+        messages,
+        model_name,
+        subagent=request.headers.get("x-openai-subagent"),
+        request_id=request_id,
+    )
     headers["X-Initiator"] = initiator
     headers["x-interaction-type"] = _interaction_type_for_initiator(initiator)
     headers["x-interaction-id"] = str(uuid.uuid4())
@@ -204,7 +210,12 @@ def build_anthropic_headers_for_request(
     _apply_forwarded_request_headers(headers, request, body, session_id_resolver=session_id_resolver)
 
     messages = body.get("messages")
-    initiator = initiator_policy.resolve_anthropic_messages(messages, body.get("model"), request_id=request_id)
+    initiator = initiator_policy.resolve_anthropic_messages(
+        messages,
+        body.get("model"),
+        subagent=request.headers.get("x-openai-subagent"),
+        request_id=request_id,
+    )
     headers["X-Initiator"] = initiator
     headers["x-interaction-type"] = _interaction_type_for_initiator(initiator)
     headers["x-interaction-id"] = str(uuid.uuid4())

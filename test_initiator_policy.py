@@ -104,6 +104,24 @@ class InitiatorPolicyTests(unittest.TestCase):
                 "user",
             )
 
+    def test_subagent_requests_do_not_activate_safeguard(self):
+        recorded = []
+        policy = initiator_policy.InitiatorPolicy(on_safeguard_triggered=recorded.append)
+        start = datetime(2026, 4, 4, 18, 0, tzinfo=timezone.utc)
+
+        policy.note_request_started("req-1", "user", started_at=start)
+
+        with mock.patch.object(initiator_policy, "utc_now", return_value=start.replace(second=5)):
+            initiator = policy.resolve_initiator(
+                "user",
+                "gpt-5.4",
+                subagent="guardian",
+                request_id="req-2",
+            )
+
+        self.assertEqual(initiator, "agent")
+        self.assertEqual(recorded, [])
+
     def test_responses_latest_user_message_wins_over_prior_assistant_history(self):
         policy = initiator_policy.InitiatorPolicy()
         input_items = [

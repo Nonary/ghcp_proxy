@@ -273,6 +273,30 @@ class RequestHeadersTests(unittest.TestCase):
 
         self.assertEqual(headers["X-Initiator"], "agent")
 
+    def test_responses_subagent_request_stays_agent(self):
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/responses"),
+            headers={"x-openai-subagent": "guardian"},
+        )
+        body = {
+            "model": "gpt-5.4",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Review and improve the layout in dashboard.html"}],
+                },
+            ],
+        }
+
+        headers = format_translation.build_responses_headers_for_request(
+            request, body, "test-key",
+            initiator_policy=proxy._initiator_policy,
+            session_id_resolver=usage_tracking.request_session_id,
+        )
+
+        self.assertEqual(headers["X-Initiator"], "agent")
+
     def test_chat_tool_message_follow_up_stays_agent(self):
         request = SimpleNamespace(url=SimpleNamespace(path="/v1/chat/completions"), headers={})
         messages = [

@@ -30,6 +30,10 @@ def _is_haiku_model(model_name: str | None) -> bool:
     return isinstance(normalized, str) and "haiku" in normalized
 
 
+def _is_subagent_request(subagent: str | None) -> bool:
+    return isinstance(subagent, str) and bool(subagent.strip())
+
+
 def _parse_event_time(value: str | None) -> datetime | None:
     if not isinstance(value, str) or not value:
         return None
@@ -463,6 +467,7 @@ class InitiatorPolicy:
         input_param,
         model_name: str | None,
         *,
+        subagent: str | None = None,
         force_initiator: str | None = None,
         now: datetime | None = None,
         request_id: str | None = None,
@@ -476,6 +481,7 @@ class InitiatorPolicy:
         initiator = self.resolve_initiator(
             candidate,
             model_name,
+            subagent=subagent,
             force_initiator=force_initiator,
             now=now,
             request_id=request_id,
@@ -487,6 +493,7 @@ class InitiatorPolicy:
         messages,
         model_name: str | None,
         *,
+        subagent: str | None = None,
         force_initiator: str | None = None,
         now: datetime | None = None,
         request_id: str | None = None,
@@ -495,6 +502,7 @@ class InitiatorPolicy:
         return self.resolve_initiator(
             candidate,
             model_name,
+            subagent=subagent,
             force_initiator=force_initiator,
             now=now,
             request_id=request_id,
@@ -505,6 +513,7 @@ class InitiatorPolicy:
         messages,
         model_name: str | None,
         *,
+        subagent: str | None = None,
         force_initiator: str | None = None,
         now: datetime | None = None,
         request_id: str | None = None,
@@ -513,6 +522,7 @@ class InitiatorPolicy:
         return self.resolve_initiator(
             candidate,
             model_name,
+            subagent=subagent,
             force_initiator=force_initiator,
             now=now,
             request_id=request_id,
@@ -523,6 +533,7 @@ class InitiatorPolicy:
         candidate_initiator: str | None,
         model_name: str | None,
         *,
+        subagent: str | None = None,
         force_initiator: str | None = None,
         now: datetime | None = None,
         request_id: str | None = None,
@@ -532,6 +543,7 @@ class InitiatorPolicy:
             initiator, safeguard_reason = self._resolve_locked(
                 candidate_initiator,
                 model_name,
+                subagent,
                 resolved_now,
                 force_initiator,
             )
@@ -592,11 +604,15 @@ class InitiatorPolicy:
         self,
         candidate_initiator: str | None,
         model_name: str | None,
+        subagent: str | None,
         now: datetime,
         force_initiator: str | None,
     ) -> tuple[str, str | None]:
         if force_initiator in {AGENT_INITIATOR, USER_INITIATOR}:
             return force_initiator, None
+
+        if _is_subagent_request(subagent):
+            return AGENT_INITIATOR, None
 
         if _is_haiku_model(model_name):
             return AGENT_INITIATOR, None
