@@ -525,9 +525,292 @@
     }
     .day-focus-head {
       display: flex;
+      align-items: end;
+      justify-content: space-between;
+      gap: 14px;
+    }
+    .day-focus-summary {
+      display: grid;
+      gap: 8px;
+      min-width: 0;
+      flex: 1 1 auto;
+    }
+    .day-focus-selected-date {
+      font-size: 1.18rem;
+      font-weight: 700;
+      letter-spacing: 0;
+      line-height: 1.15;
+    }
+    .day-focus-selected-cost {
+      font-size: clamp(1.9rem, 3vw, 2.8rem);
+      font-weight: 800;
+      letter-spacing: 0;
+      line-height: .95;
+    }
+    .day-focus-kpis {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 8px;
+      max-width: 760px;
+    }
+    .day-focus-kpi {
+      display: grid;
+      gap: 3px;
+      min-width: 0;
+      padding: 10px 12px;
+      border-radius: 8px;
+      border: 1px solid rgba(200,220,235,.1);
+      background: rgba(255,255,255,.025);
+    }
+    .day-focus-kpi .eyebrow {
+      font-size: .62rem;
+    }
+    .day-focus-kpi-value {
+      font-size: .96rem;
+      font-weight: 760;
+      letter-spacing: 0;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .day-focus-selected-meta {
+      color: var(--muted);
+      font-size: .8rem;
+      line-height: 1.45;
+    }
+    .day-focus-insights {
+      display: grid;
+      grid-template-columns: minmax(0, 1.45fr) minmax(300px, .9fr);
+      gap: 14px;
+      align-items: start;
+    }
+    .day-focus-source-panel,
+    .day-focus-token-panel,
+    .day-focus-model-panel {
+      display: grid;
+      gap: 14px;
+      min-width: 0;
+      padding: 16px;
+      border-radius: 8px;
+      border: 1px solid rgba(200,220,235,.1);
+      background: rgba(9, 14, 20, .38);
+    }
+    .day-focus-model-panel { grid-column: 1 / -1; }
+    .day-focus-panel-head {
+      display: flex;
+      align-items: start;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .day-focus-source-track {
+      display: flex;
+      gap: 3px;
+      min-height: 14px;
+      border-radius: 999px;
+      padding: 2px;
+      background: rgba(255,255,255,.04);
+      overflow: hidden;
+    }
+    .day-focus-source-segment {
+      display: block;
+      min-width: 0;
+      height: 100%;
+      border-radius: 999px;
+    }
+    .day-focus-source-stack {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+    }
+    .day-focus-source-card {
+      display: grid;
+      gap: 10px;
+      min-width: 0;
+      padding: 12px;
+      border-radius: 8px;
+      border: 1px solid rgba(200,220,235,.08);
+      background: rgba(255,255,255,.02);
+    }
+    .day-focus-source-card.zero {
+      opacity: .72;
+    }
+    .day-focus-source-card-head {
+      display: flex;
       align-items: start;
       justify-content: space-between;
       gap: 10px;
+    }
+    .day-focus-source-card-title {
+      display: grid;
+      gap: 4px;
+      min-width: 0;
+    }
+    .day-focus-source-label,
+    .day-focus-breakdown-label {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      min-width: 0;
+      font-size: .82rem;
+      font-weight: 720;
+      letter-spacing: 0;
+    }
+    .day-focus-source-card-share {
+      color: var(--muted);
+      font-size: .72rem;
+    }
+    .day-focus-source-card-values {
+      display: grid;
+      justify-items: end;
+      gap: 2px;
+      min-width: 0;
+      text-align: right;
+      white-space: nowrap;
+    }
+    .day-focus-source-card-values strong,
+    .day-focus-breakdown-values strong {
+      font-size: .98rem;
+      font-weight: 780;
+      letter-spacing: 0;
+    }
+    .day-focus-source-card-values span,
+    .day-focus-breakdown-values span {
+      color: var(--muted);
+      font-size: .72rem;
+    }
+    .day-focus-source-card-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px 12px;
+      color: var(--muted);
+      font-size: .72rem;
+    }
+    .day-focus-source-line-list,
+    .day-focus-breakdown-list {
+      display: grid;
+      gap: 0;
+    }
+    .day-focus-source-line,
+    .day-focus-breakdown-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto auto;
+      align-items: center;
+      gap: 10px;
+      min-width: 0;
+      padding: 8px 0;
+      border-top: 1px solid rgba(200,220,235,.08);
+    }
+    .day-focus-source-line:first-child,
+    .day-focus-breakdown-row:first-child {
+      border-top: 0;
+      padding-top: 0;
+    }
+    .day-focus-source-line:last-child,
+    .day-focus-breakdown-row:last-child {
+      padding-bottom: 0;
+    }
+    .day-focus-source-line-label {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      min-width: 0;
+      font-size: .76rem;
+      font-weight: 650;
+    }
+    .day-focus-source-line-tokens,
+    .day-focus-breakdown-tokens {
+      color: var(--muted);
+      font-size: .72rem;
+      white-space: nowrap;
+      text-align: right;
+    }
+    .day-focus-source-line-cost,
+    .day-focus-breakdown-cost {
+      font-size: .78rem;
+      font-weight: 700;
+      white-space: nowrap;
+      text-align: right;
+    }
+    .day-focus-token-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 999px;
+      flex-shrink: 0;
+    }
+    .day-focus-model-head {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 10px;
+    }
+    .day-focus-model-table {
+      display: grid;
+      gap: 8px;
+    }
+    .day-focus-model-row {
+      display: grid;
+      grid-template-columns: minmax(180px, 1.4fr) minmax(88px, .72fr) minmax(72px, .58fr) repeat(4, minmax(84px, .8fr));
+      gap: 10px;
+      align-items: stretch;
+      min-width: 0;
+      padding: 12px;
+      border-radius: 8px;
+      border: 1px solid rgba(200,220,235,.08);
+      background: rgba(255,255,255,.02);
+    }
+    .day-focus-model-row.head {
+      padding: 0 2px;
+      border: 0;
+      background: transparent;
+    }
+    .day-focus-model-col {
+      display: grid;
+      gap: 4px;
+      min-width: 0;
+    }
+    .day-focus-model-col span {
+      color: var(--muted);
+      font-size: .66rem;
+      text-transform: uppercase;
+      letter-spacing: .08em;
+    }
+    .day-focus-model-col strong {
+      font-size: .82rem;
+      font-weight: 700;
+      letter-spacing: -.02em;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .day-focus-model-name {
+      font-size: .9rem;
+      font-weight: 700;
+      line-height: 1.25;
+      word-break: break-word;
+    }
+    .day-focus-model-meta {
+      color: var(--muted);
+      font-size: .74rem;
+    }
+    .day-focus-model-chiplist {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .day-focus-model-chip {
+      display: inline-flex;
+      align-items: center;
+      min-width: 0;
+      max-width: 100%;
+      padding: 6px 10px;
+      border-radius: 999px;
+      border: 1px solid rgba(200,220,235,.12);
+      background: rgba(255,255,255,.03);
+      font-size: .76rem;
+      color: var(--text);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
     }
     .day-focus-nav {
       display: inline-flex;
@@ -554,17 +837,20 @@
       color: var(--text);
       font-size: .96rem;
       font-weight: 650;
-      letter-spacing: -.02em;
+      letter-spacing: 0;
     }
     .day-focus-calendar {
       display: grid;
-      gap: 8px;
+      gap: 12px;
+      overflow-x: auto;
+      padding-bottom: 2px;
     }
     .day-focus-weekdays,
     .day-focus-grid {
       display: grid;
       grid-template-columns: repeat(7, minmax(0, 1fr));
-      gap: 6px;
+      gap: 10px;
+      min-width: 1040px;
     }
     .day-focus-weekdays span {
       color: var(--muted);
@@ -572,19 +858,30 @@
       text-transform: uppercase;
       letter-spacing: .12em;
       text-align: center;
-      padding: 2px 0;
+      padding: 4px 0;
+    }
+    .day-focus-grid {
+      align-items: stretch;
+      grid-auto-rows: minmax(368px, 1fr);
+    }
+    .day-focus-cell {
+      min-width: 0;
+      height: 100%;
     }
     .day-focus-blank {
-      min-height: 92px;
+      min-height: 368px;
       border-radius: 8px;
       border: 1px dashed rgba(200,220,235,.06);
       background: rgba(255,255,255,.01);
     }
     .day-focus-chip {
       display: grid;
-      gap: 6px;
-      min-height: 92px;
-      padding: 8px;
+      grid-template-rows: auto auto 1fr;
+      gap: 10px;
+      min-height: 368px;
+      width: 100%;
+      height: 100%;
+      padding: 12px;
       border-radius: 8px;
       text-align: left;
       cursor: pointer;
@@ -596,7 +893,7 @@
     }
     .day-focus-chip.active {
       border-color: rgba(255,135,82,.34);
-      background: linear-gradient(180deg, rgba(255,135,82,.16), rgba(255,255,255,.03));
+      background: rgba(255,135,82,.08);
     }
     .day-focus-chip.today {
       box-shadow: inset 0 0 0 1px rgba(110,231,200,.18);
@@ -606,52 +903,142 @@
     }
     .day-focus-chip-top {
       display: flex;
-      align-items: start;
+      align-items: center;
       justify-content: space-between;
       gap: 6px;
     }
     .day-focus-chip-day {
-      font-size: .78rem;
-      font-weight: 650;
-      letter-spacing: -.01em;
+      font-size: 1.15rem;
+      font-weight: 760;
+      letter-spacing: 0;
     }
-    .day-focus-chip-date {
-      color: var(--muted);
-      font-size: .68rem;
+    .day-focus-chip-total {
+      font-size: 1rem;
+      font-weight: 760;
+      letter-spacing: 0;
     }
     .day-focus-chip-meta {
-      font-size: .78rem;
-      letter-spacing: -.01em;
-    }
-    .day-focus-chip-subtle {
-      color: var(--muted);
-      font-size: .68rem;
-    }
-    .day-focus-bars {
       display: flex;
-      gap: 2px;
       align-items: center;
-      height: 9px;
-      border-radius: 999px;
-      background: rgba(255,255,255,.05);
-      padding: 1px;
-      overflow: hidden;
-      margin-top: auto;
+      justify-content: space-between;
+      gap: 8px;
+      color: var(--muted);
+      font-size: .72rem;
+      text-transform: uppercase;
+      letter-spacing: .08em;
     }
-    .day-focus-bar-segment {
-      height: 100%;
-      border-radius: 999px;
+    .day-focus-chip-breakdown {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 10px;
       min-width: 0;
-      display: block;
+      align-content: start;
     }
-    .day-focus-bar-segment.tone-codex {
-      background: linear-gradient(90deg, #baf6e8, var(--accent-2));
+    .day-focus-chip-source {
+      display: grid;
+      gap: 7px;
+      min-width: 0;
+      padding: 10px;
+      border-radius: 7px;
+      border: 1px solid rgba(200,220,235,.08);
+      background: rgba(255,255,255,.02);
     }
-    .day-focus-bar-segment.tone-claude {
-      background: linear-gradient(90deg, #ffb279, var(--accent));
+    .day-focus-chip-source.zero {
+      opacity: .72;
     }
-    .day-focus-bar-segment.tone-other {
-      background: linear-gradient(90deg, #d3dde7, #8ea3b5);
+    .day-focus-chip-source-head {
+      display: grid;
+      gap: 2px;
+      min-width: 0;
+    }
+    .day-focus-chip-source-top {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 6px;
+      min-width: 0;
+    }
+    .day-focus-chip-source-name {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      min-width: 0;
+      font-size: .72rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: .08em;
+    }
+    .day-focus-chip-source-total {
+      font-size: .8rem;
+      font-weight: 760;
+      letter-spacing: 0;
+      white-space: nowrap;
+    }
+    .day-focus-chip-source-meta {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      font-size: .66rem;
+      color: var(--muted);
+    }
+    .day-focus-chip-source-dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 999px;
+      flex-shrink: 0;
+    }
+    .day-focus-chip-source-rows {
+      display: grid;
+      gap: 0;
+      margin-top: 2px;
+    }
+    .day-focus-chip-line {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 8px;
+      align-items: center;
+      min-width: 0;
+      padding: 5px 0;
+      border-top: 1px solid rgba(200,220,235,.06);
+    }
+    .day-focus-chip-line:first-child {
+      border-top: 1px solid rgba(200,220,235,.08);
+    }
+    .day-focus-chip-line-label {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      min-width: 0;
+      font-size: .66rem;
+      font-weight: 700;
+      letter-spacing: 0;
+    }
+    .day-focus-chip-line-value {
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 10px;
+      min-width: 0;
+      text-align: right;
+    }
+    .day-focus-chip-line-cost {
+      font-size: .66rem;
+      color: var(--text);
+      white-space: nowrap;
+      min-width: 48px;
+    }
+    .day-focus-chip-line-tokens {
+      font-size: .62rem;
+      color: var(--muted);
+      white-space: nowrap;
+      min-width: 46px;
+    }
+    .day-focus-chip-line-fill {
+      width: 5px;
+      height: 5px;
+      border-radius: 999px;
+      flex-shrink: 0;
     }
 
     /* Stacked bar chart fills */
@@ -910,14 +1297,25 @@
       .source-spotlight-head { flex-direction: column; }
       .source-lead-note { max-width: none; text-align: left; }
       .day-focus-head { flex-direction: column; }
+      .day-focus-insights { grid-template-columns: 1fr; }
+      .day-focus-kpis { max-width: none; }
+      .day-focus-source-stack { grid-template-columns: 1fr; }
+      .day-focus-model-row,
+      .day-focus-model-row.head { grid-template-columns: repeat(3, minmax(0, 1fr)); }
       .chart-summary { text-align: left; justify-items: start; }
       .chart-range-control { justify-items: start; }
       .mapping-table .arrow-cell { display: none; }
+      .day-focus-weekdays,
+      .day-focus-grid { min-width: 900px; }
     }
     @media (max-width: 760px) {
       .summary-grid { grid-template-columns: 1fr; }
       .source-context-pill { width: 100%; justify-items: start; }
       .panel-head { align-items: start; }
+      .day-focus-kpis { grid-template-columns: 1fr; }
+      .day-focus-weekdays,
+      .day-focus-grid { min-width: 700px; }
+      .day-focus-grid { grid-auto-rows: minmax(336px, 1fr); }
     }
   </style>
 </head>
@@ -981,6 +1379,7 @@
         </div>
         <day-focus-strip
           :daily-history="calendarHistory"
+          :recent-requests="data.recent_requests"
           :selected-day-key="selectedDayKey"
           :range-start-at="data.current_month?.start_at"
           :range-end-at="data.current_month?.end_at"
@@ -1557,13 +1956,157 @@
   <template id="day-focus-strip-template">
     <div v-if="calendarCells.length" :class="['day-focus-strip', { frameless }]">
       <div class="day-focus-head">
-        <div>
+        <div class="day-focus-summary">
           <div class="eyebrow">{{ label }}</div>
-          <div class="subtle">{{ selectedDaySummary }}</div>
+          <div class="day-focus-selected-date">{{ longDayLabel(resolvedSelectedDayKey) }}</div>
+          <div class="day-focus-selected-cost">{{ money(selectedRow.cost_usd) }}</div>
+          <div class="day-focus-kpis">
+            <div class="day-focus-kpi">
+              <div class="eyebrow">Requests</div>
+              <div class="day-focus-kpi-value">{{ integer(selectedRow.request_count) }}</div>
+            </div>
+            <div class="day-focus-kpi">
+              <div class="eyebrow">Tokens</div>
+              <div class="day-focus-kpi-value">{{ compact(selectedRow.total_tokens) }}</div>
+            </div>
+            <div class="day-focus-kpi">
+              <div class="eyebrow">Models</div>
+              <div class="day-focus-kpi-value">{{ integer(selectedKnownModels.length || selectedModelRows.length) }}</div>
+            </div>
+          </div>
+          <div class="day-focus-selected-meta">{{ selectedDayMeta }}</div>
         </div>
         <div class="day-focus-nav">
           <button type="button" @click="stepDay(-1)" :disabled="selectedIndex <= 0">Prev</button>
           <button type="button" @click="stepDay(1)" :disabled="selectedIndex >= dayOptions.length - 1">Next</button>
+        </div>
+      </div>
+      <div class="day-focus-insights">
+        <div class="day-focus-source-panel">
+          <div class="day-focus-panel-head">
+            <div>
+              <div class="eyebrow">Source Anatomy</div>
+              <div class="subtle">Selected day split, with cached, input, output, and reasoning lines for each source.</div>
+            </div>
+            <div class="subtle">{{ selectedSourceMeta }}</div>
+          </div>
+          <div class="day-focus-source-track">
+            <span
+              v-for="segment in selectedSourceSegments"
+              :key="`source-${segment.source}`"
+              class="day-focus-source-segment"
+              :style="{ width: `${segment.width}%`, background: segment.color }"
+            ></span>
+          </div>
+          <div class="day-focus-source-stack">
+            <div
+              v-for="column in selectedSourceColumns"
+              :key="`selected-${column.source}`"
+              :class="['day-focus-source-card', { zero: column.isZero }]"
+            >
+              <div class="day-focus-source-card-head">
+                <div class="day-focus-source-card-title">
+                  <div class="day-focus-source-label">
+                    <span class="day-focus-token-dot" :style="{ background: column.dotColor }"></span>
+                    {{ column.label }}
+                  </div>
+                  <div class="day-focus-source-card-share">{{ formatPercent(column.share) }} of selected-day spend</div>
+                </div>
+                <div class="day-focus-source-card-values">
+                  <strong>{{ money(column.cost_usd) }}</strong>
+                  <span>{{ compact(column.total_tokens) }} tok</span>
+                </div>
+              </div>
+              <div class="day-focus-source-card-meta">
+                <span>{{ integer(column.request_count) }} req</span>
+                <span>{{ compact(column.total_tokens) }} tokens</span>
+              </div>
+              <div class="day-focus-source-line-list">
+                <div
+                  v-for="item in column.rows"
+                  :key="`selected-${column.source}-${item.key}`"
+                  class="day-focus-source-line"
+                >
+                  <span class="day-focus-source-line-label">
+                    <span class="day-focus-chip-line-fill" :style="{ background: item.flatColor }"></span>
+                    {{ item.shortLabel }}
+                  </span>
+                  <span class="day-focus-source-line-tokens">{{ compact(item.value) }} tok</span>
+                  <span class="day-focus-source-line-cost">{{ money(item.cost) }}</span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="day-focus-token-panel">
+          <div class="day-focus-panel-head">
+            <div>
+              <div class="eyebrow">Token Breakdown</div>
+              <div class="subtle">Day totals by token category, with tokens and estimated cost kept on their own lines.</div>
+            </div>
+            <div class="subtle">{{ money(selectedRow.cost_usd) }} total</div>
+          </div>
+          <div class="day-focus-breakdown-list">
+            <div v-for="segment in selectedTokenBreakdownRows" :key="segment.key" class="day-focus-breakdown-row">
+              <div class="day-focus-breakdown-label">
+                <span class="day-focus-token-dot" :style="{ background: segment.color }"></span>
+                {{ segment.label }}
+              </div>
+              <div class="day-focus-breakdown-tokens">{{ compact(segment.value) }} tok</div>
+              <div class="day-focus-breakdown-values">
+                <strong>{{ money(segment.cost) }}</strong>
+                <span>{{ formatPercent(segment.share) }}</span>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="day-focus-model-panel">
+          <div class="day-focus-panel-head">
+            <div>
+              <div class="eyebrow">Model Breakdown</div>
+              <div class="subtle">Per-model detail from requests captured for the selected day.</div>
+            </div>
+            <div class="subtle">{{ selectedModelMeta }}</div>
+          </div>
+          <div v-if="selectedModelRows.length" class="day-focus-model-table">
+            <div class="day-focus-model-row head">
+              <div class="day-focus-model-col"><span>Model</span></div>
+              <div class="day-focus-model-col"><span>Spend</span></div>
+              <div class="day-focus-model-col"><span>Req</span></div>
+              <div class="day-focus-model-col"><span>Cached</span></div>
+              <div class="day-focus-model-col"><span>Fresh In</span></div>
+              <div class="day-focus-model-col"><span>Output</span></div>
+              <div class="day-focus-model-col"><span>Reasoning</span></div>
+            </div>
+            <div v-for="model in selectedModelRows" :key="model.model" class="day-focus-model-row">
+              <div class="day-focus-model-col">
+                <div class="day-focus-model-name">{{ formatModelName(model.model) }}</div>
+                <div class="day-focus-model-meta">{{ compact(model.total_tokens) }} total tokens</div>
+              </div>
+              <div class="day-focus-model-col">
+                <strong>{{ money(model.cost_usd) }}</strong>
+              </div>
+              <div class="day-focus-model-col">
+                <strong>{{ integer(model.request_count) }}</strong>
+              </div>
+              <div class="day-focus-model-col">
+                <strong>{{ compact(model.cached_input_tokens) }}</strong>
+              </div>
+              <div class="day-focus-model-col">
+                <strong>{{ compact(model.input_tokens) }}</strong>
+              </div>
+              <div class="day-focus-model-col">
+                <strong>{{ compact(model.visible_output_tokens) }}</strong>
+              </div>
+              <div class="day-focus-model-col">
+                <strong>{{ compact(model.reasoning_output_tokens) }}</strong>
+              </div>
+            </div>
+          </div>
+          <div v-else-if="selectedKnownModels.length" class="day-focus-model-chiplist">
+            <span v-for="model in selectedKnownModels" :key="model" class="day-focus-model-chip">{{ formatModelName(model) }}</span>
+          </div>
+          <div v-else class="subtle">No model detail recorded for this day yet.</div>
         </div>
       </div>
       <div class="day-focus-calendar">
@@ -1575,7 +2118,7 @@
           <div
             v-for="cell in calendarCells"
             :key="cell.key"
-            :class="cell.kind === 'blank' ? 'day-focus-blank' : ''"
+            :class="['day-focus-cell', { 'day-focus-blank': cell.kind === 'blank' }]"
           >
             <button
               v-if="cell.kind === 'day'"
@@ -1585,17 +2128,49 @@
             >
               <div class="day-focus-chip-top">
                 <span class="day-focus-chip-day">{{ integer(dayOfMonth(cell.row.day_key)) }}</span>
-                <span class="day-focus-chip-date">{{ weekdayLabel(cell.row.day_key) }}</span>
+                <span class="day-focus-chip-total">{{ money(cell.row.cost_usd) }}</span>
               </div>
-              <span class="day-focus-chip-meta">{{ chipMeta(cell.row) }}</span>
-              <span class="day-focus-chip-subtle">{{ integer(cell.row.request_count) }} req</span>
-              <div class="day-focus-bars">
-                <span
-                  v-for="segment in sourceSegments(cell.row)"
-                  :key="`${cell.row.day_key}-${segment.source}`"
-                  :class="['day-focus-bar-segment', segment.tone]"
-                  :style="{ width: `${segment.width}%`, opacity: segment.opacity }"
-                ></span>
+              <div class="day-focus-chip-meta">
+                <span>{{ integer(cell.row.request_count) }} req</span>
+                <span>{{ compact(cell.row.total_tokens) }} tok</span>
+              </div>
+              <div class="day-focus-chip-breakdown">
+                <div
+                  v-for="column in calendarSourceColumns(cell.row)"
+                  :key="`${cell.row.day_key}-column-${column.source}`"
+                  :class="['day-focus-chip-source', { zero: column.isZero }]"
+                >
+                  <div class="day-focus-chip-source-head">
+                    <div class="day-focus-chip-source-top">
+                      <span class="day-focus-chip-source-name">
+                        <span class="day-focus-chip-source-dot" :style="{ background: column.dotColor }"></span>
+                        {{ column.label }}
+                      </span>
+                      <span class="day-focus-chip-source-total">{{ money(column.cost_usd) }}</span>
+                    </div>
+                    <div class="day-focus-chip-source-meta">
+                      <span>{{ formatPercent(column.share) }}</span>
+                      <span>{{ integer(column.request_count) }} req</span>
+                      <span>{{ compact(column.total_tokens) }} tok</span>
+                    </div>
+                  </div>
+                  <div class="day-focus-chip-source-rows">
+                    <div
+                      v-for="item in column.rows"
+                      :key="`${cell.row.day_key}-${column.source}-${item.key}`"
+                      class="day-focus-chip-line"
+                    >
+                      <span class="day-focus-chip-line-label">
+                        <span class="day-focus-chip-line-fill" :style="{ background: item.flatColor }"></span>
+                        {{ item.shortLabel }}
+                      </span>
+                      <span class="day-focus-chip-line-value">
+                        <span class="day-focus-chip-line-cost">{{ money(item.cost) }}</span>
+                        <span class="day-focus-chip-line-tokens">{{ compact(item.value) }}</span>
+                      </span>
+                    </div>
+                  </div>
+                </div>
               </div>
             </button>
           </div>
@@ -1836,6 +2411,59 @@
       return dayKeyFromDate(new Date());
     }
 
+    function nextDayKey(dayKey) {
+      const date = parseDayKey(dayKey);
+      const next = addCalendarDays(date, 1);
+      return next ? dayKeyFromDate(next) : '';
+    }
+
+    function sameMonthAndYear(left, right) {
+      return left instanceof Date
+        && right instanceof Date
+        && !Number.isNaN(left.getTime())
+        && !Number.isNaN(right.getTime())
+        && left.getFullYear() === right.getFullYear()
+        && left.getMonth() === right.getMonth();
+    }
+
+    function normalizeRowsToLocalToday(rows) {
+      const list = Array.isArray(rows) ? rows : [];
+      const localToday = todayDayKey();
+      const utcTomorrowKey = nextDayKey(localToday);
+      const kept = [];
+      let todayRow = null;
+      let utcTomorrowRow = null;
+
+      for (const row of list) {
+        const dayKey = String(row?.day_key || '');
+        if (!dayKey) continue;
+        if (dayKey === localToday) {
+          todayRow = row;
+          continue;
+        }
+        if (dayKey === utcTomorrowKey) {
+          utcTomorrowRow = row;
+          continue;
+        }
+        if (dayKey < localToday) {
+          kept.push(row);
+        }
+      }
+
+      if (todayRow || utcTomorrowRow) {
+        const merged = mergeUsageRows([todayRow || emptyUsageRow(localToday), utcTomorrowRow || null]);
+        kept.push({
+          ...emptyUsageRow(localToday),
+          ...merged,
+          day_key: localToday,
+          day_label: localToday,
+          sources: merged.sources || {},
+        });
+      }
+
+      return kept.sort((a, b) => String(a?.day_key || '').localeCompare(String(b?.day_key || '')));
+    }
+
     function parseDayKey(dayKey) {
       if (!dayKey) return null;
       const match = String(dayKey).match(/^(\d{4})-(\d{2})-(\d{2})$/);
@@ -1894,9 +2522,13 @@
       const startDate = parseDayKey(startKey)
         || new Date(anchorDate.getFullYear(), anchorDate.getMonth(), 1);
       const explicitEndExclusive = parseDayKey(endExclusiveKey);
-      const endDate = explicitEndExclusive
+      let endDate = explicitEndExclusive
         ? addCalendarDays(explicitEndExclusive, -1)
         : new Date(anchorDate.getFullYear(), anchorDate.getMonth() + 1, 0);
+      const localTodayDate = parseDayKey(todayDayKey());
+      if (sameMonthAndYear(startDate, localTodayDate) && endDate > localTodayDate) {
+        endDate = localTodayDate;
+      }
 
       if (!startDate || !endDate || endDate < startDate) {
         return rows;
@@ -1911,6 +2543,20 @@
           : emptyUsageRow(dayKey));
       }
       return normalized;
+    }
+
+    function dayKeyFromTimestamp(raw) {
+      if (typeof raw !== 'string' || !raw) return '';
+      const date = new Date(raw);
+      if (!Number.isNaN(date.getTime())) {
+        return dayKeyFromDate(date);
+      }
+      return raw.slice(0, 10);
+    }
+
+    function requestDayKey(row) {
+      const raw = row?.finished_at || row?.started_at || '';
+      return dayKeyFromTimestamp(raw);
     }
 
     function formatDayKey(dayKey, options) {
@@ -2017,6 +2663,7 @@
       emits: ['update:selectedDayKey'],
       props: {
         dailyHistory: { type: Array, default: () => [] },
+        recentRequests: { type: Array, default: () => [] },
         selectedDayKey: { type: String, default: '' },
         rangeStartAt: { type: String, default: '' },
         rangeEndAt: { type: String, default: '' },
@@ -2071,6 +2718,94 @@
           if (!this.resolvedSelectedDayKey) return 'No daily history available yet.';
           return `${this.longDayLabel(this.resolvedSelectedDayKey)} · ${this.money(this.selectedRow.cost_usd)} · ${this.compact(this.selectedRow.total_tokens)} tokens · ${this.integer(this.selectedRow.request_count)} requests`;
         },
+        selectedDayMeta() {
+          return `${this.compact(this.selectedRow.total_tokens)} tokens · ${this.integer(this.selectedRow.request_count)} requests · ${this.selectedKnownModels.length ? this.selectedKnownModels.length + ' known models' : 'no recorded models'}`;
+        },
+        selectedSourceRows() {
+          return this.sourceBreakdownRows(this.selectedRow);
+        },
+        selectedSourceSegments() {
+          const rows = this.selectedSourceRows.filter((row) => row.share > 0);
+          if (!rows.length) {
+            return [{ source: 'idle', width: 100, color: '#6d8091' }];
+          }
+          return rows.map((row) => ({
+            source: row.source,
+            width: Math.max(8, row.share),
+            color: row.color,
+          }));
+        },
+        selectedSourceMeta() {
+          if (!this.selectedSourceRows.length || this.selectedSourceRows.every((row) => row.cost_usd <= 0 && row.request_count <= 0)) {
+            return 'no source detail';
+          }
+          const leader = this.selectedSourceRows[0];
+          return `${leader.label} leads at ${this.formatPercent(leader.share)}`;
+        },
+        selectedSourceColumns() {
+          return this.calendarSourceColumns(this.selectedRow);
+        },
+        selectedTokenSegments() {
+          return this.tokenSegments(this.selectedRow);
+        },
+        selectedTokenBreakdownRows() {
+          return this.tokenMetricCards(this.selectedRow);
+        },
+        selectedModelRows() {
+          const dayKey = this.resolvedSelectedDayKey;
+          if (!dayKey) return [];
+          const aggregate = new Map();
+          for (const row of this.recentRequests || []) {
+            if (requestDayKey(row) !== dayKey) continue;
+            const usage = row?.usage || {};
+            const model = String(row?.response_model || row?.resolved_model || row?.requested_model || 'unknown');
+            const current = aggregate.get(model) || {
+              model,
+              input_tokens: 0,
+              cached_input_tokens: 0,
+              output_tokens: 0,
+              reasoning_output_tokens: 0,
+              visible_output_tokens: 0,
+              total_tokens: 0,
+              request_count: 0,
+              cost_usd: 0,
+            };
+            const inputTokens = Number(usage.input_tokens || 0);
+            const cachedInputTokens = Number(usage.cached_input_tokens || usage.cache_read_input_tokens || usage?.prompt_tokens_details?.cached_tokens || 0);
+            const outputTokens = Number(usage.output_tokens || 0);
+            const reasoningTokens = Number(usage.reasoning_output_tokens || 0);
+            current.input_tokens += inputTokens;
+            current.cached_input_tokens += cachedInputTokens;
+            current.output_tokens += outputTokens;
+            current.reasoning_output_tokens += reasoningTokens;
+            current.visible_output_tokens += Math.max(outputTokens - reasoningTokens, 0);
+            current.total_tokens += Number(usage.total_tokens || (inputTokens + outputTokens));
+            current.request_count += 1;
+            current.cost_usd += Number(row?.cost_usd || 0);
+            aggregate.set(model, current);
+          }
+          return [...aggregate.values()]
+            .sort((a, b) => (b.cost_usd - a.cost_usd) || (b.request_count - a.request_count) || (b.input_tokens - a.input_tokens))
+            .slice(0, 4);
+        },
+        selectedKnownModels() {
+          const set = new Set();
+          for (const source of Object.values(this.selectedRow?.sources || {})) {
+            for (const model of source?.models || []) {
+              if (model) set.add(String(model));
+            }
+          }
+          return [...set].slice(0, 8);
+        },
+        selectedModelMeta() {
+          if (this.selectedModelRows.length) {
+            return 'from detailed requests';
+          }
+          if (this.selectedKnownModels.length) {
+            return 'known models for this day';
+          }
+          return 'no model detail';
+        },
       },
       methods: {
         ...sharedFormatters,
@@ -2080,12 +2815,222 @@
         longDayLabel(dayKey) {
           return formatDayKey(dayKey, { weekday: 'long', month: 'short', day: 'numeric' });
         },
-        weekdayLabel(dayKey) {
-          return formatDayKey(dayKey, { weekday: 'short' });
-        },
         dayOfMonth(dayKey) {
           const date = parseDayKey(dayKey);
           return date ? date.getDate() : 0;
+        },
+        sourceLead(row) {
+          const entries = Object.values(row?.sources || {})
+            .map((entry) => ({
+              source: String(entry?.source || 'unknown'),
+              value: this.metaMode === 'tokens'
+                ? Number(entry?.total_tokens || 0)
+                : Number(entry?.cost_usd || 0),
+              requests: Number(entry?.request_count || 0),
+            }))
+            .filter((entry) => entry.value > 0 || entry.requests > 0)
+            .sort((a, b) => (b.value - a.value) || (b.requests - a.requests));
+          return entries[0] || null;
+        },
+        sourceLeadLabel(row) {
+          const lead = this.sourceLead(row);
+          if (!lead) return 'Idle';
+          const normalized = String(lead.source || 'unknown').trim().toLowerCase();
+          if (normalized === 'codex') return 'Codex';
+          if (normalized === 'claude') return 'Claude';
+          return 'Other';
+        },
+        sourceLeadClass(row) {
+          const lead = this.sourceLead(row);
+          return this.sourceToneClass(lead?.source || 'unknown');
+        },
+        sourceFlatColor(source) {
+          const normalized = String(source || 'unknown').trim().toLowerCase();
+          if (normalized === 'codex') return '#6ee7c8';
+          if (normalized === 'claude') return '#ff8752';
+          return '#8ea3b5';
+        },
+        tokenFlatColor(key) {
+          if (key === 'cached') return '#6ee7c8';
+          if (key === 'fresh') return '#ff8752';
+          if (key === 'output') return '#7eaaff';
+          if (key === 'reasoning') return '#c89eff';
+          return '#8ea3b5';
+        },
+        calendarSourceRows(row) {
+          const rows = this.sourceBreakdownRows(row);
+          const bySource = new Map(rows.map((entry) => [String(entry.source).toLowerCase(), entry]));
+          return ['claude', 'codex'].map((source) => {
+            const entry = bySource.get(source);
+            const color = this.sourceColor(source);
+            const share = Number(entry?.share || 0);
+            const cost = Number(entry?.cost_usd || 0);
+            return {
+              source,
+              label: this.sourceLabel(source),
+              color,
+              isZero: !entry || (cost <= 0 && share <= 0),
+              valueLabel: `${this.formatPercent(share)} · ${this.money(cost)}`,
+            };
+          });
+        },
+        sourceUsageRow(row, sourceName) {
+          const entries = Object.values(row?.sources || {});
+          return entries.find((entry) => String(entry?.source || '').trim().toLowerCase() === String(sourceName).trim().toLowerCase()) || null;
+        },
+        sourceTokenCostRows(sourceRow) {
+          const freshInput = Number(sourceRow?.input_tokens || 0);
+          const cachedInput = Number(sourceRow?.cached_input_tokens || 0);
+          const totalOutput = Number(sourceRow?.output_tokens || 0);
+          const reasoningOutput = Number(sourceRow?.reasoning_output_tokens || 0);
+          const visibleOutput = Math.max(totalOutput - reasoningOutput, 0);
+          const totalCost = Number(sourceRow?.cost_usd || 0);
+          const base = [
+            { key: 'cached', shortLabel: 'Cached', value: cachedInput },
+            { key: 'fresh', shortLabel: 'Input', value: freshInput },
+            { key: 'output', shortLabel: 'Output', value: visibleOutput },
+            { key: 'reasoning', shortLabel: 'Reason', value: reasoningOutput },
+          ];
+          const weights = { cached: 0.1, fresh: 1, output: 5, reasoning: 5 };
+          const weightedTotal = base.reduce((sum, segment) => sum + (segment.value * (weights[segment.key] || 1)), 0);
+          return base.map((segment) => {
+            const weightedValue = segment.value * (weights[segment.key] || 1);
+            return {
+              ...segment,
+              cost: weightedTotal > 0 ? (weightedValue / weightedTotal) * totalCost : 0,
+              flatColor: this.tokenFlatColor(segment.key),
+            };
+          });
+        },
+        calendarSourceColumns(row) {
+          const totalDayCost = Math.max(0, Number(row?.cost_usd || 0));
+          const totalDayTokens = Math.max(0, Number(row?.total_tokens || 0));
+          return ['codex', 'claude'].map((source) => {
+            const sourceRow = this.sourceUsageRow(row, source);
+            const cost = Number(sourceRow?.cost_usd || 0);
+            const tokens = Number(sourceRow?.total_tokens || 0);
+            const requests = Number(sourceRow?.request_count || 0);
+            return {
+              source,
+              label: this.sourceLabel(source),
+              dotColor: this.sourceFlatColor(source),
+              cost_usd: cost,
+              total_tokens: tokens,
+              request_count: requests,
+              share: totalDayCost > 0 ? (cost / totalDayCost) * 100 : (totalDayTokens > 0 ? (tokens / totalDayTokens) * 100 : 0),
+              isZero: !sourceRow || (cost <= 0 && tokens <= 0 && requests <= 0),
+              rows: this.sourceTokenCostRows(sourceRow || {}),
+            };
+          });
+        },
+        sourceColor(source) {
+          const tone = this.sourceToneClass(source);
+          if (tone === 'tone-codex') return 'linear-gradient(90deg, #baf6e8, #6ee7c8)';
+          if (tone === 'tone-claude') return 'linear-gradient(90deg, #ffb279, #ff8752)';
+          return 'linear-gradient(90deg, #d3dde7, #8ea3b5)';
+        },
+        sourceLabel(source) {
+          const normalized = String(source || 'unknown').trim().toLowerCase();
+          if (normalized === 'codex') return 'Codex';
+          if (normalized === 'claude') return 'Claude';
+          if (!normalized) return 'Unknown';
+          return normalized.charAt(0).toUpperCase() + normalized.slice(1);
+        },
+        sourceBreakdownRows(row) {
+          const rawRows = Object.values(row?.sources || {})
+            .map((entry) => ({
+              source: String(entry?.source || 'unknown'),
+              label: this.sourceLabel(entry?.source),
+              cost_usd: Number(entry?.cost_usd || 0),
+              total_tokens: Number(entry?.total_tokens || 0),
+              request_count: Number(entry?.request_count || 0),
+            }))
+            .filter((entry) => entry.cost_usd > 0 || entry.total_tokens > 0 || entry.request_count > 0)
+            .sort((a, b) => (b.cost_usd - a.cost_usd) || (b.total_tokens - a.total_tokens) || (b.request_count - a.request_count));
+          const totalCost = rawRows.reduce((sum, entry) => sum + entry.cost_usd, 0);
+          const totalTokens = rawRows.reduce((sum, entry) => sum + entry.total_tokens, 0);
+          return rawRows.map((entry) => ({
+            ...entry,
+            share: totalCost > 0
+              ? (entry.cost_usd / totalCost) * 100
+              : (totalTokens > 0 ? (entry.total_tokens / totalTokens) * 100 : 0),
+            color: this.sourceColor(entry.source),
+          }));
+        },
+        tokenSegments(row) {
+          const segments = this.tokenMetricCards(row).filter((segment) => segment.value > 0);
+          const total = segments.reduce((sum, segment) => sum + segment.value, 0);
+          if (!segments.length || total <= 0) {
+            return [{ key: 'idle', label: 'Idle', value: 0, color: '#6d8091', width: 100, opacity: 0.28 }];
+          }
+          return segments.map((segment) => ({
+            ...segment,
+            width: Math.max(8, (segment.value / total) * 100),
+            opacity: 1,
+          }));
+        },
+        calendarTokenRows(row) {
+          return this.tokenMetricCards(row).map((segment) => ({
+            ...segment,
+            shortLabel: segment.key === 'cached'
+              ? 'Cached'
+              : (segment.key === 'fresh'
+                ? 'Fresh'
+                : (segment.key === 'output' ? 'Output' : 'Reason')),
+            isZero: Number(segment.value || 0) <= 0,
+            valueLabel: `${this.compact(segment.value)} · ${this.money(segment.cost)}`,
+          }));
+        },
+        tokenMetricCards(row) {
+          const freshInput = Number(row?.input_tokens || 0);
+          const cachedInput = Number(row?.cached_input_tokens || 0);
+          const totalOutput = Number(row?.output_tokens || 0);
+          const reasoningOutput = Number(row?.reasoning_output_tokens || 0);
+          const visibleOutput = Math.max(totalOutput - reasoningOutput, 0);
+          const total = Math.max(0, freshInput + cachedInput + visibleOutput + reasoningOutput);
+          const base = [
+            { key: 'cached', label: 'Cached Input', value: cachedInput, color: '#6ee7c8' },
+            { key: 'fresh', label: 'Fresh Input', value: freshInput, color: '#ff8752' },
+            { key: 'output', label: 'Output', value: visibleOutput, color: '#7eaaff' },
+            { key: 'reasoning', label: 'Reasoning', value: reasoningOutput, color: '#c89eff' },
+          ];
+          const weights = {
+            cached: 0.1,
+            fresh: 1,
+            output: 5,
+            reasoning: 5,
+          };
+          const weightedTotal = base.reduce((sum, segment) => sum + (segment.value * (weights[segment.key] || 1)), 0);
+          const totalCost = Number(row?.cost_usd || 0);
+          return base.map((segment) => {
+            const weightedValue = segment.value * (weights[segment.key] || 1);
+            const cost = weightedTotal > 0 ? (weightedValue / weightedTotal) * totalCost : 0;
+            return {
+              ...segment,
+              share: total > 0 ? (segment.value / total) * 100 : 0,
+              cost,
+              costShare: totalCost > 0 ? (cost / totalCost) * 100 : 0,
+            };
+          });
+        },
+        formatPercent(value) {
+          const numeric = Number(value || 0);
+          if (!Number.isFinite(numeric)) return '0%';
+          return `${new Intl.NumberFormat('en-US', { maximumFractionDigits: 1 }).format(numeric)}%`;
+        },
+        formatModelName(model) {
+          const value = String(model || '').trim();
+          if (!value) return 'Unknown';
+          return value
+            .replace(/-/g, ' ')
+            .replace(/\bgpt\b/gi, 'GPT')
+            .replace(/\bclaude\b/gi, 'Claude')
+            .replace(/\bopus\b/gi, 'Opus')
+            .replace(/\bsonnet\b/gi, 'Sonnet')
+            .replace(/\bhaiku\b/gi, 'Haiku')
+            .replace(/\bcodex\b/gi, 'Codex')
+            .replace(/\bmini\b/gi, 'Mini')
+            .replace(/\b4o\b/gi, '4o');
         },
         chipMeta(row) {
           if (this.metaMode === 'tokens') {
@@ -2103,27 +3048,6 @@
           if (normalized === 'claude') return 'tone-claude';
           if (normalized === 'codex') return 'tone-codex';
           return 'tone-other';
-        },
-        sourceSegments(row) {
-          const sources = Object.values(row?.sources || {})
-            .map((entry) => ({
-              source: String(entry?.source || 'unknown'),
-              value: this.metaMode === 'tokens'
-                ? Number(entry?.total_tokens || 0)
-                : Number(entry?.cost_usd || 0),
-            }))
-            .filter((entry) => entry.value > 0)
-            .sort((a, b) => b.value - a.value);
-          const total = sources.reduce((sum, entry) => sum + entry.value, 0);
-          if (!sources.length || total <= 0) {
-            return [{ source: 'unknown', tone: 'tone-other', width: 100, opacity: 0.28 }];
-          }
-          return sources.map((entry) => ({
-            source: entry.source,
-            tone: this.sourceToneClass(entry.source),
-            width: Math.max(8, (entry.value / total) * 100),
-            opacity: 1,
-          }));
         },
         stepDay(delta) {
           if (!this.dayOptions.length) return;
@@ -2639,7 +3563,7 @@
         safeguardStats() { return this.data.safeguard || {}; },
         currentMonth() { return this.data.current_month?.usage || {}; },
         allTime() { return this.data.all_time?.usage || {}; },
-        dailyHistory() { return this.data.current_month?.daily_history || []; },
+        dailyHistory() { return normalizeRowsToLocalToday(this.data.current_month?.daily_history || []); },
         calendarHistory() {
           return buildCalendarRows(
             this.dailyHistory,
@@ -3275,6 +4199,11 @@
         },
         _applyDashboardPayload(payload) {
           if (!payload || typeof payload !== 'object') {
+            return;
+          }
+          const incomingGeneratedAt = Date.parse(payload.generated_at || '');
+          const currentGeneratedAt = Date.parse(this.data?.generated_at || '');
+          if (Number.isFinite(incomingGeneratedAt) && Number.isFinite(currentGeneratedAt) && incomingGeneratedAt < currentGeneratedAt) {
             return;
           }
           const preserveScroll = this.activeTab === 'requests';
