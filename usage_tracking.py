@@ -25,7 +25,7 @@ from util import (
     utc_now, utc_now_iso,
     normalize_usage_payload, _normalize_model_name,
     _usage_event_model_name, _usage_event_source,
-    _usage_event_cost, _premium_request_multiplier,
+    _usage_event_cost, _premium_request_multiplier, _counted_premium_requests,
     _server_request_chain_key, _is_claude_request,
     extract_item_text, _parse_iso_datetime,
     _extract_payload_usage,
@@ -168,7 +168,7 @@ def _usage_event_archive_summary(event: dict) -> dict:
         "server_request_id": event.get("server_request_id"),
         "status_code": event.get("status_code"),
         "success": event.get("success"),
-        "premium_requests": _coerce_float(event.get("premium_requests")),
+        "premium_requests": _counted_premium_requests(event),
         "cost_usd": round(_coerce_float(event.get("cost_usd")), 6),
     }
 
@@ -923,7 +923,12 @@ class UsageTracker:
             or finished_event.get("requested_model")
         )
         finished_event["cost_usd"] = _usage_event_cost(model_name, derived_usage)
-        finished_event["premium_requests"] = _premium_request_multiplier(model_name) if status_code < 400 else 0.0
+        finished_event["premium_requests"] = _counted_premium_requests(
+            {
+                **finished_event,
+                "premium_requests": _premium_request_multiplier(model_name) if status_code < 400 else 0.0,
+            }
+        )
         self._remember_server_request_id(finished_event)
         self._remember_latest_claude_user_session_context(finished_event)
         self._persist_event(finished_event)

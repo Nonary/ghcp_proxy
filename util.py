@@ -328,6 +328,15 @@ def _premium_request_multiplier(model_name: str | None) -> float:
     return PREMIUM_REQUEST_MULTIPLIERS.get(normalized, 1.0)
 
 
+def _counted_premium_requests(event: dict | None) -> float:
+    if not isinstance(event, dict):
+        return 0.0
+    initiator = event.get("initiator")
+    if isinstance(initiator, str) and initiator.strip().lower() == "agent":
+        return 0.0
+    return _coerce_float(event.get("premium_requests"))
+
+
 # ---------------------------------------------------------------------------
 # Content extraction helpers
 # ---------------------------------------------------------------------------

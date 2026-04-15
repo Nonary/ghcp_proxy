@@ -514,6 +514,7 @@ class UsageTrackingTests(unittest.TestCase):
         log_path = self._make_usage_log_path()
         event = {
             "request_id": "req-999",
+            "initiator": "user",
             "resolved_model": "gpt-5.4",
             "_started_monotonic": 10.0,
             "_first_output_monotonic": 10.45,
@@ -543,6 +544,22 @@ class UsageTrackingTests(unittest.TestCase):
         self.assertEqual(finished["time_to_first_token_ms"], 450)
         self.assertEqual(finished["premium_requests"], 1.0)
         self.assertTrue(finished["success"])
+
+    def test_finish_usage_event_does_not_count_agent_request_toward_premium_quota(self):
+        tracker = self._make_usage_tracker()
+        log_path = self._make_usage_log_path()
+        event = {
+            "request_id": "req-999",
+            "initiator": "agent",
+            "resolved_model": "gpt-5.4",
+        }
+
+        tracker.usage_log_file = str(log_path)
+        tracker.finish_event(event, 200)
+
+        finished = tracker.snapshot_usage_events()[0]
+        self.assertEqual(finished["premium_requests"], 0.0)
+        self.assertEqual(finished["cost_usd"], 0.0)
 
     def test_finish_usage_event_remembers_session_server_request_id(self):
         tracker = self._make_usage_tracker()

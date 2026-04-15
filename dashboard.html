@@ -150,6 +150,36 @@
     .summary-hero .summary-chip { font-size: .9rem; padding: 8px 12px; }
     .summary-hero .summary-label { min-width: 74px; font-size: .74rem; }
     .subtle { color: var(--muted); font-size: .84rem; }
+    .sync-guide {
+      display: grid;
+      gap: 8px;
+      position: relative;
+      z-index: 1;
+      margin-top: 10px;
+      padding: 12px;
+      border: 1px solid rgba(110,231,200,.16);
+      border-radius: 8px;
+      background: rgba(110,231,200,.06);
+    }
+    .sync-link {
+      color: var(--accent-2);
+      text-decoration: none;
+      font-size: .84rem;
+      font-weight: 600;
+    }
+    .sync-link:hover {
+      text-decoration: underline;
+    }
+    .sync-steps {
+      display: grid;
+      gap: 4px;
+    }
+    .sync-url {
+      font-family: "Cascadia Code", Consolas, monospace;
+      font-size: .78rem;
+      color: var(--text);
+      word-break: break-all;
+    }
     .panel-head {
       display: flex;
       justify-content: space-between;
@@ -792,6 +822,59 @@
       ></summary-explorer-card>
     </section>
 
+    <section class="summary-grid">
+      <article class="panel">
+        <div class="panel-head">
+          <div>
+            <div class="eyebrow">Premium</div>
+            <h3>Plan Sync</h3>
+            <div class="subtle">{{ premiumPlanStatusLabel }}</div>
+          </div>
+        </div>
+        <div class="toolbar">
+          <select v-model="premiumPlan.plan">
+            <option value="">Choose plan</option>
+            <option v-for="plan in premiumPlan.availablePlans" :key="plan.id" :value="plan.id">
+              {{ plan.label }} · {{ integer(plan.included) }} premium requests
+            </option>
+          </select>
+          <input
+            v-model.number="premiumPlan.currentPercentInput"
+            @input="markPremiumPlanPercentDirty"
+            type="number"
+            min="0"
+            max="100"
+            step="0.1"
+            placeholder="Current used %"
+          />
+          <button class="primary" @click="savePremiumPlan" :disabled="savingPremiumPlan || !premiumPlan.plan">
+            Save + Resync
+          </button>
+          <button
+            @click="clearPremiumPlan"
+            :disabled="savingPremiumPlan || !premiumPlan.configured"
+          >
+            Clear
+          </button>
+        </div>
+        <div class="sync-guide">
+          <div class="sync-steps">
+            <div><strong>1.</strong> Open the Copilot quota page.</div>
+            <div><strong>2.</strong> Copy the premium requests percentage shown there.</div>
+            <div><strong>3.</strong> Type that percentage here and press <strong>Save + Resync</strong>.</div>
+          </div>
+          <a class="sync-link" href="https://github.com/settings/copilot/features" target="_blank" rel="noreferrer">
+            https://github.com/settings/copilot/features
+          </a>
+          <div class="sync-url">https://github.com/settings/copilot/features</div>
+          <div class="subtle">Use the premium requests percentage from that page to complete sync.</div>
+          <div class="subtle">Syncing at {{ premiumPlanPreviewPercent }} sets your current baseline and new proxy premium requests build from there.</div>
+        </div>
+        <div v-if="premiumPlan.error" class="status error">{{ premiumPlan.error }}</div>
+        <div v-else-if="premiumPlan.statusMessage" class="status good">{{ premiumPlan.statusMessage }}</div>
+      </article>
+    </section>
+
     <section class="chart-grid">
       <trend-chart-card
         :title="spendTrendConfig.title"
@@ -1185,36 +1268,6 @@
           <div v-else-if="proxyConfigStatusMessage" class="status good">{{ proxyConfigStatusMessage }}</div>
         </article>
 
-        <article class="panel">
-          <div class="panel-head">
-            <div>
-              <div class="eyebrow">Billing</div>
-              <h3>Billing Token</h3>
-              <div class="subtle">{{ billingTokenStatusLabel }}</div>
-            </div>
-            <span v-if="billingToken.readonly" class="badge">readonly</span>
-          </div>
-          <div class="toolbar">
-            <input
-              v-model="billingToken.tokenInput"
-              type="password"
-              placeholder="Personal access token for premium remaining lookups"
-              :disabled="billingToken.readonly"
-            />
-            <button class="primary" @click="saveBillingToken" :disabled="billingToken.readonly || savingBillingToken || !billingToken.tokenInput">
-              Save
-            </button>
-            <button
-              @click="clearBillingToken"
-              :disabled="billingToken.readonly || savingBillingToken || !billingToken.configured"
-            >
-              Clear
-            </button>
-          </div>
-          <div v-if="billingToken.error" class="status error">{{ billingToken.error }}</div>
-          <div v-else-if="billingToken.statusMessage" class="status good">{{ billingToken.statusMessage }}</div>
-          <p class="subtle">Used only to query premium requests remaining from GitHub billing data, stored locally.</p>
-        </article>
       </div>
     </section>
   </div>
@@ -1563,7 +1616,7 @@
         </div>
         <div class="summary-badge-row">
           <span class="summary-label">Premium</span>
-          <span class="summary-chip"><span class="chip-k">Remaining</span>{{ premiumValue }}</span>
+          <span class="summary-chip"><span class="chip-k">Used</span>{{ premiumValue }}</span>
         </div>
       </div>
       <div class="subtle">{{ premiumMeta }}</div>
@@ -1725,6 +1778,13 @@
         stacked_total_tokens: cachedInput + freshInput + visibleOutput + reasoningOutput,
       };
     }
+
+    const defaultPremiumPlanOptions = [
+      { id: 'pro', label: 'Pro', included: 300 },
+      { id: 'business', label: 'Business', included: 300 },
+      { id: 'enterprise', label: 'Enterprise', included: 1000 },
+      { id: 'pro_plus', label: 'Pro+', included: 1500 },
+    ];
 
     function mergeUsageRows(rows) {
       const sourceMap = {};
@@ -2231,7 +2291,7 @@
       data() {
         return {
           autoRefreshTimer: null,
-          savingBillingToken: false,
+          savingPremiumPlan: false,
           loadingClientProxyStatus: false,
           savingProxyConfig: false,
           loadingModelRoutingConfig: false,
@@ -2277,11 +2337,17 @@
             recent_requests: [],
             month_history: [],
           },
-          billingToken: {
+          premiumPlan: {
             configured: false,
-            source: 'none',
-            readonly: false,
-            tokenInput: '',
+            plan: '',
+            included: null,
+            syncedPercent: 0,
+            syncedUsed: 0,
+            syncedAt: '',
+            syncedMonth: '',
+            currentPercentInput: 0,
+            currentPercentDirty: false,
+            availablePlans: [...defaultPremiumPlanOptions],
             error: '',
             statusMessage: '',
           },
@@ -2411,44 +2477,71 @@
         },
         premiumSourceLabel() {
           const source = String(this.premium.source || '').trim();
-          if (source === 'github-rest-billing-api') return 'Premium from official GitHub billing';
+          if (source === 'manual-plan-config') {
+            if (this.premium.sync_stale) return 'Premium plan saved, sync needs refresh for this month';
+            return 'Premium from plan sync and proxy requests';
+          }
           if (source) return 'Premium from proxy request log';
           return 'Premium source pending';
         },
         premiumRemainingLabel() {
-          const remaining = this.premium.official_remaining ?? this.premium.tracked_remaining;
-          return this._formatPremiumValue(remaining);
+          const percentUsed = this._asPremiumNumber(this.premium.percent_used);
+          if (percentUsed == null) return this.premium.configured ? '0%' : 'Not synced';
+          return `${this._formatPercent(percentUsed)}%`;
         },
         premiumRemainingMetaLabel() {
           const used = this._asPremiumNumber(this.premium.used);
           const included = this._asPremiumNumber(this.premium.included);
-          const remaining = this._asPremiumNumber(this.premium.official_remaining ?? this.premium.tracked_remaining);
-          const percentLeft = this._premiumPercentLeft(included, remaining);
+          const syncedPercent = this._asPremiumNumber(this.premium.synced_percent);
+          const trackedSinceSync = this._asPremiumNumber(this.premium.tracked_since_sync);
+          const trackedThisMonth = this._asPremiumNumber(this.premium.tracked_this_month);
 
-          if (percentLeft == null && !Number.isFinite(used)) {
+          if (!Number.isFinite(used) && !Number.isFinite(trackedThisMonth)) {
             return 'No premium quota usage available yet';
           }
 
           const parts = [];
-          if (percentLeft != null) {
-            parts.push(`${this._formatPercent(percentLeft)}% left`);
-          }
           if (Number.isFinite(used)) {
-            parts.push(`${this._formatPremiumValue(used)} used this month`);
+            if (Number.isFinite(included)) {
+              parts.push(`${this._formatPremiumValue(used)} of ${this._formatPremiumValue(included)} used`);
+            } else {
+              parts.push(`${this._formatPremiumValue(used)} used`);
+            }
           }
-          if (Number.isFinite(included)) {
-            parts.push(`quota ${this._formatPremiumValue(included)}`);
+          if (Number.isFinite(trackedSinceSync) && trackedSinceSync > 0) {
+            parts.push(`+${this._formatPremiumValue(trackedSinceSync)} since sync`);
+          }
+          if (Number.isFinite(syncedPercent) && this.premium.sync_current_month) {
+            parts.push(`synced at ${this._formatPercent(syncedPercent)}%`);
+          } else if (this.premium.sync_stale) {
+            parts.push('saved sync is from a previous month');
+          } else if (Number.isFinite(trackedThisMonth)) {
+            parts.push(`${this._formatPremiumValue(trackedThisMonth)} tracked locally this month`);
           }
           return parts.join(' · ') || 'No premium quota data yet';
         },
         updatedLabel() { return `Updated ${this.stamp(this.data.generated_at)}`; },
-        billingTokenStatusLabel() {
-          if (!this.billingToken.configured) {
-            return 'No billing token configured';
+        premiumPlanStatusLabel() {
+          if (!this.premiumPlan.configured) {
+            return 'Pick a plan and sync with your current used percentage';
           }
-          return this.billingToken.source === 'environment'
-            ? 'Using GHCP_GITHUB_BILLING_TOKEN (environment)'
-            : 'Using saved local PAT';
+          const parts = [];
+          const selectedPlan = this.premiumPlan.availablePlans.find((plan) => plan.id === this.premiumPlan.plan);
+          if (selectedPlan) {
+            parts.push(`${selectedPlan.label} · ${this.integer(selectedPlan.included)} included`);
+          }
+          const livePercentUsed = this._asPremiumNumber(this.premium.percent_used);
+          if (this.premium.sync_current_month && Number.isFinite(livePercentUsed)) {
+            parts.push(`currently at ${this._formatPercent(livePercentUsed)}%`);
+          }
+          parts.push(`synced at ${this._formatPercent(this.premiumPlan.syncedPercent || 0)}%`);
+          if (this.premium.sync_stale) {
+            parts.push('last sync was in a previous month');
+          }
+          return parts.join(' · ');
+        },
+        premiumPlanPreviewPercent() {
+          return `${this._formatPercent(this.premiumPlan.currentPercentInput || 0)}%`;
         },
         filteredSessions() {
           const rows = (this.data.recent_sessions || []).filter((row) => this.allowSource(row.source) && this.matches(row));
@@ -2526,6 +2619,26 @@
           const value = (remaining / included) * 100;
           if (!Number.isFinite(value)) return null;
           return Math.min(100, Math.max(0, value));
+        },
+        _premiumPlanAutoPercent() {
+          const livePercentUsed = this._asPremiumNumber(this.premium.percent_used);
+          if (this.premiumPlan.configured && this.premium.sync_current_month && Number.isFinite(livePercentUsed)) {
+            return livePercentUsed;
+          }
+          const syncedPercent = Number(this.premiumPlan.syncedPercent);
+          if (Number.isFinite(syncedPercent)) {
+            return syncedPercent;
+          }
+          return 0;
+        },
+        syncPremiumPlanPercentInput(force = false) {
+          if (!force && this.premiumPlan.currentPercentDirty) {
+            return;
+          }
+          this.premiumPlan.currentPercentInput = this._premiumPlanAutoPercent();
+        },
+        markPremiumPlanPercentDirty() {
+          this.premiumPlan.currentPercentDirty = true;
         },
         stamp(value) {
           if (!value) return '-';
@@ -2824,29 +2937,45 @@
             this.savingModelRoutingConfig = false;
           }
         },
-        async loadBillingTokenConfig() {
+        async loadPremiumPlanConfig() {
           try {
-            const response = await fetch('/api/config/billing-token');
-            if (!response.ok) throw new Error(`billing token status request failed: ${response.status}`);
+            const response = await fetch('/api/config/premium-plan');
+            if (!response.ok) throw new Error(`premium plan status request failed: ${response.status}`);
             const payload = await response.json();
-            this.billingToken.configured = Boolean(payload.configured);
-            this.billingToken.source = payload.source || 'none';
-            this.billingToken.readonly = Boolean(payload.readonly);
-            this.billingToken.error = '';
+            this.premiumPlan.configured = Boolean(payload.configured);
+            this.premiumPlan.plan = payload.plan || '';
+            this.premiumPlan.included = Number.isFinite(Number(payload.included)) ? Number(payload.included) : null;
+            this.premiumPlan.syncedPercent = Number(payload.synced_percent || 0);
+            this.premiumPlan.syncedUsed = Number(payload.synced_used || 0);
+            this.premiumPlan.syncedAt = payload.synced_at || '';
+            this.premiumPlan.syncedMonth = payload.synced_month || '';
+            this.premiumPlan.currentPercentDirty = false;
+            this.syncPremiumPlanPercentInput(true);
+            this.premiumPlan.availablePlans = Array.isArray(payload.available_plans) && payload.available_plans.length
+              ? payload.available_plans
+              : [...defaultPremiumPlanOptions];
+            this.premiumPlan.error = '';
           } catch (error) {
-            this.billingToken.error = error.message;
+            this.premiumPlan.availablePlans = [...defaultPremiumPlanOptions];
+            this.premiumPlan.error = String(error?.message || error || '');
+            if (this.premiumPlan.error.includes('404')) {
+              this.premiumPlan.error += ' - restart the proxy so the new premium-plan API route is available.';
+            }
           }
         },
-        async saveBillingToken() {
-          if (this.savingBillingToken) return;
-          this.savingBillingToken = true;
-          this.billingToken.statusMessage = '';
-          this.billingToken.error = '';
+        async savePremiumPlan() {
+          if (this.savingPremiumPlan) return;
+          this.savingPremiumPlan = true;
+          this.premiumPlan.statusMessage = '';
+          this.premiumPlan.error = '';
           try {
-            const response = await fetch('/api/config/billing-token', {
+            const response = await fetch('/api/config/premium-plan', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ token: this.billingToken.tokenInput }),
+              body: JSON.stringify({
+                plan: this.premiumPlan.plan,
+                current_percent: this.premiumPlan.currentPercentInput,
+              }),
             });
             if (!response.ok) {
               let message = `save request failed: ${response.status}`;
@@ -2861,24 +2990,33 @@
               throw new Error(message);
             }
             const payload = await response.json();
-            this.billingToken.configured = Boolean(payload.configured);
-            this.billingToken.source = payload.source || 'none';
-            this.billingToken.readonly = Boolean(payload.readonly);
-            this.billingToken.tokenInput = '';
-            this.billingToken.statusMessage = 'Billing token saved.';
+            this.premiumPlan.configured = Boolean(payload.configured);
+            this.premiumPlan.plan = payload.plan || '';
+            this.premiumPlan.included = Number.isFinite(Number(payload.included)) ? Number(payload.included) : null;
+            this.premiumPlan.syncedPercent = Number(payload.synced_percent || 0);
+            this.premiumPlan.syncedUsed = Number(payload.synced_used || 0);
+            this.premiumPlan.syncedAt = payload.synced_at || '';
+            this.premiumPlan.syncedMonth = payload.synced_month || '';
+            this.premiumPlan.currentPercentDirty = false;
+            this.syncPremiumPlanPercentInput(true);
+            this.premiumPlan.availablePlans = Array.isArray(payload.available_plans) ? payload.available_plans : [];
+            this.premiumPlan.statusMessage = 'Premium plan synced.';
             await this.load();
           } catch (error) {
-            this.billingToken.error = error.message;
+            this.premiumPlan.error = String(error?.message || error || '');
+            if (this.premiumPlan.error.includes('404')) {
+              this.premiumPlan.error += ' - restart the proxy so the new premium-plan API route is available.';
+            }
           } finally {
-            this.savingBillingToken = false;
+            this.savingPremiumPlan = false;
           }
         },
-        async clearBillingToken() {
-          this.savingBillingToken = true;
-          this.billingToken.statusMessage = '';
-          this.billingToken.error = '';
+        async clearPremiumPlan() {
+          this.savingPremiumPlan = true;
+          this.premiumPlan.statusMessage = '';
+          this.premiumPlan.error = '';
           try {
-            const response = await fetch('/api/config/billing-token', {
+            const response = await fetch('/api/config/premium-plan', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ clear: true }),
@@ -2896,16 +3034,25 @@
               throw new Error(message);
             }
             const payload = await response.json();
-            this.billingToken.configured = Boolean(payload.configured);
-            this.billingToken.source = payload.source || 'none';
-            this.billingToken.readonly = Boolean(payload.readonly);
-            this.billingToken.tokenInput = '';
-            this.billingToken.statusMessage = 'Billing token cleared.';
+            this.premiumPlan.configured = Boolean(payload.configured);
+            this.premiumPlan.plan = payload.plan || '';
+            this.premiumPlan.included = Number.isFinite(Number(payload.included)) ? Number(payload.included) : null;
+            this.premiumPlan.syncedPercent = Number(payload.synced_percent || 0);
+            this.premiumPlan.syncedUsed = Number(payload.synced_used || 0);
+            this.premiumPlan.syncedAt = payload.synced_at || '';
+            this.premiumPlan.syncedMonth = payload.synced_month || '';
+            this.premiumPlan.currentPercentDirty = false;
+            this.syncPremiumPlanPercentInput(true);
+            this.premiumPlan.availablePlans = Array.isArray(payload.available_plans) ? payload.available_plans : [];
+            this.premiumPlan.statusMessage = 'Premium plan cleared.';
             await this.load();
           } catch (error) {
-            this.billingToken.error = error.message;
+            this.premiumPlan.error = String(error?.message || error || '');
+            if (this.premiumPlan.error.includes('404')) {
+              this.premiumPlan.error += ' - restart the proxy so the new premium-plan API route is available.';
+            }
           } finally {
-            this.savingBillingToken = false;
+            this.savingPremiumPlan = false;
           }
         },
         allowSource(source) { return this.sourceFilter === 'all' || this.sourceFilter === source; },
@@ -2930,6 +3077,7 @@
           const previousScrollTop = requestList ? requestList.scrollTop : null;
           const mergedRequests = this.mergeRecentRequests(this.data.recent_requests, payload?.recent_requests);
           Object.assign(this.data, { ...payload, recent_requests: mergedRequests });
+          this.syncPremiumPlanPercentInput();
           this.requestPage = Math.min(this.requestPageCount, Math.max(1, this.requestPage));
           const requestKeys = new Set((this.data.recent_requests || []).map((row) => this.requestKey(row)));
           if (!requestKeys.has(this.selectedRequestKey)) {
@@ -3022,7 +3170,7 @@
       },
       mounted() {
         this.load(true);
-        this.loadBillingTokenConfig();
+        this.loadPremiumPlanConfig();
         this.loadClientProxyStatus();
         this.loadModelRoutingConfig();
         this.startDashboardStream();

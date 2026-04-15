@@ -1,4 +1,4 @@
-"""Dashboard payload construction, SQLite cache, GitHub billing API integration, and premium quota management."""
+"""Dashboard payload construction, SQLite cache, and premium quota management."""
 
 import asyncio
 import hashlib
@@ -26,7 +26,8 @@ from util import (
     normalize_usage_payload, _normalize_model_name,
     _usage_event_model_name, _usage_event_source,
     _pricing_entry_for_model, _usage_event_cost,
-    _premium_request_multiplier, _month_key, month_key_for_source_row,
+    _premium_request_multiplier, _counted_premium_requests,
+    _month_key, month_key_for_source_row,
 )
 
 
@@ -63,6 +64,7 @@ class DashboardDependencies:
     load_billing_token: Callable[[], str | None] = lambda: None
     load_access_token: Callable[[], str | None] = lambda: None
     load_api_key_payload: Callable[[], dict] = lambda: {}
+    load_premium_plan_config: Callable[[], dict] = lambda: {}
     snapshot_all_usage_events: Callable[[], list[dict]] = lambda: []
     snapshot_usage_events: Callable[[], list[dict]] = lambda: []
     load_safeguard_trigger_stats: Callable[[datetime], dict] = lambda _now: {}
@@ -1220,6 +1222,65 @@ def _empty_day_history_row(day_key: str) -> dict:
     }
 
 
+def _build_premium_usage_summary(
+    premium_plan: dict | None,
+    current_month_events: list[dict],
+    *,
+    current_month_key: str,
+) -> dict:
+    plan = premium_plan if isinstance(premium_plan, dict) else {}
+    configured = bool(plan.get("configured"))
+    included = _coerce_float(plan.get("included"), default=None)
+    synced_month = str(plan.get("synced_month") or "").strip()
+    synced_at = _parse_iso_datetime(plan.get("synced_at"))
+    synced_percent = round(_coerce_float(plan.get("synced_percent")), 2) if configured else 0.0
+    synced_used = round(_coerce_float(plan.get("synced_used")), 2) if configured else 0.0
+    sync_current = configured and synced_month == current_month_key
+
+    tracked_this_month = round(
+        sum(_counted_premium_requests(event) for event in current_month_events),
+        2,
+    )
+    tracked_since_sync = 0.0
+    for event in current_month_events:
+        if sync_current and synced_at is not None:
+            recorded_at = _parse_iso_datetime(event.get("finished_at") or event.get("started_at"))
+            if recorded_at is None or recorded_at < synced_at:
+                continue
+        tracked_since_sync += _counted_premium_requests(event)
+    tracked_since_sync = round(tracked_since_sync, 2)
+
+    baseline_used = synced_used if sync_current else 0.0
+    used_unclamped = round(baseline_used + tracked_since_sync, 2)
+    used = used_unclamped
+    remaining = None
+    percent_used = None
+    if included is not None and included > 0:
+        used = round(min(used_unclamped, included), 2)
+        remaining = round(max(included - used_unclamped, 0.0), 2)
+        percent_used = round(min((used_unclamped / included) * 100.0, 100.0), 2)
+
+    return {
+        "plan": plan.get("plan") if configured else None,
+        "plan_label": plan.get("plan_label") if configured else None,
+        "configured": configured,
+        "included": int(included) if included is not None else None,
+        "used": used,
+        "used_unclamped": used_unclamped,
+        "remaining": remaining,
+        "percent_used": percent_used,
+        "tracked_this_month": tracked_this_month,
+        "tracked_since_sync": tracked_since_sync,
+        "sync_current_month": sync_current,
+        "synced_percent": synced_percent if sync_current else 0.0,
+        "synced_used": synced_used if sync_current else 0.0,
+        "synced_at": plan.get("synced_at") if sync_current else None,
+        "synced_month": synced_month if configured else "",
+        "sync_stale": configured and bool(synced_month) and synced_month != current_month_key,
+        "source": "manual-plan-config" if configured else "proxy-request-log",
+    }
+
+
 class DashboardService:
     """Owns dashboard aggregation with explicit auth/usage callbacks and runtime hooks."""
 
@@ -1466,22 +1527,11 @@ class DashboardService:
             if month_start <= recorded_at < month_end:
                 current_month_events.append(event)
 
-        premium_used = round(sum(_coerce_float(event.get("premium_requests")) for event in current_month_events), 2)
-        api_key_payload = self.dependencies.load_api_key_payload()
-        if not isinstance(api_key_payload, dict):
-            api_key_payload = {}
-        quota_summary = _extract_quota_summary(api_key_payload)
-        included = quota_summary.get("included")
-        has_tracked_premium_data = bool(current_month_events)
-        tracked_remaining = None
-        if included is not None and has_tracked_premium_data:
-            tracked_remaining = round(max(included - premium_used, 0.0), 2)
-        official_premium = self.get_official_premium_payload(force_refresh=force_refresh)
-        official_included = official_premium.get("included")
-        official_used = official_premium.get("used")
-        official_remaining = official_premium.get("remaining")
-        official_reset_date = official_premium.get("reset_date")
-        official_available = bool(official_premium.get("available"))
+        premium_summary = _build_premium_usage_summary(
+            self.dependencies.load_premium_plan_config(),
+            current_month_events,
+            current_month_key=current_month_key,
+        )
 
         local_usage = collect_local_dashboard_usage(usage_events)
         month_rows = list(local_usage.get("month_rows") or [])
@@ -1515,17 +1565,7 @@ class DashboardService:
 
         return {
             "generated_at": now.isoformat(),
-            "premium": {
-                "sku": quota_summary.get("sku") or official_premium.get("raw", {}).get("sku"),
-                "included": official_included if official_included is not None else included,
-                "used": official_used if official_available and official_used is not None else premium_used,
-                "tracked_remaining": tracked_remaining,
-                "has_tracked_data": has_tracked_premium_data,
-                "official_remaining": official_remaining if official_available else quota_summary.get("official_remaining"),
-                "reset_date": official_reset_date if official_reset_date is not None else quota_summary.get("reset_date"),
-                "source": official_premium.get("source") if official_available else "proxy-request-log",
-                "official": official_premium,
-            },
+            "premium": premium_summary,
             "safeguard": {
                 "today_count": int(safeguard_stats.get("today_count") or 0),
                 "current_month_count": int(safeguard_stats.get("current_month_count") or 0),

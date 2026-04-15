@@ -1,11 +1,8 @@
-import contextlib
-import io
 import unittest
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest import mock
 
-import auth
 import dashboard
 import initiator_policy
 import proxy
@@ -17,7 +14,6 @@ class DashboardTests(unittest.TestCase):
     def setUp(self):
         proxy.set_initiator_policy(initiator_policy.InitiatorPolicy())
         proxy.usage_tracker.clear_state()
-        proxy.dashboard_service.reset_official_premium_cache()
 
     def test_month_key_for_source_rows(self):
         self.assertEqual(util.month_key_for_source_row("claude", {"month": "2026-04"}), "2026-04")
@@ -64,32 +60,32 @@ class DashboardTests(unittest.TestCase):
             },
         ]
 
-        proxy.usage_tracker.replace_history(recent_events=usage_events)
-
-        with (
-            mock.patch.object(proxy.dashboard_service, "utc_now", return_value=fixed_now),
-            mock.patch.object(auth, "load_api_key_payload", return_value={"sku": "plus_monthly_subscriber_quota"}),
-            mock.patch.object(
-                proxy.dashboard_service,
-                "get_official_premium_payload",
-                return_value={
-                    "available": True,
-                    "remaining": 1420,
-                    "used": 80,
+        service = dashboard.DashboardService(
+            dependencies=dashboard.DashboardDependencies(
+                load_premium_plan_config=lambda: {
+                    "configured": True,
+                    "plan": "pro_plus",
+                    "plan_label": "Pro+",
                     "included": 1500,
-                    "reset_date": None,
-                    "source": "github-rest-billing-api",
-                    "raw": {},
-                    "refreshing": False,
-                    "error": None,
+                    "synced_percent": 0.0,
+                    "synced_used": 0.0,
+                    "synced_at": "2026-04-01T00:00:00+00:00",
+                    "synced_month": "2026-04",
                 },
+                snapshot_all_usage_events=lambda: usage_events,
+                snapshot_usage_events=lambda: usage_events,
+                load_safeguard_trigger_stats=lambda _now: {},
             ),
-        ):
-            payload = proxy.dashboard_service.build_payload()
+            utc_now=lambda: fixed_now,
+        )
+
+        payload = service.build_payload()
 
         self.assertEqual(payload["premium"]["included"], 1500)
-        self.assertEqual(payload["premium"]["used"], 80)
-        self.assertEqual(payload["premium"]["official_remaining"], 1420)
+        self.assertEqual(payload["premium"]["used"], 1.33)
+        self.assertEqual(payload["premium"]["remaining"], 1498.67)
+        self.assertEqual(payload["premium"]["percent_used"], 0.09)
+        self.assertEqual(payload["premium"]["tracked_since_sync"], 1.33)
         self.assertEqual(payload["current_month"]["usage"]["cost_usd"], 4.0)
         self.assertEqual(payload["current_month"]["usage"]["total_tokens"], 400)
         self.assertEqual(payload["current_month"]["usage"]["request_count"], 2)
@@ -137,31 +133,17 @@ class DashboardTests(unittest.TestCase):
             "cost_usd": 2.75,
         }
 
-        proxy.usage_tracker.replace_history(
-            recent_events=[recent_event],
-            archived_events=[archived_event],
+        service = dashboard.DashboardService(
+            dependencies=dashboard.DashboardDependencies(
+                load_premium_plan_config=lambda: {},
+                snapshot_all_usage_events=lambda: [archived_event, recent_event],
+                snapshot_usage_events=lambda: [recent_event],
+                load_safeguard_trigger_stats=lambda _now: {},
+            ),
+            utc_now=lambda: fixed_now,
         )
 
-        with (
-            mock.patch.object(proxy.dashboard_service, "utc_now", return_value=fixed_now),
-            mock.patch.object(auth, "load_api_key_payload", return_value={"sku": "plus_monthly_subscriber_quota"}),
-            mock.patch.object(
-                proxy.dashboard_service,
-                "get_official_premium_payload",
-                return_value={
-                    "available": False,
-                    "remaining": None,
-                    "used": None,
-                    "included": None,
-                    "reset_date": None,
-                    "source": "github-rest-billing-api",
-                    "raw": {},
-                    "refreshing": False,
-                    "error": None,
-                },
-            ),
-        ):
-            payload = proxy.dashboard_service.build_payload()
+        payload = service.build_payload()
 
         self.assertEqual(payload["all_time"]["proxy_requests"], 2)
         self.assertEqual(payload["all_time"]["archived_requests"], 1)
@@ -176,6 +158,9 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(payload["recent_requests"][0]["request_id"], "recent-req")
         self.assertEqual(payload["month_history"][0]["month_key"], "2026-04")
         self.assertEqual(payload["month_history"][1]["month_key"], "2026-03")
+        self.assertIsNone(payload["premium"]["included"])
+        self.assertEqual(payload["premium"]["used"], 0.33)
+        self.assertIsNone(payload["premium"]["percent_used"])
 
     def test_build_dashboard_payload_zero_fills_daily_history_for_current_month(self):
         fixed_now = datetime(2026, 4, 4, 18, 0, tzinfo=timezone.utc)
@@ -195,28 +180,17 @@ class DashboardTests(unittest.TestCase):
             }
         ]
 
-        proxy.usage_tracker.replace_history(recent_events=usage_events)
-
-        with (
-            mock.patch.object(proxy.dashboard_service, "utc_now", return_value=fixed_now),
-            mock.patch.object(auth, "load_api_key_payload", return_value={}),
-            mock.patch.object(
-                proxy.dashboard_service,
-                "get_official_premium_payload",
-                return_value={
-                    "available": False,
-                    "remaining": None,
-                    "used": None,
-                    "included": None,
-                    "reset_date": None,
-                    "source": "github-rest-billing-api",
-                    "raw": {},
-                    "refreshing": False,
-                    "error": None,
-                },
+        service = dashboard.DashboardService(
+            dependencies=dashboard.DashboardDependencies(
+                load_premium_plan_config=lambda: {},
+                snapshot_all_usage_events=lambda: usage_events,
+                snapshot_usage_events=lambda: usage_events,
+                load_safeguard_trigger_stats=lambda _now: {},
             ),
-        ):
-            payload = proxy.dashboard_service.build_payload()
+            utc_now=lambda: fixed_now,
+        )
+
+        payload = service.build_payload()
 
         self.assertEqual(
             [row["day_key"] for row in payload["current_month"]["daily_history"]],
@@ -243,24 +217,7 @@ class DashboardTests(unittest.TestCase):
             utc_now=lambda: fixed_now,
         )
 
-        with (
-            mock.patch.object(
-                service,
-                "get_official_premium_payload",
-                return_value={
-                    "available": False,
-                    "remaining": None,
-                    "used": None,
-                    "included": None,
-                    "reset_date": None,
-                    "source": "github-rest-billing-api",
-                    "raw": {},
-                    "refreshing": False,
-                    "error": None,
-                },
-            ),
-        ):
-            payload = service.build_payload()
+        payload = service.build_payload()
 
         self.assertEqual(payload["safeguard"]["today_count"], 1)
         self.assertEqual(payload["safeguard"]["current_month_count"], 2)
@@ -277,133 +234,140 @@ class DashboardTests(unittest.TestCase):
         mocked_to_thread.assert_awaited_once_with(proxy.dashboard_service.build_payload, True)
         self.assertEqual(response.headers["cache-control"], "no-store")
 
-    def test_trigger_official_premium_refresh_notifies_dashboard_stream_listeners(self):
-        class ImmediateThread:
-            def __init__(self, target=None, daemon=None):
-                self._target = target
-                self.daemon = daemon
-
-            def start(self):
-                if self._target is not None:
-                    self._target()
-
-        premium_payload = {
-            "available": True,
-            "loaded_at": "2026-04-04T18:00:00+00:00",
-            "remaining": 1420,
-            "used": 80,
-            "included": 1500,
-            "reset_date": None,
-            "source": "github-rest-billing-api",
-            "raw": {},
-            "error": None,
-        }
-
-        with (
-            mock.patch.object(
-                proxy.dashboard_service,
-                "collect_official_premium_payload",
-                return_value=premium_payload,
-            ),
-            mock.patch.object(proxy.dashboard_service, "sqlite_cache_put"),
-            mock.patch.object(proxy.dashboard_service, "notify_dashboard_stream_listeners") as notify,
-            mock.patch.object(proxy.dashboard_service, "thread_class", ImmediateThread),
-        ):
-            proxy.dashboard_service.trigger_official_premium_refresh()
-
-        notify.assert_called_once_with()
-        cache_state = proxy.dashboard_service.official_premium_cache_state()
-        self.assertEqual(cache_state["payload"], premium_payload)
-        self.assertFalse(cache_state["refreshing"])
-        self.assertIsNone(cache_state["last_error"])
-        self.assertGreater(cache_state["loaded_at"], 0.0)
-
-    def test_collect_official_premium_payload_skips_github_when_no_billing_token(self):
-        service = dashboard.DashboardService(
-            dependencies=dashboard.DashboardDependencies(
-                load_billing_token=lambda: None,
-                load_access_token=lambda: "access-token",
-                load_api_key_payload=lambda: {},
-            ),
-            sqlite_cache_put=lambda *args, **kwargs: None,
-        )
-
-        with mock.patch.object(dashboard, "_fetch_github_identity") as fetch_identity:
-            payload = service.collect_official_premium_payload(skip_cache=True)
-
-        fetch_identity.assert_not_called()
-        self.assertFalse(payload["available"])
-        self.assertIsNone(payload["error"])
-
-    def test_collect_official_premium_payload_falls_back_to_org_after_user_scope_400(self):
+    def test_build_dashboard_payload_adds_tracked_requests_on_top_of_synced_percent(self):
         fixed_now = datetime(2026, 4, 4, 18, 0, tzinfo=timezone.utc)
-        org_payload = {
-            "included": 1500,
-            "usageItems": [{"grossQuantity": 80, "discountQuantity": 80, "netQuantity": 0}],
-        }
+        usage_events = [
+            {
+                "request_id": "before-sync",
+                "initiator": "user",
+                "started_at": "2026-04-04T17:40:00+00:00",
+                "finished_at": "2026-04-04T17:41:00+00:00",
+                "resolved_model": "gpt-5.4",
+                "path": "/v1/responses",
+                "premium_requests": 1.0,
+            },
+            {
+                "request_id": "after-sync",
+                "initiator": "user",
+                "started_at": "2026-04-04T17:55:00+00:00",
+                "finished_at": "2026-04-04T17:56:00+00:00",
+                "resolved_model": "gpt-5.4-mini",
+                "path": "/v1/responses",
+                "premium_requests": 0.33,
+            },
+        ]
         service = dashboard.DashboardService(
             dependencies=dashboard.DashboardDependencies(
-                load_billing_token=lambda: "token",
-                load_access_token=lambda: None,
-                load_api_key_payload=lambda: {},
+                load_premium_plan_config=lambda: {
+                    "configured": True,
+                    "plan": "pro_plus",
+                    "plan_label": "Pro+",
+                    "included": 1500,
+                    "synced_percent": 10.0,
+                    "synced_used": 150.0,
+                    "synced_at": "2026-04-04T17:50:00+00:00",
+                    "synced_month": "2026-04",
+                },
+                snapshot_all_usage_events=lambda: usage_events,
+                snapshot_usage_events=lambda: usage_events,
+                load_safeguard_trigger_stats=lambda _now: {},
             ),
-            sqlite_cache_put=lambda *args, **kwargs: None,
+            utc_now=lambda: fixed_now,
         )
 
-        def fake_rest_get(access_token, url, params=None):
-            if "/users/" in url:
-                raise RuntimeError(
-                    f"GitHub REST request to {url} failed: 400 "
-                    '{"message":"Unable to get billing usage data.","status":"400"}'
-                )
-            if "/organizations/" in url:
-                return org_payload, "Bearer"
-            raise AssertionError(f"unexpected url {url}")
+        payload = service.build_payload()
 
-        stdout = io.StringIO()
-        with (
-            mock.patch.object(dashboard, "_fetch_github_identity", return_value={"login": "user-login"}),
-            mock.patch.object(dashboard, "_load_billing_org_candidates", return_value=["acme-inc"]),
-            mock.patch.object(dashboard, "_github_rest_get_json", side_effect=fake_rest_get),
-            contextlib.redirect_stdout(stdout),
-        ):
-            payload = service.collect_official_premium_payload(now=fixed_now, skip_cache=True)
+        self.assertEqual(payload["premium"]["used"], 150.33)
+        self.assertEqual(payload["premium"]["tracked_this_month"], 1.33)
+        self.assertEqual(payload["premium"]["tracked_since_sync"], 0.33)
+        self.assertEqual(payload["premium"]["remaining"], 1349.67)
+        self.assertEqual(payload["premium"]["percent_used"], 10.02)
+        self.assertTrue(payload["premium"]["sync_current_month"])
 
-        self.assertTrue(payload["available"])
-        self.assertEqual(payload["scope"], "org")
-        self.assertEqual(payload["target"], "acme-inc")
-        self.assertEqual(payload["used"], 80.0)
-        self.assertNotIn("Billing API fallback attempt failed", stdout.getvalue())
-        self.assertNotIn("user-login", stdout.getvalue())
-        self.assertNotIn("acme-inc", stdout.getvalue())
+    def test_build_dashboard_payload_excludes_agent_requests_from_premium_usage(self):
+        fixed_now = datetime(2026, 4, 4, 18, 0, tzinfo=timezone.utc)
+        usage_events = [
+            {
+                "request_id": "user-req",
+                "initiator": "user",
+                "started_at": "2026-04-04T17:40:00+00:00",
+                "finished_at": "2026-04-04T17:41:00+00:00",
+                "resolved_model": "gpt-5.4",
+                "path": "/v1/responses",
+                "premium_requests": 1.0,
+            },
+            {
+                "request_id": "agent-req",
+                "initiator": "agent",
+                "started_at": "2026-04-04T17:55:00+00:00",
+                "finished_at": "2026-04-04T17:56:00+00:00",
+                "resolved_model": "gpt-5.4-mini",
+                "path": "/v1/responses",
+                "premium_requests": 0.33,
+            },
+        ]
+        service = dashboard.DashboardService(
+            dependencies=dashboard.DashboardDependencies(
+                load_premium_plan_config=lambda: {
+                    "configured": True,
+                    "plan": "pro_plus",
+                    "plan_label": "Pro+",
+                    "included": 1500,
+                    "synced_percent": 10.0,
+                    "synced_used": 150.0,
+                    "synced_at": "2026-04-04T17:30:00+00:00",
+                    "synced_month": "2026-04",
+                },
+                snapshot_all_usage_events=lambda: usage_events,
+                snapshot_usage_events=lambda: usage_events,
+                load_safeguard_trigger_stats=lambda _now: {},
+            ),
+            utc_now=lambda: fixed_now,
+        )
 
-    def test_collect_official_premium_payload_raises_actionable_error_for_user_scope_400(self):
+        payload = service.build_payload()
+
+        self.assertEqual(payload["premium"]["tracked_this_month"], 1.0)
+        self.assertEqual(payload["premium"]["tracked_since_sync"], 1.0)
+        self.assertEqual(payload["premium"]["used"], 151.0)
+        self.assertEqual(payload["premium"]["remaining"], 1349.0)
+        self.assertEqual(payload["premium"]["percent_used"], 10.07)
+
+    def test_build_dashboard_payload_clamps_manual_plan_usage_at_100_percent(self):
         fixed_now = datetime(2026, 4, 4, 18, 0, tzinfo=timezone.utc)
         service = dashboard.DashboardService(
             dependencies=dashboard.DashboardDependencies(
-                load_billing_token=lambda: "token",
-                load_access_token=lambda: None,
-                load_api_key_payload=lambda: {},
+                load_premium_plan_config=lambda: {
+                    "configured": True,
+                    "plan": "pro",
+                    "plan_label": "Pro",
+                    "included": 300,
+                    "synced_percent": 99.8,
+                    "synced_used": 299.4,
+                    "synced_at": "2026-04-04T17:00:00+00:00",
+                    "synced_month": "2026-04",
+                },
+                snapshot_all_usage_events=lambda: [
+                    {
+                        "request_id": "overflow-req",
+                        "started_at": "2026-04-04T17:55:00+00:00",
+                        "finished_at": "2026-04-04T17:56:00+00:00",
+                        "resolved_model": "claude-sonnet-4.6",
+                        "path": "/v1/responses",
+                        "premium_requests": 1.0,
+                    }
+                ],
+                snapshot_usage_events=lambda: [],
+                load_safeguard_trigger_stats=lambda _now: {},
             ),
-            sqlite_cache_put=lambda *args, **kwargs: None,
+            utc_now=lambda: fixed_now,
         )
 
-        def fake_rest_get(access_token, url, params=None):
-            raise RuntimeError(
-                f"GitHub REST request to {url} failed: 400 "
-                '{"message":"Unable to get billing usage data.","status":"400"}'
-            )
+        payload = service.build_payload()
 
-        with (
-            mock.patch.object(dashboard, "_fetch_github_identity", return_value={"login": "user-login"}),
-            mock.patch.object(dashboard, "_load_billing_org_candidates", return_value=[]),
-            mock.patch.object(dashboard, "_github_rest_get_json", side_effect=fake_rest_get),
-        ):
-            with self.assertRaises(RuntimeError) as ctx:
-                service.collect_official_premium_payload(now=fixed_now, skip_cache=True)
-
-        self.assertIn("GHCP_GITHUB_BILLING_SCOPE", str(ctx.exception))
-        self.assertIn("organization or enterprise", str(ctx.exception))
+        self.assertEqual(payload["premium"]["used"], 300.0)
+        self.assertEqual(payload["premium"]["remaining"], 0.0)
+        self.assertEqual(payload["premium"]["percent_used"], 100.0)
 
     def test_normalize_session_claude_accepts_cached_input_tokens_shape(self):
         normalized = dashboard.normalize_session(

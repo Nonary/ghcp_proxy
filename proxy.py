@@ -22,6 +22,7 @@ import os
 import sqlite3
 import sys
 import time
+import premium_plan_config
 import usage_tracking
 import util
 from dataclasses import dataclass
@@ -139,13 +140,15 @@ client_proxy_config_service = ProxyClientConfigService(
     )
 )
 model_routing_config_service = ModelRoutingConfigService(ModelRoutingConfig())
+premium_plan_config_service = premium_plan_config.PremiumPlanConfigService(
+    premium_plan_config.PremiumPlanConfig()
+)
 bridge_planner = ProtocolBridgePlanner(model_routing_config_service)
 
 dashboard_service = dashboard_module.create_dashboard_service(
     dependencies=dashboard_module.DashboardDependencies(
-        load_billing_token=auth.load_billing_token,
-        load_access_token=auth.load_access_token,
         load_api_key_payload=auth.load_api_key_payload,
+        load_premium_plan_config=premium_plan_config_service.load_settings,
         snapshot_all_usage_events=usage_tracker.snapshot_all_usage_events,
         snapshot_usage_events=usage_tracker.snapshot_usage_events,
         load_safeguard_trigger_stats=safeguard_event_store.load_stats,
@@ -1173,9 +1176,6 @@ async def _proxy_bridge_streaming_response(plan: UpstreamRequestPlan, bridge_pla
     )
 
 
-dashboard_service.trigger_official_premium_refresh()
-
-
 # ─── Dashboard routes ─────────────────────────────────────────────────────────
 
 
@@ -1242,39 +1242,22 @@ async def dashboard_stream(request: Request):
 
 # ─── Config API routes ────────────────────────────────────────────────────────
 
-@app.get("/api/config/billing-token")
-async def billing_token_status_api():
-    return JSONResponse(content=auth.billing_token_status())
+@app.get("/api/config/premium-plan")
+async def premium_plan_status_api():
+    return JSONResponse(content=premium_plan_config_service.config_payload())
 
 
-@app.post("/api/config/billing-token")
-async def billing_token_config_api(request: Request):
+@app.post("/api/config/premium-plan")
+async def premium_plan_config_api(request: Request):
     payload = await parse_json_request(request)
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="Request body must be an object")
 
     if bool(payload.get("clear")):
-        auth.clear_billing_token()
-        return JSONResponse(content=auth.billing_token_status())
-
-    token = payload.get("token")
-    if token is None:
-        raise HTTPException(status_code=400, detail="Missing token field")
-    if not isinstance(token, str):
-        raise HTTPException(status_code=400, detail="Token must be a string")
-    token = token.strip()
-    if not token:
-        raise HTTPException(status_code=400, detail="Token must not be empty")
-
-    current_status = auth.billing_token_status()
-    if current_status.get("readonly"):
-        raise HTTPException(
-            status_code=409,
-            detail="Billing token is configured via GHCP_GITHUB_BILLING_TOKEN and cannot be changed via UI.",
-        )
-
-    auth.save_billing_token(token)
-    return JSONResponse(content=auth.billing_token_status())
+        result = premium_plan_config_service.clear_settings()
+    else:
+        result = premium_plan_config_service.save_settings(payload)
+    return JSONResponse(content=result)
 
 
 @app.get("/api/config/client-proxy")
