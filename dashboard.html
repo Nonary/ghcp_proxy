@@ -510,537 +510,6 @@
       font-size: .82rem;
       font-weight: 650;
     }
-    .day-focus-strip {
-      display: grid;
-      gap: 10px;
-      padding: 12px;
-      border-radius: 8px;
-      border: 1px solid rgba(200,220,235,.12);
-      background: rgba(255,255,255,.03);
-    }
-    .day-focus-strip.frameless {
-      padding: 0;
-      border: 0;
-      background: transparent;
-    }
-    .day-focus-head {
-      display: flex;
-      align-items: end;
-      justify-content: space-between;
-      gap: 14px;
-    }
-    .day-focus-summary {
-      display: grid;
-      gap: 8px;
-      min-width: 0;
-      flex: 1 1 auto;
-    }
-    .day-focus-selected-date {
-      font-size: 1.18rem;
-      font-weight: 700;
-      letter-spacing: 0;
-      line-height: 1.15;
-    }
-    .day-focus-selected-cost {
-      font-size: clamp(1.9rem, 3vw, 2.8rem);
-      font-weight: 800;
-      letter-spacing: 0;
-      line-height: .95;
-    }
-    .day-focus-kpis {
-      display: grid;
-      grid-template-columns: repeat(3, minmax(0, 1fr));
-      gap: 8px;
-      max-width: 760px;
-    }
-    .day-focus-kpi {
-      display: grid;
-      gap: 3px;
-      min-width: 0;
-      padding: 10px 12px;
-      border-radius: 8px;
-      border: 1px solid rgba(200,220,235,.1);
-      background: rgba(255,255,255,.025);
-    }
-    .day-focus-kpi .eyebrow {
-      font-size: .62rem;
-    }
-    .day-focus-kpi-value {
-      font-size: .96rem;
-      font-weight: 760;
-      letter-spacing: 0;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
-    .day-focus-selected-meta {
-      color: var(--muted);
-      font-size: .8rem;
-      line-height: 1.45;
-    }
-    .day-focus-insights {
-      display: grid;
-      grid-template-columns: minmax(0, 1.45fr) minmax(300px, .9fr);
-      gap: 14px;
-      align-items: start;
-    }
-    .day-focus-source-panel,
-    .day-focus-token-panel,
-    .day-focus-model-panel {
-      display: grid;
-      gap: 14px;
-      min-width: 0;
-      padding: 16px;
-      border-radius: 8px;
-      border: 1px solid rgba(200,220,235,.1);
-      background: rgba(9, 14, 20, .38);
-    }
-    .day-focus-model-panel { grid-column: 1 / -1; }
-    .day-focus-panel-head {
-      display: flex;
-      align-items: start;
-      justify-content: space-between;
-      gap: 12px;
-    }
-    .day-focus-source-track {
-      display: flex;
-      gap: 3px;
-      min-height: 14px;
-      border-radius: 999px;
-      padding: 2px;
-      background: rgba(255,255,255,.04);
-      overflow: hidden;
-    }
-    .day-focus-source-segment {
-      display: block;
-      min-width: 0;
-      height: 100%;
-      border-radius: 999px;
-    }
-    .day-focus-source-stack {
-      display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 10px;
-    }
-    .day-focus-source-card {
-      display: grid;
-      gap: 10px;
-      min-width: 0;
-      padding: 12px;
-      border-radius: 8px;
-      border: 1px solid rgba(200,220,235,.08);
-      background: rgba(255,255,255,.02);
-    }
-    .day-focus-source-card.zero {
-      opacity: .72;
-    }
-    .day-focus-source-card-head {
-      display: flex;
-      align-items: start;
-      justify-content: space-between;
-      gap: 10px;
-    }
-    .day-focus-source-card-title {
-      display: grid;
-      gap: 4px;
-      min-width: 0;
-    }
-    .day-focus-source-label,
-    .day-focus-breakdown-label {
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      min-width: 0;
-      font-size: .82rem;
-      font-weight: 720;
-      letter-spacing: 0;
-    }
-    .day-focus-source-card-share {
-      color: var(--muted);
-      font-size: .72rem;
-    }
-    .day-focus-source-card-values {
-      display: grid;
-      justify-items: end;
-      gap: 2px;
-      min-width: 0;
-      text-align: right;
-      white-space: nowrap;
-    }
-    .day-focus-source-card-values strong,
-    .day-focus-breakdown-values strong {
-      font-size: .98rem;
-      font-weight: 780;
-      letter-spacing: 0;
-    }
-    .day-focus-source-card-values span,
-    .day-focus-breakdown-values span {
-      color: var(--muted);
-      font-size: .72rem;
-    }
-    .day-focus-source-card-meta {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 8px 12px;
-      color: var(--muted);
-      font-size: .72rem;
-    }
-    .day-focus-source-line-list,
-    .day-focus-breakdown-list {
-      display: grid;
-      gap: 0;
-    }
-    .day-focus-source-line,
-    .day-focus-breakdown-row {
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) auto auto;
-      align-items: center;
-      gap: 10px;
-      min-width: 0;
-      padding: 8px 0;
-      border-top: 1px solid rgba(200,220,235,.08);
-    }
-    .day-focus-source-line:first-child,
-    .day-focus-breakdown-row:first-child {
-      border-top: 0;
-      padding-top: 0;
-    }
-    .day-focus-source-line:last-child,
-    .day-focus-breakdown-row:last-child {
-      padding-bottom: 0;
-    }
-    .day-focus-source-line-label {
-      display: inline-flex;
-      align-items: center;
-      gap: 7px;
-      min-width: 0;
-      font-size: .76rem;
-      font-weight: 650;
-    }
-    .day-focus-source-line-tokens,
-    .day-focus-breakdown-tokens {
-      color: var(--muted);
-      font-size: .72rem;
-      white-space: nowrap;
-      text-align: right;
-    }
-    .day-focus-source-line-cost,
-    .day-focus-breakdown-cost {
-      font-size: .78rem;
-      font-weight: 700;
-      white-space: nowrap;
-      text-align: right;
-    }
-    .day-focus-token-dot {
-      width: 10px;
-      height: 10px;
-      border-radius: 999px;
-      flex-shrink: 0;
-    }
-    .day-focus-model-head {
-      display: flex;
-      align-items: baseline;
-      justify-content: space-between;
-      gap: 10px;
-    }
-    .day-focus-model-table {
-      display: grid;
-      gap: 8px;
-    }
-    .day-focus-model-row {
-      display: grid;
-      grid-template-columns: minmax(180px, 1.4fr) minmax(88px, .72fr) minmax(72px, .58fr) repeat(4, minmax(84px, .8fr));
-      gap: 10px;
-      align-items: stretch;
-      min-width: 0;
-      padding: 12px;
-      border-radius: 8px;
-      border: 1px solid rgba(200,220,235,.08);
-      background: rgba(255,255,255,.02);
-    }
-    .day-focus-model-row.head {
-      padding: 0 2px;
-      border: 0;
-      background: transparent;
-    }
-    .day-focus-model-col {
-      display: grid;
-      gap: 4px;
-      min-width: 0;
-    }
-    .day-focus-model-col span {
-      color: var(--muted);
-      font-size: .66rem;
-      text-transform: uppercase;
-      letter-spacing: .08em;
-    }
-    .day-focus-model-col strong {
-      font-size: .82rem;
-      font-weight: 700;
-      letter-spacing: -.02em;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
-    .day-focus-model-name {
-      font-size: .9rem;
-      font-weight: 700;
-      line-height: 1.25;
-      word-break: break-word;
-    }
-    .day-focus-model-meta {
-      color: var(--muted);
-      font-size: .74rem;
-    }
-    .day-focus-model-chiplist {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 8px;
-    }
-    .day-focus-model-chip {
-      display: inline-flex;
-      align-items: center;
-      min-width: 0;
-      max-width: 100%;
-      padding: 6px 10px;
-      border-radius: 999px;
-      border: 1px solid rgba(200,220,235,.12);
-      background: rgba(255,255,255,.03);
-      font-size: .76rem;
-      color: var(--text);
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
-    .day-focus-nav {
-      display: inline-flex;
-      gap: 6px;
-      flex-shrink: 0;
-    }
-    .day-focus-nav button,
-    .day-focus-chip {
-      font: inherit;
-      color: var(--text);
-      border: 1px solid rgba(200,220,235,.14);
-      background: rgba(255,255,255,.03);
-    }
-    .day-focus-nav button {
-      padding: 7px 10px;
-      border-radius: 8px;
-      cursor: pointer;
-    }
-    .day-focus-nav button:disabled {
-      opacity: .45;
-      cursor: default;
-    }
-    .day-focus-month {
-      color: var(--text);
-      font-size: .96rem;
-      font-weight: 650;
-      letter-spacing: 0;
-    }
-    .day-focus-calendar {
-      display: grid;
-      gap: 12px;
-      overflow-x: auto;
-      padding-bottom: 2px;
-    }
-    .day-focus-weekdays,
-    .day-focus-grid {
-      display: grid;
-      grid-template-columns: repeat(7, minmax(0, 1fr));
-      gap: 10px;
-      min-width: 1040px;
-    }
-    .day-focus-weekdays span {
-      color: var(--muted);
-      font-size: .68rem;
-      text-transform: uppercase;
-      letter-spacing: .12em;
-      text-align: center;
-      padding: 4px 0;
-    }
-    .day-focus-grid {
-      align-items: stretch;
-      grid-auto-rows: minmax(368px, 1fr);
-    }
-    .day-focus-cell {
-      min-width: 0;
-      height: 100%;
-    }
-    .day-focus-blank {
-      min-height: 368px;
-      border-radius: 8px;
-      border: 1px dashed rgba(200,220,235,.06);
-      background: rgba(255,255,255,.01);
-    }
-    .day-focus-chip {
-      display: grid;
-      grid-template-rows: auto auto 1fr;
-      gap: 10px;
-      min-height: 368px;
-      width: 100%;
-      height: 100%;
-      padding: 12px;
-      border-radius: 8px;
-      text-align: left;
-      cursor: pointer;
-      transition: border-color .18s ease, transform .18s ease, background .18s ease;
-    }
-    .day-focus-chip:hover {
-      border-color: rgba(255,255,255,.22);
-      transform: translateY(-1px);
-    }
-    .day-focus-chip.active {
-      border-color: rgba(255,135,82,.34);
-      background: rgba(255,135,82,.08);
-    }
-    .day-focus-chip.today {
-      box-shadow: inset 0 0 0 1px rgba(110,231,200,.18);
-    }
-    .day-focus-chip.zero {
-      opacity: .72;
-    }
-    .day-focus-chip-top {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 6px;
-    }
-    .day-focus-chip-day {
-      font-size: 1.15rem;
-      font-weight: 760;
-      letter-spacing: 0;
-    }
-    .day-focus-chip-total {
-      font-size: 1rem;
-      font-weight: 760;
-      letter-spacing: 0;
-    }
-    .day-focus-chip-meta {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 8px;
-      color: var(--muted);
-      font-size: .72rem;
-      text-transform: uppercase;
-      letter-spacing: .08em;
-    }
-    .day-focus-chip-breakdown {
-      display: grid;
-      grid-template-columns: 1fr;
-      gap: 10px;
-      min-width: 0;
-      align-content: start;
-    }
-    .day-focus-chip-source {
-      display: grid;
-      gap: 7px;
-      min-width: 0;
-      padding: 10px;
-      border-radius: 7px;
-      border: 1px solid rgba(200,220,235,.08);
-      background: rgba(255,255,255,.02);
-    }
-    .day-focus-chip-source.zero {
-      opacity: .72;
-    }
-    .day-focus-chip-source-head {
-      display: grid;
-      gap: 2px;
-      min-width: 0;
-    }
-    .day-focus-chip-source-top {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 6px;
-      min-width: 0;
-    }
-    .day-focus-chip-source-name {
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      min-width: 0;
-      font-size: .72rem;
-      font-weight: 700;
-      text-transform: uppercase;
-      letter-spacing: .08em;
-    }
-    .day-focus-chip-source-total {
-      font-size: .8rem;
-      font-weight: 760;
-      letter-spacing: 0;
-      white-space: nowrap;
-    }
-    .day-focus-chip-source-meta {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 8px;
-      font-size: .66rem;
-      color: var(--muted);
-    }
-    .day-focus-chip-source-dot {
-      width: 7px;
-      height: 7px;
-      border-radius: 999px;
-      flex-shrink: 0;
-    }
-    .day-focus-chip-source-rows {
-      display: grid;
-      gap: 0;
-      margin-top: 2px;
-    }
-    .day-focus-chip-line {
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) auto;
-      gap: 8px;
-      align-items: center;
-      min-width: 0;
-      padding: 5px 0;
-      border-top: 1px solid rgba(200,220,235,.06);
-    }
-    .day-focus-chip-line:first-child {
-      border-top: 1px solid rgba(200,220,235,.08);
-    }
-    .day-focus-chip-line-label {
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      min-width: 0;
-      font-size: .66rem;
-      font-weight: 700;
-      letter-spacing: 0;
-    }
-    .day-focus-chip-line-value {
-      display: flex;
-      align-items: center;
-      justify-content: flex-end;
-      gap: 10px;
-      min-width: 0;
-      text-align: right;
-    }
-    .day-focus-chip-line-cost {
-      font-size: .66rem;
-      color: var(--text);
-      white-space: nowrap;
-      min-width: 48px;
-    }
-    .day-focus-chip-line-tokens {
-      font-size: .62rem;
-      color: var(--muted);
-      white-space: nowrap;
-      min-width: 46px;
-    }
-    .day-focus-chip-line-fill {
-      width: 5px;
-      height: 5px;
-      border-radius: 999px;
-      flex-shrink: 0;
-    }
-
     /* Stacked bar chart fills */
     .stacked-fill {
       width: 100%;
@@ -1296,26 +765,14 @@
       .source-period-grid, .source-duel-grid { grid-template-columns: 1fr; }
       .source-spotlight-head { flex-direction: column; }
       .source-lead-note { max-width: none; text-align: left; }
-      .day-focus-head { flex-direction: column; }
-      .day-focus-insights { grid-template-columns: 1fr; }
-      .day-focus-kpis { max-width: none; }
-      .day-focus-source-stack { grid-template-columns: 1fr; }
-      .day-focus-model-row,
-      .day-focus-model-row.head { grid-template-columns: repeat(3, minmax(0, 1fr)); }
       .chart-summary { text-align: left; justify-items: start; }
       .chart-range-control { justify-items: start; }
       .mapping-table .arrow-cell { display: none; }
-      .day-focus-weekdays,
-      .day-focus-grid { min-width: 900px; }
     }
     @media (max-width: 760px) {
       .summary-grid { grid-template-columns: 1fr; }
       .source-context-pill { width: 100%; justify-items: start; }
       .panel-head { align-items: start; }
-      .day-focus-kpis { grid-template-columns: 1fr; }
-      .day-focus-weekdays,
-      .day-focus-grid { min-width: 700px; }
-      .day-focus-grid { grid-auto-rows: minmax(336px, 1fr); }
     }
   </style>
 </head>
@@ -1351,14 +808,13 @@
         range-label="Spend view"
         @update:range-value="spendTrendRange = $event"
       ></trend-chart-card>
-      <stacked-bar-chart-card
+      <trend-chart-card
         :title="tokenVolumeConfig.title"
         :subtitle="tokenVolumeConfig.subtitle"
         :headline="tokenVolumeConfig.headline"
         :meta="tokenVolumeConfig.meta"
         :rows="tokenVolumeConfig.rows"
-        :segments="tokenSegments"
-        total-key="total_tokens"
+        metric-key="stacked_total_tokens"
         value-format="compact"
         :period="tokenVolumeConfig.period"
         :tone="tokenVolumeConfig.tone"
@@ -1366,29 +822,7 @@
         :range-value="tokenVolumeRange"
         range-label="Token view"
         @update:range-value="tokenVolumeRange = $event"
-      ></stacked-bar-chart-card>
-    </section>
-
-    <section class="summary-grid">
-      <article class="panel source-mix-card">
-        <div class="panel-head">
-          <div>
-            <h3>Daily Calendar</h3>
-            <div class="subtle">Pick any day in the current month to drive both breakdown cards.</div>
-          </div>
-        </div>
-        <day-focus-strip
-          :daily-history="calendarHistory"
-          :recent-requests="data.recent_requests"
-          :selected-day-key="selectedDayKey"
-          :range-start-at="data.current_month?.start_at"
-          :range-end-at="data.current_month?.end_at"
-          label="Current Month"
-          meta-mode="money"
-          :frameless="true"
-          @update:selectedDayKey="selectedDayKey = $event"
-        ></day-focus-strip>
-      </article>
+      ></trend-chart-card>
     </section>
 
     <section class="content">
@@ -1611,9 +1045,7 @@
           :current-usage="currentMonth"
           :all-time-usage="allTime"
           :scope="analysisScope"
-          :selected-day-key="selectedDayKey"
           @update:scope="analysisScope = $event"
-          @update:selectedDayKey="selectedDayKey = $event"
         ></source-breakdown-card>
 
         <token-breakdown-card
@@ -1621,9 +1053,7 @@
           :current-usage="currentMonth"
           :all-time-usage="allTime"
           :scope="analysisScope"
-          :selected-day-key="selectedDayKey"
           @update:scope="analysisScope = $event"
-          @update:selectedDayKey="selectedDayKey = $event"
         ></token-breakdown-card>
       </div>
     </section>
@@ -1896,8 +1326,8 @@
       <div class="toolbar breakdown-controls">
         <label class="control">
           <span class="subtle">Window</span>
-          <select :value="scope" @change="$emit('update:scope', $event.target.value)">
-            <option value="day">Focused day</option>
+          <select :value="selectedScope" @change="updateScope($event.target.value)">
+            <option value="today">Today</option>
             <option value="week">Last 7 days</option>
             <option value="month">This month</option>
             <option value="all">All time</option>
@@ -1951,232 +1381,6 @@
         <div class="subtle">of input tokens served from cache</div>
       </div>
     </article>
-  </template>
-
-  <template id="day-focus-strip-template">
-    <div v-if="calendarCells.length" :class="['day-focus-strip', { frameless }]">
-      <div class="day-focus-head">
-        <div class="day-focus-summary">
-          <div class="eyebrow">{{ label }}</div>
-          <div class="day-focus-selected-date">{{ longDayLabel(resolvedSelectedDayKey) }}</div>
-          <div class="day-focus-selected-cost">{{ money(selectedRow.cost_usd) }}</div>
-          <div class="day-focus-kpis">
-            <div class="day-focus-kpi">
-              <div class="eyebrow">Requests</div>
-              <div class="day-focus-kpi-value">{{ integer(selectedRow.request_count) }}</div>
-            </div>
-            <div class="day-focus-kpi">
-              <div class="eyebrow">Tokens</div>
-              <div class="day-focus-kpi-value">{{ compact(selectedRow.total_tokens) }}</div>
-            </div>
-            <div class="day-focus-kpi">
-              <div class="eyebrow">Models</div>
-              <div class="day-focus-kpi-value">{{ integer(selectedKnownModels.length || selectedModelRows.length) }}</div>
-            </div>
-          </div>
-          <div class="day-focus-selected-meta">{{ selectedDayMeta }}</div>
-        </div>
-        <div class="day-focus-nav">
-          <button type="button" @click="stepDay(-1)" :disabled="selectedIndex <= 0">Prev</button>
-          <button type="button" @click="stepDay(1)" :disabled="selectedIndex >= dayOptions.length - 1">Next</button>
-        </div>
-      </div>
-      <div class="day-focus-insights">
-        <div class="day-focus-source-panel">
-          <div class="day-focus-panel-head">
-            <div>
-              <div class="eyebrow">Source Anatomy</div>
-              <div class="subtle">Selected day split, with cached, input, output, and reasoning lines for each source.</div>
-            </div>
-            <div class="subtle">{{ selectedSourceMeta }}</div>
-          </div>
-          <div class="day-focus-source-track">
-            <span
-              v-for="segment in selectedSourceSegments"
-              :key="`source-${segment.source}`"
-              class="day-focus-source-segment"
-              :style="{ width: `${segment.width}%`, background: segment.color }"
-            ></span>
-          </div>
-          <div class="day-focus-source-stack">
-            <div
-              v-for="column in selectedSourceColumns"
-              :key="`selected-${column.source}`"
-              :class="['day-focus-source-card', { zero: column.isZero }]"
-            >
-              <div class="day-focus-source-card-head">
-                <div class="day-focus-source-card-title">
-                  <div class="day-focus-source-label">
-                    <span class="day-focus-token-dot" :style="{ background: column.dotColor }"></span>
-                    {{ column.label }}
-                  </div>
-                  <div class="day-focus-source-card-share">{{ formatPercent(column.share) }} of selected-day spend</div>
-                </div>
-                <div class="day-focus-source-card-values">
-                  <strong>{{ money(column.cost_usd) }}</strong>
-                  <span>{{ compact(column.total_tokens) }} tok</span>
-                </div>
-              </div>
-              <div class="day-focus-source-card-meta">
-                <span>{{ integer(column.request_count) }} req</span>
-                <span>{{ compact(column.total_tokens) }} tokens</span>
-              </div>
-              <div class="day-focus-source-line-list">
-                <div
-                  v-for="item in column.rows"
-                  :key="`selected-${column.source}-${item.key}`"
-                  class="day-focus-source-line"
-                >
-                  <span class="day-focus-source-line-label">
-                    <span class="day-focus-chip-line-fill" :style="{ background: item.flatColor }"></span>
-                    {{ item.shortLabel }}
-                  </span>
-                  <span class="day-focus-source-line-tokens">{{ compact(item.value) }} tok</span>
-                  <span class="day-focus-source-line-cost">{{ money(item.cost) }}</span>
-                </div>
-              </div>
-            </div>
-          </div>
-        </div>
-        <div class="day-focus-token-panel">
-          <div class="day-focus-panel-head">
-            <div>
-              <div class="eyebrow">Token Breakdown</div>
-              <div class="subtle">Day totals by token category, with tokens and estimated cost kept on their own lines.</div>
-            </div>
-            <div class="subtle">{{ money(selectedRow.cost_usd) }} total</div>
-          </div>
-          <div class="day-focus-breakdown-list">
-            <div v-for="segment in selectedTokenBreakdownRows" :key="segment.key" class="day-focus-breakdown-row">
-              <div class="day-focus-breakdown-label">
-                <span class="day-focus-token-dot" :style="{ background: segment.color }"></span>
-                {{ segment.label }}
-              </div>
-              <div class="day-focus-breakdown-tokens">{{ compact(segment.value) }} tok</div>
-              <div class="day-focus-breakdown-values">
-                <strong>{{ money(segment.cost) }}</strong>
-                <span>{{ formatPercent(segment.share) }}</span>
-              </div>
-            </div>
-          </div>
-        </div>
-        <div class="day-focus-model-panel">
-          <div class="day-focus-panel-head">
-            <div>
-              <div class="eyebrow">Model Breakdown</div>
-              <div class="subtle">Per-model detail from requests captured for the selected day.</div>
-            </div>
-            <div class="subtle">{{ selectedModelMeta }}</div>
-          </div>
-          <div v-if="selectedModelRows.length" class="day-focus-model-table">
-            <div class="day-focus-model-row head">
-              <div class="day-focus-model-col"><span>Model</span></div>
-              <div class="day-focus-model-col"><span>Spend</span></div>
-              <div class="day-focus-model-col"><span>Req</span></div>
-              <div class="day-focus-model-col"><span>Cached</span></div>
-              <div class="day-focus-model-col"><span>Fresh In</span></div>
-              <div class="day-focus-model-col"><span>Output</span></div>
-              <div class="day-focus-model-col"><span>Reasoning</span></div>
-            </div>
-            <div v-for="model in selectedModelRows" :key="model.model" class="day-focus-model-row">
-              <div class="day-focus-model-col">
-                <div class="day-focus-model-name">{{ formatModelName(model.model) }}</div>
-                <div class="day-focus-model-meta">{{ compact(model.total_tokens) }} total tokens</div>
-              </div>
-              <div class="day-focus-model-col">
-                <strong>{{ money(model.cost_usd) }}</strong>
-              </div>
-              <div class="day-focus-model-col">
-                <strong>{{ integer(model.request_count) }}</strong>
-              </div>
-              <div class="day-focus-model-col">
-                <strong>{{ compact(model.cached_input_tokens) }}</strong>
-              </div>
-              <div class="day-focus-model-col">
-                <strong>{{ compact(model.input_tokens) }}</strong>
-              </div>
-              <div class="day-focus-model-col">
-                <strong>{{ compact(model.visible_output_tokens) }}</strong>
-              </div>
-              <div class="day-focus-model-col">
-                <strong>{{ compact(model.reasoning_output_tokens) }}</strong>
-              </div>
-            </div>
-          </div>
-          <div v-else-if="selectedKnownModels.length" class="day-focus-model-chiplist">
-            <span v-for="model in selectedKnownModels" :key="model" class="day-focus-model-chip">{{ formatModelName(model) }}</span>
-          </div>
-          <div v-else class="subtle">No model detail recorded for this day yet.</div>
-        </div>
-      </div>
-      <div class="day-focus-calendar">
-        <div class="day-focus-month">{{ monthLabel }}</div>
-        <div class="day-focus-weekdays">
-          <span v-for="weekday in weekdayHeaders" :key="weekday">{{ weekday }}</span>
-        </div>
-        <div class="day-focus-grid">
-          <div
-            v-for="cell in calendarCells"
-            :key="cell.key"
-            :class="['day-focus-cell', { 'day-focus-blank': cell.kind === 'blank' }]"
-          >
-            <button
-              v-if="cell.kind === 'day'"
-              type="button"
-              :class="['day-focus-chip', { active: cell.row.day_key === resolvedSelectedDayKey, today: cell.isToday, zero: !hasActivity(cell.row) }]"
-              @click="$emit('update:selectedDayKey', cell.row.day_key)"
-            >
-              <div class="day-focus-chip-top">
-                <span class="day-focus-chip-day">{{ integer(dayOfMonth(cell.row.day_key)) }}</span>
-                <span class="day-focus-chip-total">{{ money(cell.row.cost_usd) }}</span>
-              </div>
-              <div class="day-focus-chip-meta">
-                <span>{{ integer(cell.row.request_count) }} req</span>
-                <span>{{ compact(cell.row.total_tokens) }} tok</span>
-              </div>
-              <div class="day-focus-chip-breakdown">
-                <div
-                  v-for="column in calendarSourceColumns(cell.row)"
-                  :key="`${cell.row.day_key}-column-${column.source}`"
-                  :class="['day-focus-chip-source', { zero: column.isZero }]"
-                >
-                  <div class="day-focus-chip-source-head">
-                    <div class="day-focus-chip-source-top">
-                      <span class="day-focus-chip-source-name">
-                        <span class="day-focus-chip-source-dot" :style="{ background: column.dotColor }"></span>
-                        {{ column.label }}
-                      </span>
-                      <span class="day-focus-chip-source-total">{{ money(column.cost_usd) }}</span>
-                    </div>
-                    <div class="day-focus-chip-source-meta">
-                      <span>{{ formatPercent(column.share) }}</span>
-                      <span>{{ integer(column.request_count) }} req</span>
-                      <span>{{ compact(column.total_tokens) }} tok</span>
-                    </div>
-                  </div>
-                  <div class="day-focus-chip-source-rows">
-                    <div
-                      v-for="item in column.rows"
-                      :key="`${cell.row.day_key}-${column.source}-${item.key}`"
-                      class="day-focus-chip-line"
-                    >
-                      <span class="day-focus-chip-line-label">
-                        <span class="day-focus-chip-line-fill" :style="{ background: item.flatColor }"></span>
-                        {{ item.shortLabel }}
-                      </span>
-                      <span class="day-focus-chip-line-value">
-                        <span class="day-focus-chip-line-cost">{{ money(item.cost) }}</span>
-                        <span class="day-focus-chip-line-tokens">{{ compact(item.value) }}</span>
-                      </span>
-                    </div>
-                  </div>
-                </div>
-              </div>
-            </button>
-          </div>
-        </div>
-      </div>
-    </div>
   </template>
 
   <template id="source-breakdown-card-template">
@@ -2506,78 +1710,20 @@
       };
     }
 
-    function buildCalendarRows(dailyHistory, startAt, endAt, anchorDayKey) {
-      const rows = Array.isArray(dailyHistory) ? dailyHistory : [];
-      const rowMap = new Map(
-        rows
-          .filter((row) => row?.day_key)
-          .map((row) => [String(row.day_key), row]),
-      );
-
-      const startKey = typeof startAt === 'string' ? startAt.slice(0, 10) : '';
-      const endExclusiveKey = typeof endAt === 'string' ? endAt.slice(0, 10) : '';
-      const anchorDate = parseDayKey(anchorDayKey)
-        || parseDayKey(rows[rows.length - 1]?.day_key)
-        || new Date();
-      const startDate = parseDayKey(startKey)
-        || new Date(anchorDate.getFullYear(), anchorDate.getMonth(), 1);
-      const explicitEndExclusive = parseDayKey(endExclusiveKey);
-      let endDate = explicitEndExclusive
-        ? addCalendarDays(explicitEndExclusive, -1)
-        : new Date(anchorDate.getFullYear(), anchorDate.getMonth() + 1, 0);
-      const localTodayDate = parseDayKey(todayDayKey());
-      if (sameMonthAndYear(startDate, localTodayDate) && endDate > localTodayDate) {
-        endDate = localTodayDate;
-      }
-
-      if (!startDate || !endDate || endDate < startDate) {
-        return rows;
-      }
-
-      const normalized = [];
-      for (let cursor = startDate; cursor <= endDate; cursor = addCalendarDays(cursor, 1)) {
-        const dayKey = dayKeyFromDate(cursor);
-        const existing = rowMap.get(dayKey);
-        normalized.push(existing
-          ? { ...emptyUsageRow(dayKey), ...existing, day_key: dayKey, day_label: existing.day_label || dayKey, sources: existing.sources || {} }
-          : emptyUsageRow(dayKey));
-      }
-      return normalized;
-    }
-
-    function dayKeyFromTimestamp(raw) {
-      if (typeof raw !== 'string' || !raw) return '';
-      const date = new Date(raw);
-      if (!Number.isNaN(date.getTime())) {
-        return dayKeyFromDate(date);
-      }
-      return raw.slice(0, 10);
-    }
-
-    function requestDayKey(row) {
-      const raw = row?.finished_at || row?.started_at || '';
-      return dayKeyFromTimestamp(raw);
-    }
-
     function formatDayKey(dayKey, options) {
       const date = parseDayKey(dayKey);
       return date ? date.toLocaleDateString([], options) : (dayKey || '-');
     }
 
-    function latestDailyRow(dailyHistory) {
-      const rows = Array.isArray(dailyHistory) ? dailyHistory : [];
-      return rows.length ? (rows[rows.length - 1] || {}) : {};
-    }
-
-    function findDailyRowByKey(dailyHistory, selectedDayKey) {
-      const rows = Array.isArray(dailyHistory) ? dailyHistory : [];
-      if (selectedDayKey) {
-        const match = rows.find((row) => row?.day_key === selectedDayKey);
-        if (match) return match;
-        return emptyUsageRow(selectedDayKey);
-      }
-      if (!rows.length) return {};
-      return latestDailyRow(rows);
+    function totalTokenConsumption(row) {
+      const freshInput = Math.max(0, Number(row?.input_tokens || 0));
+      const cachedInput = Math.max(0, Number(row?.cached_input_tokens || 0));
+      const reasoningOutput = Math.max(0, Number(row?.reasoning_output_tokens || 0));
+      const visibleOutput = Math.max(0, Number(row?.output_tokens || 0) - reasoningOutput);
+      return {
+        visible_output_tokens: visibleOutput,
+        stacked_total_tokens: cachedInput + freshInput + visibleOutput + reasoningOutput,
+      };
     }
 
     function mergeUsageRows(rows) {
@@ -2655,409 +1801,6 @@
       },
       methods: {
         ...sharedFormatters,
-      },
-    };
-
-    const DayFocusStrip = {
-      template: '#day-focus-strip-template',
-      emits: ['update:selectedDayKey'],
-      props: {
-        dailyHistory: { type: Array, default: () => [] },
-        recentRequests: { type: Array, default: () => [] },
-        selectedDayKey: { type: String, default: '' },
-        rangeStartAt: { type: String, default: '' },
-        rangeEndAt: { type: String, default: '' },
-        label: { type: String, default: 'Focused Day' },
-        metaMode: { type: String, default: 'money' },
-        frameless: { type: Boolean, default: false },
-      },
-      computed: {
-        dayOptions() {
-          return buildCalendarRows(this.dailyHistory, this.rangeStartAt, this.rangeEndAt, this.selectedDayKey);
-        },
-        weekdayHeaders() {
-          return ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
-        },
-        selectedRow() {
-          return findDailyRowByKey(this.dayOptions, this.selectedDayKey);
-        },
-        resolvedSelectedDayKey() {
-          return String(this.selectedRow?.day_key || '');
-        },
-        selectedIndex() {
-          return this.dayOptions.findIndex((row) => row?.day_key === this.resolvedSelectedDayKey);
-        },
-        monthLabel() {
-          const anchor = this.dayOptions.find((row) => row?.day_key) || this.selectedRow;
-          return formatDayKey(anchor?.day_key, { month: 'long', year: 'numeric' });
-        },
-        calendarCells() {
-          if (!this.dayOptions.length) return [];
-          const firstKey = this.dayOptions.find((row) => row?.day_key)?.day_key;
-          const firstDate = parseDayKey(firstKey);
-          const leading = firstDate ? firstDate.getDay() : 0;
-          const blanks = Array.from({ length: leading }, (_, index) => ({
-            kind: 'blank',
-            key: `blank-${index}`,
-          }));
-          const todayKey = todayDayKey();
-          const days = this.dayOptions.map((row, index) => ({
-            kind: 'day',
-            key: row?.day_key || `day-${index}`,
-            row,
-            isToday: row?.day_key === todayKey,
-          }));
-          const trailing = (7 - ((blanks.length + days.length) % 7)) % 7;
-          const trailingBlanks = Array.from({ length: trailing }, (_, index) => ({
-            kind: 'blank',
-            key: `blank-tail-${index}`,
-          }));
-          return [...blanks, ...days, ...trailingBlanks];
-        },
-        selectedDaySummary() {
-          if (!this.resolvedSelectedDayKey) return 'No daily history available yet.';
-          return `${this.longDayLabel(this.resolvedSelectedDayKey)} · ${this.money(this.selectedRow.cost_usd)} · ${this.compact(this.selectedRow.total_tokens)} tokens · ${this.integer(this.selectedRow.request_count)} requests`;
-        },
-        selectedDayMeta() {
-          return `${this.compact(this.selectedRow.total_tokens)} tokens · ${this.integer(this.selectedRow.request_count)} requests · ${this.selectedKnownModels.length ? this.selectedKnownModels.length + ' known models' : 'no recorded models'}`;
-        },
-        selectedSourceRows() {
-          return this.sourceBreakdownRows(this.selectedRow);
-        },
-        selectedSourceSegments() {
-          const rows = this.selectedSourceRows.filter((row) => row.share > 0);
-          if (!rows.length) {
-            return [{ source: 'idle', width: 100, color: '#6d8091' }];
-          }
-          return rows.map((row) => ({
-            source: row.source,
-            width: Math.max(8, row.share),
-            color: row.color,
-          }));
-        },
-        selectedSourceMeta() {
-          if (!this.selectedSourceRows.length || this.selectedSourceRows.every((row) => row.cost_usd <= 0 && row.request_count <= 0)) {
-            return 'no source detail';
-          }
-          const leader = this.selectedSourceRows[0];
-          return `${leader.label} leads at ${this.formatPercent(leader.share)}`;
-        },
-        selectedSourceColumns() {
-          return this.calendarSourceColumns(this.selectedRow);
-        },
-        selectedTokenSegments() {
-          return this.tokenSegments(this.selectedRow);
-        },
-        selectedTokenBreakdownRows() {
-          return this.tokenMetricCards(this.selectedRow);
-        },
-        selectedModelRows() {
-          const dayKey = this.resolvedSelectedDayKey;
-          if (!dayKey) return [];
-          const aggregate = new Map();
-          for (const row of this.recentRequests || []) {
-            if (requestDayKey(row) !== dayKey) continue;
-            const usage = row?.usage || {};
-            const model = String(row?.response_model || row?.resolved_model || row?.requested_model || 'unknown');
-            const current = aggregate.get(model) || {
-              model,
-              input_tokens: 0,
-              cached_input_tokens: 0,
-              output_tokens: 0,
-              reasoning_output_tokens: 0,
-              visible_output_tokens: 0,
-              total_tokens: 0,
-              request_count: 0,
-              cost_usd: 0,
-            };
-            const inputTokens = Number(usage.input_tokens || 0);
-            const cachedInputTokens = Number(usage.cached_input_tokens || usage.cache_read_input_tokens || usage?.prompt_tokens_details?.cached_tokens || 0);
-            const outputTokens = Number(usage.output_tokens || 0);
-            const reasoningTokens = Number(usage.reasoning_output_tokens || 0);
-            current.input_tokens += inputTokens;
-            current.cached_input_tokens += cachedInputTokens;
-            current.output_tokens += outputTokens;
-            current.reasoning_output_tokens += reasoningTokens;
-            current.visible_output_tokens += Math.max(outputTokens - reasoningTokens, 0);
-            current.total_tokens += Number(usage.total_tokens || (inputTokens + outputTokens));
-            current.request_count += 1;
-            current.cost_usd += Number(row?.cost_usd || 0);
-            aggregate.set(model, current);
-          }
-          return [...aggregate.values()]
-            .sort((a, b) => (b.cost_usd - a.cost_usd) || (b.request_count - a.request_count) || (b.input_tokens - a.input_tokens))
-            .slice(0, 4);
-        },
-        selectedKnownModels() {
-          const set = new Set();
-          for (const source of Object.values(this.selectedRow?.sources || {})) {
-            for (const model of source?.models || []) {
-              if (model) set.add(String(model));
-            }
-          }
-          return [...set].slice(0, 8);
-        },
-        selectedModelMeta() {
-          if (this.selectedModelRows.length) {
-            return 'from detailed requests';
-          }
-          if (this.selectedKnownModels.length) {
-            return 'known models for this day';
-          }
-          return 'no model detail';
-        },
-      },
-      methods: {
-        ...sharedFormatters,
-        shortDayLabel(dayKey) {
-          return formatDayKey(dayKey, { month: 'short', day: 'numeric' });
-        },
-        longDayLabel(dayKey) {
-          return formatDayKey(dayKey, { weekday: 'long', month: 'short', day: 'numeric' });
-        },
-        dayOfMonth(dayKey) {
-          const date = parseDayKey(dayKey);
-          return date ? date.getDate() : 0;
-        },
-        sourceLead(row) {
-          const entries = Object.values(row?.sources || {})
-            .map((entry) => ({
-              source: String(entry?.source || 'unknown'),
-              value: this.metaMode === 'tokens'
-                ? Number(entry?.total_tokens || 0)
-                : Number(entry?.cost_usd || 0),
-              requests: Number(entry?.request_count || 0),
-            }))
-            .filter((entry) => entry.value > 0 || entry.requests > 0)
-            .sort((a, b) => (b.value - a.value) || (b.requests - a.requests));
-          return entries[0] || null;
-        },
-        sourceLeadLabel(row) {
-          const lead = this.sourceLead(row);
-          if (!lead) return 'Idle';
-          const normalized = String(lead.source || 'unknown').trim().toLowerCase();
-          if (normalized === 'codex') return 'Codex';
-          if (normalized === 'claude') return 'Claude';
-          return 'Other';
-        },
-        sourceLeadClass(row) {
-          const lead = this.sourceLead(row);
-          return this.sourceToneClass(lead?.source || 'unknown');
-        },
-        sourceFlatColor(source) {
-          const normalized = String(source || 'unknown').trim().toLowerCase();
-          if (normalized === 'codex') return '#6ee7c8';
-          if (normalized === 'claude') return '#ff8752';
-          return '#8ea3b5';
-        },
-        tokenFlatColor(key) {
-          if (key === 'cached') return '#6ee7c8';
-          if (key === 'fresh') return '#ff8752';
-          if (key === 'output') return '#7eaaff';
-          if (key === 'reasoning') return '#c89eff';
-          return '#8ea3b5';
-        },
-        calendarSourceRows(row) {
-          const rows = this.sourceBreakdownRows(row);
-          const bySource = new Map(rows.map((entry) => [String(entry.source).toLowerCase(), entry]));
-          return ['claude', 'codex'].map((source) => {
-            const entry = bySource.get(source);
-            const color = this.sourceColor(source);
-            const share = Number(entry?.share || 0);
-            const cost = Number(entry?.cost_usd || 0);
-            return {
-              source,
-              label: this.sourceLabel(source),
-              color,
-              isZero: !entry || (cost <= 0 && share <= 0),
-              valueLabel: `${this.formatPercent(share)} · ${this.money(cost)}`,
-            };
-          });
-        },
-        sourceUsageRow(row, sourceName) {
-          const entries = Object.values(row?.sources || {});
-          return entries.find((entry) => String(entry?.source || '').trim().toLowerCase() === String(sourceName).trim().toLowerCase()) || null;
-        },
-        sourceTokenCostRows(sourceRow) {
-          const freshInput = Number(sourceRow?.input_tokens || 0);
-          const cachedInput = Number(sourceRow?.cached_input_tokens || 0);
-          const totalOutput = Number(sourceRow?.output_tokens || 0);
-          const reasoningOutput = Number(sourceRow?.reasoning_output_tokens || 0);
-          const visibleOutput = Math.max(totalOutput - reasoningOutput, 0);
-          const totalCost = Number(sourceRow?.cost_usd || 0);
-          const base = [
-            { key: 'cached', shortLabel: 'Cached', value: cachedInput },
-            { key: 'fresh', shortLabel: 'Input', value: freshInput },
-            { key: 'output', shortLabel: 'Output', value: visibleOutput },
-            { key: 'reasoning', shortLabel: 'Reason', value: reasoningOutput },
-          ];
-          const weights = { cached: 0.1, fresh: 1, output: 5, reasoning: 5 };
-          const weightedTotal = base.reduce((sum, segment) => sum + (segment.value * (weights[segment.key] || 1)), 0);
-          return base.map((segment) => {
-            const weightedValue = segment.value * (weights[segment.key] || 1);
-            return {
-              ...segment,
-              cost: weightedTotal > 0 ? (weightedValue / weightedTotal) * totalCost : 0,
-              flatColor: this.tokenFlatColor(segment.key),
-            };
-          });
-        },
-        calendarSourceColumns(row) {
-          const totalDayCost = Math.max(0, Number(row?.cost_usd || 0));
-          const totalDayTokens = Math.max(0, Number(row?.total_tokens || 0));
-          return ['codex', 'claude'].map((source) => {
-            const sourceRow = this.sourceUsageRow(row, source);
-            const cost = Number(sourceRow?.cost_usd || 0);
-            const tokens = Number(sourceRow?.total_tokens || 0);
-            const requests = Number(sourceRow?.request_count || 0);
-            return {
-              source,
-              label: this.sourceLabel(source),
-              dotColor: this.sourceFlatColor(source),
-              cost_usd: cost,
-              total_tokens: tokens,
-              request_count: requests,
-              share: totalDayCost > 0 ? (cost / totalDayCost) * 100 : (totalDayTokens > 0 ? (tokens / totalDayTokens) * 100 : 0),
-              isZero: !sourceRow || (cost <= 0 && tokens <= 0 && requests <= 0),
-              rows: this.sourceTokenCostRows(sourceRow || {}),
-            };
-          });
-        },
-        sourceColor(source) {
-          const tone = this.sourceToneClass(source);
-          if (tone === 'tone-codex') return 'linear-gradient(90deg, #baf6e8, #6ee7c8)';
-          if (tone === 'tone-claude') return 'linear-gradient(90deg, #ffb279, #ff8752)';
-          return 'linear-gradient(90deg, #d3dde7, #8ea3b5)';
-        },
-        sourceLabel(source) {
-          const normalized = String(source || 'unknown').trim().toLowerCase();
-          if (normalized === 'codex') return 'Codex';
-          if (normalized === 'claude') return 'Claude';
-          if (!normalized) return 'Unknown';
-          return normalized.charAt(0).toUpperCase() + normalized.slice(1);
-        },
-        sourceBreakdownRows(row) {
-          const rawRows = Object.values(row?.sources || {})
-            .map((entry) => ({
-              source: String(entry?.source || 'unknown'),
-              label: this.sourceLabel(entry?.source),
-              cost_usd: Number(entry?.cost_usd || 0),
-              total_tokens: Number(entry?.total_tokens || 0),
-              request_count: Number(entry?.request_count || 0),
-            }))
-            .filter((entry) => entry.cost_usd > 0 || entry.total_tokens > 0 || entry.request_count > 0)
-            .sort((a, b) => (b.cost_usd - a.cost_usd) || (b.total_tokens - a.total_tokens) || (b.request_count - a.request_count));
-          const totalCost = rawRows.reduce((sum, entry) => sum + entry.cost_usd, 0);
-          const totalTokens = rawRows.reduce((sum, entry) => sum + entry.total_tokens, 0);
-          return rawRows.map((entry) => ({
-            ...entry,
-            share: totalCost > 0
-              ? (entry.cost_usd / totalCost) * 100
-              : (totalTokens > 0 ? (entry.total_tokens / totalTokens) * 100 : 0),
-            color: this.sourceColor(entry.source),
-          }));
-        },
-        tokenSegments(row) {
-          const segments = this.tokenMetricCards(row).filter((segment) => segment.value > 0);
-          const total = segments.reduce((sum, segment) => sum + segment.value, 0);
-          if (!segments.length || total <= 0) {
-            return [{ key: 'idle', label: 'Idle', value: 0, color: '#6d8091', width: 100, opacity: 0.28 }];
-          }
-          return segments.map((segment) => ({
-            ...segment,
-            width: Math.max(8, (segment.value / total) * 100),
-            opacity: 1,
-          }));
-        },
-        calendarTokenRows(row) {
-          return this.tokenMetricCards(row).map((segment) => ({
-            ...segment,
-            shortLabel: segment.key === 'cached'
-              ? 'Cached'
-              : (segment.key === 'fresh'
-                ? 'Fresh'
-                : (segment.key === 'output' ? 'Output' : 'Reason')),
-            isZero: Number(segment.value || 0) <= 0,
-            valueLabel: `${this.compact(segment.value)} · ${this.money(segment.cost)}`,
-          }));
-        },
-        tokenMetricCards(row) {
-          const freshInput = Number(row?.input_tokens || 0);
-          const cachedInput = Number(row?.cached_input_tokens || 0);
-          const totalOutput = Number(row?.output_tokens || 0);
-          const reasoningOutput = Number(row?.reasoning_output_tokens || 0);
-          const visibleOutput = Math.max(totalOutput - reasoningOutput, 0);
-          const total = Math.max(0, freshInput + cachedInput + visibleOutput + reasoningOutput);
-          const base = [
-            { key: 'cached', label: 'Cached Input', value: cachedInput, color: '#6ee7c8' },
-            { key: 'fresh', label: 'Fresh Input', value: freshInput, color: '#ff8752' },
-            { key: 'output', label: 'Output', value: visibleOutput, color: '#7eaaff' },
-            { key: 'reasoning', label: 'Reasoning', value: reasoningOutput, color: '#c89eff' },
-          ];
-          const weights = {
-            cached: 0.1,
-            fresh: 1,
-            output: 5,
-            reasoning: 5,
-          };
-          const weightedTotal = base.reduce((sum, segment) => sum + (segment.value * (weights[segment.key] || 1)), 0);
-          const totalCost = Number(row?.cost_usd || 0);
-          return base.map((segment) => {
-            const weightedValue = segment.value * (weights[segment.key] || 1);
-            const cost = weightedTotal > 0 ? (weightedValue / weightedTotal) * totalCost : 0;
-            return {
-              ...segment,
-              share: total > 0 ? (segment.value / total) * 100 : 0,
-              cost,
-              costShare: totalCost > 0 ? (cost / totalCost) * 100 : 0,
-            };
-          });
-        },
-        formatPercent(value) {
-          const numeric = Number(value || 0);
-          if (!Number.isFinite(numeric)) return '0%';
-          return `${new Intl.NumberFormat('en-US', { maximumFractionDigits: 1 }).format(numeric)}%`;
-        },
-        formatModelName(model) {
-          const value = String(model || '').trim();
-          if (!value) return 'Unknown';
-          return value
-            .replace(/-/g, ' ')
-            .replace(/\bgpt\b/gi, 'GPT')
-            .replace(/\bclaude\b/gi, 'Claude')
-            .replace(/\bopus\b/gi, 'Opus')
-            .replace(/\bsonnet\b/gi, 'Sonnet')
-            .replace(/\bhaiku\b/gi, 'Haiku')
-            .replace(/\bcodex\b/gi, 'Codex')
-            .replace(/\bmini\b/gi, 'Mini')
-            .replace(/\b4o\b/gi, '4o');
-        },
-        chipMeta(row) {
-          if (this.metaMode === 'tokens') {
-            return this.compact(row?.total_tokens);
-          }
-          return this.money(row?.cost_usd);
-        },
-        hasActivity(row) {
-          return Number(row?.cost_usd || 0) > 0
-            || Number(row?.total_tokens || 0) > 0
-            || Number(row?.request_count || 0) > 0;
-        },
-        sourceToneClass(source) {
-          const normalized = String(source || 'unknown').trim().toLowerCase();
-          if (normalized === 'claude') return 'tone-claude';
-          if (normalized === 'codex') return 'tone-codex';
-          return 'tone-other';
-        },
-        stepDay(delta) {
-          if (!this.dayOptions.length) return;
-          const currentIndex = this.selectedIndex >= 0 ? this.selectedIndex : this.dayOptions.length - 1;
-          const nextIndex = Math.min(this.dayOptions.length - 1, Math.max(0, currentIndex + delta));
-          const row = this.dayOptions[nextIndex];
-          if (row?.day_key) {
-            this.$emit('update:selectedDayKey', row.day_key);
-          }
-        },
       },
     };
 
@@ -3173,12 +1916,13 @@
           return this.rows.map((row, index) => {
             const total = Number(row?.[this.totalKey] || 0);
             const height = total > 0 ? Math.max(8, (total / scale) * 100) : 0;
+            const segmentTotal = this.segments.reduce((sum, seg) => sum + Number(row?.[seg.field] || 0), 0);
             const segs = this.segments.map(seg => {
               const val = Number(row?.[seg.field] || 0);
               return {
                 key: seg.key,
                 color: seg.color,
-                percent: total > 0 ? (val / total) * 100 : 0,
+                percent: segmentTotal > 0 ? (val / segmentTotal) * 100 : 0,
               };
             });
             return {
@@ -3209,7 +1953,7 @@
         buildTooltip(row) {
           const dateKey = this.period === 'month' ? row?.month_key : row?.day_key;
           const parts = this.segments.map(seg =>
-            `${seg.label}: ${this.compact(row?.[seg.field] || 0)}`
+            `${seg.label}: ${this.compact(row?.[seg.tooltipField || seg.field] || 0)}`
           );
           return `${dateKey || '-'}\n${parts.join(' · ')}`;
         },
@@ -3218,44 +1962,46 @@
 
     const TokenBreakdownCard = {
       template: '#token-breakdown-card-template',
-      emits: ['update:scope', 'update:selectedDayKey'],
+      emits: ['update:scope'],
       props: {
         dailyHistory: { type: Array, default: () => [] },
         currentUsage: { type: Object, default: () => ({}) },
         allTimeUsage: { type: Object, default: () => ({}) },
         scope: { type: String, default: 'week' },
-        selectedDayKey: { type: String, default: '' },
       },
       data() {
         return {
+          scopeOverride: '',
           barMetric: 'cost',
           sortMode: 'cost',
           minTokens: 0,
         };
       },
       computed: {
-        dailyUsage() {
-          return findDailyRowByKey(this.dailyHistory, this.selectedDayKey);
+        selectedScope() {
+          return this.scopeOverride || this.scope;
+        },
+        todayUsage() {
+          const rows = Array.isArray(this.dailyHistory) ? this.dailyHistory : [];
+          return rows.length ? (rows[rows.length - 1] || {}) : {};
         },
         weeklyUsage() {
           const rows = (this.dailyHistory || []).slice(-7);
           return mergeUsageRows(rows);
         },
         activeUsage() {
-          if (this.scope === 'all') return this.allTimeUsage || {};
-          if (this.scope === 'week') return this.weeklyUsage || {};
-          if (this.scope === 'day') return this.dailyUsage || {};
+          if (this.selectedScope === 'all') return this.allTimeUsage || {};
+          if (this.selectedScope === 'week') return this.weeklyUsage || {};
+          if (this.selectedScope === 'today') return this.todayUsage || {};
           return this.currentUsage || {};
         },
         activeUsageSubtitle() {
           const u = this.activeUsage || {};
-          const range = this.scope === 'all'
+          const range = this.selectedScope === 'all'
             ? 'All time'
-            : (this.scope === 'week'
+            : (this.selectedScope === 'week'
               ? 'Last 7 days'
-              : (this.scope === 'day'
-                ? formatDayKey(this.dailyUsage?.day_key, { month: 'short', day: 'numeric' })
-                : 'This month'));
+              : (this.selectedScope === 'today' ? 'Today' : 'This month'));
           return `${range} · ${this.integer(u.request_count)} requests · ${this.compact(u.total_tokens)} tokens · ${this.money(u.cost_usd)}`;
         },
         rawRows() {
@@ -3333,30 +2079,33 @@
         formatPercent(value) {
           return new Intl.NumberFormat('en-US', { maximumFractionDigits: 1 }).format(value);
         },
+        updateScope(value) {
+          if (value === 'today') {
+            this.scopeOverride = 'today';
+            return;
+          }
+          this.scopeOverride = '';
+          this.$emit('update:scope', value);
+        },
       },
     };
 
     const SourceBreakdownCard = {
       template: '#source-breakdown-card-template',
-      emits: ['update:scope', 'update:selectedDayKey'],
+      emits: ['update:scope'],
       props: {
         dailyHistory: { type: Array, default: () => [] },
         currentUsage: { type: Object, default: () => ({}) },
         allTimeUsage: { type: Object, default: () => ({}) },
         scope: { type: String, default: 'week' },
-        selectedDayKey: { type: String, default: '' },
       },
       computed: {
-        dailyUsage() {
-          return findDailyRowByKey(this.dailyHistory, this.selectedDayKey);
-        },
         weeklyUsage() {
           const rows = (this.dailyHistory || []).slice(-7);
           return mergeUsageRows(rows);
         },
         periodCards() {
           return [
-            { key: 'day', label: this.focusedDayShortLabel, kicker: 'Focused day', usage: this.dailyUsage || {} },
             { key: 'week', label: 'Last 7 Days', kicker: 'Weekly split', usage: this.weeklyUsage || {} },
             { key: 'month', label: 'This Month', kicker: 'Monthly split', usage: this.currentUsage || {} },
           ];
@@ -3364,20 +2113,15 @@
         activeUsage() {
           if (this.scope === 'all') return this.allTimeUsage || {};
           if (this.scope === 'week') return this.weeklyUsage || {};
-          if (this.scope === 'day') return this.dailyUsage || {};
           return this.currentUsage || {};
         },
         activeSubtitle() {
           const u = this.activeUsage || {};
           return `${this.spotlightTitle} · ${this.integer(u.request_count)} requests · ${this.compact(u.total_tokens)} total tokens · ${this.money(u.cost_usd)}`;
         },
-        focusedDayShortLabel() {
-          return formatDayKey(this.dailyUsage?.day_key, { month: 'short', day: 'numeric' });
-        },
         spotlightTitle() {
           if (this.scope === 'all') return 'All-Time Split';
           if (this.scope === 'week') return 'Last 7 Days';
-          if (this.scope === 'day') return formatDayKey(this.dailyUsage?.day_key, { weekday: 'long', month: 'short', day: 'numeric' });
           return 'This Month';
         },
         rawRows() {
@@ -3481,7 +2225,6 @@
         SummaryExplorerCard,
         TrendChartCard,
         StackedBarChartCard,
-        DayFocusStrip,
         SourceBreakdownCard,
         TokenBreakdownCard,
       },
@@ -3523,7 +2266,6 @@
           search: '',
           sourceFilter: 'all',
           sortMode: 'recent',
-          selectedDayKey: todayDayKey(),
           requestPage: 1,
           selectedRequestKey: '',
           data: {
@@ -3564,17 +2306,11 @@
         currentMonth() { return this.data.current_month?.usage || {}; },
         allTime() { return this.data.all_time?.usage || {}; },
         dailyHistory() { return normalizeRowsToLocalToday(this.data.current_month?.daily_history || []); },
-        calendarHistory() {
-          return buildCalendarRows(
-            this.dailyHistory,
-            this.data.current_month?.start_at,
-            this.data.current_month?.end_at,
-            this.selectedDayKey || todayDayKey(),
-          );
-        },
-        selectedDayUsage() { return findDailyRowByKey(this.calendarHistory, this.selectedDayKey); },
         monthHistoryChronological() { return [...((this.data.month_history || []).slice(0, 12))].reverse(); },
         todayUsage() { return this.dailyHistory[this.dailyHistory.length - 1] || {}; },
+        todayTokenConsumption() { return totalTokenConsumption(this.todayUsage).stacked_total_tokens; },
+        currentMonthTokenConsumption() { return totalTokenConsumption(this.currentMonth).stacked_total_tokens; },
+        allTimeTokenConsumption() { return totalTokenConsumption(this.allTime).stacked_total_tokens; },
         trackedMonths() { return Number(this.allTime.months_tracked || (this.data.month_history || []).length || 0); },
         daysElapsedInMonth() { return Math.max(1, this.dailyHistory.length || 0); },
         daysInCurrentMonth() {
@@ -3630,7 +2366,7 @@
             return {
               title: 'Monthly Token Volume',
               subtitle: 'Recent history',
-              headline: this.compact(this.allTime.total_tokens),
+              headline: this.compact(this.allTimeTokenConsumption),
               meta: this.monthlyTokenMeta,
               rows: this.monthHistoryEnriched,
               period: 'month',
@@ -3640,7 +2376,7 @@
           return {
             title: 'Daily Token Volume',
             subtitle: 'Month to date',
-            headline: this.compact(this.currentMonth.total_tokens),
+            headline: this.compact(this.currentMonthTokenConsumption),
             meta: this.dailyTokenMeta,
             rows: this.dailyHistoryEnriched,
             period: 'day',
@@ -3657,26 +2393,21 @@
           return (this.dailyHistory || []).map(row => ({
             ...row,
             fresh_input_tokens: Number(row.input_tokens || 0),
+            ...totalTokenConsumption(row),
           }));
         },
         monthHistoryEnriched() {
           return (this.monthHistoryChronological || []).map(row => ({
             ...row,
             fresh_input_tokens: Number(row.input_tokens || 0),
+            ...totalTokenConsumption(row),
           }));
         },
-        tokenSegments() {
-          return [
-            { key: 'cached', label: 'Cached Input', color: '#6ee7c8', field: 'cached_input_tokens' },
-            { key: 'input',  label: 'Fresh Input',  color: '#ff8752', field: 'fresh_input_tokens' },
-            { key: 'output', label: 'Output',       color: '#7eaaff', field: 'output_tokens' },
-          ];
-        },
         dailyTokenMeta() {
-          return `${this.compact(this.todayUsage.total_tokens)} today · ${this.compact(this.todayUsage.input_tokens)} in · ${this.compact(this.todayUsage.output_tokens)} out`;
+          return `${this.compact(this.todayTokenConsumption)} today · ${this.compact(this.todayUsage.input_tokens)} fresh in · ${this.compact(this.todayUsage.cached_input_tokens)} cached`;
         },
         monthlyTokenMeta() {
-          return `${this.compact(this.allTime.total_tokens)} total · ${this.compact(this.allTime.input_tokens)} in · ${this.compact(this.allTime.output_tokens)} out`;
+          return `${this.compact(this.allTimeTokenConsumption)} total · ${this.compact(this.allTime.input_tokens)} fresh in · ${this.compact(this.allTime.cached_input_tokens)} cached`;
         },
         premiumSourceLabel() {
           const source = String(this.premium.source || '').trim();
@@ -4185,18 +2916,6 @@
           if (this.sortMode === 'tokens') return sorted.sort((a, b) => Number(b.total_tokens || b?.usage?.total_tokens || 0) - Number(a.total_tokens || a?.usage?.total_tokens || 0));
           return sorted.sort((a, b) => String(b[dateKey] || b.started_at || '').localeCompare(String(a[dateKey] || a.started_at || '')));
         },
-        syncSelectedDayKey() {
-          const rows = this.calendarHistory || [];
-          if (!rows.length) {
-            this.selectedDayKey = todayDayKey();
-            return;
-          }
-          const dayKeys = new Set(rows.map((row) => row?.day_key).filter(Boolean));
-          if (!this.selectedDayKey || !dayKeys.has(this.selectedDayKey)) {
-            const latestActualDayKey = String((this.dailyHistory || [])[this.dailyHistory.length - 1]?.day_key || '');
-            this.selectedDayKey = latestActualDayKey || todayDayKey();
-          }
-        },
         _applyDashboardPayload(payload) {
           if (!payload || typeof payload !== 'object') {
             return;
@@ -4211,7 +2930,6 @@
           const previousScrollTop = requestList ? requestList.scrollTop : null;
           const mergedRequests = this.mergeRecentRequests(this.data.recent_requests, payload?.recent_requests);
           Object.assign(this.data, { ...payload, recent_requests: mergedRequests });
-          this.syncSelectedDayKey();
           this.requestPage = Math.min(this.requestPageCount, Math.max(1, this.requestPage));
           const requestKeys = new Set((this.data.recent_requests || []).map((row) => this.requestKey(row)));
           if (!requestKeys.has(this.selectedRequestKey)) {
