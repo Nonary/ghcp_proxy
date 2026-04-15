@@ -222,6 +222,75 @@ class InitiatorPolicyTests(unittest.TestCase):
         self.assertEqual(messages[-1]["content"][-1]["text"], "new prompt")
         self.assertEqual(initiator, "user")
 
+    def test_anthropic_tool_result_with_empty_text_tail_is_agent(self):
+        policy = initiator_policy.InitiatorPolicy()
+        messages = [
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "tool-1", "name": "Bash", "input": {}}]},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "tool-1", "content": "done", "is_error": False},
+                    {"type": "text", "text": "   "},
+                ],
+            },
+        ]
+
+        initiator = policy.resolve_anthropic_messages(messages, "claude-sonnet-4.6")
+
+        self.assertEqual(initiator, "agent")
+
+    def test_anthropic_compaction_summary_is_agent(self):
+        policy = initiator_policy.InitiatorPolicy()
+        messages = [
+            {"role": "assistant", "content": [{"type": "text", "text": "previous answer"}]},
+            {
+                "role": "user",
+                "content": (
+                    "This session is being continued from a previous conversation that ran out of context. "
+                    "The summary below covers the earlier portion of the conversation.\n\nSummary:\n1. Example"
+                ),
+            },
+        ]
+
+        initiator = policy.resolve_anthropic_messages(messages, "claude-opus-4.6")
+
+        self.assertEqual(initiator, "agent")
+
+    def test_anthropic_local_command_wrapper_is_agent(self):
+        policy = initiator_policy.InitiatorPolicy()
+        messages = [
+            {"role": "assistant", "content": [{"type": "text", "text": "previous answer"}]},
+            {
+                "role": "user",
+                "content": (
+                    "<command-name>/cost</command-name>\n"
+                    "<command-message>cost</command-message>\n"
+                    "<command-args></command-args>"
+                ),
+            },
+        ]
+
+        initiator = policy.resolve_anthropic_messages(messages, "claude-sonnet-4.6")
+
+        self.assertEqual(initiator, "agent")
+
+    def test_anthropic_tool_result_with_real_user_text_stays_user(self):
+        policy = initiator_policy.InitiatorPolicy()
+        messages = [
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "tool-1", "name": "Bash", "input": {}}]},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "tool-1", "content": "done", "is_error": False},
+                    {"type": "text", "text": "Now compare that with upstream."},
+                ],
+            },
+        ]
+
+        initiator = policy.resolve_anthropic_messages(messages, "claude-sonnet-4.6")
+
+        self.assertEqual(initiator, "user")
+
     def test_plus_prefix_does_not_override_haiku(self):
         policy = initiator_policy.InitiatorPolicy()
 

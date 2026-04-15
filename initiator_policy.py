@@ -58,6 +58,37 @@ def _strip_explicit_initiator_prefix(text: str) -> tuple[str, str | None]:
     return normalized, initiator
 
 
+def _is_claude_compaction_summary_text(text: str) -> bool:
+    if not isinstance(text, str):
+        return False
+    normalized = text.lstrip()
+    return normalized.startswith(
+        "This session is being continued from a previous conversation that ran out of context."
+    )
+
+
+def _is_claude_meta_user_text(text: str) -> bool:
+    if not isinstance(text, str):
+        return False
+    normalized = text.lstrip()
+    if not normalized:
+        return False
+    if normalized.startswith((
+        "<local-command-caveat>",
+        "<local-command-stdout>",
+        "<local-command-stderr>",
+        "<task-notification>",
+    )):
+        return True
+    if (
+        normalized.startswith("<command-name>")
+        and "<command-message>" in normalized
+        and "<command-args>" in normalized
+    ):
+        return True
+    return _is_claude_compaction_summary_text(normalized)
+
+
 def _strip_explicit_initiator_prefix_from_item(item, *, default_initiator: str | None = USER_INITIATOR) -> str | None:
     if not isinstance(item, dict):
         return AGENT_INITIATOR
@@ -307,6 +338,9 @@ def _strip_explicit_initiator_prefix_from_anthropic_message(
         if explicit_initiator is not None:
             message["content"] = updated_text
             return explicit_initiator
+        message["content"] = updated_text
+        if _is_claude_meta_user_text(updated_text):
+            return AGENT_INITIATOR
         return default_initiator
 
     if not isinstance(content, list):
@@ -314,6 +348,7 @@ def _strip_explicit_initiator_prefix_from_anthropic_message(
 
     saw_tool_result = False
     saw_non_tool_result = False
+    saw_agent_meta = False
     for item in content:
         if not isinstance(item, dict):
             saw_non_tool_result = True
@@ -322,17 +357,25 @@ def _strip_explicit_initiator_prefix_from_anthropic_message(
         if item_type == "tool_result":
             saw_tool_result = True
             continue
-        saw_non_tool_result = True
         if item_type != "text":
+            saw_non_tool_result = True
             continue
         text = item.get("text")
         if not isinstance(text, str):
+            saw_non_tool_result = True
             continue
         updated_text, explicit_initiator = _strip_explicit_initiator_prefix(text)
         if explicit_initiator is not None:
             item["text"] = updated_text
             return explicit_initiator
-    if saw_tool_result and not saw_non_tool_result:
+        item["text"] = updated_text
+        if not updated_text.strip():
+            continue
+        if _is_claude_meta_user_text(updated_text):
+            saw_agent_meta = True
+            continue
+        saw_non_tool_result = True
+    if (saw_tool_result or saw_agent_meta) and not saw_non_tool_result:
         return AGENT_INITIATOR
     return default_initiator
 
