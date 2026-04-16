@@ -240,15 +240,17 @@ class InitiatorPolicyTests(unittest.TestCase):
         self.assertEqual(messages[-1]["content"][-1]["text"], "new prompt")
         self.assertEqual(initiator, "user")
 
-    def test_plus_prefix_bypasses_active_safeguard(self):
+    def test_plus_prefixed_anthropic_user_message_wins_over_trailing_task_notification(self):
         policy = initiator_policy.InitiatorPolicy()
-        start = datetime(2026, 4, 4, 18, 0, tzinfo=timezone.utc)
+        messages = [
+            {"role": "assistant", "content": [{"type": "text", "text": "previous answer"}]},
+            {"role": "user", "content": [{"type": "text", "text": "+ new prompt"}]},
+            {"role": "user", "content": [{"type": "text", "text": "<task-notification>queued</task-notification>"}]},
+        ]
 
-        policy.note_request_started("req-1", "user", started_at=start)
+        initiator = policy.resolve_anthropic_messages(messages, "claude-sonnet-4.6")
 
-        with mock.patch.object(initiator_policy, "utc_now", return_value=start.replace(second=5)):
-            initiator = policy.resolve_initiator("user!", "gpt-5.4", request_id="req-2")
-
+        self.assertEqual(messages[1]["content"][-1]["text"], "new prompt")
         self.assertEqual(initiator, "user")
 
     def test_anthropic_tool_result_with_empty_text_tail_is_agent(self):
@@ -303,25 +305,6 @@ class InitiatorPolicyTests(unittest.TestCase):
 
         self.assertEqual(initiator, "agent")
 
-    def test_anthropic_approval_agent_transcript_is_agent(self):
-        """Claude Code approval agents send a <transcript> block as a user message."""
-        policy = initiator_policy.InitiatorPolicy()
-        messages = [
-            {"role": "user", "content": [{"type": "text", "text": "System context"}]},
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "<transcript>\n"},
-                    {"type": "text", "text": "User: help me with code"},
-                    {"type": "text", "text": "Agent: I will run bash"},
-                ],
-            },
-        ]
-
-        initiator = policy.resolve_anthropic_messages(messages, "claude-sonnet-4.6")
-
-        self.assertEqual(initiator, "agent")
-
     def test_anthropic_tool_result_with_real_user_text_stays_user(self):
         policy = initiator_policy.InitiatorPolicy()
         messages = [
@@ -336,6 +319,73 @@ class InitiatorPolicyTests(unittest.TestCase):
         ]
 
         initiator = policy.resolve_anthropic_messages(messages, "claude-sonnet-4.6")
+
+        self.assertEqual(initiator, "user")
+
+    def test_anthropic_tool_result_with_system_reminder_only_is_agent(self):
+        policy = initiator_policy.InitiatorPolicy()
+        messages = [
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "tool-1", "name": "Bash", "input": {}}]},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "tool-1", "content": "done", "is_error": False},
+                    {"type": "text", "text": "<system-reminder>\nThe task tools haven't been used recently.\n</system-reminder>"},
+                ],
+            },
+        ]
+
+        initiator = policy.resolve_anthropic_messages(messages, "claude-opus-4.6")
+
+        self.assertEqual(initiator, "agent")
+
+    def test_anthropic_transcript_container_is_agent(self):
+        """Claude Code approval agents wrap the conversation in a <transcript> block.
+
+        Even with a genuine-looking user preamble (e.g. CLAUDE.md configuration)
+        earlier in the messages list, the trailing transcript container is
+        agent-generated and must be classified as agent. Regression test for
+        a classifier gap uncovered by real /v1/messages captures.
+        """
+        policy = initiator_policy.InitiatorPolicy()
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "The following is the user's CLAUDE.md configuration."},
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "<transcript>\n"},
+                    {"type": "text", "text": "User: something the user said earlier\n"},
+                    {"type": "text", "text": "Assistant: earlier reply\n"},
+                    {"type": "text", "text": "</transcript>\n"},
+                    {"type": "text", "text": "Err on the side of blocking."},
+                ],
+            },
+        ]
+
+        initiator = policy.resolve_anthropic_messages(messages, "claude-sonnet-4.6")
+
+        self.assertEqual(initiator, "agent")
+
+    def test_anthropic_system_reminder_with_real_user_text_stays_user(self):
+        policy = initiator_policy.InitiatorPolicy()
+        messages = [
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "tool-1", "name": "Bash", "input": {}}]},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "tool-1", "content": "done", "is_error": False},
+                    {"type": "text", "text": "<system-reminder>\nTask tools reminder.\n</system-reminder>"},
+                    {"type": "text", "text": "Can you look at the proxy code?"},
+                ],
+            },
+        ]
+
+        initiator = policy.resolve_anthropic_messages(messages, "claude-opus-4.6")
 
         self.assertEqual(initiator, "user")
 
@@ -375,6 +425,110 @@ class InitiatorPolicyTests(unittest.TestCase):
             "<environment_context>\n  <cwd>D:\\sources\\ghcp_proxy</cwd>\n</environment_context>",
         )
         self.assertEqual(initiator, "agent")
+
+    def test_plus_prefix_only_disables_safeguard_and_still_loses_to_active_request(self):
+        policy = initiator_policy.InitiatorPolicy()
+        start = datetime(2026, 4, 4, 18, 0, tzinfo=timezone.utc)
+
+        policy.note_request_started("req-1", "user", started_at=start)
+
+        with mock.patch.object(initiator_policy, "utc_now", return_value=start.replace(second=5)):
+            normalized_input, initiator = policy.resolve_responses_input(
+                "+ hello",
+                "gpt-5.4",
+            )
+
+        self.assertEqual(normalized_input, "hello")
+        self.assertEqual(initiator, "agent")
+
+    def test_plus_prefix_active_request_event_reports_user_candidate(self):
+        recorded = []
+        policy = initiator_policy.InitiatorPolicy(on_safeguard_triggered=recorded.append)
+        start = datetime(2026, 4, 4, 18, 0, tzinfo=timezone.utc)
+
+        policy.note_request_started("req-1", "user", started_at=start)
+
+        with mock.patch.object(initiator_policy, "utc_now", return_value=start.replace(second=5)):
+            _normalized_input, initiator = policy.resolve_responses_input(
+                "+ hello",
+                "gpt-5.4",
+                request_id="req-2",
+            )
+
+        self.assertEqual(initiator, "agent")
+        self.assertEqual(recorded[0]["candidate_initiator"], "user")
+        self.assertEqual(recorded[0]["resolved_initiator"], "agent")
+
+    def test_plus_prefix_bypasses_cooldown_for_plain_responses_input(self):
+        policy = initiator_policy.InitiatorPolicy()
+        start = datetime(2026, 4, 4, 18, 0, tzinfo=timezone.utc)
+
+        policy.note_request_started("req-1", "user", started_at=start)
+        policy.note_request_finished("req-1", finished_at=start.replace(second=5))
+
+        with mock.patch.object(initiator_policy, "utc_now", return_value=start.replace(second=10)):
+            normalized_input, initiator = policy.resolve_responses_input("+ hello", "gpt-5.4")
+
+        self.assertEqual(normalized_input, "hello")
+        self.assertEqual(initiator, "user")
+
+    def test_plus_prefixed_responses_message_bypasses_cooldown_through_trailing_turn_aborted_wrapper(self):
+        policy = initiator_policy.InitiatorPolicy()
+        start = datetime(2026, 4, 4, 18, 0, tzinfo=timezone.utc)
+        input_items = [
+            {"type": "message", "role": "assistant", "content": "previous answer"},
+            {"type": "message", "role": "user", "content": "+ new prompt"},
+            {
+                "type": "message",
+                "role": "user",
+                "content": "<turn_aborted>interrupted</turn_aborted>",
+            },
+        ]
+
+        policy.note_request_started("req-1", "user", started_at=start)
+        policy.note_request_finished("req-1", finished_at=start.replace(second=5))
+
+        with mock.patch.object(initiator_policy, "utc_now", return_value=start.replace(second=10)):
+            normalized_input, initiator = policy.resolve_responses_input(input_items, "gpt-5.4")
+
+        self.assertIs(normalized_input, input_items)
+        self.assertEqual(input_items[1]["content"], "new prompt")
+        self.assertEqual(initiator, "user")
+
+    def test_plus_prefix_bypasses_cooldown_for_chat_messages(self):
+        policy = initiator_policy.InitiatorPolicy()
+        start = datetime(2026, 4, 4, 18, 0, tzinfo=timezone.utc)
+        messages = [
+            {"role": "assistant", "content": "previous answer"},
+            {"role": "user", "content": "+ new prompt"},
+        ]
+
+        policy.note_request_started("req-1", "user", started_at=start)
+        policy.note_request_finished("req-1", finished_at=start.replace(second=5))
+
+        with mock.patch.object(initiator_policy, "utc_now", return_value=start.replace(second=10)):
+            initiator = policy.resolve_chat_messages(messages, "gpt-5.4")
+
+        self.assertEqual(messages[-1]["content"], "new prompt")
+        self.assertEqual(initiator, "user")
+
+    def test_plus_prefix_bypasses_cooldown_for_anthropic_messages(self):
+        policy = initiator_policy.InitiatorPolicy()
+        start = datetime(2026, 4, 4, 18, 0, tzinfo=timezone.utc)
+        messages = [
+            {"role": "assistant", "content": [{"type": "text", "text": "previous answer"}]},
+            {"role": "user", "content": [{"type": "text", "text": "+ new prompt"}]},
+        ]
+
+        policy.note_request_started("req-1", "user", started_at=start)
+        policy.note_request_finished("req-1", finished_at=start.replace(second=5))
+
+        with mock.patch.object(initiator_policy, "utc_now", return_value=start.replace(second=10)):
+            initiator = policy.resolve_anthropic_messages(messages, "claude-sonnet-4.6")
+
+        self.assertEqual(messages[-1]["content"][-1]["text"], "new prompt")
+        self.assertEqual(initiator, "user")
+
     def test_active_request_forces_following_user_request_to_agent(self):
         policy = initiator_policy.InitiatorPolicy()
         start = datetime(2026, 4, 4, 18, 0, tzinfo=timezone.utc)

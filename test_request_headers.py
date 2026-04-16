@@ -1,4 +1,5 @@
 import unittest
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest import mock
 
@@ -110,6 +111,62 @@ class RequestHeadersTests(unittest.TestCase):
         )
 
         self.assertEqual(headers["X-Initiator"], "agent")
+        self.assertEqual(body["input"], "hello")
+
+    def test_plus_prefixed_responses_string_is_user_and_stripped(self):
+        request = SimpleNamespace(url=SimpleNamespace(path="/v1/responses"), headers={})
+        body = {
+            "model": "gpt-5",
+            "input": "+hello",
+        }
+
+        headers = format_translation.build_responses_headers_for_request(
+            request, body, "test-key",
+            initiator_policy=proxy._initiator_policy,
+            session_id_resolver=usage_tracking.request_session_id,
+        )
+
+        self.assertEqual(headers["X-Initiator"], "user")
+        self.assertEqual(body["input"], "hello")
+
+    def test_plus_prefixed_responses_string_does_not_override_forced_agent_and_is_stripped(self):
+        request = SimpleNamespace(url=SimpleNamespace(path="/v1/responses"), headers={})
+        body = {
+            "model": "gpt-5",
+            "input": "+hello",
+        }
+
+        headers = format_translation.build_responses_headers_for_request(
+            request,
+            body,
+            "test-key",
+            force_initiator="agent",
+            initiator_policy=proxy._initiator_policy,
+            session_id_resolver=usage_tracking.request_session_id,
+        )
+
+        self.assertEqual(headers["X-Initiator"], "agent")
+        self.assertEqual(body["input"], "hello")
+
+    def test_plus_prefixed_responses_string_bypasses_cooldown_and_is_stripped(self):
+        request = SimpleNamespace(url=SimpleNamespace(path="/v1/responses"), headers={})
+        body = {
+            "model": "gpt-5",
+            "input": "+hello",
+        }
+        start = datetime(2026, 4, 4, 18, 0, tzinfo=timezone.utc)
+
+        proxy._initiator_policy.note_request_started("req-1", "user", started_at=start)
+        proxy._initiator_policy.note_request_finished("req-1", finished_at=start.replace(second=5))
+
+        with mock.patch.object(initiator_policy, "utc_now", return_value=start.replace(second=10)):
+            headers = format_translation.build_responses_headers_for_request(
+                request, body, "test-key",
+                initiator_policy=proxy._initiator_policy,
+                session_id_resolver=usage_tracking.request_session_id,
+            )
+
+        self.assertEqual(headers["X-Initiator"], "user")
         self.assertEqual(body["input"], "hello")
 
     def test_responses_history_with_assistant_item_and_trailing_user_is_user(self):
@@ -236,6 +293,22 @@ class RequestHeadersTests(unittest.TestCase):
         self.assertEqual(headers["X-Initiator"], "agent")
         self.assertEqual(messages[-1]["content"], "finish the task")
 
+    def test_chat_plus_prefixed_user_message_is_user_and_stripped(self):
+        request = SimpleNamespace(url=SimpleNamespace(path="/v1/chat/completions"), headers={})
+        messages = [
+            {"role": "assistant", "content": "prior work"},
+            {"role": "user", "content": "+finish the task"},
+        ]
+
+        headers = format_translation.build_chat_headers_for_request(
+            request, messages, "gpt-4.1", "test-key",
+            initiator_policy=proxy._initiator_policy,
+            session_id_resolver=usage_tracking.request_session_id,
+        )
+
+        self.assertEqual(headers["X-Initiator"], "user")
+        self.assertEqual(messages[-1]["content"], "finish the task")
+
     def test_responses_function_call_output_follow_up_stays_agent(self):
         request = SimpleNamespace(url=SimpleNamespace(path="/v1/responses"), headers={})
         body = {
@@ -339,6 +412,56 @@ class RequestHeadersTests(unittest.TestCase):
 
         self.assertEqual(headers["X-Initiator"], "agent")
         self.assertEqual(body["messages"][0]["content"][0]["text"], "hello")
+
+    def test_anthropic_plus_prefixed_user_message_is_user_and_stripped(self):
+        request = SimpleNamespace(url=SimpleNamespace(path="/v1/messages"), headers={})
+        body = {
+            "model": "claude-sonnet-4.6",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "+hello"}],
+                }
+            ],
+        }
+
+        headers = format_translation.build_anthropic_headers_for_request(
+            request, body, "test-key",
+            initiator_policy=proxy._initiator_policy,
+            session_id_resolver=usage_tracking.request_session_id,
+        )
+
+        self.assertEqual(headers["X-Initiator"], "user")
+        self.assertEqual(body["messages"][0]["content"][0]["text"], "hello")
+
+    def test_anthropic_plus_prefixed_user_message_wins_over_trailing_task_notification(self):
+        request = SimpleNamespace(url=SimpleNamespace(path="/v1/messages"), headers={})
+        body = {
+            "model": "claude-sonnet-4.6",
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "previous answer"}],
+                },
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "+hello"}],
+                },
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "<task-notification>queued</task-notification>"}],
+                },
+            ],
+        }
+
+        headers = format_translation.build_anthropic_headers_for_request(
+            request, body, "test-key",
+            initiator_policy=proxy._initiator_policy,
+            session_id_resolver=usage_tracking.request_session_id,
+        )
+
+        self.assertEqual(headers["X-Initiator"], "user")
+        self.assertEqual(body["messages"][1]["content"][0]["text"], "hello")
 
     def test_anthropic_tool_result_follow_up_stays_agent(self):
         request = SimpleNamespace(url=SimpleNamespace(path="/v1/messages"), headers={})

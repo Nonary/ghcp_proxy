@@ -111,7 +111,8 @@ The basic idea is simple:
 
 - normal requests are treated as user traffic
 - if you want a request treated as agent traffic, prefix the prompt with `_`
-- the proxy strips that leading `_` before forwarding the prompt upstream
+- if you want to explicitly try a request as user traffic, prefix the prompt with `+`
+- the proxy strips a leading `_` or `+` before forwarding the prompt upstream
 - Claude Haiku requests are always treated as agent traffic
 - the first unprefixed request is user traffic
 - tool calls themselves are free
@@ -130,6 +131,12 @@ _continue the tool-driven fix
 
 This is sent as agent traffic, and the upstream model receives `continue the tool-driven fix`.
 
+```text
++summarize only the latest compiler error
+```
+
+This is sent as user traffic when only the safeguard would have flipped it to agent, and the upstream model receives `summarize only the latest compiler error`.
+
 ## Practical Use Of `_`
 
 Use `_` only when you explicitly want agent initiator semantics for that request.
@@ -143,11 +150,13 @@ _finish the refactor and run the tests
 Use this sparingly.
 
 - omit `_` when you want that specific request treated as user traffic
+- use `+` when you want to disable only the safeguard for that specific request
 - use `_` when you want the request treated as agent traffic
+- `+` does not override logic that already forces agent traffic, such as Claude Haiku or other explicit agent-only paths
 - Claude Haiku requests are always treated as agent traffic
 - while any proxied request is still active, the next user-looking request is forced to agent traffic
 - after any proxied activity, the safeguard stays active for 15 more seconds and refreshes again on the next request start or finish
-- remember that the leading `_` is removed before forwarding upstream
+- remember that a leading `_` or `+` is removed before forwarding upstream
 - be pragmatic
 
 ## Proxy Activation

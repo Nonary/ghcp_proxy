@@ -7,9 +7,9 @@ from typing import Callable
 
 AGENT_INITIATOR = "agent"
 USER_INITIATOR = "user"
-EXPLICIT_USER_INITIATOR = "user!"
 AGENT_INITIATOR_PREFIX = "_"
 USER_INITIATOR_PREFIX = "+"
+_EXPLICIT_USER_INITIATOR = "__explicit_user__"
 REQUEST_FINISH_GUARD_SECONDS = 15.0
 
 
@@ -53,7 +53,7 @@ def _strip_explicit_initiator_prefix(text: str) -> tuple[str, str | None]:
     if stripped.startswith(AGENT_INITIATOR_PREFIX):
         initiator = AGENT_INITIATOR
     elif stripped.startswith(USER_INITIATOR_PREFIX):
-        initiator = EXPLICIT_USER_INITIATOR
+        initiator = _EXPLICIT_USER_INITIATOR
     else:
         return text, None
 
@@ -61,6 +61,20 @@ def _strip_explicit_initiator_prefix(text: str) -> tuple[str, str | None]:
     if normalized.startswith(" "):
         normalized = normalized[1:]
     return normalized, initiator
+
+
+def _is_user_candidate(candidate_initiator: str | None) -> bool:
+    return candidate_initiator in {USER_INITIATOR, _EXPLICIT_USER_INITIATOR}
+
+
+def _public_candidate_initiator(candidate_initiator: str | None) -> str:
+    if _is_user_candidate(candidate_initiator):
+        return USER_INITIATOR
+    return AGENT_INITIATOR
+
+
+def _candidate_bypasses_cooldown(candidate_initiator: str | None) -> bool:
+    return candidate_initiator == _EXPLICIT_USER_INITIATOR
 
 
 def _is_claude_compaction_summary_text(text: str) -> bool:
@@ -83,7 +97,7 @@ def _is_claude_meta_user_text(text: str) -> bool:
         "<local-command-stdout>",
         "<local-command-stderr>",
         "<task-notification>",
-        "<transcript>",
+        "<system-reminder>",
     )):
         return True
     if (
@@ -93,6 +107,27 @@ def _is_claude_meta_user_text(text: str) -> bool:
     ):
         return True
     return _is_claude_compaction_summary_text(normalized)
+
+
+def _is_claude_transcript_container(content) -> bool:
+    """Detect Claude Code approval agent transcript messages.
+
+    Approval agents send a user message whose content list starts with a
+    ``<transcript>`` text block followed by the conversation transcript.
+    The entire message is agent-generated, not user-typed.
+    """
+    if not isinstance(content, list):
+        return False
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("type", "")).lower() != "text":
+            continue
+        text = item.get("text")
+        if isinstance(text, str) and text.lstrip().startswith("<transcript>"):
+            return True
+        return False
+    return False
 
 
 def _strip_explicit_initiator_prefix_from_item(item, *, default_initiator: str | None = USER_INITIATOR) -> str | None:
@@ -189,7 +224,20 @@ def _determine_responses_candidate(input_param) -> tuple[object, str]:
 
     if isinstance(input_param, list):
         explicit_initiators = _explicit_initiators_for_responses_input(input_param)
+        ignorable_meta_messages: set[int] = set()
+        for item in input_param:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("role", "")).lower() != "user":
+                continue
+            if id(item) in explicit_initiators:
+                continue
+            saw_agent_meta, saw_real_user_content = _responses_user_message_traits(item)
+            if saw_agent_meta and not saw_real_user_content:
+                ignorable_meta_messages.add(id(item))
         for item in reversed(input_param):
+            if isinstance(item, dict) and id(item) in ignorable_meta_messages:
+                continue
             candidate = _responses_item_candidate(item, explicit_initiators=explicit_initiators)
             if candidate is not None:
                 return input_param, candidate
@@ -224,6 +272,23 @@ def _responses_item_text(item) -> str:
     return ""
 
 
+def _is_codex_meta_user_text(text: str) -> bool:
+    if not isinstance(text, str):
+        return False
+    normalized = text.lstrip()
+    if not normalized:
+        return False
+    if normalized.startswith((
+        "<turn_aborted>",
+        "<subagent_notification>",
+        "<subagent-notification>",
+        "<task-notification>",
+        "<system-reminder>",
+    )):
+        return True
+    return _is_claude_compaction_summary_text(normalized)
+
+
 def _is_environment_context_message(item) -> bool:
     if not isinstance(item, dict):
         return False
@@ -244,6 +309,67 @@ def _is_task_title_generation_message(item) -> bool:
         and "Generate a concise UI title" in text
         and "User prompt:" in text
     )
+
+
+def _responses_user_message_traits(item) -> tuple[bool, bool]:
+    if not isinstance(item, dict):
+        return False, False
+    if str(item.get("role", "")).lower() != "user":
+        return False, False
+
+    if _is_environment_context_message(item) or _is_task_title_generation_message(item):
+        return True, False
+
+    content = item.get("content")
+    if isinstance(content, str):
+        stripped = content.strip()
+        if not stripped:
+            return False, False
+        if _is_codex_meta_user_text(content):
+            return True, False
+        return False, True
+
+    if isinstance(content, list):
+        saw_agent_meta = False
+        saw_real_user_content = False
+        for entry in content:
+            if not isinstance(entry, dict):
+                saw_real_user_content = True
+                continue
+            entry_type = str(entry.get("type", "")).lower()
+            if entry_type == "input_image":
+                saw_real_user_content = True
+                continue
+            if entry_type not in {"", "text", "input_text", "output_text"}:
+                saw_real_user_content = True
+                continue
+
+            text = entry.get("text")
+            if not isinstance(text, str):
+                text = entry.get("input_text")
+            if not isinstance(text, str):
+                text = entry.get("output_text")
+            if not isinstance(text, str):
+                saw_real_user_content = True
+                continue
+            if not text.strip():
+                continue
+            if _is_codex_meta_user_text(text):
+                saw_agent_meta = True
+                continue
+            saw_real_user_content = True
+        return saw_agent_meta, saw_real_user_content
+
+    for key in ("text", "input_text"):
+        value = item.get(key)
+        if not isinstance(value, str):
+            continue
+        if not value.strip():
+            return False, False
+        if _is_codex_meta_user_text(value):
+            return True, False
+        return False, True
+    return False, False
 
 
 def _is_codex_bootstrap_mini_request(input_param, model_name: str | None) -> bool:
@@ -330,27 +456,6 @@ def _determine_chat_candidate(messages) -> str:
     return AGENT_INITIATOR
 
 
-def _is_claude_transcript_container(content) -> bool:
-    """Detect Claude Code approval agent transcript messages.
-
-    Approval agents send a user message whose content list starts with a
-    ``<transcript>`` text block followed by the conversation transcript.
-    The entire message is agent-generated, not user-typed.
-    """
-    if not isinstance(content, list):
-        return False
-    for item in content:
-        if not isinstance(item, dict):
-            continue
-        if str(item.get("type", "")).lower() != "text":
-            continue
-        text = item.get("text")
-        if isinstance(text, str) and text.lstrip().startswith("<transcript>"):
-            return True
-        return False
-    return False
-
-
 def _strip_explicit_initiator_prefix_from_anthropic_message(
     message,
     *,
@@ -362,52 +467,74 @@ def _strip_explicit_initiator_prefix_from_anthropic_message(
     content = message.get("content")
     if isinstance(content, str):
         updated_text, explicit_initiator = _strip_explicit_initiator_prefix(content)
-        if explicit_initiator is not None:
-            message["content"] = updated_text
-            return explicit_initiator
         message["content"] = updated_text
-        if _is_claude_meta_user_text(updated_text):
-            return AGENT_INITIATOR
+        if explicit_initiator is not None:
+            return explicit_initiator
         return default_initiator
 
     if not isinstance(content, list):
         return default_initiator
 
-    if _is_claude_transcript_container(content):
-        return AGENT_INITIATOR
-
-    saw_tool_result = False
-    saw_non_tool_result = False
-    saw_agent_meta = False
     for item in content:
         if not isinstance(item, dict):
-            saw_non_tool_result = True
+            continue
+        item_type = str(item.get("type", "")).lower()
+        if item_type != "text":
+            continue
+        text = item.get("text")
+        if not isinstance(text, str):
+            continue
+        updated_text, explicit_initiator = _strip_explicit_initiator_prefix(text)
+        item["text"] = updated_text
+        if explicit_initiator is not None:
+            return explicit_initiator
+    return default_initiator
+
+
+def _anthropic_user_message_traits(message) -> tuple[bool, bool, bool]:
+    if not isinstance(message, dict):
+        return False, False, False
+
+    content = message.get("content")
+    if isinstance(content, str):
+        stripped = content.strip()
+        if not stripped:
+            return False, False, False
+        if _is_claude_meta_user_text(content):
+            return False, True, False
+        return False, False, True
+
+    if not isinstance(content, list):
+        return False, False, False
+
+    if _is_claude_transcript_container(content):
+        return False, True, False
+
+    saw_tool_result = False
+    saw_agent_meta = False
+    saw_real_user_content = False
+    for item in content:
+        if not isinstance(item, dict):
+            saw_real_user_content = True
             continue
         item_type = str(item.get("type", "")).lower()
         if item_type == "tool_result":
             saw_tool_result = True
             continue
         if item_type != "text":
-            saw_non_tool_result = True
+            saw_real_user_content = True
             continue
         text = item.get("text")
         if not isinstance(text, str):
-            saw_non_tool_result = True
+            saw_real_user_content = True
             continue
-        updated_text, explicit_initiator = _strip_explicit_initiator_prefix(text)
-        if explicit_initiator is not None:
-            item["text"] = updated_text
-            return explicit_initiator
-        item["text"] = updated_text
-        if not updated_text.strip():
+        if not text.strip():
             continue
-        if _is_claude_meta_user_text(updated_text):
+        if _is_claude_meta_user_text(text):
             saw_agent_meta = True
             continue
-        saw_non_tool_result = True
-    if (saw_tool_result or saw_agent_meta) and not saw_non_tool_result:
-        return AGENT_INITIATOR
-    return default_initiator
+        saw_real_user_content = True
+    return saw_tool_result, saw_agent_meta, saw_real_user_content
 
 
 def _determine_anthropic_candidate(messages) -> str:
@@ -415,6 +542,7 @@ def _determine_anthropic_candidate(messages) -> str:
         return AGENT_INITIATOR
 
     explicit_initiators: dict[int, str] = {}
+    ignorable_meta_messages: set[int] = set()
     for message in messages:
         if not isinstance(message, dict):
             continue
@@ -426,12 +554,25 @@ def _determine_anthropic_candidate(messages) -> str:
         )
         if explicit_initiator is not None:
             explicit_initiators[id(message)] = explicit_initiator
+            continue
+        saw_tool_result, saw_agent_meta, saw_real_user_content = _anthropic_user_message_traits(message)
+        if saw_agent_meta and not saw_tool_result and not saw_real_user_content:
+            ignorable_meta_messages.add(id(message))
 
     for message in reversed(messages):
         if not isinstance(message, dict):
             continue
         role = str(message.get("role", "")).lower()
         if role == "user":
+            if _is_claude_transcript_container(message.get("content")):
+                return AGENT_INITIATOR
+            if id(message) in ignorable_meta_messages:
+                continue
+            if id(message) in explicit_initiators:
+                return explicit_initiators[id(message)]
+            saw_tool_result, _saw_agent_meta, saw_real_user_content = _anthropic_user_message_traits(message)
+            if saw_tool_result and not saw_real_user_content:
+                return AGENT_INITIATOR
             return explicit_initiators.get(id(message), USER_INITIATOR)
         if role:
             return AGENT_INITIATOR
@@ -580,7 +721,7 @@ class InitiatorPolicy:
                 {
                     "triggered_at": resolved_now.isoformat(),
                     "trigger_reason": safeguard_reason,
-                    "candidate_initiator": candidate_initiator,
+                    "candidate_initiator": _public_candidate_initiator(candidate_initiator),
                     "resolved_initiator": initiator,
                     "model_name": _normalize_model_name(model_name),
                     "request_id": request_id,
@@ -643,11 +784,11 @@ class InitiatorPolicy:
         if _is_haiku_model(model_name):
             return AGENT_INITIATOR, None
 
-        initiator = USER_INITIATOR if candidate_initiator in {USER_INITIATOR, EXPLICIT_USER_INITIATOR} else AGENT_INITIATOR
-        if initiator == USER_INITIATOR and candidate_initiator == EXPLICIT_USER_INITIATOR:
-            return initiator, None
+        initiator = _public_candidate_initiator(candidate_initiator)
         safeguard_reason = self._safeguard_reason_locked(now)
         if initiator == USER_INITIATOR and safeguard_reason is not None:
+            if _candidate_bypasses_cooldown(candidate_initiator) and safeguard_reason == "cooldown":
+                return USER_INITIATOR, None
             return AGENT_INITIATOR, safeguard_reason
         return initiator, None
 

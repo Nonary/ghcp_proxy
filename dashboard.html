@@ -943,7 +943,7 @@
                 <th>Session</th>
                 <th>Model</th>
                 <th>Last Activity</th>
-                <th>Requests</th>
+                <th>Proxy Call Count</th>
                 <th>Tokens</th>
                 <th>Cost</th>
               </tr>
@@ -1450,7 +1450,7 @@
         >
           <span class="subtle">All-time context</span>
           <strong>{{ money(allTimeUsage.cost_usd) }}</strong>
-          <span class="subtle">{{ integer(allTimeUsage.request_count) }} requests · {{ compact(allTimeUsage.total_tokens) }} tokens</span>
+          <span class="subtle">{{ integer(allTimeUsage.request_count) }} proxy calls · {{ compact(allTimeUsage.total_tokens) }} tokens</span>
         </button>
       </div>
 
@@ -1470,7 +1470,7 @@
             <span class="badge">{{ dominantSourceLabel(card.usage) }}</span>
           </div>
           <div class="source-period-value">{{ money(card.usage.cost_usd) }}</div>
-          <div class="source-period-meta">{{ integer(card.usage.request_count) }} requests · {{ compact(card.usage.total_tokens) }} tokens</div>
+          <div class="source-period-meta">{{ integer(card.usage.request_count) }} proxy calls · {{ compact(card.usage.total_tokens) }} tokens</div>
           <div class="source-period-track">
             <span
               v-for="segment in periodSegments(card.usage)"
@@ -1554,7 +1554,7 @@
               </div>
               <div class="source-metric">
                 <div class="source-metric-head">
-                  <span>Requests</span>
+                  <span>Proxy Call Count</span>
                   <strong>{{ integer(row.request_count) }}</strong>
                 </div>
                 <div class="source-metric-track">
@@ -1603,7 +1603,7 @@
           <span class="summary-chip"><span class="chip-k">All-Time</span>{{ compact(allTime.total_tokens) }}</span>
         </div>
         <div class="summary-badge-row">
-          <span class="summary-label">Requests</span>
+          <span class="summary-label">Proxy Call Count</span>
           <span class="summary-chip"><span class="chip-k">Today</span>{{ integer(todayUsage.request_count) }}</span>
           <span class="summary-chip"><span class="chip-k">Month</span>{{ integer(currentMonth.request_count) }}</span>
           <span class="summary-chip"><span class="chip-k">All-Time</span>{{ integer(allTime.request_count) }}</span>
@@ -1908,7 +1908,7 @@
               height,
               shortLabel: this.shortLabel(row),
               showLabel: index === 0 || index === count - 1 || index % step === 0,
-              tooltip: `${this.longLabel(row)}: ${this.formatValue(value)} · ${this.integer(row?.request_count)} requests`,
+              tooltip: `${this.longLabel(row)}: ${this.formatValue(value)} · ${this.integer(row?.request_count)} proxy calls`,
             };
           });
         },
@@ -2062,7 +2062,7 @@
             : (this.selectedScope === 'week'
               ? 'Last 7 days'
               : (this.selectedScope === 'today' ? 'Today' : 'This month'));
-          return `${range} · ${this.integer(u.request_count)} requests · ${this.compact(u.total_tokens)} tokens · ${this.money(u.cost_usd)}`;
+          return `${range} · ${this.integer(u.request_count)} proxy calls · ${this.compact(u.total_tokens)} tokens · ${this.money(u.cost_usd)}`;
         },
         rawRows() {
           const u = this.activeUsage || {};
@@ -2177,7 +2177,7 @@
         },
         activeSubtitle() {
           const u = this.activeUsage || {};
-          return `${this.spotlightTitle} · ${this.integer(u.request_count)} requests · ${this.compact(u.total_tokens)} total tokens · ${this.money(u.cost_usd)}`;
+          return `${this.spotlightTitle} · ${this.integer(u.request_count)} proxy calls · ${this.compact(u.total_tokens)} total tokens · ${this.money(u.cost_usd)}`;
         },
         spotlightTitle() {
           if (this.scope === 'all') return 'All-Time Split';
@@ -2453,7 +2453,7 @@
           return `${this.money(this.todayUsage.cost_usd)} today · ${this.money(this.averageDailySpend)} avg/day · ${this.money(this.monthlySpendProjection)} projected`;
         },
         monthlySpendMeta() {
-          return `${this.integer(this.trackedMonths)} months tracked · ${this.integer(this.allTime.request_count)} requests overall`;
+          return `${this.integer(this.trackedMonths)} months tracked · ${this.integer(this.allTime.request_count)} proxy calls overall`;
         },
         dailyHistoryEnriched() {
           return (this.dailyHistory || []).map(row => ({
