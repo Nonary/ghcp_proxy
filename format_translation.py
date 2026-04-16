@@ -41,11 +41,11 @@ def resolve_copilot_model_name(model_name: str | None) -> str | None:
     if not isinstance(normalized, str):
         return model_name
 
-    if normalized in ("claude-opus-4.6", "claude-sonnet-4.6", "claude-haiku-4.5"):
+    if normalized in ("claude-opus-4.6", "claude-opus-4.7", "claude-sonnet-4.6", "claude-haiku-4.5"):
         return normalized
 
     if "opus" in normalized:
-        return "claude-opus-4.6"
+        return "claude-opus-4.7"
     if "sonnet" in normalized:
         return "claude-sonnet-4.6"
     if "haiku" in normalized:
@@ -235,17 +235,10 @@ def anthropic_message_to_chat_messages(message: dict) -> list[dict]:
 
     chat_messages = []
     buffered_user_blocks = []
+    buffered_tool_messages = []
     for item in blocks:
         item_type = str(item.get("type", "")).lower()
         if item_type == "tool_result":
-            if buffered_user_blocks:
-                chat_messages.append(
-                    {
-                        "role": "user",
-                        "content": _anthropic_blocks_to_chat_content(buffered_user_blocks),
-                    }
-                )
-                buffered_user_blocks = []
             tool_use_id = item.get("tool_use_id")
             if not isinstance(tool_use_id, str):
                 raise ValueError("Anthropic tool_result blocks must include tool_use_id")
@@ -260,13 +253,14 @@ def anthropic_message_to_chat_messages(message: dict) -> list[dict]:
             cache_control = _normalize_anthropic_cache_control(item.get("cache_control"))
             if cache_control is not None:
                 tool_message["copilot_cache_control"] = cache_control
-            chat_messages.append(tool_message)
+            buffered_tool_messages.append(tool_message)
             continue
         content_item = _anthropic_text_or_image_block_to_chat(item)
         if content_item is None:
             raise ValueError(f"Unsupported Anthropic content block type: {item_type}")
         buffered_user_blocks.append(item)
 
+    chat_messages.extend(buffered_tool_messages)
     if buffered_user_blocks:
         chat_messages.append(
             {
@@ -568,6 +562,20 @@ def responses_request_to_chat(body: dict) -> dict:
     raw_input = body.get("input")
     chat_messages = []
     system_prompt_parts = []
+    pending_tool_call_ids = set()
+    deferred_messages = []
+
+    def append_or_defer_message(message: dict):
+        if pending_tool_call_ids and message.get("role") != "assistant":
+            deferred_messages.append(message)
+            return
+        chat_messages.append(message)
+
+    def flush_deferred_messages():
+        if pending_tool_call_ids or not deferred_messages:
+            return
+        chat_messages.extend(deferred_messages)
+        deferred_messages.clear()
 
     instructions = body.get("instructions")
     if isinstance(instructions, str) and instructions.strip():
@@ -590,7 +598,7 @@ def responses_request_to_chat(body: dict) -> dict:
                     if message_content:
                         system_prompt_parts.append(message_content)
                     continue
-                chat_messages.append(
+                append_or_defer_message(
                     {
                         "role": normalized_role,
                         "content": message_content,
@@ -601,13 +609,14 @@ def responses_request_to_chat(body: dict) -> dict:
                 function_name = item.get("name")
                 if not isinstance(function_name, str):
                     raise ValueError("Responses function_call items must include a name")
+                call_id = item.get("call_id") or item.get("id") or f"call_{uuid4().hex}"
                 chat_messages.append(
                     {
                         "role": "assistant",
                         "content": "",
                         "tool_calls": [
                             {
-                                "id": item.get("call_id") or item.get("id") or f"call_{uuid4().hex}",
+                                "id": call_id,
                                 "type": "function",
                                 "function": {
                                     "name": function_name,
@@ -619,6 +628,7 @@ def responses_request_to_chat(body: dict) -> dict:
                         ],
                     }
                 )
+                pending_tool_call_ids.add(call_id)
                 continue
             if item_type == "function_call_output":
                 call_id = item.get("call_id")
@@ -636,6 +646,8 @@ def responses_request_to_chat(body: dict) -> dict:
                         "content": output_text,
                     }
                 )
+                pending_tool_call_ids.discard(call_id)
+                flush_deferred_messages()
                 continue
             if item_type == "custom_tool_call":
                 custom_tool_text = _format_custom_tool_call_for_chat(item)
@@ -664,6 +676,9 @@ def responses_request_to_chat(body: dict) -> dict:
                 # internal tool-call record.
                 continue
             raise ValueError(f"Unsupported Responses input item type: {item_type}")
+
+    if deferred_messages:
+        chat_messages.extend(deferred_messages)
 
     system_prompt = _merge_chat_system_prompt_parts(system_prompt_parts)
     if system_prompt:

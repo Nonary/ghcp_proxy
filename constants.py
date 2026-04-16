@@ -417,6 +417,7 @@ PREMIUM_REQUEST_MULTIPLIERS = {
     "claude-haiku-4-5": 0.33,
     "claude-opus-4.5": 3.0,
     "claude-opus-4.6": 3.0,
+    "claude-opus-4.7": 7.5,
     "claude-sonnet-4": 1.0,
     "claude-sonnet-4.5": 1.0,
     "claude-sonnet-4.6": 1.0,

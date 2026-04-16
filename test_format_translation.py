@@ -147,6 +147,32 @@ class FormatTranslationTests(unittest.TestCase):
         tool_msg = [m for m in outbound["messages"] if m["role"] == "tool"][0]
         self.assertNotIn("copilot_cache_control", tool_msg)
 
+    def test_anthropic_request_to_chat_emits_tool_results_before_user_text(self):
+        body = {
+            "model": "claude-opus-4.7",
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "tool_use", "id": "tool_1", "name": "Read", "input": {"file": "test.py"}},
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Here is the output."},
+                        {"type": "tool_result", "tool_use_id": "tool_1", "content": "file contents"},
+                    ],
+                },
+            ],
+        }
+
+        outbound = proxy.asyncio.run(format_translation.anthropic_request_to_chat(body, "https://example.invalid", "test-key"))
+
+        self.assertEqual([message["role"] for message in outbound["messages"]], ["assistant", "tool", "user"])
+        self.assertEqual(outbound["messages"][1]["tool_call_id"], "tool_1")
+        self.assertEqual(outbound["messages"][2]["content"], "Here is the output.")
+
     def test_build_fake_compaction_request_preserves_openai_xhigh_reasoning(self):
         body = {
             "model": "openai/gpt-5.4",
@@ -676,6 +702,40 @@ class FormatTranslationTests(unittest.TestCase):
         self.assertEqual(translated["messages"][3]["content"], "file contents")
         self.assertEqual(translated["stream_options"], {"include_usage": True})
 
+    def test_responses_request_to_chat_defers_user_messages_until_tool_output(self):
+        body = {
+            "model": "claude-opus-4.7",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "hello"}],
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "Read",
+                    "arguments": '{"file":"main.py"}',
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Use that for the answer."}],
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "file contents",
+                },
+            ],
+        }
+
+        translated = format_translation.responses_request_to_chat(body)
+
+        self.assertEqual([message["role"] for message in translated["messages"]], ["user", "assistant", "tool", "user"])
+        self.assertEqual(translated["messages"][2]["tool_call_id"], "call_1")
+        self.assertEqual(translated["messages"][3]["content"], "Use that for the answer.")
+
     def test_responses_request_to_chat_skips_web_search_call_items(self):
         body = {
             "model": "claude-opus-4.6",
@@ -1032,6 +1092,18 @@ class FormatTranslationTests(unittest.TestCase):
         self.assertEqual(
             format_translation.resolve_copilot_model_name("claude-haiku-4-5-20251001"),
             "claude-haiku-4.5",
+        )
+
+    def test_resolve_copilot_model_name_preserves_supported_opus_4_7(self):
+        self.assertEqual(
+            format_translation.resolve_copilot_model_name("claude-opus-4.7"),
+            "claude-opus-4.7",
+        )
+
+    def test_resolve_copilot_model_name_maps_generic_opus_to_latest_supported_version(self):
+        self.assertEqual(
+            format_translation.resolve_copilot_model_name("opus"),
+            "claude-opus-4.7",
         )
 
 
