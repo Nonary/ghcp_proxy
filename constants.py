@@ -266,6 +266,12 @@ MODEL_PRICING = {
         "cached_input_per_million": 0.50,
         "output_per_million": 25.00,
     },
+    "claude-opus-4.7": {
+        "provider": "Anthropic",
+        "input_per_million": 5.00,
+        "cached_input_per_million": 0.50,
+        "output_per_million": 25.00,
+    },
     "gpt-4.1": {
         "provider": "OpenAI",
         "input_per_million": 2.00,

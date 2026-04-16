@@ -831,8 +831,12 @@ def _ingest_usage_event(bucket: dict, event: dict):
 
     usage = normalize_usage_payload(event.get("usage")) or {}
     event_cost = event.get("cost_usd")
-    if not isinstance(event_cost, (int, float)):
-        event_cost = _usage_event_cost(_usage_event_model_name(event), usage)
+    if not isinstance(event_cost, (int, float)) or not event_cost:
+        recomputed_cost = _usage_event_cost(_usage_event_model_name(event), usage)
+        if recomputed_cost:
+            event_cost = recomputed_cost
+        elif not isinstance(event_cost, (int, float)):
+            event_cost = 0.0
 
     event_time = _parse_iso_datetime(event.get("finished_at") or event.get("started_at"))
     if event_time is not None:
