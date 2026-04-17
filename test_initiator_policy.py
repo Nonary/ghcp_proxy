@@ -16,13 +16,14 @@ class InitiatorPolicyTests(unittest.TestCase):
         start = datetime(2026, 4, 4, 18, 0, tzinfo=timezone.utc)
 
         policy.note_request_started("req-1", "user", started_at=start)
+        policy.note_request_finished("req-1", finished_at=start.replace(second=4))
 
         with mock.patch.object(initiator_policy, "utc_now", return_value=start.replace(second=5)):
             initiator = policy.resolve_initiator("user", "gpt-5.4", request_id="req-2")
 
         self.assertEqual(initiator, "agent")
         self.assertEqual(len(recorded), 1)
-        self.assertEqual(recorded[0]["trigger_reason"], "active_request")
+        self.assertEqual(recorded[0]["trigger_reason"], "cooldown")
         self.assertEqual(recorded[0]["resolved_initiator"], "agent")
         self.assertEqual(recorded[0]["request_id"], "req-2")
 
@@ -555,16 +556,16 @@ class InitiatorPolicyTests(unittest.TestCase):
         self.assertEqual(messages[-1]["content"][-1]["text"], "new prompt")
         self.assertEqual(initiator, "user")
 
-    def test_active_request_forces_following_user_request_to_agent(self):
+    def test_parallel_user_candidate_requests_both_resolve_to_user(self):
         policy = initiator_policy.InitiatorPolicy()
         start = datetime(2026, 4, 4, 18, 0, tzinfo=timezone.utc)
 
         policy.note_request_started("req-1", "user", started_at=start)
 
         with mock.patch.object(initiator_policy, "utc_now", return_value=start.replace(second=5)):
-            self.assertEqual(policy.resolve_initiator("user", "gpt-5"), "agent")
+            self.assertEqual(policy.resolve_initiator("user", "gpt-5"), "user")
 
-    def test_request_resolution_with_request_id_marks_activity_for_other_requests(self):
+    def test_request_resolution_with_request_id_marks_parallel_user_request_active(self):
         policy = initiator_policy.InitiatorPolicy()
         start = datetime(2026, 4, 4, 18, 5, tzinfo=timezone.utc)
 
@@ -572,7 +573,9 @@ class InitiatorPolicyTests(unittest.TestCase):
             self.assertEqual(policy.resolve_initiator("user", "gpt-5", request_id="req-1"), "user")
 
         with mock.patch.object(initiator_policy, "utc_now", return_value=start.replace(second=1)):
-            self.assertEqual(policy.resolve_initiator("user", "gpt-5", request_id="req-2"), "agent")
+            self.assertEqual(policy.resolve_initiator("user", "gpt-5", request_id="req-2"), "user")
+
+        self.assertEqual(set(policy._active_requests), {"req-1", "req-2"})
 
     def test_recent_finished_request_forces_following_user_looking_request_to_agent(self):
         policy = initiator_policy.InitiatorPolicy()
@@ -618,7 +621,7 @@ class InitiatorPolicyTests(unittest.TestCase):
         with mock.patch.object(initiator_policy, "utc_now", return_value=datetime(2026, 4, 4, 18, 40, 34, tzinfo=timezone.utc)):
             self.assertEqual(policy.resolve_initiator("user", "gpt-5"), "user")
 
-    def test_stream_like_request_stays_active_until_finished(self):
+    def test_stream_like_request_does_not_block_parallel_user_request(self):
         policy = initiator_policy.InitiatorPolicy()
         started_at = datetime(2026, 4, 4, 18, 30, tzinfo=timezone.utc)
         finished_at = datetime(2026, 4, 4, 18, 31, tzinfo=timezone.utc)
@@ -626,7 +629,7 @@ class InitiatorPolicyTests(unittest.TestCase):
         policy.note_request_started("stream-1", "user", started_at=started_at)
 
         with mock.patch.object(initiator_policy, "utc_now", return_value=finished_at):
-            self.assertEqual(policy.resolve_initiator("user", "gpt-5"), "agent")
+            self.assertEqual(policy.resolve_initiator("user", "gpt-5"), "user")
 
         policy.note_request_finished("stream-1", finished_at=finished_at)
 
@@ -692,7 +695,7 @@ class InitiatorPolicyTests(unittest.TestCase):
         with mock.patch.object(initiator_policy, "utc_now", return_value=start.replace(second=2)):
             self.assertEqual(
                 policy.resolve_initiator("user", "claude-sonnet-4.6"),
-                "agent",
+                "user",
             )
 
     def test_safeguard_activates_after_first_user_request(self):
@@ -707,6 +710,8 @@ class InitiatorPolicyTests(unittest.TestCase):
                 policy.resolve_initiator("user", "gpt-5", request_id="req-2"),
                 "user",
             )
+
+        policy.note_request_finished("req-2", finished_at=start.replace(second=6))
 
         with mock.patch.object(initiator_policy, "utc_now", return_value=start.replace(second=7)):
             self.assertEqual(policy.resolve_initiator("user", "gpt-5"), "agent")

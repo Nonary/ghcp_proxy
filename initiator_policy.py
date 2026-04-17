@@ -597,6 +597,7 @@ class InitiatorPolicy:
         self._lock = Lock()
         self._active_requests: dict[str, dict[str, str | None]] = {}
         self._last_activity_at: datetime | None = None
+        self._last_finished_at: datetime | None = None
         self._seen_user_request: bool = False
 
     def seed_from_usage_events(self, events, *, now: datetime | None = None):
@@ -605,6 +606,7 @@ class InitiatorPolicy:
             self._events.clear()
             self._active_requests.clear()
             self._last_activity_at = None
+            self._last_finished_at = None
             self._seen_user_request = False
 
             if not isinstance(events, list):
@@ -625,6 +627,7 @@ class InitiatorPolicy:
             seeded_events.sort(key=lambda item: item[0])
             for finished_at, initiator in seeded_events:
                 self._last_activity_at = finished_at
+                self._last_finished_at = finished_at
                 self._events.append(
                     {
                         "at": finished_at.isoformat(),
@@ -732,7 +735,7 @@ class InitiatorPolicy:
             if isinstance(request_id, str) and request_id:
                 self._record_request_started_locked(request_id, initiator, resolved_now)
             active_count = len(self._active_requests)
-            last_activity_at = self._last_activity_at
+            last_finished_at = self._last_finished_at
         if safeguard_reason is not None and self.on_safeguard_triggered is not None:
             self.on_safeguard_triggered(
                 {
@@ -756,8 +759,8 @@ class InitiatorPolicy:
                     "explicit_user_prefix": candidate_initiator == _EXPLICIT_USER_INITIATOR,
                     "active_requests_at_decision": active_count,
                     "seconds_since_last_activity": (
-                        (resolved_now - last_activity_at).total_seconds()
-                        if last_activity_at is not None
+                        (resolved_now - last_finished_at).total_seconds()
+                        if last_finished_at is not None
                         else None
                     ),
                     "cooldown_seconds": self.request_finish_guard_seconds,
@@ -794,6 +797,7 @@ class InitiatorPolicy:
             initiator = active.get("initiator") if isinstance(active, dict) else None
             if active is not None:
                 self._last_activity_at = event_time
+                self._last_finished_at = event_time
             self._events.append(
                 {
                     "at": event_time.isoformat(),
@@ -831,11 +835,20 @@ class InitiatorPolicy:
     def _safeguard_reason_locked(self, now: datetime) -> str | None:
         if not self._seen_user_request:
             return None
-        if self._active_requests:
-            return "active_request"
-        if self._last_activity_at is None:
+        # Note: we intentionally do NOT demote candidate=user just because
+        # other requests are in flight. Clients like opencode/Copilot fan out
+        # multiple parallel requests (title-gen, context-prep, the real turn)
+        # at the moment the user hits enter, so "active requests exist" is
+        # routinely true for the genuine user turn. The structural candidate
+        # walker (_determine_*_candidate) already rejects tool_result-tail
+        # continuations as agent regardless of timing, so an agent follow-up
+        # that races in during an in-flight user turn will still be classified
+        # correctly on its own merits. The post-finish cooldown below is
+        # retained as a belt-and-suspenders guard for the narrow window
+        # immediately after a request completes.
+        if self._last_finished_at is None:
             return None
-        elapsed_seconds = (now - self._last_activity_at).total_seconds()
+        elapsed_seconds = (now - self._last_finished_at).total_seconds()
         if elapsed_seconds < self.request_finish_guard_seconds:
             return "cooldown"
         return None
