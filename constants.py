@@ -28,6 +28,7 @@ BILLING_TOKEN_FILE = os.path.join(TOKEN_DIR, "billing-token")
 API_KEY_FILE      = os.path.join(TOKEN_DIR, "api-key.json")
 MODEL_ROUTING_CONFIG_FILE = os.path.join(TOKEN_DIR, "model-routing.json")
 PREMIUM_PLAN_CONFIG_FILE = os.path.join(TOKEN_DIR, "premium-plan.json")
+SAFEGUARD_CONFIG_FILE = os.path.join(TOKEN_DIR, "safeguard.json")
 USAGE_LOG_FILE    = os.path.join(TOKEN_DIR, "usage-log.jsonl")
 REQUEST_ERROR_LOG_FILE = os.path.join(TOKEN_DIR, "request-errors.log")
 REQUEST_TRACE_LOG_FILE = os.path.join(TOKEN_DIR, "request-trace.jsonl")
@@ -445,6 +446,11 @@ PREMIUM_REQUEST_MULTIPLIERS = {
     "gemini-3.1-pro": 1.0,
     "raptor-mini": 0.0,
 }
+
+# ─── Safeguard defaults ──────────────────────────────────────────────────────
+SAFEGUARD_DEFAULT_COOLDOWN_SECONDS = 15.0
+SAFEGUARD_MIN_COOLDOWN_SECONDS = 0.0
+SAFEGUARD_MAX_COOLDOWN_SECONDS = 600.0
 
 SKU_PREMIUM_ALLOWANCES = {
     "copilot_free": 50,

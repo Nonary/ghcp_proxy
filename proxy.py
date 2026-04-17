@@ -23,6 +23,7 @@ import sqlite3
 import sys
 import time
 import premium_plan_config
+import safeguard_config as safeguard_config_module
 import usage_tracking
 import util
 from dataclasses import dataclass
@@ -101,6 +102,18 @@ def _record_safeguard_trigger(event: dict):
         pass
 
 _initiator_policy = InitiatorPolicy(on_safeguard_triggered=_record_safeguard_trigger)
+safeguard_config_service = safeguard_config_module.SafeguardConfigService(
+    safeguard_config_module.SafeguardConfig()
+)
+
+
+def _apply_safeguard_settings(settings: dict):
+    cooldown = settings.get("cooldown_seconds") if isinstance(settings, dict) else None
+    if isinstance(cooldown, (int, float)):
+        _initiator_policy.request_finish_guard_seconds = float(cooldown)
+
+
+_apply_safeguard_settings(safeguard_config_service.load_settings())
 usage_event_bus = EventBus()
 
 
@@ -118,6 +131,7 @@ def set_initiator_policy(policy: InitiatorPolicy):
     global _initiator_policy
     policy.on_safeguard_triggered = _record_safeguard_trigger
     _initiator_policy = policy
+    _apply_safeguard_settings(safeguard_config_service.load_settings())
     usage_tracker.on_request_finished = policy.note_request_finished
 
 
@@ -1245,6 +1259,27 @@ async def dashboard_stream(request: Request):
 @app.get("/api/config/premium-plan")
 async def premium_plan_status_api():
     return JSONResponse(content=premium_plan_config_service.config_payload())
+
+
+@app.get("/api/config/safeguard")
+async def safeguard_status_api():
+    return JSONResponse(content=safeguard_config_service.config_payload())
+
+
+@app.post("/api/config/safeguard")
+async def safeguard_config_api(request: Request):
+    payload = await parse_json_request(request)
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Request body must be an object")
+
+    if bool(payload.get("reset")):
+        result = safeguard_config_service.save_settings(
+            {"cooldown_seconds": safeguard_config_service.default_settings()["cooldown_seconds"]}
+        )
+    else:
+        result = safeguard_config_service.save_settings(payload)
+    _apply_safeguard_settings(result)
+    return JSONResponse(content=result)
 
 
 @app.post("/api/config/premium-plan")

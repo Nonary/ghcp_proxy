@@ -873,6 +873,40 @@
         <div v-if="premiumPlan.error" class="status error">{{ premiumPlan.error }}</div>
         <div v-else-if="premiumPlan.statusMessage" class="status good">{{ premiumPlan.statusMessage }}</div>
       </article>
+      <article class="panel">
+        <div class="panel-head">
+          <div>
+            <div class="eyebrow">Safeguard</div>
+            <h3>Cooldown</h3>
+            <div class="subtle">{{ safeguardConfigStatusLabel }}</div>
+          </div>
+        </div>
+        <div class="toolbar">
+          <input
+            v-model.number="safeguardConfig.cooldownInput"
+            type="number"
+            :min="safeguardConfig.min"
+            :max="safeguardConfig.max"
+            step="1"
+            placeholder="Seconds"
+          />
+          <button class="primary" @click="saveSafeguardConfig" :disabled="savingSafeguardConfig">
+            Save
+          </button>
+          <button @click="resetSafeguardConfig" :disabled="savingSafeguardConfig">
+            Reset to default
+          </button>
+        </div>
+        <div class="sync-guide">
+          <div class="subtle">
+            After any proxied request, the safeguard flips follow-up user turns to agent traffic for this many seconds.
+            Default is {{ integer(safeguardConfig.defaultSeconds) }}s.
+            Allowed range {{ integer(safeguardConfig.min) }}–{{ integer(safeguardConfig.max) }}s.
+          </div>
+        </div>
+        <div v-if="safeguardConfig.error" class="status error">{{ safeguardConfig.error }}</div>
+        <div v-else-if="safeguardConfig.statusMessage" class="status good">{{ safeguardConfig.statusMessage }}</div>
+      </article>
     </section>
 
     <section class="chart-grid">
@@ -1081,7 +1115,7 @@
                   </div>
                   <div>
                     <div class="detail-label">Output Tokens</div>
-                    <div class="detail-value">{{ compact(selectedRequest.usage.output_tokens) }}</div>
+                    <div class="detail-value">{{ compact(displayOutputTokens(selectedRequest.usage)) }}</div>
                   </div>
                   <div>
                     <div class="detail-label">Cached Input Tokens</div>
@@ -1104,7 +1138,7 @@
                   </div>
                   <div>
                     <div class="detail-label">Output Tokens</div>
-                    <div class="detail-value">{{ compact(requestChainUsage(selectedRequest).output_tokens) }}</div>
+                    <div class="detail-value">{{ compact(displayOutputTokens(requestChainUsage(selectedRequest))) }}</div>
                   </div>
                   <div>
                     <div class="detail-label">Cached Input Tokens</div>
@@ -1770,12 +1804,15 @@
 
     function totalTokenConsumption(row) {
       const freshInput = Math.max(0, Number(row?.input_tokens || 0));
-      const cachedInput = Math.max(0, Number(row?.cached_input_tokens || 0));
-      const reasoningOutput = Math.max(0, Number(row?.reasoning_output_tokens || 0));
-      const visibleOutput = Math.max(0, Number(row?.output_tokens || 0) - reasoningOutput);
+      // Unify output accounting for display: OpenAI's output_tokens excludes reasoning
+      // (reported separately in reasoning_output_tokens); Anthropic's output_tokens already
+      // includes thinking and reasoning_output_tokens is 0. Summing gives the true billable
+      // output token count across both providers without changing API contracts.
+      const output = Math.max(0, Number(row?.output_tokens || 0))
+                   + Math.max(0, Number(row?.reasoning_output_tokens || 0));
       return {
-        visible_output_tokens: visibleOutput,
-        stacked_total_tokens: cachedInput + freshInput + visibleOutput + reasoningOutput,
+        visible_output_tokens: output,
+        stacked_total_tokens: freshInput + output,
       };
     }
 
@@ -2067,19 +2104,19 @@
         rawRows() {
           const u = this.activeUsage || {};
           const freshInput = Number(u.input_tokens || 0);
+          const outputTokens = Number(u.output_tokens || 0) + Number(u.reasoning_output_tokens || 0);
           const rows = [
             { label: 'Input (fresh)',    tokens: freshInput,                                     field: 'input_fresh',             color: '#ff8752' },
             { label: 'Input (cached)',   tokens: Number(u.cached_input_tokens || 0),             field: 'cached_input_tokens',     color: '#6ee7c8' },
             { label: 'Cache Creation',   tokens: Number(u.cache_creation_tokens || 0),           field: 'cache_creation_tokens',   color: '#f6b16d' },
-            { label: 'Output',           tokens: Number(u.output_tokens || 0),                   field: 'output_tokens',           color: '#7eaaff' },
-            { label: 'Reasoning Output', tokens: Number(u.reasoning_output_tokens || 0),         field: 'reasoning_output_tokens', color: '#c89eff' },
+            { label: 'Output',           tokens: outputTokens,                                   field: 'output_tokens',           color: '#7eaaff' },
           ].filter(r => r.tokens > 0);
 
           const totalCost = Number(u.cost_usd || 0);
 
           const weights = {
             input_fresh: 1, cached_input_tokens: 0.1, cache_creation_tokens: 1.25,
-            output_tokens: 5, reasoning_output_tokens: 5,
+            output_tokens: 5,
           };
           const totalWeighted = rows.reduce((sum, r) => sum + r.tokens * (weights[r.field] || 1), 0);
 
@@ -2351,6 +2388,16 @@
             error: '',
             statusMessage: '',
           },
+          safeguardConfig: {
+            cooldownSeconds: 15,
+            cooldownInput: 15,
+            defaultSeconds: 15,
+            min: 0,
+            max: 600,
+            error: '',
+            statusMessage: '',
+          },
+          savingSafeguardConfig: false,
           modelRouting: {
             enabled: false,
             mappings: [],
@@ -2470,10 +2517,10 @@
           }));
         },
         dailyTokenMeta() {
-          return `${this.compact(this.todayTokenConsumption)} today · ${this.compact(this.todayUsage.input_tokens)} fresh in · ${this.compact(this.todayUsage.cached_input_tokens)} cached`;
+          return `${this.compact(this.todayTokenConsumption)} today · ${this.compact(this.todayUsage.input_tokens)} input · ${this.compact(totalTokenConsumption(this.todayUsage).visible_output_tokens)} output`;
         },
         monthlyTokenMeta() {
-          return `${this.compact(this.allTimeTokenConsumption)} total · ${this.compact(this.allTime.input_tokens)} fresh in · ${this.compact(this.allTime.cached_input_tokens)} cached`;
+          return `${this.compact(this.allTimeTokenConsumption)} total · ${this.compact(this.allTime.input_tokens)} input · ${this.compact(totalTokenConsumption(this.allTime).visible_output_tokens)} output`;
         },
         premiumSourceLabel() {
           const source = String(this.premium.source || '').trim();
@@ -2542,6 +2589,12 @@
         },
         premiumPlanPreviewPercent() {
           return `${this._formatPercent(this.premiumPlan.currentPercentInput || 0)}%`;
+        },
+        safeguardConfigStatusLabel() {
+          const seconds = Number(this.safeguardConfig.cooldownSeconds);
+          if (!Number.isFinite(seconds)) return 'Cooldown not configured';
+          if (seconds <= 0) return 'Cooldown disabled (0s)';
+          return `Cooldown of ${this.integer(seconds)}s after each proxied request`;
         },
         filteredSessions() {
           const rows = (this.data.recent_sessions || []).filter((row) => this.allowSource(row.source) && this.matches(row));
@@ -2657,7 +2710,7 @@
         tokenSummary(row) {
           const usage = row?.usage || {};
           const input = Number(usage.input_tokens || 0);
-          const output = Number(usage.output_tokens || 0);
+          const output = this.displayOutputTokens(usage);
           const total = Number(usage.total_tokens || (input + output));
           if (!Number.isFinite(input) && !Number.isFinite(output) && !Number.isFinite(total)) {
             return '-';
@@ -2680,6 +2733,15 @@
           if (details && details.cached_tokens != null) return Number(details.cached_tokens);
           return 0;
         },
+        displayOutputTokens(usage) {
+          // Unified output for display: OpenAI separates reasoning from output, Anthropic
+          // folds it into output already. Summing gives the true billable output token
+          // count across both providers. Storage/API fields are unchanged.
+          if (!usage || typeof usage !== 'object') return 0;
+          const output = Number(usage.output_tokens || 0);
+          const reasoning = Number(usage.reasoning_output_tokens || 0);
+          return (Number.isFinite(output) ? output : 0) + (Number.isFinite(reasoning) ? reasoning : 0);
+        },
         requestChainRows(row) {
           const chainId = row?.server_request_id;
           if (!chainId) return [];
@@ -2692,15 +2754,17 @@
             const usage = item?.usage || {};
             const input = Number(usage.input_tokens || 0);
             const output = Number(usage.output_tokens || 0);
+            const reasoning = Number(usage.reasoning_output_tokens || 0);
             const total = Number(usage.total_tokens || (input + output));
             const cost = Number(item?.cost_usd || 0);
             totals.input_tokens += Number.isFinite(input) ? input : 0;
             totals.output_tokens += Number.isFinite(output) ? output : 0;
+            totals.reasoning_output_tokens += Number.isFinite(reasoning) ? reasoning : 0;
             totals.total_tokens += Number.isFinite(total) ? total : 0;
             totals.cached_input_tokens += this.cachedInputTokens(item);
             totals.cost_usd += Number.isFinite(cost) ? cost : 0;
             return totals;
-          }, { input_tokens: 0, output_tokens: 0, total_tokens: 0, cached_input_tokens: 0, cost_usd: 0 });
+          }, { input_tokens: 0, output_tokens: 0, reasoning_output_tokens: 0, total_tokens: 0, cached_input_tokens: 0, cost_usd: 0 });
         },
         requestChainCount(row) {
           return this.requestChainRows(row).length;
@@ -3055,6 +3119,92 @@
             this.savingPremiumPlan = false;
           }
         },
+        _applySafeguardConfigPayload(payload) {
+          if (!payload || typeof payload !== 'object') return;
+          const cooldown = Number(payload.cooldown_seconds);
+          const defaultCooldown = Number(payload.default_cooldown_seconds);
+          const minCooldown = Number(payload.min_cooldown_seconds);
+          const maxCooldown = Number(payload.max_cooldown_seconds);
+          if (Number.isFinite(cooldown)) {
+            this.safeguardConfig.cooldownSeconds = cooldown;
+            this.safeguardConfig.cooldownInput = cooldown;
+          }
+          if (Number.isFinite(defaultCooldown)) this.safeguardConfig.defaultSeconds = defaultCooldown;
+          if (Number.isFinite(minCooldown)) this.safeguardConfig.min = minCooldown;
+          if (Number.isFinite(maxCooldown)) this.safeguardConfig.max = maxCooldown;
+        },
+        async loadSafeguardConfig() {
+          try {
+            const response = await fetch('/api/config/safeguard');
+            if (!response.ok) throw new Error(`safeguard status request failed: ${response.status}`);
+            const payload = await response.json();
+            this._applySafeguardConfigPayload(payload);
+            this.safeguardConfig.error = '';
+          } catch (error) {
+            this.safeguardConfig.error = String(error?.message || error || '');
+            if (this.safeguardConfig.error.includes('404')) {
+              this.safeguardConfig.error += ' - restart the proxy so the new safeguard API route is available.';
+            }
+          }
+        },
+        async saveSafeguardConfig() {
+          if (this.savingSafeguardConfig) return;
+          this.savingSafeguardConfig = true;
+          this.safeguardConfig.statusMessage = '';
+          this.safeguardConfig.error = '';
+          try {
+            const response = await fetch('/api/config/safeguard', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ cooldown_seconds: Number(this.safeguardConfig.cooldownInput) }),
+            });
+            if (!response.ok) {
+              let message = `save request failed: ${response.status}`;
+              try {
+                const data = await response.json();
+                if (data?.detail) message = data.detail;
+                else if (data?.error) message = data.error;
+              } catch (_error) {}
+              throw new Error(message);
+            }
+            const payload = await response.json();
+            this._applySafeguardConfigPayload(payload);
+            this.safeguardConfig.statusMessage = 'Safeguard cooldown saved.';
+          } catch (error) {
+            this.safeguardConfig.error = String(error?.message || error || '');
+          } finally {
+            this.savingSafeguardConfig = false;
+          }
+        },
+        async resetSafeguardConfig() {
+          if (this.savingSafeguardConfig) return;
+          this.savingSafeguardConfig = true;
+          this.safeguardConfig.statusMessage = '';
+          this.safeguardConfig.error = '';
+          try {
+            const response = await fetch('/api/config/safeguard', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ reset: true }),
+            });
+            if (!response.ok) {
+              let message = `reset request failed: ${response.status}`;
+              try {
+                const data = await response.json();
+                if (data?.detail) message = data.detail;
+                else if (data?.error) message = data.error;
+              } catch (_error) {}
+              throw new Error(message);
+            }
+            const payload = await response.json();
+            this._applySafeguardConfigPayload(payload);
+            this.safeguardConfig.statusMessage = 'Safeguard cooldown reset to default.';
+          } catch (error) {
+            this.safeguardConfig.error = String(error?.message || error || '');
+          } finally {
+            this.savingSafeguardConfig = false;
+          }
+        },
         allowSource(source) { return this.sourceFilter === 'all' || this.sourceFilter === source; },
         matches(row) { return !this.search || JSON.stringify(row).toLowerCase().includes(this.search.toLowerCase()); },
         sortRows(rows, dateKey) {
@@ -3171,6 +3321,7 @@
       mounted() {
         this.load(true);
         this.loadPremiumPlanConfig();
+        this.loadSafeguardConfig();
         this.loadClientProxyStatus();
         this.loadModelRoutingConfig();
         this.startDashboardStream();
