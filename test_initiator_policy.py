@@ -426,7 +426,7 @@ class InitiatorPolicyTests(unittest.TestCase):
         )
         self.assertEqual(initiator, "agent")
 
-    def test_plus_prefix_only_disables_safeguard_and_still_loses_to_active_request(self):
+    def test_plus_prefix_bypasses_active_request_safeguard(self):
         policy = initiator_policy.InitiatorPolicy()
         start = datetime(2026, 4, 4, 18, 0, tzinfo=timezone.utc)
 
@@ -439,9 +439,9 @@ class InitiatorPolicyTests(unittest.TestCase):
             )
 
         self.assertEqual(normalized_input, "hello")
-        self.assertEqual(initiator, "agent")
+        self.assertEqual(initiator, "user")
 
-    def test_plus_prefix_active_request_event_reports_user_candidate(self):
+    def test_plus_prefix_active_request_does_not_trigger_safeguard_event(self):
         recorded = []
         policy = initiator_policy.InitiatorPolicy(on_safeguard_triggered=recorded.append)
         start = datetime(2026, 4, 4, 18, 0, tzinfo=timezone.utc)
@@ -455,9 +455,35 @@ class InitiatorPolicyTests(unittest.TestCase):
                 request_id="req-2",
             )
 
+        self.assertEqual(initiator, "user")
+        self.assertEqual(recorded, [])
+
+    def test_plus_prefix_does_not_override_haiku_agent_rule(self):
+        policy = initiator_policy.InitiatorPolicy()
+        _normalized, initiator = policy.resolve_responses_input(
+            "+ hello", "claude-haiku-4.5"
+        )
         self.assertEqual(initiator, "agent")
-        self.assertEqual(recorded[0]["candidate_initiator"], "user")
-        self.assertEqual(recorded[0]["resolved_initiator"], "agent")
+
+    def test_plus_prefix_does_not_override_subagent_agent_rule(self):
+        policy = initiator_policy.InitiatorPolicy()
+        _normalized, initiator = policy.resolve_responses_input(
+            "+ hello", "gpt-5.4", subagent="general-purpose"
+        )
+        self.assertEqual(initiator, "agent")
+
+    def test_plus_prefix_does_not_override_codex_mini_bootstrap_rule(self):
+        policy = initiator_policy.InitiatorPolicy()
+        input_items = [
+            {"type": "message", "role": "developer", "content": "+ dev preamble"},
+            {
+                "type": "message",
+                "role": "user",
+                "content": "<environment_context>\n  <cwd>/tmp</cwd>\n</environment_context>",
+            },
+        ]
+        _normalized, initiator = policy.resolve_responses_input(input_items, "gpt-5.4-mini")
+        self.assertEqual(initiator, "agent")
 
     def test_plus_prefix_bypasses_cooldown_for_plain_responses_input(self):
         policy = initiator_policy.InitiatorPolicy()

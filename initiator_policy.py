@@ -73,7 +73,11 @@ def _public_candidate_initiator(candidate_initiator: str | None) -> str:
     return AGENT_INITIATOR
 
 
-def _candidate_bypasses_cooldown(candidate_initiator: str | None) -> bool:
+def _candidate_bypasses_safeguards(candidate_initiator: str | None) -> bool:
+    # Explicit "+" prefix signals "this is a user turn, I mean it" — it
+    # bypasses both the post-request cooldown AND the active_request guard.
+    # Hard agent rules (subagent, Haiku, codex bootstrap/title-gen) are
+    # checked earlier in _resolve_locked and are NOT overridden by "+".
     return candidate_initiator == _EXPLICIT_USER_INITIATOR
 
 
@@ -787,7 +791,7 @@ class InitiatorPolicy:
         initiator = _public_candidate_initiator(candidate_initiator)
         safeguard_reason = self._safeguard_reason_locked(now)
         if initiator == USER_INITIATOR and safeguard_reason is not None:
-            if _candidate_bypasses_cooldown(candidate_initiator) and safeguard_reason == "cooldown":
+            if _candidate_bypasses_safeguards(candidate_initiator):
                 return USER_INITIATOR, None
             return AGENT_INITIATOR, safeguard_reason
         return initiator, None
