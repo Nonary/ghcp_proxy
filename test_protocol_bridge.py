@@ -5,9 +5,10 @@ from protocol_bridge import ProtocolBridgePlanner
 
 
 class _RoutingConfigStub:
-    def __init__(self, target_model=None, approval_target_model=None):
+    def __init__(self, target_model=None, approval_target_model=None, compact_fallback_model=None):
         self.target_model = target_model
         self.approval_target_model = approval_target_model
+        self.compact_fallback_model = compact_fallback_model
 
     def resolve_target_model(self, requested_model):
         del requested_model
@@ -16,6 +17,10 @@ class _RoutingConfigStub:
     def resolve_approval_target_model(self, requested_model):
         del requested_model
         return self.approval_target_model
+
+    def resolve_compact_fallback_model(self, requested_model):
+        del requested_model
+        return self.compact_fallback_model
 
 
 class ProtocolBridgePlannerTests(unittest.TestCase):
@@ -130,6 +135,70 @@ class ProtocolBridgePlannerTests(unittest.TestCase):
         )
 
         self.assertEqual(plan.resolved_model, "claude-opus-4.6")
+
+    def test_planner_swaps_to_gpt_fallback_on_compact_against_claude(self):
+        planner = ProtocolBridgePlanner(
+            _RoutingConfigStub(target_model="claude-opus-4.6", compact_fallback_model="gpt-5.4")
+        )
+        body = {"model": "gpt-5.3-codex", "input": "hello", "stream": False}
+
+        plan = proxy.asyncio.run(
+            planner.plan(
+                "responses",
+                body,
+                api_base="https://example.invalid",
+                api_key="test-key",
+                is_compact=True,
+            )
+        )
+
+        self.assertEqual(plan.strategy_name, "responses_to_responses")
+        self.assertEqual(plan.resolved_model, "gpt-5.4")
+        self.assertEqual(plan.upstream_path, "/responses")
+
+    def test_planner_does_not_swap_on_compact_when_target_is_codex(self):
+        planner = ProtocolBridgePlanner(
+            _RoutingConfigStub(target_model="gpt-5.4", compact_fallback_model=None)
+        )
+        body = {"model": "gpt-5.3-codex", "input": "hello", "stream": False}
+
+        plan = proxy.asyncio.run(
+            planner.plan(
+                "responses",
+                body,
+                api_base="https://example.invalid",
+                api_key="test-key",
+                is_compact=True,
+            )
+        )
+
+        self.assertEqual(plan.resolved_model, "gpt-5.4")
+        self.assertEqual(plan.strategy_name, "responses_to_responses")
+
+    def test_planner_keeps_claude_on_non_compact_request(self):
+        planner = ProtocolBridgePlanner(
+            _RoutingConfigStub(target_model="claude-opus-4.6", compact_fallback_model="gpt-5.4")
+        )
+        body = {
+            "model": "gpt-5.3-codex",
+            "input": [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}
+            ],
+            "stream": False,
+        }
+
+        plan = proxy.asyncio.run(
+            planner.plan(
+                "responses",
+                body,
+                api_base="https://example.invalid",
+                api_key="test-key",
+                is_compact=False,
+            )
+        )
+
+        self.assertEqual(plan.resolved_model, "claude-opus-4.6")
+        self.assertEqual(plan.strategy_name, "responses_to_chat")
 
 if __name__ == "__main__":
     unittest.main()

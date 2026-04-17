@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from fastapi import HTTPException
 
 import format_translation
-from constants import MODEL_PRICING, MODEL_ROUTING_CONFIG_FILE, TOKEN_DIR
+from constants import DEFAULT_COMPACT_FALLBACK_MODEL, MODEL_PRICING, MODEL_ROUTING_CONFIG_FILE, TOKEN_DIR
 from util import _normalize_model_name
 
 
@@ -125,6 +125,35 @@ class ModelRoutingConfigService:
                 return mapping["target_model"]
         return None
 
+    def resolve_compact_fallback_model(self, requested_model: str | None) -> str | None:
+        """Return the GPT model to use when a compact is requested against a
+        Claude target. Returns None if no remap is active for this model or if
+        the resolved target is not a Claude model (Codex targets don't need a
+        swap). Falls back to DEFAULT_COMPACT_FALLBACK_MODEL when the mapping
+        entry has no explicit override.
+        """
+        normalized_requested = normalize_routing_model_name(requested_model)
+        if not normalized_requested:
+            return None
+
+        settings = self.load_settings()
+        if not settings["enabled"]:
+            return None
+
+        for mapping in settings["mappings"]:
+            if mapping["source_model"] != normalized_requested:
+                continue
+            if mapping.get("target_provider") != "claude":
+                return None
+            override = mapping.get("compact_fallback_model")
+            fallback = override or DEFAULT_COMPACT_FALLBACK_MODEL
+            if model_provider_family(fallback) != "codex":
+                # Guard against a misconfigured non-GPT fallback — that would
+                # just reproduce the original context-overflow error.
+                return DEFAULT_COMPACT_FALLBACK_MODEL
+            return fallback
+        return None
+
     def resolve_approval_target_model(self, requested_model: str | None) -> str | None:
         normalized_requested = normalize_routing_model_name(requested_model)
         if not normalized_requested:
@@ -193,12 +222,30 @@ class ModelRoutingConfigService:
                 raise HTTPException(status_code=400, detail=f"Duplicate {label.lower()} source_model: {source_model}")
 
             seen_sources.add(source_model)
-            mappings.append(
-                {
-                    "source_model": source_model,
-                    "source_provider": model_provider_family(source_model),
-                    "target_model": target_model,
-                    "target_provider": model_provider_family(target_model),
-                }
-            )
+            normalized_entry: dict[str, str] = {
+                "source_model": source_model,
+                "source_provider": model_provider_family(source_model),
+                "target_model": target_model,
+                "target_provider": model_provider_family(target_model),
+            }
+            raw_compact_fallback = entry.get("compact_fallback_model") or entry.get("compact_fallback")
+            if raw_compact_fallback is not None and str(raw_compact_fallback).strip():
+                compact_fallback = normalize_routing_model_name(raw_compact_fallback)
+                if not compact_fallback:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"{label} #{index} compact_fallback_model is not a recognized model.",
+                    )
+                if compact_fallback not in self._known_models:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"{label} #{index} compact_fallback_model is unsupported: {compact_fallback}",
+                    )
+                if model_provider_family(compact_fallback) != "codex":
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"{label} #{index} compact_fallback_model must be a GPT model (got {compact_fallback}).",
+                    )
+                normalized_entry["compact_fallback_model"] = compact_fallback
+            mappings.append(normalized_entry)
         return mappings

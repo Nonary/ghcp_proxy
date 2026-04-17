@@ -195,6 +195,106 @@ class ModelRoutingConfigTests(unittest.TestCase):
             b'{"enabled":false,"mappings":[],"available_models":[],"path":"x"}',
         )
 
+    def test_compact_fallback_defaults_to_gpt_5_4_for_claude_target(self):
+        config_path = self._make_temp_file_path("model-routing-", ".json")
+        service = self._make_service(str(config_path))
+
+        service.save_settings(
+            {
+                "enabled": True,
+                "mappings": [
+                    {"source_model": "gpt-5.3-codex", "target_model": "claude-opus-4.6"},
+                ],
+            }
+        )
+
+        self.assertEqual(
+            service.resolve_compact_fallback_model("gpt-5.3-codex"),
+            "gpt-5.4",
+        )
+
+    def test_compact_fallback_respects_explicit_override(self):
+        config_path = self._make_temp_file_path("model-routing-", ".json")
+        service = self._make_service(str(config_path))
+
+        payload = service.save_settings(
+            {
+                "enabled": True,
+                "mappings": [
+                    {
+                        "source_model": "gpt-5.3-codex",
+                        "target_model": "claude-opus-4.6",
+                        "compact_fallback_model": "gpt-5.1-codex-max",
+                    },
+                ],
+            }
+        )
+
+        self.assertEqual(
+            payload["mappings"][0]["compact_fallback_model"],
+            "gpt-5.1-codex-max",
+        )
+        self.assertEqual(
+            service.resolve_compact_fallback_model("gpt-5.3-codex"),
+            "gpt-5.1-codex-max",
+        )
+        written = json.loads(config_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            written["mappings"][0]["compact_fallback_model"],
+            "gpt-5.1-codex-max",
+        )
+
+    def test_compact_fallback_rejects_non_gpt_override(self):
+        config_path = self._make_temp_file_path("model-routing-", ".json")
+        service = self._make_service(str(config_path))
+
+        with self.assertRaises(HTTPException) as exc:
+            service.save_settings(
+                {
+                    "enabled": True,
+                    "mappings": [
+                        {
+                            "source_model": "gpt-5.3-codex",
+                            "target_model": "claude-opus-4.6",
+                            "compact_fallback_model": "claude-sonnet-4.6",
+                        },
+                    ],
+                }
+            )
+
+        self.assertEqual(exc.exception.status_code, 400)
+        self.assertIn("must be a GPT model", str(exc.exception.detail))
+
+    def test_compact_fallback_none_for_codex_target(self):
+        config_path = self._make_temp_file_path("model-routing-", ".json")
+        service = self._make_service(str(config_path))
+
+        service.save_settings(
+            {
+                "enabled": True,
+                "mappings": [
+                    {"source_model": "gpt-5.3-codex", "target_model": "gpt-5.4"},
+                ],
+            }
+        )
+
+        self.assertIsNone(service.resolve_compact_fallback_model("gpt-5.3-codex"))
+
+    def test_compact_fallback_none_when_routing_disabled(self):
+        config_path = self._make_temp_file_path("model-routing-", ".json")
+        service = self._make_service(str(config_path))
+
+        service.save_settings(
+            {
+                "enabled": False,
+                "mappings": [
+                    {"source_model": "gpt-5.3-codex", "target_model": "claude-opus-4.6"},
+                ],
+            }
+        )
+
+        self.assertIsNone(service.resolve_compact_fallback_model("gpt-5.3-codex"))
+
 
 if __name__ == "__main__":
     unittest.main()

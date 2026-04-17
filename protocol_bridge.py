@@ -171,6 +171,7 @@ class ProtocolBridgePlanner:
         api_base: str,
         api_key: str,
         subagent: str | None = None,
+        is_compact: bool = False,
     ) -> BridgeExecutionPlan:
         requested_model = body.get("model") if isinstance(body, dict) else None
         mapped_model = None
@@ -186,6 +187,17 @@ class ProtocolBridgePlanner:
         target_family = model_provider_family(resolved_model)
         if target_family is None:
             raise ValueError(f"Unsupported mapped model family: {resolved_model}")
+
+        # Codex compact requests do not fit in Claude's 128K window; swap to a
+        # configured GPT fallback so the compaction call itself can complete.
+        # The subsequent normal turns remain routed to Claude as configured.
+        if is_compact and target_family == "claude":
+            fallback = self._routing_config_service.resolve_compact_fallback_model(requested_model)
+            if fallback:
+                resolved_model = normalize_routing_model_name(fallback)
+                target_family = model_provider_family(resolved_model)
+                if target_family is None:
+                    raise ValueError(f"Unsupported compact fallback model: {resolved_model}")
 
         strategy = self._strategy_for(inbound_protocol, target_family)
         return await strategy.build_plan(

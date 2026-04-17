@@ -1201,6 +1201,9 @@
             <div class="detail-label">Mappings</div>
             <button class="primary sm" @click="addModelRoutingMapping" :disabled="savingModelRoutingConfig || loadingModelRoutingConfig || !modelRouting.available_models.length">+ Add</button>
           </div>
+          <div class="subtle" style="font-size: 11px; margin-top: 2px;">
+            <strong>Compact fallback</strong> only applies when the target is a Claude model. Codex compact payloads can exceed Claude's 128K window, so <code>/v1/responses/compact</code> is routed to the chosen GPT model; normal turns stay on the Claude target. Leave as <em>auto</em> to use <code>gpt-5.4</code>.
+          </div>
 
           <table v-if="modelRouting.mappings.length" class="mapping-table">
             <thead>
@@ -1208,6 +1211,7 @@
                 <th>Source model</th>
                 <th></th>
                 <th>Target model</th>
+                <th>Compact fallback</th>
                 <th></th>
               </tr>
             </thead>
@@ -1227,6 +1231,20 @@
                       {{ option.provider }} · {{ option.model }}
                     </option>
                   </select>
+                </td>
+                <td>
+                  <select
+                    v-if="isClaudeTargetMapping(mapping)"
+                    v-model="mapping.compact_fallback_model"
+                    :disabled="savingModelRoutingConfig || loadingModelRoutingConfig"
+                    :title="'Codex compact payloads exceed Claude\\'s 128K window. Compact calls for this mapping are routed to the selected GPT model; normal turns stay on ' + (mapping.target_model || 'Claude') + '.'"
+                  >
+                    <option value="">auto (gpt-5.4)</option>
+                    <option v-for="option in gptFallbackOptions" :key="`compact-${index}-${option.model}`" :value="option.model">
+                      {{ option.model }}
+                    </option>
+                  </select>
+                  <span v-else class="subtle" style="font-size: 11px;">—</span>
                 </td>
                 <td>
                   <button class="sm danger" @click="removeModelRoutingMapping(index)" :disabled="savingModelRoutingConfig || loadingModelRoutingConfig">×</button>
@@ -2498,6 +2516,9 @@
       computed: {
         premium() { return this.data.premium || {}; },
         safeguardStats() { return this.data.safeguard || {}; },
+        gptFallbackOptions() {
+          return (this.modelRouting.available_models || []).filter((option) => option.provider === 'codex');
+        },
         currentMonth() { return this.data.current_month?.usage || {}; },
         allTime() { return this.data.all_time?.usage || {}; },
         dailyHistory() { return normalizeRowsToLocalToday(this.data.current_month?.daily_history || []); },
@@ -3006,7 +3027,13 @@
           return {
             source_model: source,
             target_model: target,
+            compact_fallback_model: '',
           };
+        },
+        isClaudeTargetMapping(mapping) {
+          if (!mapping || !mapping.target_model) return false;
+          const option = (this.modelRouting.available_models || []).find((row) => row.model === mapping.target_model);
+          return option ? option.provider === 'claude' : false;
         },
         addModelRoutingMapping() {
           this.modelRouting.statusMessage = '';
@@ -3040,6 +3067,7 @@
               ? payload.mappings.map((mapping) => ({
                   source_model: mapping.source_model || '',
                   target_model: mapping.target_model || '',
+                  compact_fallback_model: mapping.compact_fallback_model || '',
                 }))
               : [];
             this.modelRouting.available_models = Array.isArray(payload.available_models) ? payload.available_models : [];
@@ -3070,7 +3098,16 @@
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({
                 enabled: this.modelRouting.enabled,
-                mappings: this.modelRouting.mappings,
+                mappings: this.modelRouting.mappings.map((mapping) => {
+                  const entry = {
+                    source_model: mapping.source_model,
+                    target_model: mapping.target_model,
+                  };
+                  if (mapping.compact_fallback_model && this.isClaudeTargetMapping(mapping)) {
+                    entry.compact_fallback_model = mapping.compact_fallback_model;
+                  }
+                  return entry;
+                }),
                 approval_enabled: this.approvalModelRouting.enabled,
                 approval_mappings: this.approvalModelRouting.mappings,
               }),
@@ -3093,6 +3130,7 @@
               ? payload.mappings.map((mapping) => ({
                   source_model: mapping.source_model || '',
                   target_model: mapping.target_model || '',
+                  compact_fallback_model: mapping.compact_fallback_model || '',
                 }))
               : [];
             this.modelRouting.available_models = Array.isArray(payload.available_models) ? payload.available_models : [];
