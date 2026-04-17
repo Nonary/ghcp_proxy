@@ -411,6 +411,114 @@ class InitiatorPolicyTests(unittest.TestCase):
         self.assertEqual(verdict["candidate_initiator"], "agent")
         self.assertIsNone(verdict["safeguard_reason"])
 
+    def test_anthropic_transcript_after_user_claude_md_wrapper_stays_agent(self):
+        policy = initiator_policy.InitiatorPolicy()
+        verdict = {}
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            "The following is the user's CLAUDE.md configuration.\n\n"
+                            "<user_claude_md>\nProxy instructions\n</user_claude_md>"
+                        ),
+                    },
+                    {
+                        "type": "text",
+                        "text": (
+                            "<transcript>\nUser: inspect the trace\nAssistant: running checks\n</transcript>"
+                        ),
+                    },
+                    {
+                        "type": "text",
+                        "text": "Err on the side of blocking. <block> immediately.",
+                    },
+                ],
+            },
+        ]
+
+        initiator = policy.resolve_anthropic_messages(
+            messages,
+            "claude-opus-4.6",
+            verdict_sink=verdict,
+        )
+
+        self.assertEqual(initiator, "agent")
+        self.assertEqual(verdict["candidate_initiator"], "agent")
+
+    def test_anthropic_string_transcript_wrapper_is_agent(self):
+        policy = initiator_policy.InitiatorPolicy()
+        verdict = {}
+        messages = [
+            {
+                "role": "user",
+                "content": (
+                    "The following is the user's CLAUDE.md configuration.\n\n"
+                    "<user_claude_md>\nProxy instructions\n</user_claude_md>\n\n"
+                    "<transcript>\nUser: inspect the trace\nAssistant: running checks\n</transcript>\n\n"
+                    "Review the classification process and follow it carefully, "
+                    "making sure you deny actions that should be blocked. "
+                    "Use <thinking> before responding with <block>."
+                ),
+            },
+        ]
+
+        initiator = policy.resolve_anthropic_messages(
+            messages,
+            "claude-opus-4.6",
+            verdict_sink=verdict,
+        )
+
+        self.assertEqual(initiator, "agent")
+        self.assertEqual(verdict["candidate_initiator"], "agent")
+
+    def test_anthropic_user_claude_md_wrapper_without_transcript_stays_user(self):
+        policy = initiator_policy.InitiatorPolicy()
+        verdict = {}
+        messages = [
+            {
+                "role": "user",
+                "content": (
+                    "The following is the user's CLAUDE.md configuration.\n\n"
+                    "<user_claude_md>\nProxy instructions\n</user_claude_md>\n\n"
+                    "Can you review whether this config looks correct?"
+                ),
+            },
+        ]
+
+        initiator = policy.resolve_anthropic_messages(
+            messages,
+            "claude-opus-4.6",
+            verdict_sink=verdict,
+        )
+
+        self.assertEqual(initiator, "user")
+        self.assertEqual(verdict["candidate_initiator"], "user")
+
+    def test_anthropic_literal_transcript_tag_without_approval_markers_stays_user(self):
+        policy = initiator_policy.InitiatorPolicy()
+        verdict = {}
+        messages = [
+            {
+                "role": "user",
+                "content": (
+                    "I found the literal string <transcript> in a file. "
+                    "Can you explain what it means?"
+                ),
+            },
+        ]
+
+        initiator = policy.resolve_anthropic_messages(
+            messages,
+            "claude-opus-4.6",
+            verdict_sink=verdict,
+        )
+
+        self.assertEqual(initiator, "user")
+        self.assertEqual(verdict["candidate_initiator"], "user")
+
     def test_anthropic_system_reminder_with_real_user_text_stays_user(self):
         policy = initiator_policy.InitiatorPolicy()
         messages = [

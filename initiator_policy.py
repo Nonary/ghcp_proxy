@@ -121,21 +121,46 @@ def _is_claude_meta_user_text(text: str) -> bool:
 def _is_claude_transcript_container(content) -> bool:
     """Detect Claude Code approval agent transcript messages.
 
-    Approval agents send a user message whose content list starts with a
-    ``<transcript>`` text block followed by the conversation transcript.
-    The entire message is agent-generated, not user-typed.
+    Approval agents send a user message that either starts with a
+    ``<transcript>`` block or contains one alongside the approval-review
+    prompt text. Some clients prepend wrapper text such as
+    ``<user_claude_md>`` before the transcript block, so we handle that
+    shape too without treating every literal ``<transcript>`` mention as
+    agent traffic.
     """
+    approval_markers = (
+        "<block>",
+        "Err on the side of blocking",
+        "Review the classification process and follow it carefully",
+        "Stage 1 does NOT apply user intent or ALLOW exceptions",
+    )
+
+    def _looks_like_approval_text(text: str) -> bool:
+        normalized = text.lstrip()
+        if normalized.startswith("<transcript>"):
+            return True
+        if "<transcript>" not in normalized:
+            return False
+        return any(marker in normalized for marker in approval_markers)
+
+    if isinstance(content, str):
+        return _looks_like_approval_text(content)
     if not isinstance(content, list):
         return False
+    joined_text_parts: list[str] = []
     for item in content:
         if not isinstance(item, dict):
             continue
         if str(item.get("type", "")).lower() != "text":
             continue
         text = item.get("text")
-        if isinstance(text, str) and text.lstrip().startswith("<transcript>"):
+        if not isinstance(text, str):
+            continue
+        if text.lstrip().startswith("<transcript>"):
             return True
-        return False
+        joined_text_parts.append(text)
+    if joined_text_parts:
+        return _looks_like_approval_text("".join(joined_text_parts))
     return False
 
 
@@ -509,6 +534,8 @@ def _anthropic_user_message_traits(message) -> tuple[bool, bool, bool]:
         stripped = content.strip()
         if not stripped:
             return False, False, False
+        if _is_claude_transcript_container(content):
+            return False, True, False
         if _is_claude_meta_user_text(content):
             return False, True, False
         return False, False, True
