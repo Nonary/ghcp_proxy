@@ -68,6 +68,8 @@ class ModelRoutingConfigService:
         return {
             "enabled": current["enabled"],
             "mappings": current["mappings"],
+            "approval_enabled": current["approval_enabled"],
+            "approval_mappings": current["approval_mappings"],
             "available_models": self._available_models,
             "path": self._config.config_file,
         }
@@ -100,6 +102,8 @@ class ModelRoutingConfigService:
                 {
                     "enabled": normalized["enabled"],
                     "mappings": normalized["mappings"],
+                    "approval_enabled": normalized["approval_enabled"],
+                    "approval_mappings": normalized["approval_mappings"],
                 },
                 f,
                 indent=2,
@@ -121,10 +125,26 @@ class ModelRoutingConfigService:
                 return mapping["target_model"]
         return None
 
+    def resolve_approval_target_model(self, requested_model: str | None) -> str | None:
+        normalized_requested = normalize_routing_model_name(requested_model)
+        if not normalized_requested:
+            return None
+
+        settings = self.load_settings()
+        if not settings["approval_enabled"]:
+            return None
+
+        for mapping in settings["approval_mappings"]:
+            if mapping["source_model"] == normalized_requested:
+                return mapping["target_model"]
+        return None
+
     def default_settings(self) -> dict[str, object]:
         return {
             "enabled": False,
             "mappings": [],
+            "approval_enabled": False,
+            "approval_mappings": [],
         }
 
     def _normalize_settings_payload(self, payload: dict) -> dict[str, object]:
@@ -132,30 +152,45 @@ class ModelRoutingConfigService:
             raise HTTPException(status_code=400, detail="Request body must be an object")
 
         enabled = bool(payload.get("enabled", False))
-        raw_mappings = payload.get("mappings", [])
+        mappings = self._normalize_mapping_list(payload.get("mappings", []), label="Mapping")
+
+        approval_enabled = bool(payload.get("approval_enabled", False))
+        approval_mappings = self._normalize_mapping_list(
+            payload.get("approval_mappings", []),
+            label="Approval mapping",
+        )
+
+        return {
+            "enabled": enabled,
+            "mappings": mappings,
+            "approval_enabled": approval_enabled,
+            "approval_mappings": approval_mappings,
+        }
+
+    def _normalize_mapping_list(self, raw_mappings, *, label: str) -> list[dict[str, str]]:
         if raw_mappings is None:
             raw_mappings = []
         if not isinstance(raw_mappings, list):
-            raise HTTPException(status_code=400, detail='"mappings" must be a list.')
+            raise HTTPException(status_code=400, detail=f'"{label.lower()}s" must be a list.')
 
-        mappings = []
-        seen_sources = set()
+        mappings: list[dict[str, str]] = []
+        seen_sources: set[str] = set()
         for index, entry in enumerate(raw_mappings, start=1):
             if not isinstance(entry, dict):
-                raise HTTPException(status_code=400, detail=f"Mapping #{index} must be an object.")
+                raise HTTPException(status_code=400, detail=f"{label} #{index} must be an object.")
 
             source_model = normalize_routing_model_name(entry.get("source_model") or entry.get("source"))
             target_model = normalize_routing_model_name(entry.get("target_model") or entry.get("target"))
             if not source_model:
-                raise HTTPException(status_code=400, detail=f"Mapping #{index} must include a valid source_model.")
+                raise HTTPException(status_code=400, detail=f"{label} #{index} must include a valid source_model.")
             if not target_model:
-                raise HTTPException(status_code=400, detail=f"Mapping #{index} must include a valid target_model.")
+                raise HTTPException(status_code=400, detail=f"{label} #{index} must include a valid target_model.")
             if source_model not in self._known_models:
-                raise HTTPException(status_code=400, detail=f"Mapping #{index} source model is unsupported: {source_model}")
+                raise HTTPException(status_code=400, detail=f"{label} #{index} source model is unsupported: {source_model}")
             if target_model not in self._known_models:
-                raise HTTPException(status_code=400, detail=f"Mapping #{index} target model is unsupported: {target_model}")
+                raise HTTPException(status_code=400, detail=f"{label} #{index} target model is unsupported: {target_model}")
             if source_model in seen_sources:
-                raise HTTPException(status_code=400, detail=f"Duplicate mapping source_model: {source_model}")
+                raise HTTPException(status_code=400, detail=f"Duplicate {label.lower()} source_model: {source_model}")
 
             seen_sources.add(source_model)
             mappings.append(
@@ -166,8 +201,4 @@ class ModelRoutingConfigService:
                     "target_provider": model_provider_family(target_model),
                 }
             )
-
-        return {
-            "enabled": enabled,
-            "mappings": mappings,
-        }
+        return mappings

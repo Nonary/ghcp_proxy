@@ -1251,6 +1251,82 @@
         </div>
       </article>
 
+      <article class="panel">
+        <div class="panel-head">
+          <div>
+            <div class="eyebrow">Proxy Controls</div>
+            <h3>Approval Agent Model Remapping</h3>
+            <div class="subtle">Route approval-agent requests (Codex <code>x-openai-subagent</code>, Claude Code <code>&lt;transcript&gt;</code> reviewers) to a model of your choice. Applied before the main remap table.</div>
+          </div>
+          <span :class="['chip', approvalModelRouting.enabled ? 'good' : 'warn']">
+            {{ approvalModelRouting.enabled ? 'Active' : 'Off' }}
+            · {{ approvalModelRouting.mappings.length }} {{ approvalModelRouting.mappings.length === 1 ? 'rule' : 'rules' }}
+          </span>
+        </div>
+
+        <div class="routing-shell">
+          <div class="routing-toggle">
+            <span class="routing-toggle-label">Remap approval-agent requests before forwarding upstream</span>
+            <label :class="['switch-track', approvalModelRouting.enabled ? 'on' : '']" :style="{ opacity: (savingModelRoutingConfig || loadingModelRoutingConfig) ? 0.5 : 1 }">
+              <input type="checkbox" v-model="approvalModelRouting.enabled" :disabled="savingModelRoutingConfig || loadingModelRoutingConfig">
+              <span class="switch-knob"></span>
+            </label>
+          </div>
+
+          <div class="mapping-header">
+            <div class="detail-label">Approval Mappings</div>
+            <button class="primary sm" @click="addApprovalModelRoutingMapping" :disabled="savingModelRoutingConfig || loadingModelRoutingConfig || !modelRouting.available_models.length">+ Add</button>
+          </div>
+
+          <table v-if="approvalModelRouting.mappings.length" class="mapping-table">
+            <thead>
+              <tr>
+                <th>Source model</th>
+                <th></th>
+                <th>Target model</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="(mapping, index) in approvalModelRouting.mappings" :key="`approval-${index}-${mapping.source_model}-${mapping.target_model}`">
+                <td>
+                  <select v-model="mapping.source_model" :disabled="savingModelRoutingConfig || loadingModelRoutingConfig">
+                    <option v-for="option in modelRouting.available_models" :key="`approval-source-${index}-${option.model}`" :value="option.model">
+                      {{ option.provider }} · {{ option.model }}
+                    </option>
+                  </select>
+                </td>
+                <td class="arrow-cell">→</td>
+                <td>
+                  <select v-model="mapping.target_model" :disabled="savingModelRoutingConfig || loadingModelRoutingConfig">
+                    <option v-for="option in modelRouting.available_models" :key="`approval-target-${index}-${option.model}`" :value="option.model">
+                      {{ option.provider }} · {{ option.model }}
+                    </option>
+                  </select>
+                </td>
+                <td>
+                  <button class="sm danger" @click="removeApprovalModelRoutingMapping(index)" :disabled="savingModelRoutingConfig || loadingModelRoutingConfig">×</button>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+          <div v-else class="empty-state">
+            {{ loadingModelRoutingConfig ? 'Loading...' : 'No approval-agent mappings yet — add one to override the model used for approval reviewers.' }}
+          </div>
+
+          <div class="toolbar" style="margin-top: 4px;">
+            <button @click="loadModelRoutingConfig" :disabled="savingModelRoutingConfig || loadingModelRoutingConfig">Reload</button>
+            <div class="spacer"></div>
+            <button class="primary" @click="saveModelRoutingConfig" :disabled="savingModelRoutingConfig || loadingModelRoutingConfig">Save</button>
+          </div>
+
+          <div class="status-stack">
+            <div v-if="approvalModelRouting.error" class="status error">{{ approvalModelRouting.error }}</div>
+            <div v-else-if="approvalModelRouting.statusMessage" class="status good">{{ approvalModelRouting.statusMessage }}</div>
+          </div>
+        </div>
+      </article>
+
       <div class="control-secondary-grid">
         <article class="panel">
           <div class="panel-head">
@@ -2406,6 +2482,12 @@
             error: '',
             statusMessage: '',
           },
+          approvalModelRouting: {
+            enabled: false,
+            mappings: [],
+            error: '',
+            statusMessage: '',
+          },
           dashboardStream: null,
           dashboardStreamConnected: false,
           dashboardStreamError: '',
@@ -2936,6 +3018,16 @@
           this.modelRouting.error = '';
           this.modelRouting.mappings.splice(index, 1);
         },
+        addApprovalModelRoutingMapping() {
+          this.approvalModelRouting.statusMessage = '';
+          this.approvalModelRouting.error = '';
+          this.approvalModelRouting.mappings.push(this.defaultModelRoutingMapping());
+        },
+        removeApprovalModelRoutingMapping(index) {
+          this.approvalModelRouting.statusMessage = '';
+          this.approvalModelRouting.error = '';
+          this.approvalModelRouting.mappings.splice(index, 1);
+        },
         async loadModelRoutingConfig() {
           this.loadingModelRoutingConfig = true;
           this.modelRouting.error = '';
@@ -2952,6 +3044,13 @@
               : [];
             this.modelRouting.available_models = Array.isArray(payload.available_models) ? payload.available_models : [];
             this.modelRouting.path = payload.path || '';
+            this.approvalModelRouting.enabled = Boolean(payload.approval_enabled);
+            this.approvalModelRouting.mappings = Array.isArray(payload.approval_mappings)
+              ? payload.approval_mappings.map((mapping) => ({
+                  source_model: mapping.source_model || '',
+                  target_model: mapping.target_model || '',
+                }))
+              : [];
           } catch (error) {
             this.modelRouting.error = error.message;
           } finally {
@@ -2963,6 +3062,8 @@
           this.savingModelRoutingConfig = true;
           this.modelRouting.statusMessage = '';
           this.modelRouting.error = '';
+          this.approvalModelRouting.statusMessage = '';
+          this.approvalModelRouting.error = '';
           try {
             const response = await fetch('/api/config/model-remapping', {
               method: 'POST',
@@ -2970,6 +3071,8 @@
               body: JSON.stringify({
                 enabled: this.modelRouting.enabled,
                 mappings: this.modelRouting.mappings,
+                approval_enabled: this.approvalModelRouting.enabled,
+                approval_mappings: this.approvalModelRouting.mappings,
               }),
             });
             if (!response.ok) {
@@ -2994,9 +3097,18 @@
               : [];
             this.modelRouting.available_models = Array.isArray(payload.available_models) ? payload.available_models : [];
             this.modelRouting.path = payload.path || '';
+            this.approvalModelRouting.enabled = Boolean(payload.approval_enabled);
+            this.approvalModelRouting.mappings = Array.isArray(payload.approval_mappings)
+              ? payload.approval_mappings.map((mapping) => ({
+                  source_model: mapping.source_model || '',
+                  target_model: mapping.target_model || '',
+                }))
+              : [];
             this.modelRouting.statusMessage = 'Model remapping saved.';
+            this.approvalModelRouting.statusMessage = 'Approval model remapping saved.';
           } catch (error) {
             this.modelRouting.error = error.message;
+            this.approvalModelRouting.error = error.message;
           } finally {
             this.savingModelRoutingConfig = false;
           }

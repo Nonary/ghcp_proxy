@@ -5,12 +5,17 @@ from protocol_bridge import ProtocolBridgePlanner
 
 
 class _RoutingConfigStub:
-    def __init__(self, target_model=None):
+    def __init__(self, target_model=None, approval_target_model=None):
         self.target_model = target_model
+        self.approval_target_model = approval_target_model
 
     def resolve_target_model(self, requested_model):
         del requested_model
         return self.target_model
+
+    def resolve_approval_target_model(self, requested_model):
+        del requested_model
+        return self.approval_target_model
 
 
 class ProtocolBridgePlannerTests(unittest.TestCase):
@@ -67,6 +72,64 @@ class ProtocolBridgePlannerTests(unittest.TestCase):
         self.assertEqual(plan.upstream_body["input"][0]["role"], "user")
         self.assertEqual(plan.upstream_body["input"][0]["content"][0]["text"], "hello")
 
+    def test_planner_uses_approval_mapping_for_codex_subagent_request(self):
+        planner = ProtocolBridgePlanner(
+            _RoutingConfigStub(target_model="claude-opus-4.6", approval_target_model="gpt-5.4-mini")
+        )
+        body = {"model": "gpt-5.4", "input": "hello", "stream": False}
+
+        plan = proxy.asyncio.run(
+            planner.plan(
+                "responses",
+                body,
+                api_base="https://example.invalid",
+                api_key="test-key",
+                subagent="guardian",
+            )
+        )
+
+        self.assertEqual(plan.resolved_model, "gpt-5.4-mini")
+        self.assertEqual(plan.strategy_name, "responses_to_responses")
+
+    def test_planner_uses_approval_mapping_for_claude_transcript_container(self):
+        planner = ProtocolBridgePlanner(
+            _RoutingConfigStub(target_model="gpt-5.4", approval_target_model="claude-haiku-4.5")
+        )
+        body = {
+            "model": "claude-sonnet-4.6",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "<transcript>\nblah\n</transcript>"}],
+                }
+            ],
+            "stream": False,
+        }
+
+        plan = proxy.asyncio.run(
+            planner.plan("messages", body, api_base="https://example.invalid", api_key="test-key")
+        )
+
+        self.assertEqual(plan.resolved_model, "claude-haiku-4-5")
+        self.assertEqual(plan.strategy_name, "messages_to_chat")
+
+    def test_planner_falls_back_to_regular_mapping_when_no_approval_rule(self):
+        planner = ProtocolBridgePlanner(
+            _RoutingConfigStub(target_model="claude-opus-4.6", approval_target_model=None)
+        )
+        body = {"model": "gpt-5.4", "input": "hello", "stream": False}
+
+        plan = proxy.asyncio.run(
+            planner.plan(
+                "responses",
+                body,
+                api_base="https://example.invalid",
+                api_key="test-key",
+                subagent="guardian",
+            )
+        )
+
+        self.assertEqual(plan.resolved_model, "claude-opus-4.6")
 
 if __name__ == "__main__":
     unittest.main()

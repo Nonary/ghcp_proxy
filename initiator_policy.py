@@ -834,3 +834,38 @@ class InitiatorPolicy:
                 "type": "started",
             }
         )
+
+
+def _anthropic_messages_include_transcript_container(messages) -> bool:
+    if not isinstance(messages, list):
+        return False
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        if str(message.get("role", "")).lower() != "user":
+            continue
+        if _is_claude_transcript_container(message.get("content")):
+            return True
+    return False
+
+
+def is_approval_agent_request(
+    *,
+    subagent: str | None = None,
+    inbound_protocol: str | None = None,
+    body: dict | None = None,
+) -> bool:
+    """Detect whether an incoming request originates from an approval agent.
+
+    Covers two patterns:
+      * Codex sends ``x-openai-subagent: <name>`` (e.g. ``guardian``) for
+        approval / review spawns; callers surface that header via ``subagent``.
+      * Claude Code approval agents wrap the conversation in a ``<transcript>``
+        user-message container (see :func:`_is_claude_transcript_container`).
+    """
+    if _is_subagent_request(subagent):
+        return True
+    if inbound_protocol == "messages" and isinstance(body, dict):
+        if _anthropic_messages_include_transcript_container(body.get("messages")):
+            return True
+    return False

@@ -78,6 +78,69 @@ class ModelRoutingConfigTests(unittest.TestCase):
         written = json.loads(config_path.read_text(encoding="utf-8"))
         self.assertTrue(written["enabled"])
 
+    def test_approval_mappings_round_trip_and_resolve(self):
+        config_path = self._make_temp_file_path("model-routing-", ".json")
+        service = self._make_service(str(config_path))
+
+        payload = service.save_settings(
+            {
+                "enabled": False,
+                "mappings": [],
+                "approval_enabled": True,
+                "approval_mappings": [
+                    {"source_model": "gpt-5.4", "target_model": "gpt-5.4-mini"}
+                ],
+            }
+        )
+
+        self.assertTrue(payload["approval_enabled"])
+        self.assertEqual(
+            payload["approval_mappings"],
+            [
+                {
+                    "source_model": "gpt-5.4",
+                    "source_provider": "codex",
+                    "target_model": "gpt-5.4-mini",
+                    "target_provider": "codex",
+                }
+            ],
+        )
+        self.assertEqual(service.resolve_approval_target_model("gpt-5.4"), "gpt-5.4-mini")
+        # Regular mapping unaffected
+        self.assertIsNone(service.resolve_target_model("gpt-5.4"))
+
+    def test_approval_mappings_skip_when_disabled(self):
+        config_path = self._make_temp_file_path("model-routing-", ".json")
+        service = self._make_service(str(config_path))
+
+        service.save_settings(
+            {
+                "approval_enabled": False,
+                "approval_mappings": [
+                    {"source_model": "gpt-5.4", "target_model": "gpt-5.4-mini"}
+                ],
+            }
+        )
+        self.assertIsNone(service.resolve_approval_target_model("gpt-5.4"))
+
+    def test_save_settings_rejects_duplicate_approval_source_models(self):
+        config_path = self._make_temp_file_path("model-routing-", ".json")
+        service = self._make_service(str(config_path))
+
+        with self.assertRaises(HTTPException) as exc:
+            service.save_settings(
+                {
+                    "approval_enabled": True,
+                    "approval_mappings": [
+                        {"source_model": "gpt-5.4", "target_model": "gpt-5.4-mini"},
+                        {"source_model": "GPT 5.4", "target_model": "claude-haiku-4.5"},
+                    ],
+                }
+            )
+
+        self.assertEqual(exc.exception.status_code, 400)
+        self.assertIn("Duplicate approval mapping", str(exc.exception.detail))
+
     def test_save_settings_rejects_duplicate_source_models(self):
         config_path = self._make_temp_file_path("model-routing-", ".json")
         service = self._make_service(str(config_path))

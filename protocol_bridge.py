@@ -6,6 +6,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
 import format_translation
+from initiator_policy import is_approval_agent_request
 from model_routing_config import ModelRoutingConfigService, model_provider_family, normalize_routing_model_name
 
 
@@ -169,9 +170,18 @@ class ProtocolBridgePlanner:
         *,
         api_base: str,
         api_key: str,
+        subagent: str | None = None,
     ) -> BridgeExecutionPlan:
         requested_model = body.get("model") if isinstance(body, dict) else None
-        mapped_model = self._routing_config_service.resolve_target_model(requested_model)
+        mapped_model = None
+        if is_approval_agent_request(
+            subagent=subagent,
+            inbound_protocol=inbound_protocol,
+            body=body if isinstance(body, dict) else None,
+        ):
+            mapped_model = self._routing_config_service.resolve_approval_target_model(requested_model)
+        if mapped_model is None:
+            mapped_model = self._routing_config_service.resolve_target_model(requested_model)
         resolved_model = normalize_routing_model_name(mapped_model or requested_model)
         target_family = model_provider_family(resolved_model)
         if target_family is None:

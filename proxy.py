@@ -1387,7 +1387,13 @@ async def responses(request: Request):
 
     api_base = auth.get_api_base()
     try:
-        bridge_plan = await bridge_planner.plan("responses", body, api_base=api_base, api_key=api_key)
+        bridge_plan = await bridge_planner.plan(
+            "responses",
+            body,
+            api_base=api_base,
+            api_key=api_key,
+            subagent=request.headers.get("x-openai-subagent"),
+        )
     except ValueError:
         return format_translation.openai_error_response(400, INVALID_BRIDGE_REQUEST_MESSAGE)
 
@@ -1425,7 +1431,13 @@ async def responses_compact(request: Request):
 
     api_base = auth.get_api_base()
     try:
-        bridge_plan = await bridge_planner.plan("responses", summary_request, api_base=api_base, api_key=api_key)
+        bridge_plan = await bridge_planner.plan(
+            "responses",
+            summary_request,
+            api_base=api_base,
+            api_key=api_key,
+            subagent=request.headers.get("x-openai-subagent"),
+        )
     except ValueError:
         return format_translation.openai_error_response(400, INVALID_BRIDGE_REQUEST_MESSAGE)
 
@@ -1520,7 +1532,13 @@ async def anthropic_messages(request: Request):
 
     api_base = auth.get_api_base()
     try:
-        bridge_plan = await bridge_planner.plan("messages", body, api_base=api_base, api_key=api_key)
+        bridge_plan = await bridge_planner.plan(
+            "messages",
+            body,
+            api_base=api_base,
+            api_key=api_key,
+            subagent=request.headers.get("x-openai-subagent"),
+        )
     except ValueError:
         return format_translation.anthropic_error_response(400, INVALID_BRIDGE_REQUEST_MESSAGE)
 
