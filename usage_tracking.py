@@ -756,6 +756,8 @@ class UsageTracker:
         request_body: dict | None = None,
         upstream_path: str | None = None,
         outbound_headers: dict | None = None,
+        prompt_preview: dict | None = None,
+        initiator_verdict: dict | None = None,
     ) -> dict:
         # Log the proxy request (absorbed from log_proxy_request)
         parts = [
@@ -844,6 +846,26 @@ class UsageTracker:
             "prior_server_request_id": prior_server_request_id,
             "_started_monotonic": time.perf_counter(),
         }
+        if isinstance(prompt_preview, dict) and prompt_preview:
+            event["request_prompt"] = prompt_preview
+        if isinstance(initiator_verdict, dict) and initiator_verdict:
+            safeguard_reason = initiator_verdict.get("safeguard_reason")
+            candidate_initiator = initiator_verdict.get("candidate_initiator")
+            resolved_initiator = initiator_verdict.get("resolved_initiator")
+            verdict_snapshot = {
+                key: value
+                for key, value in initiator_verdict.items()
+                if value is not None
+            }
+            if verdict_snapshot:
+                event["initiator_verdict"] = verdict_snapshot
+            if isinstance(safeguard_reason, str) and safeguard_reason:
+                event["safeguard_triggered"] = True
+                event["safeguard_reason"] = safeguard_reason
+            if isinstance(candidate_initiator, str) and candidate_initiator:
+                event["candidate_initiator"] = candidate_initiator
+            if isinstance(resolved_initiator, str) and resolved_initiator:
+                event["resolved_initiator"] = resolved_initiator
         self._remember_server_request_id(event)
         self._remember_active_server_request_id(event)
         return event

@@ -83,6 +83,10 @@ REQUEST_TRACE_RETENTION_SLACK = 64
 # 1000-row file to a bounded size even when upstream system prompts are
 # multi-megabyte. See proxy._trim_trace_field.
 REQUEST_TRACE_BODY_MAX_BYTES = 8192
+# Maximum characters of each prompt slot (system/user) captured alongside
+# usage events and the request trace so the dashboard can surface a
+# human-readable preview without retaining full upstream payloads.
+REQUEST_PROMPT_PREVIEW_MAX_CHARS = 4000
 FORWARDED_REQUEST_HEADERS = (
     "x-client-request-id",
     "x-openai-subagent",

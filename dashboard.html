@@ -611,6 +611,98 @@
     .status.error { color: var(--danger); }
     .status.good { color: var(--accent-2); }
     .status.warn { color: #ffd27f; }
+    .badge-safeguard { color: #ffd27f; border-color: rgba(255, 210, 127, .28); background: rgba(255, 210, 127, .10); }
+    .safeguard-banner { display: flex; align-items: center; gap: 8px; margin-top: 4px; }
+    .debug-toolbar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 4px; }
+    .debug-btn {
+      font: inherit;
+      cursor: pointer;
+      border-radius: 10px;
+      border: 1px solid var(--line);
+      background: rgba(110, 231, 200, .08);
+      color: var(--accent-2);
+      padding: 6px 12px;
+      font-size: .8rem;
+      letter-spacing: .02em;
+    }
+    .debug-btn:hover { border-color: rgba(110, 231, 200, .36); background: rgba(110, 231, 200, .14); }
+    .prompt-box {
+      margin-top: 6px;
+      padding: 10px 12px;
+      border-radius: 10px;
+      border: 1px solid var(--line);
+      background: rgba(255, 255, 255, .025);
+      color: var(--text);
+      font-family: "Cascadia Code", Consolas, monospace;
+      font-size: .78rem;
+      white-space: pre-wrap;
+      word-break: break-word;
+      max-height: 260px;
+      overflow: auto;
+    }
+    .prompt-box.system { border-color: rgba(255, 210, 127, .22); background: rgba(255, 210, 127, .06); }
+    .modal-backdrop {
+      position: fixed;
+      inset: 0;
+      background: rgba(4, 8, 12, .72);
+      backdrop-filter: blur(6px);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+      z-index: 9999;
+    }
+    .modal-shell {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      box-shadow: var(--shadow);
+      max-width: min(1080px, 100%);
+      width: 100%;
+      max-height: calc(100vh - 48px);
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+    .modal-head {
+      padding: 14px 18px;
+      border-bottom: 1px solid var(--line);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+    }
+    .modal-head h3 { margin: 0; font-size: 1rem; letter-spacing: -.01em; }
+    .modal-body {
+      padding: 14px 18px;
+      overflow: auto;
+      display: grid;
+      gap: 12px;
+    }
+    .modal-foot {
+      padding: 10px 18px;
+      border-top: 1px solid var(--line);
+      display: flex;
+      gap: 8px;
+      justify-content: flex-end;
+    }
+    .json-block {
+      font-family: "Cascadia Code", Consolas, monospace;
+      font-size: .78rem;
+      background: #0c1521;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 12px 14px;
+      color: var(--text);
+      white-space: pre;
+      overflow: auto;
+      max-height: 60vh;
+    }
+    .json-block .j-key { color: #ffb080; }
+    .json-block .j-str { color: #9bdcb6; }
+    .json-block .j-num { color: #8dd0ff; }
+    .json-block .j-bool { color: #f3a0ff; }
+    .json-block .j-null { color: #8aa0b4; }
     .proxy-grid { display: grid; gap: 10px; grid-template-columns: 1fr 1fr; }
     .request-layout { display: grid; gap: 10px; grid-template-columns: minmax(0, .92fr) minmax(280px, .88fr); }
     .request-list-wrap { display: grid; gap: 8px; min-height: 0; }
@@ -955,12 +1047,22 @@
         </div>
 
         <div class="toolbar">
-          <input v-model.trim="search" type="search" placeholder="Filter by model, source, path, session, or request id">
+          <input v-model.trim="search" type="search" placeholder="Filter by model, source, path, session, request id, or prompt">
           <select v-model="sourceFilter">
             <option value="all">All sources</option>
             <option value="claude">Claude</option>
             <option value="codex">Codex</option>
             <option value="proxy">Proxy</option>
+          </select>
+          <select v-model="initiatorFilter" v-if="activeTab === 'requests'">
+            <option value="all">All initiators</option>
+            <option value="user">User only</option>
+            <option value="agent">Agent only</option>
+          </select>
+          <select v-model="safeguardFilter" v-if="activeTab === 'requests'">
+            <option value="all">Any safeguard</option>
+            <option value="triggered">Safeguarded only</option>
+            <option value="clean">Not safeguarded</option>
           </select>
           <select v-model="sortMode">
             <option value="recent">Newest first</option>
@@ -1027,6 +1129,10 @@
                     <div class="request-title">{{ row.resolved_model || row.requested_model || '-' }}</div>
                     <div class="subtle">{{ stamp(row.finished_at || row.started_at) }}</div>
                   </div>
+                  <div v-if="row.safeguard_triggered" class="safeguard-banner">
+                    <span class="badge badge-safeguard">Safeguarded</span>
+                    <span class="subtle">{{ row.safeguard_reason }}</span>
+                  </div>
                   <div class="request-meta subtle">
                     <div><span class="mono">{{ row.path || '-' }}</span></div>
                     <div>{{ row.success === false ? `HTTP ${row.status_code}` : `${row.duration_ms ?? '-'} ms` }}</div>
@@ -1049,6 +1155,11 @@
                   <span :class="['badge', selectedRequest.success === false ? 'status error' : '']">
                     {{ selectedRequest.success === false ? `HTTP ${selectedRequest.status_code}` : 'success' }}
                   </span>
+                </div>
+                <div class="debug-toolbar">
+                  <button type="button" class="debug-btn" @click="openDebugModal(selectedRequest)">Debug · view raw JSON</button>
+                  <span v-if="selectedRequest.safeguard_triggered" class="badge badge-safeguard">Safeguarded</span>
+                  <span v-if="selectedRequest.safeguard_reason" class="subtle">{{ selectedRequest.safeguard_reason }}</span>
                 </div>
                 <div class="detail-grid">
                   <div>
@@ -1150,6 +1261,22 @@
                   </div>
                 </div>
               </article>
+
+              <article class="detail-block" v-if="selectedRequest.request_prompt && (selectedRequest.request_prompt.system || selectedRequest.request_prompt.user)">
+                <div class="detail-label">Prompt Preview</div>
+                <div v-if="selectedRequest.request_prompt.system">
+                  <div class="subtle" style="margin-top:6px">System
+                    <span v-if="selectedRequest.request_prompt.system_truncated">· truncated</span>
+                  </div>
+                  <pre class="prompt-box system">{{ selectedRequest.request_prompt.system }}</pre>
+                </div>
+                <div v-if="selectedRequest.request_prompt.user">
+                  <div class="subtle" style="margin-top:6px">User
+                    <span v-if="selectedRequest.request_prompt.user_truncated">· truncated</span>
+                  </div>
+                  <pre class="prompt-box">{{ selectedRequest.request_prompt.user }}</pre>
+                </div>
+              </article>
             </div>
           </div>
           <div v-else class="empty">No requests match the current filter.</div>
@@ -1237,7 +1364,7 @@
                     v-if="isClaudeTargetMapping(mapping)"
                     v-model="mapping.compact_fallback_model"
                     :disabled="savingModelRoutingConfig || loadingModelRoutingConfig"
-                    :title="'Codex compact payloads exceed Claude\\'s 128K window. Compact calls for this mapping are routed to the selected GPT model; normal turns stay on ' + (mapping.target_model || 'Claude') + '.'"
+                    :title="'Codex compact payloads exceed Claude\'s 128K window. Compact calls for this mapping are routed to the selected GPT model; normal turns stay on ' + (mapping.target_model || 'Claude') + '.'"
                   >
                     <option value="">auto (gpt-5.4)</option>
                     <option v-for="option in gptFallbackOptions" :key="`compact-${index}-${option.model}`" :value="option.model">
@@ -1398,6 +1525,28 @@
 
       </div>
     </section>
+
+    <div v-if="debugModalRow" class="modal-backdrop" @click.self="closeDebugModal">
+      <div class="modal-shell" role="dialog" aria-modal="true">
+        <div class="modal-head">
+          <div>
+            <h3>Request Debug</h3>
+            <div class="subtle mono">{{ debugModalRow.request_id || debugModalRow.server_request_id || '(no id)' }}</div>
+          </div>
+          <div style="display:flex; gap:8px; align-items:center;">
+            <span v-if="debugModalRow.safeguard_triggered" class="badge badge-safeguard">Safeguarded</span>
+            <span class="badge">{{ debugModalRow.initiator || 'unknown' }}</span>
+          </div>
+        </div>
+        <div class="modal-body">
+          <pre class="json-block" v-html="debugModalJsonHighlighted()"></pre>
+        </div>
+        <div class="modal-foot">
+          <button type="button" class="debug-btn" @click="copyDebugJson">Copy JSON</button>
+          <button type="button" class="debug-btn" @click="closeDebugModal">Close</button>
+        </div>
+      </div>
+    </div>
   </div>
 
   <template id="metric-card-template">
@@ -2456,9 +2605,12 @@
           analysisScope: 'week',
           search: '',
           sourceFilter: 'all',
+          initiatorFilter: 'all',
+          safeguardFilter: 'all',
           sortMode: 'recent',
           requestPage: 1,
           selectedRequestKey: '',
+          debugModalRow: null,
           data: {
             premium: {},
             safeguard: {},
@@ -2708,7 +2860,14 @@
             ...row,
             source: 'proxy',
             total_tokens: Number(row?.usage?.total_tokens || row?.total_tokens || 0),
-          })).filter((row) => this.allowSource(row.source) && this.matches(row));
+          })).filter((row) => {
+            if (!this.allowSource(row.source)) return false;
+            if (!this.matches(row)) return false;
+            if (this.initiatorFilter !== 'all' && String(row.initiator || '').toLowerCase() !== this.initiatorFilter) return false;
+            if (this.safeguardFilter === 'triggered' && !row.safeguard_triggered) return false;
+            if (this.safeguardFilter === 'clean' && row.safeguard_triggered) return false;
+            return true;
+          });
           return this.sortRows(rows, 'finished_at');
         },
         requestPageCount() {
@@ -3357,6 +3516,53 @@
         },
         allowSource(source) { return this.sourceFilter === 'all' || this.sourceFilter === source; },
         matches(row) { return !this.search || JSON.stringify(row).toLowerCase().includes(this.search.toLowerCase()); },
+        openDebugModal(row) {
+          if (!row) return;
+          this.debugModalRow = row;
+        },
+        closeDebugModal() {
+          this.debugModalRow = null;
+        },
+        debugModalJson() {
+          if (!this.debugModalRow) return '';
+          try {
+            return JSON.stringify(this.debugModalRow, null, 2);
+          } catch (err) {
+            return String(err);
+          }
+        },
+        debugModalJsonHighlighted() {
+          const raw = this.debugModalJson();
+          if (!raw) return '';
+          const escaped = raw.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+          return escaped.replace(
+            /("(?:\\.|[^"\\])*"\s*:)|("(?:\\.|[^"\\])*")|\b(true|false)\b|\b(null)\b|(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)/g,
+            (match, key, str, bool, nul, num) => {
+              if (key) return `<span class="j-key">${key}</span>`;
+              if (str) return `<span class="j-str">${str}</span>`;
+              if (bool) return `<span class="j-bool">${bool}</span>`;
+              if (nul) return `<span class="j-null">${nul}</span>`;
+              if (num) return `<span class="j-num">${num}</span>`;
+              return match;
+            },
+          );
+        },
+        async copyDebugJson() {
+          const raw = this.debugModalJson();
+          if (!raw) return;
+          try {
+            await navigator.clipboard.writeText(raw);
+          } catch (_err) {
+            const textarea = document.createElement('textarea');
+            textarea.value = raw;
+            textarea.style.position = 'fixed';
+            textarea.style.opacity = '0';
+            document.body.appendChild(textarea);
+            textarea.select();
+            try { document.execCommand('copy'); } catch (_) { /* noop */ }
+            document.body.removeChild(textarea);
+          }
+        },
         sortRows(rows, dateKey) {
           const sorted = [...rows];
           if (this.sortMode === 'cost') return sorted.sort((a, b) => Number(b.cost_usd || 0) - Number(a.cost_usd || 0));
@@ -3478,6 +3684,12 @@
         this.autoRefreshTimer = window.setInterval(() => {
           this.load(true);
         }, 60000);
+        this._debugModalKeyHandler = (event) => {
+          if (event.key === 'Escape' && this.debugModalRow) {
+            this.closeDebugModal();
+          }
+        };
+        window.addEventListener('keydown', this._debugModalKeyHandler);
       },
       beforeUnmount() {
         if (this.autoRefreshTimer) {
@@ -3485,6 +3697,10 @@
           this.autoRefreshTimer = null;
         }
         this.stopDashboardStream();
+        if (this._debugModalKeyHandler) {
+          window.removeEventListener('keydown', this._debugModalKeyHandler);
+          this._debugModalKeyHandler = null;
+        }
       },
     }).mount('#app');
   </script>

@@ -64,6 +64,7 @@ from constants import (
     REQUEST_TRACE_HISTORY_LIMIT,
     REQUEST_TRACE_RETENTION_SLACK,
     REQUEST_TRACE_BODY_MAX_BYTES,
+    REQUEST_PROMPT_PREVIEW_MAX_CHARS,
     TOKEN_DIR,
 )
 
@@ -569,6 +570,92 @@ def _trim_trace_text(value, *, max_chars: int = REQUEST_TRACE_BODY_MAX_BYTES):
     return value[:max_chars] + f"\n…[truncated; original {len(value)} chars]"
 
 
+def _extract_prompt_preview(
+    body: dict | None,
+    *,
+    max_chars: int = REQUEST_PROMPT_PREVIEW_MAX_CHARS,
+) -> dict | None:
+    """Pull a human-readable prompt preview out of a request body.
+
+    Returns a dict with ``system`` (concatenated system/developer prompts),
+    ``user`` (most recent user turn text) and ``truncated`` flags. ``None``
+    is returned when the body carries no recognizable prompt material.
+    Works for both OpenAI ``messages``/``input`` shapes and Anthropic
+    ``system`` + ``messages`` bodies.
+    """
+    if not isinstance(body, dict) or max_chars <= 0:
+        return None
+
+    system_parts: list[str] = []
+    user_parts: list[str] = []
+
+    raw_system = body.get("system")
+    if isinstance(raw_system, str) and raw_system.strip():
+        system_parts.append(raw_system)
+    elif isinstance(raw_system, list):
+        for entry in raw_system:
+            text = util.extract_item_text(entry) if isinstance(entry, dict) else ""
+            if not text and isinstance(entry, dict) and isinstance(entry.get("text"), str):
+                text = entry["text"]
+            if isinstance(text, str) and text.strip():
+                system_parts.append(text)
+
+    def _collect(items):
+        if not isinstance(items, list):
+            return
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            role = str(item.get("role") or item.get("type") or "").strip().lower()
+            text = util.extract_item_text(item)
+            if not isinstance(text, str) or not text.strip():
+                continue
+            if role in ("system", "developer"):
+                system_parts.append(text)
+            elif role in ("user", "human", "message", ""):
+                user_parts.append(text)
+
+    _collect(body.get("messages"))
+    input_value = body.get("input")
+    if isinstance(input_value, str) and input_value.strip():
+        user_parts.append(input_value)
+    else:
+        _collect(input_value)
+
+    if not system_parts and not user_parts:
+        return None
+
+    def _finalize(parts: list[str]) -> tuple[str, bool]:
+        combined = "\n\n".join(part.strip() for part in parts if isinstance(part, str) and part.strip())
+        if not combined:
+            return "", False
+        # Keep the most recent context for user prompts (tail) and the
+        # leading context for system prompts (head) since the head carries
+        # the instructions.
+        if len(combined) <= max_chars:
+            return combined, False
+        return combined[:max_chars] + f"\n…[truncated; original {len(combined)} chars]", True
+
+    system_text, system_truncated = _finalize(system_parts)
+    # For user prompts, prefer the latest turn when truncating.
+    user_combined = "\n\n".join(part.strip() for part in user_parts if isinstance(part, str) and part.strip())
+    user_truncated = False
+    if len(user_combined) > max_chars:
+        user_combined = "…[truncated; original " + str(len(user_combined)) + " chars]\n" + user_combined[-max_chars:]
+        user_truncated = True
+
+    preview: dict = {}
+    if system_text:
+        preview["system"] = system_text
+        if system_truncated:
+            preview["system_truncated"] = True
+    if user_combined:
+        preview["user"] = user_combined
+        if user_truncated:
+            preview["user_truncated"] = True
+    return preview or None
+
+
 def _emit_request_trace_start(
     *,
     request_id: str,
@@ -609,6 +696,12 @@ def _emit_request_trace_start(
         "outbound_headers": _header_trace_subset(outbound_headers),
         "trace": trace_metadata or {},
     }
+    prompt_preview = _extract_prompt_preview(
+        request_body if isinstance(request_body, dict) else upstream_body
+    )
+    if prompt_preview:
+        payload["request_prompt"] = prompt_preview
+        context["request_prompt"] = prompt_preview
     if initiator_verdict is not None:
         payload["initiator_verdict"] = initiator_verdict
         context["initiator_verdict"] = initiator_verdict
@@ -702,6 +795,9 @@ def _prepare_upstream_request(
     initiator_verdict = None
     if isinstance(trace_metadata, dict):
         initiator_verdict = trace_metadata.get("initiator_verdict")
+    prompt_preview = _extract_prompt_preview(
+        source_body if isinstance(source_body, dict) else body
+    )
     usage_event = usage_tracker.start_event(
         request,
         requested_model,
@@ -711,6 +807,8 @@ def _prepare_upstream_request(
         request_body=body,
         upstream_path=upstream_path,
         outbound_headers=headers,
+        prompt_preview=prompt_preview,
+        initiator_verdict=initiator_verdict if isinstance(initiator_verdict, dict) else None,
     )
     trace_context = {
         "request_id": request_id,
