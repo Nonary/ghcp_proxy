@@ -53,7 +53,54 @@ def resolve_copilot_model_name(model_name: str | None) -> str | None:
     return normalized
 
 
+def _responses_model_disallows_temperature(model_name: str | None) -> bool:
+    normalized = normalize_upstream_model_name(resolve_copilot_model_name(model_name))
+    return normalized == "gpt-5.4-mini"
+
+
 # ─── Anthropic content helpers ────────────────────────────────────────────────
+
+def _anthropic_thinking_to_reasoning_effort(thinking) -> str | None:
+    """Translate Anthropic ``thinking`` block into GHCP ``reasoning_effort``.
+
+    Copilot's chat/completions endpoint expects a top-level ``reasoning_effort``
+    string (``low``/``medium``/``high``/``max``) rather than Anthropic's
+    ``thinking.budget_tokens`` integer.
+
+    Matches the native GHCP CLI wire behavior observed in packet captures:
+    every outbound Claude request carries ``reasoning_effort: "medium"`` as
+    a top-level field regardless of whether the Anthropic client advertised
+    an explicit budget. We therefore default to ``"medium"`` whenever the
+    inbound ``thinking`` block is absent, disabled, or uses the opaque
+    ``adaptive`` mode that Claude Code emits by default, and only upgrade
+    when the client requested explicit extended thinking:
+
+    - ``think``     → 4000  tokens → ``medium``
+    - ``megathink`` → 10000 tokens → ``high``
+    - ``ultrathink``→ 31999 tokens → ``max``
+    """
+    # No thinking object at all → match GHCP native default.
+    if not isinstance(thinking, dict):
+        return "medium"
+
+    thinking_type = thinking.get("type")
+    normalized_type = thinking_type.lower() if isinstance(thinking_type, str) else None
+
+    # Explicitly disabled or the opaque "adaptive" mode Claude Code emits by
+    # default → emit the GHCP-native default regardless of any stray budget.
+    if normalized_type in ("disabled", "adaptive"):
+        return "medium"
+
+    budget_tokens = thinking.get("budget_tokens")
+    if not isinstance(budget_tokens, int) or budget_tokens <= 0:
+        return "medium"
+
+    if budget_tokens >= 24576:
+        return "max"
+    if budget_tokens >= 8192:
+        return "high"
+    return "medium"
+
 
 def _normalize_anthropic_cache_control(value):
     if not isinstance(value, dict):
@@ -359,11 +406,9 @@ async def anthropic_request_to_chat(body: dict, api_base: str, api_key: str) -> 
         if value is not None:
             payload[target_key] = value
 
-    thinking = body.get("thinking")
-    if isinstance(thinking, dict):
-        budget_tokens = thinking.get("budget_tokens")
-        if isinstance(budget_tokens, int):
-            payload["thinking_budget"] = budget_tokens
+    reasoning_effort = _anthropic_thinking_to_reasoning_effort(body.get("thinking"))
+    if reasoning_effort is not None:
+        payload["reasoning_effort"] = reasoning_effort
 
     if body.get("tools") is not None:
         payload["tools"] = anthropic_tools_to_chat(body.get("tools"))
@@ -878,6 +923,8 @@ def anthropic_request_to_responses(body: dict) -> dict:
     ):
         value = body.get(source_key)
         if value is not None:
+            if source_key == "temperature" and _responses_model_disallows_temperature(payload.get("model")):
+                continue
             payload[target_key] = value
 
     tools = body.get("tools")
@@ -891,11 +938,9 @@ def anthropic_request_to_responses(body: dict) -> dict:
     if mapped_tool_choice is not None:
         payload["tool_choice"] = chat_tool_choice_to_responses(mapped_tool_choice)
 
-    thinking = body.get("thinking")
-    if isinstance(thinking, dict):
-        budget_tokens = thinking.get("budget_tokens")
-        if isinstance(budget_tokens, int) and budget_tokens > 0:
-            payload["reasoning"] = {"effort": "high" if budget_tokens >= 8192 else "medium"}
+    reasoning_effort = _anthropic_thinking_to_reasoning_effort(body.get("thinking"))
+    if reasoning_effort is not None:
+        payload["reasoning"] = {"effort": reasoning_effort}
 
     # copilot_cache_control is only valid for Chat Completions; strip for Responses API.
     payload["input"] = _strip_copilot_cache_control(payload["input"])

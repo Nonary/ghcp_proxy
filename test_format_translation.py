@@ -66,7 +66,9 @@ class FormatTranslationTests(unittest.TestCase):
         outbound = proxy.asyncio.run(format_translation.anthropic_request_to_chat(body, "https://example.invalid", "test-key"))
 
         self.assertEqual(outbound["model"], "claude-sonnet-4.6")
-        self.assertEqual(outbound["thinking_budget"], 4096)
+        self.assertEqual(outbound["reasoning_effort"], "medium")
+        self.assertNotIn("thinking_budget", outbound)
+        self.assertNotIn("thinking", outbound)
         self.assertEqual(outbound["messages"][0]["role"], "system")
         self.assertIsInstance(outbound["messages"][0]["content"], list)
         self.assertNotIn("stream_options", outbound)
@@ -78,6 +80,71 @@ class FormatTranslationTests(unittest.TestCase):
             outbound["messages"][1]["content"][0]["copilot_cache_control"],
             {"type": "ephemeral"},
         )
+
+    def test_anthropic_thinking_to_reasoning_effort_thresholds(self):
+        cases = [
+            # Absent / disabled / adaptive → GHCP-native default of medium
+            ({"type": "enabled", "budget_tokens": 0}, "medium"),
+            ({"type": "disabled", "budget_tokens": 31999}, "medium"),
+            ({"type": "disabled"}, "medium"),
+            ({"type": "adaptive"}, "medium"),
+            (None, "medium"),
+            ({}, "medium"),
+            # Explicit enabled with budget respects thresholds
+            ({"type": "enabled", "budget_tokens": 1024}, "medium"),
+            ({"type": "enabled", "budget_tokens": 4000}, "medium"),
+            ({"type": "enabled", "budget_tokens": 8191}, "medium"),
+            ({"type": "enabled", "budget_tokens": 8192}, "high"),
+            ({"type": "enabled", "budget_tokens": 10000}, "high"),
+            ({"type": "enabled", "budget_tokens": 24575}, "high"),
+            ({"type": "enabled", "budget_tokens": 24576}, "max"),
+            ({"type": "enabled", "budget_tokens": 31999}, "max"),
+        ]
+        for thinking, expected in cases:
+            with self.subTest(thinking=thinking):
+                self.assertEqual(
+                    format_translation._anthropic_thinking_to_reasoning_effort(thinking),
+                    expected,
+                )
+
+    def test_anthropic_request_to_chat_emits_reasoning_effort_high(self):
+        body = {
+            "model": "claude-sonnet-4.6",
+            "thinking": {"type": "enabled", "budget_tokens": 10000},
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+        outbound = proxy.asyncio.run(format_translation.anthropic_request_to_chat(body, "https://example.invalid", "test-key"))
+        self.assertEqual(outbound["reasoning_effort"], "high")
+        self.assertNotIn("thinking_budget", outbound)
+        self.assertNotIn("reasoning", outbound)
+
+    def test_anthropic_request_to_chat_emits_reasoning_effort_max(self):
+        body = {
+            "model": "claude-sonnet-4.6",
+            "thinking": {"type": "enabled", "budget_tokens": 31999},
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+        outbound = proxy.asyncio.run(format_translation.anthropic_request_to_chat(body, "https://example.invalid", "test-key"))
+        self.assertEqual(outbound["reasoning_effort"], "max")
+
+    def test_anthropic_request_to_chat_omits_reasoning_effort_when_no_thinking(self):
+        body = {
+            "model": "claude-sonnet-4.6",
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+        outbound = proxy.asyncio.run(format_translation.anthropic_request_to_chat(body, "https://example.invalid", "test-key"))
+        # Matches GHCP-native CLI which always emits medium on Claude requests.
+        self.assertEqual(outbound["reasoning_effort"], "medium")
+        self.assertNotIn("thinking_budget", outbound)
+
+    def test_anthropic_request_to_chat_adaptive_thinking_defaults_medium(self):
+        body = {
+            "model": "claude-sonnet-4.6",
+            "thinking": {"type": "adaptive"},
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+        outbound = proxy.asyncio.run(format_translation.anthropic_request_to_chat(body, "https://example.invalid", "test-key"))
+        self.assertEqual(outbound["reasoning_effort"], "medium")
 
     def test_anthropic_request_to_chat_preserves_cache_control_on_tool_results(self):
         body = {
@@ -665,6 +732,27 @@ class FormatTranslationTests(unittest.TestCase):
         self.assertEqual(translated["input"][3]["type"], "function_call_output")
         self.assertEqual(translated["input"][3]["output"], "file contents")
         self.assertEqual(translated["tools"][0]["name"], "Read")
+
+    def test_anthropic_request_to_responses_strips_temperature_for_gpt_5_4_mini(self):
+        body = {
+            "model": "gpt-5.4-mini",
+            "max_tokens": 64,
+            "temperature": 0,
+            "thinking": {"type": "enabled", "budget_tokens": 10000},
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "approve or block"}],
+                }
+            ],
+        }
+
+        translated = format_translation.anthropic_request_to_responses(body)
+
+        self.assertEqual(translated["model"], "gpt-5.4-mini")
+        self.assertEqual(translated["max_output_tokens"], 64)
+        self.assertEqual(translated["reasoning"], {"effort": "high"})
+        self.assertNotIn("temperature", translated)
 
     def test_responses_request_to_chat_translates_function_calls_and_outputs(self):
         body = {
