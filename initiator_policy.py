@@ -642,13 +642,16 @@ class InitiatorPolicy:
         force_initiator: str | None = None,
         now: datetime | None = None,
         request_id: str | None = None,
+        verdict_sink: dict | None = None,
     ) -> tuple[object, str]:
         normalized_input, candidate = _determine_responses_candidate(input_param)
+        forced_by_codex_mini = False
         if (
             _is_codex_bootstrap_mini_request(normalized_input, model_name)
             or _is_codex_title_generation_mini_request(normalized_input, model_name)
         ):
             candidate = AGENT_INITIATOR
+            forced_by_codex_mini = True
         initiator = self.resolve_initiator(
             candidate,
             model_name,
@@ -656,7 +659,10 @@ class InitiatorPolicy:
             force_initiator=force_initiator,
             now=now,
             request_id=request_id,
+            verdict_sink=verdict_sink,
         )
+        if isinstance(verdict_sink, dict) and forced_by_codex_mini:
+            verdict_sink["codex_mini_forced"] = True
         return normalized_input, initiator
 
     def resolve_chat_messages(
@@ -668,6 +674,7 @@ class InitiatorPolicy:
         force_initiator: str | None = None,
         now: datetime | None = None,
         request_id: str | None = None,
+        verdict_sink: dict | None = None,
     ) -> str:
         candidate = _determine_chat_candidate(messages)
         return self.resolve_initiator(
@@ -677,6 +684,7 @@ class InitiatorPolicy:
             force_initiator=force_initiator,
             now=now,
             request_id=request_id,
+            verdict_sink=verdict_sink,
         )
 
     def resolve_anthropic_messages(
@@ -688,6 +696,7 @@ class InitiatorPolicy:
         force_initiator: str | None = None,
         now: datetime | None = None,
         request_id: str | None = None,
+        verdict_sink: dict | None = None,
     ) -> str:
         candidate = _determine_anthropic_candidate(messages)
         return self.resolve_initiator(
@@ -697,6 +706,7 @@ class InitiatorPolicy:
             force_initiator=force_initiator,
             now=now,
             request_id=request_id,
+            verdict_sink=verdict_sink,
         )
 
     def resolve_initiator(
@@ -708,6 +718,7 @@ class InitiatorPolicy:
         force_initiator: str | None = None,
         now: datetime | None = None,
         request_id: str | None = None,
+        verdict_sink: dict | None = None,
     ) -> str:
         resolved_now = now or utc_now()
         with self._lock:
@@ -720,6 +731,8 @@ class InitiatorPolicy:
             )
             if isinstance(request_id, str) and request_id:
                 self._record_request_started_locked(request_id, initiator, resolved_now)
+            active_count = len(self._active_requests)
+            last_activity_at = self._last_activity_at
         if safeguard_reason is not None and self.on_safeguard_triggered is not None:
             self.on_safeguard_triggered(
                 {
@@ -729,6 +742,25 @@ class InitiatorPolicy:
                     "resolved_initiator": initiator,
                     "model_name": _normalize_model_name(model_name),
                     "request_id": request_id,
+                }
+            )
+        if isinstance(verdict_sink, dict):
+            verdict_sink.update(
+                {
+                    "candidate_initiator": _public_candidate_initiator(candidate_initiator),
+                    "resolved_initiator": initiator,
+                    "safeguard_reason": safeguard_reason,
+                    "force_initiator": force_initiator if force_initiator in {AGENT_INITIATOR, USER_INITIATOR} else None,
+                    "subagent": subagent if _is_subagent_request(subagent) else None,
+                    "haiku_forced": _is_haiku_model(model_name),
+                    "explicit_user_prefix": candidate_initiator == _EXPLICIT_USER_INITIATOR,
+                    "active_requests_at_decision": active_count,
+                    "seconds_since_last_activity": (
+                        (resolved_now - last_activity_at).total_seconds()
+                        if last_activity_at is not None
+                        else None
+                    ),
+                    "cooldown_seconds": self.request_finish_guard_seconds,
                 }
             )
         return initiator

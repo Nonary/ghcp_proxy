@@ -45,6 +45,11 @@ CLAUDE_CONFIG_DIR   = os.path.expanduser("~/.claude")
 CLAUDE_SETTINGS_FILE = os.path.join(CLAUDE_CONFIG_DIR, "settings.json")
 CLAUDE_MAX_CONTEXT_TOKENS = "128000"
 CLAUDE_MAX_OUTPUT_TOKENS = "64000"
+# Default GPT model to fall back to when Codex requests a compact against a
+# Claude target. Claude's 128K window cannot hold Codex compact payloads that
+# already approach/exceed the limit, so we route the compact call to a GPT
+# model instead. Per-mapping override lives in model-routing.json.
+DEFAULT_COMPACT_FALLBACK_MODEL = "gpt-5.4"
 CODEX_PROXY_CONFIG = """\
 model_provider = "custom"
 model = "gpt-5.4"
@@ -67,6 +72,17 @@ CLAUDE_PROXY_SETTINGS = {
     "effortLevel": "medium",
 }
 DETAILED_REQUEST_HISTORY_LIMIT = 1000
+# Rolling retention for the request-trace log. Appends past this count are
+# compacted down to the most recent N rows via a temp-file rewrite (same
+# pattern as the usage log). See proxy._enforce_trace_retention.
+REQUEST_TRACE_HISTORY_LIMIT = 1000
+# Trim only when we've drifted this far past the limit so the rewrite cost
+# is amortized across many appends instead of firing on every line.
+REQUEST_TRACE_RETENTION_SLACK = 64
+# Per-field cap for body payloads captured in the trace log. Keeps a
+# 1000-row file to a bounded size even when upstream system prompts are
+# multi-megabyte. See proxy._trim_trace_field.
+REQUEST_TRACE_BODY_MAX_BYTES = 8192
 FORWARDED_REQUEST_HEADERS = (
     "x-client-request-id",
     "x-openai-subagent",

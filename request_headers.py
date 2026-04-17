@@ -109,6 +109,7 @@ def build_responses_headers_for_request(
     *,
     initiator_policy=None,
     session_id_resolver=None,
+    verdict_sink: dict | None = None,
 ) -> dict:
     headers = build_copilot_headers(api_key)
     session_id = _apply_forwarded_request_headers(headers, request, body, session_id_resolver=session_id_resolver)
@@ -121,6 +122,7 @@ def build_responses_headers_for_request(
         subagent=request.headers.get("x-openai-subagent"),
         force_initiator=force_initiator,
         request_id=request_id,
+        verdict_sink=verdict_sink,
     )
     if had_input:
         body["input"] = effective_input
@@ -144,6 +146,7 @@ def build_chat_headers_for_request(
     *,
     initiator_policy=None,
     session_id_resolver=None,
+    verdict_sink: dict | None = None,
 ) -> dict:
     headers = build_copilot_headers(api_key)
     _apply_forwarded_request_headers(headers, request, session_id_resolver=session_id_resolver)
@@ -153,6 +156,7 @@ def build_chat_headers_for_request(
         model_name,
         subagent=request.headers.get("x-openai-subagent"),
         request_id=request_id,
+        verdict_sink=verdict_sink,
     )
     headers["X-Initiator"] = initiator
     headers["x-interaction-type"] = _interaction_type_for_initiator(initiator)
@@ -205,6 +209,7 @@ def build_anthropic_headers_for_request(
     *,
     initiator_policy=None,
     session_id_resolver=None,
+    verdict_sink: dict | None = None,
 ) -> dict:
     headers = build_copilot_headers(api_key)
     _apply_forwarded_request_headers(headers, request, body, session_id_resolver=session_id_resolver)
@@ -215,6 +220,7 @@ def build_anthropic_headers_for_request(
         body.get("model"),
         subagent=request.headers.get("x-openai-subagent"),
         request_id=request_id,
+        verdict_sink=verdict_sink,
     )
     headers["X-Initiator"] = initiator
     headers["x-interaction-type"] = _interaction_type_for_initiator(initiator)

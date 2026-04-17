@@ -107,6 +107,7 @@ class ProxyRoutesTests(unittest.TestCase):
             request_id=mock.ANY,
             initiator_policy=proxy._initiator_policy,
             session_id_resolver=usage_tracking.request_session_id,
+            verdict_sink=mock.ANY,
         )
         self.assertEqual(post.await_args.args[1], "https://example.invalid/chat/completions")
         self.assertEqual(post.await_args.kwargs["headers"], {"X-Initiator": "user"})

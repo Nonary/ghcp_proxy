@@ -21,6 +21,7 @@ import json
 import os
 import sqlite3
 import sys
+import tempfile
 import time
 import premium_plan_config
 import safeguard_config as safeguard_config_module
@@ -60,6 +61,10 @@ from constants import (
     CLAUDE_MAX_OUTPUT_TOKENS,
     DEFAULT_UPSTREAM_TIMEOUT_SECONDS,
     REQUEST_TRACE_LOG_FILE,
+    REQUEST_TRACE_HISTORY_LIMIT,
+    REQUEST_TRACE_RETENTION_SLACK,
+    REQUEST_TRACE_BODY_MAX_BYTES,
+    TOKEN_DIR,
 )
 
 from rate_limiting import (
@@ -259,8 +264,27 @@ def _env_flag(name: str) -> bool:
     return value in {"1", "true", "yes", "on"}
 
 
+def _env_flag_default(name: str, *, default: bool) -> bool:
+    """``_env_flag`` variant that defaults to True unless explicitly disabled.
+
+    Accepts 0/false/no/off (case-insensitive) as opt-out when ``default`` is
+    True. Any other value — including unset — keeps the default.
+    """
+    raw = str(os.environ.get(name, "")).strip().lower()
+    if not raw:
+        return default
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    return default
+
+
 def request_tracing_enabled() -> bool:
-    return _env_flag("GHCP_TRACE_REQUESTS")
+    # Default-on: request tracing is always a rolling window bounded by
+    # REQUEST_TRACE_HISTORY_LIMIT, so it's cheap to leave on. Users can still
+    # opt out with GHCP_TRACE_REQUESTS=0 (accepts 0/false/no/off).
+    return _env_flag_default("GHCP_TRACE_REQUESTS", default=True)
 
 
 def request_trace_log_path() -> str:
@@ -457,8 +481,92 @@ def _append_request_trace(payload: dict, *, force: bool = False) -> None:
             with open(trace_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(payload, separators=(",", ":"), default=util._json_default))
                 f.write("\n")
+            _enforce_trace_retention_locked(trace_path)
     except OSError as exc:
         print(f"Warning: failed to write request trace log: {exc}", file=sys.stderr, flush=True)
+
+
+def _enforce_trace_retention_locked(trace_path: str) -> None:
+    """Keep the trace log bounded at ``REQUEST_TRACE_HISTORY_LIMIT`` rows.
+
+    Only rewrites the file once it has drifted ``REQUEST_TRACE_RETENTION_SLACK``
+    entries past the limit, so the rewrite cost is amortized across many
+    appends. Caller must hold ``_REQUEST_TRACE_LOCK``.
+    """
+    limit = REQUEST_TRACE_HISTORY_LIMIT
+    if limit <= 0:
+        return
+    threshold = limit + max(REQUEST_TRACE_RETENTION_SLACK, 0)
+    try:
+        # Fast pre-check: only count lines when the file is large enough that
+        # it *might* be over-limit. Short bodies are ~200-500B; long ones are
+        # multi-KB. Assume worst-case 256B/line to decide whether to scan.
+        size = os.path.getsize(trace_path)
+    except OSError:
+        return
+    if size < threshold * 256:
+        return
+
+    try:
+        with open(trace_path, "rb") as f:
+            line_count = sum(1 for _ in f)
+    except OSError as exc:
+        print(f"Warning: trace retention scan failed: {exc}", file=sys.stderr, flush=True)
+        return
+    if line_count <= threshold:
+        return
+
+    keep = limit
+    drop = line_count - keep
+    log_dir = os.path.dirname(trace_path) or TOKEN_DIR
+    try:
+        fd, temp_path = tempfile.mkstemp(prefix="request-trace-", suffix=".jsonl", dir=log_dir)
+        try:
+            with os.fdopen(fd, "wb") as out_f, open(trace_path, "rb") as in_f:
+                for idx, line in enumerate(in_f):
+                    if idx < drop:
+                        continue
+                    out_f.write(line)
+            os.replace(temp_path, trace_path)
+        finally:
+            if os.path.exists(temp_path):
+                try:
+                    os.unlink(temp_path)
+                except OSError:
+                    pass
+    except OSError as exc:
+        print(f"Warning: trace retention rewrite failed: {exc}", file=sys.stderr, flush=True)
+
+
+def _trim_trace_field(value, *, max_bytes: int = REQUEST_TRACE_BODY_MAX_BYTES):
+    """Cap a body-ish trace field so retained rows stay bounded in size.
+
+    If the serialized form is under ``max_bytes`` the value is returned
+    unchanged. Otherwise we return a wrapper dict that preserves type info
+    plus a truncated prefix, so the row remains self-describing.
+    """
+    if value is None or max_bytes <= 0:
+        return value
+    try:
+        serialized = json.dumps(value, separators=(",", ":"), default=util._json_default)
+    except (TypeError, ValueError):
+        return value
+    encoded = serialized.encode("utf-8", errors="replace")
+    if len(encoded) <= max_bytes:
+        return value
+    truncated = encoded[:max_bytes].decode("utf-8", errors="replace")
+    return {
+        "_truncated": True,
+        "original_bytes": len(encoded),
+        "preview": truncated,
+        "original_type": type(value).__name__,
+    }
+
+
+def _trim_trace_text(value, *, max_chars: int = REQUEST_TRACE_BODY_MAX_BYTES):
+    if not isinstance(value, str) or max_chars <= 0 or len(value) <= max_chars:
+        return value
+    return value[:max_chars] + f"\n…[truncated; original {len(value)} chars]"
 
 
 def _emit_request_trace_start(
@@ -481,20 +589,30 @@ def _emit_request_trace_start(
         "upstream_host": parsed_upstream.netloc,
         "upstream_path": upstream_path or parsed_upstream.path,
     }
-    _append_request_trace(
-        {
-            "event": "request_started",
-            "time": util.utc_now_iso(),
-            **context,
-            "method": request.method,
-            "requested_model": requested_model,
-            "resolved_model": resolved_model,
-            "request_body": _trace_body_summary(request_body),
-            "upstream_body": _trace_body_summary(upstream_body),
-            "outbound_headers": _header_trace_subset(outbound_headers),
-            "trace": trace_metadata or {},
-        }
-    )
+    # Snapshot the initiator verdict at emit time — the caller may still be
+    # mutating the shared sink (it's populated during header_builder and again
+    # on subsequent requests using the same dict reference in tests).
+    initiator_verdict = None
+    if isinstance(trace_metadata, dict):
+        raw_verdict = trace_metadata.get("initiator_verdict")
+        if isinstance(raw_verdict, dict):
+            initiator_verdict = dict(raw_verdict)
+    payload = {
+        "event": "request_started",
+        "time": util.utc_now_iso(),
+        **context,
+        "method": request.method,
+        "requested_model": requested_model,
+        "resolved_model": resolved_model,
+        "request_body": _trace_body_summary(request_body),
+        "upstream_body": _trace_body_summary(upstream_body),
+        "outbound_headers": _header_trace_subset(outbound_headers),
+        "trace": trace_metadata or {},
+    }
+    if initiator_verdict is not None:
+        payload["initiator_verdict"] = initiator_verdict
+        context["initiator_verdict"] = initiator_verdict
+    _append_request_trace(payload)
     return context
 
 
@@ -535,13 +653,15 @@ def _finish_usage_and_trace(
                 "response_text_present": isinstance(response_text, str) and bool(response_text),
             }
             if status_code >= 400:
-                trace_payload["source_body"] = plan.source_body if isinstance(plan.source_body, dict) else plan.body
-                trace_payload["upstream_body"] = plan.body
+                trace_payload["source_body"] = _trim_trace_field(
+                    plan.source_body if isinstance(plan.source_body, dict) else plan.body
+                )
+                trace_payload["upstream_body"] = _trim_trace_field(plan.body)
                 trace_payload["outbound_headers"] = _header_trace_subset(plan.headers)
                 if isinstance(response_payload, dict):
-                    trace_payload["response_payload"] = response_payload
+                    trace_payload["response_payload"] = _trim_trace_field(response_payload)
                 if isinstance(response_text, str) and response_text:
-                    trace_payload["response_text"] = response_text
+                    trace_payload["response_text"] = _trim_trace_text(response_text)
             _append_request_trace(trace_payload, force=force_trace)
         return
 
@@ -579,6 +699,9 @@ def _prepare_upstream_request(
             return None, error_response(401, AUTH_FAILURE_MESSAGE)
 
     headers = header_builder(effective_api_key, request_id)
+    initiator_verdict = None
+    if isinstance(trace_metadata, dict):
+        initiator_verdict = trace_metadata.get("initiator_verdict")
     usage_event = usage_tracker.start_event(
         request,
         requested_model,
@@ -595,6 +718,8 @@ def _prepare_upstream_request(
         "upstream_path": upstream_path,
         **(trace_metadata or {}),
     }
+    if initiator_verdict is not None:
+        trace_context["initiator_verdict"] = initiator_verdict
     if request_tracing_enabled():
         trace_context = _emit_request_trace_start(
             request_id=request_id,
@@ -638,6 +763,7 @@ def _build_bridge_headers(
     request_id: str | None = None,
     *,
     force_initiator: str | None = None,
+    verdict_sink: dict | None = None,
 ) -> dict:
     if bridge_plan.header_kind == "responses":
         return format_translation.build_responses_headers_for_request(
@@ -648,6 +774,7 @@ def _build_bridge_headers(
             request_id=request_id,
             initiator_policy=_initiator_policy,
             session_id_resolver=usage_tracking.request_session_id,
+            verdict_sink=verdict_sink,
         )
     if bridge_plan.header_kind == "chat":
         return format_translation.build_chat_headers_for_request(
@@ -658,6 +785,7 @@ def _build_bridge_headers(
             request_id=request_id,
             initiator_policy=_initiator_policy,
             session_id_resolver=usage_tracking.request_session_id,
+            verdict_sink=verdict_sink,
         )
     if bridge_plan.header_kind == "anthropic":
         return format_translation.build_anthropic_headers_for_request(
@@ -667,6 +795,7 @@ def _build_bridge_headers(
             request_id=request_id,
             initiator_policy=_initiator_policy,
             session_id_resolver=usage_tracking.request_session_id,
+            verdict_sink=verdict_sink,
         )
     raise ValueError(f"Unsupported bridge header kind: {bridge_plan.header_kind}")
 
@@ -681,6 +810,7 @@ def _prepare_bridge_request(
     force_initiator: str | None = None,
 ) -> tuple[UpstreamRequestPlan | None, Response | None]:
     upstream_url = f"{api_base.rstrip('/')}{bridge_plan.upstream_path}"
+    verdict_sink: dict = {}
     return _prepare_upstream_request(
         request,
         body=bridge_plan.upstream_body,
@@ -695,6 +825,7 @@ def _prepare_bridge_request(
             resolved_api_key,
             request_id=request_id,
             force_initiator=force_initiator,
+            verdict_sink=verdict_sink,
         ),
         error_response=_bridge_error_response(bridge_plan),
         api_key=api_key,
@@ -705,6 +836,7 @@ def _prepare_bridge_request(
             "caller_protocol": bridge_plan.caller_protocol,
             "upstream_protocol": bridge_plan.upstream_protocol,
             "header_kind": bridge_plan.header_kind,
+            "initiator_verdict": verdict_sink,
         },
     )
 
@@ -1437,6 +1569,7 @@ async def responses_compact(request: Request):
             api_base=api_base,
             api_key=api_key,
             subagent=request.headers.get("x-openai-subagent"),
+            is_compact=True,
         )
     except ValueError:
         return format_translation.openai_error_response(400, INVALID_BRIDGE_REQUEST_MESSAGE)
@@ -1476,6 +1609,7 @@ async def chat_completions(request: Request):
     messages = body.get("messages", [])
 
     upstream_url = f"{auth.get_api_base().rstrip('/')}/chat/completions"
+    verdict_sink: dict = {}
     plan, error_response = _prepare_upstream_request(
         request,
         body=body,
@@ -1491,8 +1625,10 @@ async def chat_completions(request: Request):
             request_id=request_id,
             initiator_policy=_initiator_policy,
             session_id_resolver=usage_tracking.request_session_id,
+            verdict_sink=verdict_sink,
         ),
         error_response=format_translation.openai_error_response,
+        trace_metadata={"initiator_verdict": verdict_sink},
     )
     if error_response is not None:
         return error_response
