@@ -11,7 +11,7 @@ import httpx
 from constants import (
     GITHUB_CLIENT_ID, GITHUB_DEVICE_CODE_URL, GITHUB_ACCESS_TOKEN_URL,
     GITHUB_API_KEY_URL,
-    TOKEN_DIR, ACCESS_TOKEN_FILE, BILLING_TOKEN_FILE, API_KEY_FILE,
+    TOKEN_DIR, ACCESS_TOKEN_FILE, API_KEY_FILE,
     GITHUB_COPILOT_API_BASE,
 )
 
@@ -37,45 +37,6 @@ def load_access_token() -> str | None:
         return tok or None
     except OSError:
         return None
-
-
-def load_billing_token() -> str | None:
-    env_token = os.environ.get("GHCP_GITHUB_BILLING_TOKEN", "").strip()
-    if env_token:
-        return env_token
-
-    try:
-        with open(BILLING_TOKEN_FILE, encoding="utf-8") as f:
-            tok = f.read().strip()
-        return tok or None
-    except OSError:
-        return None
-
-
-def save_billing_token(token: str):
-    os.makedirs(TOKEN_DIR, exist_ok=True)
-    with open(BILLING_TOKEN_FILE, "w", encoding="utf-8") as f:
-        f.write(token.strip())
-
-
-def clear_billing_token():
-    try:
-        os.remove(BILLING_TOKEN_FILE)
-    except OSError:
-        pass
-
-
-def billing_token_status() -> dict[str, bool | str]:
-    env_token = os.environ.get("GHCP_GITHUB_BILLING_TOKEN", "").strip()
-    if env_token:
-        return {"configured": True, "source": "environment", "readonly": True}
-
-    try:
-        with open(BILLING_TOKEN_FILE, encoding="utf-8") as f:
-            tok = f.read().strip()
-    except OSError:
-        tok = ""
-    return {"configured": bool(tok), "source": "file" if tok else "none", "readonly": False}
 
 
 def _save_access_token(token: str):

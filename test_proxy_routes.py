@@ -19,43 +19,6 @@ class ProxyRoutesTests(unittest.TestCase):
         proxy.set_initiator_policy(initiator_policy.InitiatorPolicy())
         proxy.usage_tracker.clear_state()
 
-    def test_premium_plan_status_api_returns_service_payload(self):
-        expected = {"configured": True, "plan": "pro_plus"}
-
-        with mock.patch.object(proxy.premium_plan_config_service, "config_payload", return_value=expected):
-            response = proxy.asyncio.run(proxy.premium_plan_status_api())
-
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(json.loads(response.body), expected)
-
-    def test_premium_plan_config_api_saves_settings(self):
-        request = SimpleNamespace()
-        expected = {"configured": True, "plan": "business", "synced_percent": 44.5}
-
-        with (
-            mock.patch.object(proxy, "parse_json_request", mock.AsyncMock(return_value={"plan": "business", "current_percent": 44.5})),
-            mock.patch.object(proxy.premium_plan_config_service, "save_settings", return_value=expected) as save_settings,
-        ):
-            response = proxy.asyncio.run(proxy.premium_plan_config_api(request))
-
-        save_settings.assert_called_once_with({"plan": "business", "current_percent": 44.5})
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(json.loads(response.body), expected)
-
-    def test_premium_plan_config_api_clears_settings(self):
-        request = SimpleNamespace()
-        expected = {"configured": False, "plan": ""}
-
-        with (
-            mock.patch.object(proxy, "parse_json_request", mock.AsyncMock(return_value={"clear": True})),
-            mock.patch.object(proxy.premium_plan_config_service, "clear_settings", return_value=expected) as clear_settings,
-        ):
-            response = proxy.asyncio.run(proxy.premium_plan_config_api(request))
-
-        clear_settings.assert_called_once_with()
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(json.loads(response.body), expected)
-
     def test_anthropic_messages_route_uses_anthropic_headers_and_error_shape(self):
         request = SimpleNamespace(
             url=SimpleNamespace(path="/v1/messages"),

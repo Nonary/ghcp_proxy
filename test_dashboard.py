@@ -62,16 +62,6 @@ class DashboardTests(unittest.TestCase):
 
         service = dashboard.DashboardService(
             dependencies=dashboard.DashboardDependencies(
-                load_premium_plan_config=lambda: {
-                    "configured": True,
-                    "plan": "pro_plus",
-                    "plan_label": "Pro+",
-                    "included": 1500,
-                    "synced_percent": 0.0,
-                    "synced_used": 0.0,
-                    "synced_at": "2026-04-01T00:00:00+00:00",
-                    "synced_month": "2026-04",
-                },
                 snapshot_all_usage_events=lambda: usage_events,
                 snapshot_usage_events=lambda: usage_events,
                 load_safeguard_trigger_stats=lambda _now: {},
@@ -81,11 +71,6 @@ class DashboardTests(unittest.TestCase):
 
         payload = service.build_payload()
 
-        self.assertEqual(payload["premium"]["included"], 1500)
-        self.assertEqual(payload["premium"]["used"], 1.33)
-        self.assertEqual(payload["premium"]["remaining"], 1498.67)
-        self.assertEqual(payload["premium"]["percent_used"], 0.09)
-        self.assertEqual(payload["premium"]["tracked_since_sync"], 1.33)
         self.assertEqual(payload["current_month"]["usage"]["cost_usd"], 4.0)
         self.assertEqual(payload["current_month"]["usage"]["total_tokens"], 400)
         self.assertEqual(payload["current_month"]["usage"]["request_count"], 2)
@@ -119,7 +104,6 @@ class DashboardTests(unittest.TestCase):
 
         service = dashboard.DashboardService(
             dependencies=dashboard.DashboardDependencies(
-                load_premium_plan_config=lambda: {},
                 snapshot_all_usage_events=lambda: usage_events,
                 snapshot_usage_events=lambda: usage_events,
                 load_safeguard_trigger_stats=lambda _now: {},
@@ -179,7 +163,6 @@ class DashboardTests(unittest.TestCase):
 
         service = dashboard.DashboardService(
             dependencies=dashboard.DashboardDependencies(
-                load_premium_plan_config=lambda: {},
                 snapshot_all_usage_events=lambda: [archived_event, recent_event],
                 snapshot_usage_events=lambda: [recent_event],
                 load_safeguard_trigger_stats=lambda _now: {},
@@ -203,8 +186,7 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(payload["month_history"][0]["month_key"], "2026-04")
         self.assertEqual(payload["month_history"][1]["month_key"], "2026-03")
         self.assertIsNone(payload["premium"]["included"])
-        self.assertEqual(payload["premium"]["used"], 0.33)
-        self.assertIsNone(payload["premium"]["percent_used"])
+        self.assertEqual(payload["premium"]["source"], "awaiting-first-request")
 
     def test_build_dashboard_payload_zero_fills_daily_history_for_current_month(self):
         fixed_now = datetime(2026, 4, 4, 18, 0, tzinfo=timezone.utc)
@@ -226,7 +208,6 @@ class DashboardTests(unittest.TestCase):
 
         service = dashboard.DashboardService(
             dependencies=dashboard.DashboardDependencies(
-                load_premium_plan_config=lambda: {},
                 snapshot_all_usage_events=lambda: usage_events,
                 snapshot_usage_events=lambda: usage_events,
                 load_safeguard_trigger_stats=lambda _now: {},
@@ -278,40 +259,43 @@ class DashboardTests(unittest.TestCase):
         mocked_to_thread.assert_awaited_once_with(proxy.dashboard_service.build_payload, True)
         self.assertEqual(response.headers["cache-control"], "no-store")
 
-    def test_build_dashboard_payload_adds_tracked_requests_on_top_of_synced_percent(self):
-        fixed_now = datetime(2026, 4, 4, 18, 0, tzinfo=timezone.utc)
+    def test_premium_summary_derived_from_quota_snapshot_headers(self):
+        fixed_now = datetime(2026, 4, 17, 12, 0, tzinfo=timezone.utc)
         usage_events = [
             {
-                "request_id": "before-sync",
-                "initiator": "user",
-                "started_at": "2026-04-04T17:40:00+00:00",
-                "finished_at": "2026-04-04T17:41:00+00:00",
-                "resolved_model": "gpt-5.4",
-                "path": "/v1/responses",
-                "premium_requests": 1.0,
-            },
-            {
-                "request_id": "after-sync",
-                "initiator": "user",
-                "started_at": "2026-04-04T17:55:00+00:00",
-                "finished_at": "2026-04-04T17:56:00+00:00",
-                "resolved_model": "gpt-5.4-mini",
-                "path": "/v1/responses",
-                "premium_requests": 0.33,
+                "request_id": "req-1",
+                "started_at": "2026-04-17T11:30:00+00:00",
+                "finished_at": "2026-04-17T11:30:01+00:00",
+                "quota_snapshots": {
+                    "premium_interactions": {
+                        "included": 1000,
+                        "unlimited": False,
+                        "percent_remaining": 36.0,
+                        "percent_used": 64.0,
+                        "absolute_remaining": 360.0,
+                        "absolute_used": 640.0,
+                        "overage": 0.0,
+                        "overage_permitted": True,
+                        "reset_at": "2026-05-01T00:00:00Z",
+                        "raw": {"ent": "1000", "rem": "36.0"},
+                    },
+                    "chat": {
+                        "included": None,
+                        "unlimited": True,
+                        "percent_remaining": 100.0,
+                        "percent_used": 0.0,
+                        "absolute_remaining": None,
+                        "absolute_used": None,
+                        "overage": 0.0,
+                        "overage_permitted": False,
+                        "reset_at": "2026-05-01T00:00:00Z",
+                        "raw": {"ent": "-1", "rem": "100.0"},
+                    },
+                },
             },
         ]
         service = dashboard.DashboardService(
             dependencies=dashboard.DashboardDependencies(
-                load_premium_plan_config=lambda: {
-                    "configured": True,
-                    "plan": "pro_plus",
-                    "plan_label": "Pro+",
-                    "included": 1500,
-                    "synced_percent": 10.0,
-                    "synced_used": 150.0,
-                    "synced_at": "2026-04-04T17:50:00+00:00",
-                    "synced_month": "2026-04",
-                },
                 snapshot_all_usage_events=lambda: usage_events,
                 snapshot_usage_events=lambda: usage_events,
                 load_safeguard_trigger_stats=lambda _now: {},
@@ -320,48 +304,49 @@ class DashboardTests(unittest.TestCase):
         )
 
         payload = service.build_payload()
+        premium = payload["premium"]
 
-        self.assertEqual(payload["premium"]["used"], 150.33)
-        self.assertEqual(payload["premium"]["tracked_this_month"], 1.33)
-        self.assertEqual(payload["premium"]["tracked_since_sync"], 0.33)
-        self.assertEqual(payload["premium"]["remaining"], 1349.67)
-        self.assertEqual(payload["premium"]["percent_used"], 10.02)
-        self.assertTrue(payload["premium"]["sync_current_month"])
+        self.assertEqual(premium["source"], "upstream-quota-snapshot")
+        self.assertEqual(premium["included"], 1000)
+        self.assertEqual(premium["remaining"], 360.0)
+        self.assertEqual(premium["used"], 640.0)
+        self.assertEqual(premium["percent_remaining"], 36.0)
+        self.assertEqual(premium["percent_used"], 64.0)
+        self.assertEqual(premium["reset_at"], "2026-05-01T00:00:00Z")
+        self.assertEqual(premium["days_until_reset"], 13)
+        self.assertFalse(premium["unlimited"])
+        # The chat bucket was unlimited; surfaced through the buckets dict.
+        self.assertTrue(premium["buckets"]["chat"]["unlimited"])
 
-    def test_build_dashboard_payload_excludes_agent_requests_from_premium_usage(self):
-        fixed_now = datetime(2026, 4, 4, 18, 0, tzinfo=timezone.utc)
+    def test_premium_summary_uses_latest_snapshot(self):
+        fixed_now = datetime(2026, 4, 17, 12, 0, tzinfo=timezone.utc)
+
+        def _snapshot(percent_remaining, when):
+            return {
+                "premium_interactions": {
+                    "included": 1000,
+                    "unlimited": False,
+                    "percent_remaining": percent_remaining,
+                    "percent_used": 100.0 - percent_remaining,
+                    "absolute_remaining": 1000 * percent_remaining / 100.0,
+                    "absolute_used": 1000 - 1000 * percent_remaining / 100.0,
+                    "overage": 0.0,
+                    "overage_permitted": True,
+                    "reset_at": "2026-05-01T00:00:00Z",
+                    "raw": {},
+                },
+            }
+
         usage_events = [
-            {
-                "request_id": "user-req",
-                "initiator": "user",
-                "started_at": "2026-04-04T17:40:00+00:00",
-                "finished_at": "2026-04-04T17:41:00+00:00",
-                "resolved_model": "gpt-5.4",
-                "path": "/v1/responses",
-                "premium_requests": 1.0,
-            },
-            {
-                "request_id": "agent-req",
-                "initiator": "agent",
-                "started_at": "2026-04-04T17:55:00+00:00",
-                "finished_at": "2026-04-04T17:56:00+00:00",
-                "resolved_model": "gpt-5.4-mini",
-                "path": "/v1/responses",
-                "premium_requests": 0.33,
-            },
+            {"request_id": "old", "started_at": "2026-04-17T10:00:00+00:00",
+             "finished_at": "2026-04-17T10:00:01+00:00",
+             "quota_snapshots": _snapshot(50.0, "10:00:01")},
+            {"request_id": "newer", "started_at": "2026-04-17T11:30:00+00:00",
+             "finished_at": "2026-04-17T11:30:01+00:00",
+             "quota_snapshots": _snapshot(36.0, "11:30:01")},
         ]
         service = dashboard.DashboardService(
             dependencies=dashboard.DashboardDependencies(
-                load_premium_plan_config=lambda: {
-                    "configured": True,
-                    "plan": "pro_plus",
-                    "plan_label": "Pro+",
-                    "included": 1500,
-                    "synced_percent": 10.0,
-                    "synced_used": 150.0,
-                    "synced_at": "2026-04-04T17:30:00+00:00",
-                    "synced_month": "2026-04",
-                },
                 snapshot_all_usage_events=lambda: usage_events,
                 snapshot_usage_events=lambda: usage_events,
                 load_safeguard_trigger_stats=lambda _now: {},
@@ -370,48 +355,64 @@ class DashboardTests(unittest.TestCase):
         )
 
         payload = service.build_payload()
+        self.assertEqual(payload["premium"]["percent_remaining"], 36.0)
+        self.assertEqual(payload["premium"]["request_id"], "newer")
 
-        self.assertEqual(payload["premium"]["tracked_this_month"], 1.0)
-        self.assertEqual(payload["premium"]["tracked_since_sync"], 1.0)
-        self.assertEqual(payload["premium"]["used"], 151.0)
-        self.assertEqual(payload["premium"]["remaining"], 1349.0)
-        self.assertEqual(payload["premium"]["percent_used"], 10.07)
-
-    def test_build_dashboard_payload_clamps_manual_plan_usage_at_100_percent(self):
-        fixed_now = datetime(2026, 4, 4, 18, 0, tzinfo=timezone.utc)
+    def test_premium_summary_awaiting_first_request_when_no_snapshots(self):
+        fixed_now = datetime(2026, 4, 17, 12, 0, tzinfo=timezone.utc)
         service = dashboard.DashboardService(
             dependencies=dashboard.DashboardDependencies(
-                load_premium_plan_config=lambda: {
-                    "configured": True,
-                    "plan": "pro",
-                    "plan_label": "Pro",
-                    "included": 300,
-                    "synced_percent": 99.8,
-                    "synced_used": 299.4,
-                    "synced_at": "2026-04-04T17:00:00+00:00",
-                    "synced_month": "2026-04",
-                },
-                snapshot_all_usage_events=lambda: [
-                    {
-                        "request_id": "overflow-req",
-                        "started_at": "2026-04-04T17:55:00+00:00",
-                        "finished_at": "2026-04-04T17:56:00+00:00",
-                        "resolved_model": "claude-sonnet-4.6",
-                        "path": "/v1/responses",
-                        "premium_requests": 1.0,
-                    }
-                ],
+                snapshot_all_usage_events=lambda: [],
                 snapshot_usage_events=lambda: [],
                 load_safeguard_trigger_stats=lambda _now: {},
             ),
             utc_now=lambda: fixed_now,
         )
-
         payload = service.build_payload()
+        self.assertFalse(payload["premium"]["configured"])
+        self.assertEqual(payload["premium"]["source"], "awaiting-first-request")
+        self.assertIsNone(payload["premium"]["percent_remaining"])
+        self.assertIsNone(payload["premium"]["reset_at"])
+        self.assertIsNone(payload["premium"]["days_until_reset"])
 
-        self.assertEqual(payload["premium"]["used"], 300.0)
-        self.assertEqual(payload["premium"]["remaining"], 0.0)
-        self.assertEqual(payload["premium"]["percent_used"], 100.0)
+    def test_premium_summary_clamps_days_until_reset_at_zero(self):
+        fixed_now = datetime(2026, 5, 2, 12, 0, tzinfo=timezone.utc)
+        usage_events = [
+            {
+                "request_id": "req-1",
+                "started_at": "2026-04-17T11:30:00+00:00",
+                "finished_at": "2026-04-17T11:30:01+00:00",
+                "quota_snapshots": {
+                    "premium_interactions": {
+                        "included": 1000,
+                        "unlimited": False,
+                        "percent_remaining": 36.0,
+                        "percent_used": 64.0,
+                        "absolute_remaining": 360.0,
+                        "absolute_used": 640.0,
+                        "overage": 0.0,
+                        "overage_permitted": True,
+                        "reset_at": "2026-05-01T00:00:00Z",
+                        "raw": {},
+                    },
+                },
+            },
+        ]
+        service = dashboard.DashboardService(
+            dependencies=dashboard.DashboardDependencies(
+                snapshot_all_usage_events=lambda: usage_events,
+                snapshot_usage_events=lambda: usage_events,
+                load_safeguard_trigger_stats=lambda _now: {},
+            ),
+            utc_now=lambda: fixed_now,
+        )
+        payload = service.build_payload()
+        # Reset already passed; days_until_reset should be clamped at 0, not negative.
+        self.assertEqual(payload["premium"]["days_until_reset"], 0)
+
+
+
+
 
     def test_normalize_session_claude_accepts_cached_input_tokens_shape(self):
         normalized = dashboard.normalize_session(

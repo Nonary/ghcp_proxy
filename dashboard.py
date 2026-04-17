@@ -1,10 +1,15 @@
-"""Dashboard payload construction, SQLite cache, and premium quota management."""
+"""Dashboard payload construction and SQLite cache.
+
+Premium quota is sourced exclusively from the upstream `x-quota-snapshot-*`
+response headers captured by `usage_tracking.UsageTrackingService`. There is
+no separate REST billing fetch, no manual sync, and no billing token: every
+successful chat completion already tells us what the dashboard needs.
+"""
 
 import asyncio
 import hashlib
 import json
 import os
-import re
 import sqlite3
 import time
 from collections import deque
@@ -14,11 +19,8 @@ from datetime import datetime, timedelta, timezone
 from threading import Lock, Thread
 from typing import Callable
 
-import httpx
-
 from constants import (
-    TOKEN_DIR, SQLITE_CACHE_FILE, PREMIUM_CACHE_TTL_SECONDS,
-    SKU_PREMIUM_ALLOWANCES, DETAILED_REQUEST_HISTORY_LIMIT,
+    TOKEN_DIR, SQLITE_CACHE_FILE, DETAILED_REQUEST_HISTORY_LIMIT,
 )
 from util import (
     _json_default, _coerce_float, _coerce_int,
@@ -45,26 +47,12 @@ _dashboard_stream_lock = Lock()
 _dashboard_stream_version = 0
 
 
-# ─── Premium cache state ─────────────────────────────────────────────────────
-
-_premium_cache_lock = Lock()
-_premium_cache = {
-    "loaded_at": 0.0,
-    "payload": None,
-    "refreshing": False,
-    "last_error": None,
-    "last_started_at": None,
-}
-
-
 # ─── Runtime dependencies ─────────────────────────────────────────────────────
 
 @dataclass(frozen=True)
 class DashboardDependencies:
-    load_billing_token: Callable[[], str | None] = lambda: None
     load_access_token: Callable[[], str | None] = lambda: None
     load_api_key_payload: Callable[[], dict] = lambda: {}
-    load_premium_plan_config: Callable[[], dict] = lambda: {}
     snapshot_all_usage_events: Callable[[], list[dict]] = lambda: []
     snapshot_usage_events: Callable[[], list[dict]] = lambda: []
     load_safeguard_trigger_stats: Callable[[datetime], dict] = lambda _now: {}
@@ -375,268 +363,6 @@ def create_safeguard_event_store():
     return dashboard_cache_store.safeguard_event_store()
 
 
-# ─── GitHub billing API ──────────────────────────────────────────────────────
-
-def _infer_premium_allowance(api_key_payload: dict) -> int | None:
-    override = os.environ.get("GHCP_PREMIUM_REQUESTS_INCLUDED")
-    if override:
-        return _coerce_int(override, default=None)
-
-    sku = str(api_key_payload.get("sku") or "").strip().lower()
-    if not sku:
-        return None
-
-    if "plus" in sku:
-        return SKU_PREMIUM_ALLOWANCES["plus"]
-    if "enterprise" in sku:
-        return SKU_PREMIUM_ALLOWANCES["enterprise"]
-    if "business" in sku:
-        return SKU_PREMIUM_ALLOWANCES["business"]
-    if "pro" in sku:
-        return SKU_PREMIUM_ALLOWANCES["pro"]
-    if "free" in sku:
-        return SKU_PREMIUM_ALLOWANCES["free"]
-    return None
-
-
-def _extract_quota_summary(api_key_payload: dict) -> dict:
-    included = _infer_premium_allowance(api_key_payload)
-    sku = api_key_payload.get("sku")
-    reset_date = api_key_payload.get("limited_user_reset_date")
-    quotas = api_key_payload.get("limited_user_quotas")
-    remaining = None
-    if isinstance(quotas, dict):
-        for key in ("remaining", "premium_requests_remaining", "available", "left"):
-            if key in quotas:
-                remaining = _coerce_float(quotas.get(key), default=None)
-                break
-
-    return {
-        "sku": sku,
-        "included": included,
-        "official_remaining": remaining,
-        "reset_date": reset_date,
-    }
-
-
-def _github_rest_headers(access_token: str, scheme: str = "Bearer") -> dict:
-    authorization = (
-        f"Bearer {access_token}"
-        if scheme.lower() == "bearer"
-        else f"token {access_token}"
-    )
-    return {
-        "Accept": "application/vnd.github+json",
-        "Authorization": authorization,
-        "X-GitHub-Api-Version": "2026-03-10",
-        "User-Agent": "ghcp-proxy-dashboard",
-    }
-
-
-def _github_rest_get_json(access_token: str, url: str, params: dict | None = None) -> tuple[dict, str]:
-    if not access_token:
-        raise RuntimeError("No GitHub token provided for GitHub REST call")
-    last_error = None
-    for scheme in ("Bearer", "token"):
-        headers = _github_rest_headers(access_token, scheme=scheme)
-        try:
-            with httpx.Client(timeout=30) as client:
-                response = client.get(url, headers=headers, params=params)
-                status = response.status_code
-                if status == 401:
-                    last_error = f"{scheme} auth failed: 401 unauthorized"
-                    continue
-                if status == 403:
-                    body = (response.text or "").strip()
-                    last_error = (
-                        f"{scheme} auth got 403 forbidden: {body[:240] if body else 'forbidden'}"
-                    )
-                    if scheme == "Bearer":
-                        continue
-                response.raise_for_status()
-                payload = response.json()
-        except httpx.TimeoutException as exc:
-            raise RuntimeError(f"GitHub REST request to {url} timed out: {exc}") from exc
-        except ValueError as exc:
-            raise RuntimeError(f"GitHub REST response from {url} was not JSON: {exc}") from exc
-        except httpx.HTTPStatusError as exc:
-            if scheme == "Bearer" and exc.response.status_code in {401, 403}:
-                continue
-            raise RuntimeError(f"GitHub REST request to {url} failed: {exc.response.status_code} {exc.response.text}") from exc
-        except Exception as exc:
-            raise RuntimeError(f"GitHub REST request to {url} failed ({scheme}): {exc}") from exc
-        if not isinstance(payload, dict):
-            raise RuntimeError(f"GitHub REST response from {url} had non-dict payload")
-        return payload, scheme
-    raise RuntimeError(last_error or f"GitHub REST request to {url} failed with unsupported authentication scheme")
-
-
-def _github_rest_error_status(error: Exception | str | None) -> int | None:
-    message = str(error or "")
-    match = re.search(r" failed: (\d{3})\b", message)
-    if not match:
-        return None
-    try:
-        return int(match.group(1))
-    except ValueError:
-        return None
-
-
-def _is_inapplicable_user_billing_error(scope: str, error: Exception | str | None) -> bool:
-    if scope != "user":
-        return False
-    message = str(error or "")
-    return (
-        _github_rest_error_status(message) == 400
-        and "Unable to get billing usage data." in message
-    )
-
-
-def _load_cached_github_identity() -> dict | None:
-    return _sqlite_cache_get("github_identity")
-
-
-def _fetch_github_identity(access_token: str) -> dict:
-    cached = _load_cached_github_identity()
-    if isinstance(cached, dict) and isinstance(cached.get("login"), str) and cached.get("login"):
-        return cached
-
-    payload, _ = _github_rest_get_json(access_token, "https://api.github.com/user")
-    if not isinstance(payload, dict) or not isinstance(payload.get("login"), str):
-        raise RuntimeError("GitHub user API did not return a valid login")
-
-    identity = {"login": payload["login"]}
-    _sqlite_cache_put("github_identity", identity)
-    return identity
-
-
-def _load_billing_org_candidates(access_token: str) -> list[str]:
-    try:
-        payload, _ = _github_rest_get_json(access_token, "https://api.github.com/user/orgs")
-    except Exception:
-        return []
-
-    if not isinstance(payload, list):
-        return []
-
-    candidates = []
-    for org in payload:
-        if not isinstance(org, dict):
-            continue
-        login = org.get("login")
-        if isinstance(login, str) and login:
-            candidates.append(login)
-    return candidates
-
-
-def _billing_target_from_env_or_identity(identity: dict) -> tuple[str, str]:
-    scope = str(os.environ.get("GHCP_GITHUB_BILLING_SCOPE") or "user").strip().lower()
-    target = str(os.environ.get("GHCP_GITHUB_BILLING_TARGET") or "").strip()
-    if scope == "user":
-        return "user", target or identity["login"]
-    if scope in {"organization", "org"}:
-        if not target:
-            raise RuntimeError("GHCP_GITHUB_BILLING_TARGET is required when GHCP_GITHUB_BILLING_SCOPE=org")
-        return "org", target
-    if scope == "enterprise":
-        if not target:
-            raise RuntimeError("GHCP_GITHUB_BILLING_TARGET is required when GHCP_GITHUB_BILLING_SCOPE=enterprise")
-        return "enterprise", target
-    raise RuntimeError(f"Unsupported GHCP_GITHUB_BILLING_SCOPE: {scope}")
-
-
-def _official_premium_cache_key(scope: str, target: str, year: int, month: int) -> str:
-    return f"premium_usage:{scope}:{target}:{year:04d}:{month:02d}"
-
-
-def _premium_usage_endpoint(scope: str, target: str) -> str:
-    if scope == "user":
-        return f"https://api.github.com/users/{target}/settings/billing/premium_request/usage"
-    if scope == "org":
-        return f"https://api.github.com/organizations/{target}/settings/billing/premium_request/usage"
-    if scope == "enterprise":
-        return f"https://api.github.com/enterprises/{target}/settings/billing/premium_request/usage"
-    raise RuntimeError(f"Unsupported billing scope: {scope}")
-
-
-def _extract_explicit_remaining_from_billing_payload(payload: dict) -> float | None:
-    if not isinstance(payload, dict):
-        return None
-    candidate_paths = (
-        ("remainingQuota",),
-        ("remaining",),
-        ("quota", "remaining"),
-        ("includedUsage", "remaining"),
-        ("entitlement", "remaining"),
-    )
-    for path in candidate_paths:
-        current = payload
-        for key in path:
-            if not isinstance(current, dict) or key not in current:
-                current = None
-                break
-            current = current[key]
-        if current is not None:
-            return _coerce_float(current, default=None)
-    return None
-
-
-def _extract_included_from_billing_payload(payload: dict) -> int | None:
-    if not isinstance(payload, dict):
-        return None
-    for key in ("included", "entitlement", "allowed", "quota"):
-        if key in payload:
-            value = _coerce_int(payload.get(key), default=None)
-            if value is not None:
-                return value
-    usage_summary = payload.get("summary")
-    if isinstance(usage_summary, dict):
-        for key in ("included", "allowed", "quota"):
-            if key in usage_summary:
-                value = _coerce_int(usage_summary.get(key), default=None)
-                if value is not None:
-                    return value
-    return None
-
-
-def _infer_remaining_from_billing_payload(payload: dict, included: int | None) -> tuple[float | None, float]:
-    usage_items = payload.get("usageItems") if isinstance(payload, dict) else None
-    if not isinstance(usage_items, list):
-        return None, 0.0
-
-    included_used = 0.0
-    total_used = 0.0
-    for item in usage_items:
-        if not isinstance(item, dict):
-            continue
-        total_used += _coerce_float(item.get("grossQuantity"))
-        discount_quantity = item.get("discountQuantity")
-        net_quantity = item.get("netQuantity")
-        if discount_quantity is not None:
-            included_used += _coerce_float(discount_quantity)
-        elif net_quantity is not None:
-            included_used += max(_coerce_float(item.get("grossQuantity")) - _coerce_float(net_quantity), 0.0)
-    if included is None:
-        return None, total_used
-    return max(included - included_used, 0.0), total_used
-
-
-def _empty_official_premium_payload() -> dict:
-    return {
-        "available": False,
-        "loaded_at": None,
-        "scope": None,
-        "target": None,
-        "remaining": None,
-        "used": 0.0,
-        "included": None,
-        "reset_date": None,
-        "source": "github-rest-billing-api",
-        "raw": None,
-        "error": None,
-        "inference": None,
-    }
-
 
 def _current_billing_month_bounds(now: datetime | None = None) -> tuple[datetime, datetime]:
     current = now or utc_now()
@@ -793,14 +519,12 @@ def _monotonic_loaded_at_from_payload(payload: dict | None) -> float:
 
 
 def seed_cached_payloads_from_sqlite():
-    premium_payload = dashboard_cache_store.get_latest("premium_usage:")
-    if isinstance(premium_payload, dict):
-        with _premium_cache_lock:
-            _premium_cache["payload"] = premium_payload
-            _premium_cache["loaded_at"] = _monotonic_loaded_at_from_payload(premium_payload)
-            _premium_cache["last_error"] = premium_payload.get("error")
-            _premium_cache["refreshing"] = False
-            _premium_cache["last_started_at"] = None
+    """No-op shim retained for backward compatibility.
+
+    Premium quota is now sourced live from upstream `x-quota-snapshot-*` headers
+    captured by UsageTrackingService. No SQLite-cached premium payload to seed.
+    """
+    return None
 
 
 # ─── Usage aggregation and dashboard building ────────────────────────────────
@@ -1304,63 +1028,100 @@ def _empty_day_history_row(day_key: str) -> dict:
     }
 
 
+def _latest_quota_snapshots(events: list[dict]) -> dict | None:
+    """Return the most recent x-quota-snapshot-* payload captured on a successful event.
+
+    The Copilot upstream emits per-bucket quota snapshots on every chat completion
+    response. UsageTrackingService parses those into event["quota_snapshots"].
+    Find the newest event that has them.
+    """
+    best_at = ""
+    best: dict | None = None
+    best_event_id: str | None = None
+    for event in events:
+        snapshots = event.get("quota_snapshots")
+        if not isinstance(snapshots, dict) or not snapshots:
+            continue
+        recorded_at = event.get("finished_at") or event.get("started_at") or ""
+        if not isinstance(recorded_at, str):
+            continue
+        if recorded_at <= best_at:
+            continue
+        best_at = recorded_at
+        best = snapshots
+        best_event_id = event.get("request_id") if isinstance(event.get("request_id"), str) else None
+    if best is None:
+        return None
+    return {
+        "captured_at": best_at,
+        "request_id": best_event_id,
+        "snapshots": best,
+    }
+
+
 def _build_premium_usage_summary(
-    premium_plan: dict | None,
-    current_month_events: list[dict],
+    usage_events: list[dict],
     *,
-    current_month_key: str,
+    now: datetime,
 ) -> dict:
-    plan = premium_plan if isinstance(premium_plan, dict) else {}
-    configured = bool(plan.get("configured"))
-    included = _coerce_float(plan.get("included"), default=None)
-    synced_month = str(plan.get("synced_month") or "").strip()
-    synced_at = _parse_iso_datetime(plan.get("synced_at"))
-    synced_percent = round(_coerce_float(plan.get("synced_percent")), 2) if configured else 0.0
-    synced_used = round(_coerce_float(plan.get("synced_used")), 2) if configured else 0.0
-    sync_current = configured and synced_month == current_month_key
+    """Build the dashboard's `premium` block from the most recent quota snapshot.
 
-    tracked_this_month = round(
-        sum(_counted_premium_requests(event) for event in current_month_events),
-        2,
-    )
-    tracked_since_sync = 0.0
-    for event in current_month_events:
-        if sync_current and synced_at is not None:
-            recorded_at = _parse_iso_datetime(event.get("finished_at") or event.get("started_at"))
-            if recorded_at is None or recorded_at < synced_at:
-                continue
-        tracked_since_sync += _counted_premium_requests(event)
-    tracked_since_sync = round(tracked_since_sync, 2)
+    Source of truth: the `quota_snapshots` field that UsageTrackingService writes
+    on every successful chat completion (parsed from `x-quota-snapshot-*` headers).
+    Returns an `awaiting-first-request` placeholder when no snapshot has been seen.
+    """
+    latest = _latest_quota_snapshots(usage_events)
+    if latest is None:
+        return {
+            "configured": False,
+            "source": "awaiting-first-request",
+            "message": "Make a request through the proxy to populate the live quota.",
+            "captured_at": None,
+            "buckets": {},
+            "included": None,
+            "remaining": None,
+            "used": None,
+            "percent_remaining": None,
+            "percent_used": None,
+            "reset_at": None,
+            "days_until_reset": None,
+            "unlimited": None,
+        }
 
-    baseline_used = synced_used if sync_current else 0.0
-    used_unclamped = round(baseline_used + tracked_since_sync, 2)
-    used = used_unclamped
-    remaining = None
-    percent_used = None
-    if included is not None and included > 0:
-        used = round(min(used_unclamped, included), 2)
-        remaining = round(max(included - used_unclamped, 0.0), 2)
-        percent_used = round(min((used_unclamped / included) * 100.0, 100.0), 2)
+    snapshots = latest["snapshots"]
+    primary = snapshots.get("premium_interactions") if isinstance(snapshots, dict) else None
+    primary = primary if isinstance(primary, dict) else {}
+
+    reset_at = primary.get("reset_at")
+    days_until_reset = _days_until(reset_at, now)
 
     return {
-        "plan": plan.get("plan") if configured else None,
-        "plan_label": plan.get("plan_label") if configured else None,
-        "configured": configured,
-        "included": int(included) if included is not None else None,
-        "used": used,
-        "used_unclamped": used_unclamped,
-        "remaining": remaining,
-        "percent_used": percent_used,
-        "tracked_this_month": tracked_this_month,
-        "tracked_since_sync": tracked_since_sync,
-        "sync_current_month": sync_current,
-        "synced_percent": synced_percent if sync_current else 0.0,
-        "synced_used": synced_used if sync_current else 0.0,
-        "synced_at": plan.get("synced_at") if sync_current else None,
-        "synced_month": synced_month if configured else "",
-        "sync_stale": configured and bool(synced_month) and synced_month != current_month_key,
-        "source": "manual-plan-config" if configured else "proxy-request-log",
+        "configured": True,
+        "source": "upstream-quota-snapshot",
+        "captured_at": latest.get("captured_at"),
+        "request_id": latest.get("request_id"),
+        "buckets": snapshots,
+        "included": primary.get("included"),
+        "remaining": primary.get("absolute_remaining"),
+        "used": primary.get("absolute_used"),
+        "percent_remaining": primary.get("percent_remaining"),
+        "percent_used": primary.get("percent_used"),
+        "overage": primary.get("overage"),
+        "overage_permitted": primary.get("overage_permitted"),
+        "reset_at": reset_at,
+        "days_until_reset": days_until_reset,
+        "unlimited": bool(primary.get("unlimited")),
     }
+
+
+def _days_until(reset_at: str | None, now: datetime) -> int | None:
+    parsed = _parse_iso_datetime(reset_at) if isinstance(reset_at, str) else None
+    if parsed is None:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    delta = parsed - now
+    return max(0, int(delta.total_seconds() // 86400))
 
 
 class DashboardService:
@@ -1391,209 +1152,6 @@ class DashboardService:
             resolved_thread_class = resolved_thread_class()
         return resolved_thread_class
 
-    def reset_official_premium_cache(self):
-        with _premium_cache_lock:
-            _premium_cache.update(
-                {
-                    "loaded_at": 0.0,
-                    "payload": None,
-                    "refreshing": False,
-                    "last_error": None,
-                    "last_started_at": None,
-                }
-            )
-
-    def official_premium_cache_state(self) -> dict:
-        with _premium_cache_lock:
-            return dict(_premium_cache)
-
-    def collect_official_premium_payload(
-        self,
-        now: datetime | None = None,
-        *,
-        skip_cache: bool = False,
-    ) -> dict:
-        current = now or self.utc_now()
-        access_token = self.dependencies.load_billing_token()
-        if not access_token:
-            result = _empty_official_premium_payload()
-            result["loaded_at"] = self.utc_now_iso()
-            result["error"] = None
-            return result
-
-        identity = _fetch_github_identity(access_token)
-        scope, target = _billing_target_from_env_or_identity(identity)
-        api_key_payload = self.dependencies.load_api_key_payload()
-        if not isinstance(api_key_payload, dict):
-            api_key_payload = {}
-        quota_summary = _extract_quota_summary(api_key_payload)
-        included = quota_summary.get("included")
-        explicit_scope = os.environ.get("GHCP_GITHUB_BILLING_SCOPE")
-        candidates: list[tuple[str, str]] = [(scope, target)]
-        seen_candidates = {f"{scope}:{target}"}
-        if not explicit_scope:
-            for org_login in _load_billing_org_candidates(access_token):
-                candidate_key = f"org:{org_login}"
-                if candidate_key in seen_candidates:
-                    continue
-                seen_candidates.add(candidate_key)
-                candidates.append(("org", org_login))
-
-        payload = None
-        cache_key = None
-        last_error = None
-        saw_inapplicable_user_billing_error = False
-        for attempt_scope, attempt_target in candidates:
-            cache_key = _official_premium_cache_key(attempt_scope, attempt_target, current.year, current.month)
-            if not skip_cache:
-                cached = _sqlite_cache_get(cache_key)
-                if isinstance(cached, dict):
-                    return cached
-
-            endpoint = _premium_usage_endpoint(attempt_scope, attempt_target)
-            fetch_attempts = (
-                ({"year": current.year, "month": current.month}, "with month filter"),
-                ({}, "without month filter"),
-            )
-            for attempt_params, attempt_label in fetch_attempts:
-                try:
-                    payload, _ = _github_rest_get_json(access_token, endpoint, params=attempt_params)
-                    scope, target = attempt_scope, attempt_target
-                    break
-                except Exception as exc:
-                    last_error = str(exc)
-                    if _is_inapplicable_user_billing_error(attempt_scope, exc):
-                        saw_inapplicable_user_billing_error = True
-                        print(
-                            "Billing API user-scoped usage unavailable; trying alternate billing owners if available.",
-                            flush=True,
-                        )
-                        break
-                    if "without month filter" in attempt_label:
-                        print(
-                            "Billing API fallback attempt failed while probing alternate billing owners.",
-                            flush=True,
-                        )
-                        continue
-                    print("Billing API month-filtered call failed.", flush=True)
-            if payload is not None:
-                break
-
-        if payload is None or cache_key is None:
-            if saw_inapplicable_user_billing_error:
-                raise RuntimeError(
-                    "GitHub user-scoped billing usage is unavailable for this account. "
-                    "This usually means the Copilot plan is billed through an organization or enterprise instead of "
-                    "the personal account. Set GHCP_GITHUB_BILLING_SCOPE and GHCP_GITHUB_BILLING_TARGET to the "
-                    "billing owner, or use a billing token that can read that billing account. "
-                    f"Last error: {last_error}"
-                )
-            raise RuntimeError(f"GitHub billing API failed after probing identities: {last_error}")
-
-        endpoint_included = _extract_included_from_billing_payload(payload if isinstance(payload, dict) else {})
-        effective_included = _coerce_int(endpoint_included, default=None)
-        if effective_included is None:
-            effective_included = _coerce_int(included, default=None)
-
-        explicit_remaining = _extract_explicit_remaining_from_billing_payload(payload if isinstance(payload, dict) else {})
-        inferred_remaining, total_used = _infer_remaining_from_billing_payload(
-            payload if isinstance(payload, dict) else {},
-            effective_included,
-        )
-        reset_date = quota_summary.get("reset_date")
-        if isinstance(payload, dict):
-            reset_date = payload.get("resetDate") or payload.get("reset_date") or reset_date
-        result = {
-            "available": True,
-            "loaded_at": self.utc_now_iso(),
-            "scope": scope,
-            "target": target,
-            "remaining": explicit_remaining if explicit_remaining is not None else inferred_remaining,
-            "used": total_used,
-            "included": effective_included,
-            "reset_date": reset_date,
-            "source": "github-rest-billing-api",
-            "raw": payload if isinstance(payload, dict) else None,
-            "error": None,
-            "inference": "explicit" if explicit_remaining is not None else "usageItems",
-        }
-        self.sqlite_cache_put(cache_key, result)
-        self.sqlite_cache_put("premium_usage:latest", result)
-        return result
-
-    def refresh_official_premium_cache_sync(self):
-        with _premium_cache_lock:
-            _premium_cache["refreshing"] = True
-            _premium_cache["last_started_at"] = self.utc_now_iso()
-
-        try:
-            result = self.collect_official_premium_payload(skip_cache=True)
-            self.sqlite_cache_put("premium_usage:latest", result)
-            with _premium_cache_lock:
-                _premium_cache["loaded_at"] = time.monotonic()
-                _premium_cache["payload"] = result
-                _premium_cache["last_error"] = None
-            self.notify_dashboard_stream_listeners()
-        except Exception as exc:
-            with _premium_cache_lock:
-                _premium_cache["last_error"] = str(exc)
-        finally:
-            with _premium_cache_lock:
-                _premium_cache["refreshing"] = False
-
-    def trigger_official_premium_refresh(self, force: bool = False):
-        with _premium_cache_lock:
-            payload = _premium_cache.get("payload")
-            loaded_at = _premium_cache.get("loaded_at", 0.0)
-            refreshing = _premium_cache.get("refreshing", False)
-            is_stale = payload is None or (time.monotonic() - loaded_at) >= PREMIUM_CACHE_TTL_SECONDS
-            should_refresh = force or is_stale
-            if refreshing or not should_refresh:
-                return
-            _premium_cache["refreshing"] = True
-            _premium_cache["last_started_at"] = self.utc_now_iso()
-
-        collector = self.collect_official_premium_payload
-        sqlite_cache_put = self.sqlite_cache_put
-        notify_listeners = self.notify_dashboard_stream_listeners
-
-        def _runner():
-            try:
-                result = collector(skip_cache=force)
-                sqlite_cache_put("premium_usage:latest", result)
-                with _premium_cache_lock:
-                    _premium_cache["loaded_at"] = time.monotonic()
-                    _premium_cache["payload"] = result
-                    _premium_cache["last_error"] = None
-                notify_listeners()
-            except Exception as exc:
-                with _premium_cache_lock:
-                    _premium_cache["last_error"] = str(exc)
-            finally:
-                with _premium_cache_lock:
-                    _premium_cache["refreshing"] = False
-
-        self._resolved_thread_class()(target=_runner, daemon=True).start()
-
-    def get_official_premium_payload(self, force_refresh: bool = False) -> dict:
-        if force_refresh:
-            self.refresh_official_premium_cache_sync()
-        else:
-            self.trigger_official_premium_refresh(force=False)
-        with _premium_cache_lock:
-            payload = _premium_cache.get("payload") or _empty_official_premium_payload()
-            age_seconds = None
-            loaded_at = _premium_cache.get("loaded_at", 0.0)
-            if loaded_at:
-                age_seconds = max(0.0, time.monotonic() - loaded_at)
-            return {
-                **payload,
-                "refreshing": bool(_premium_cache.get("refreshing")),
-                "age_seconds": age_seconds,
-                "last_error": _premium_cache.get("last_error"),
-                "last_started_at": _premium_cache.get("last_started_at"),
-            }
-
     def build_payload(self, force_refresh: bool = False) -> dict:
         now = self.utc_now()
         month_start, month_end = _current_billing_month_bounds(now)
@@ -1609,11 +1167,7 @@ class DashboardService:
             if month_start <= recorded_at < month_end:
                 current_month_events.append(event)
 
-        premium_summary = _build_premium_usage_summary(
-            self.dependencies.load_premium_plan_config(),
-            current_month_events,
-            current_month_key=current_month_key,
-        )
+        premium_summary = _build_premium_usage_summary(usage_events, now=now)
 
         local_usage = collect_local_dashboard_usage(usage_events)
         month_rows = list(local_usage.get("month_rows") or [])

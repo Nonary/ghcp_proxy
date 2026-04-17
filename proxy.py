@@ -23,7 +23,6 @@ import sqlite3
 import sys
 import tempfile
 import time
-import premium_plan_config
 import safeguard_config as safeguard_config_module
 import usage_tracking
 import util
@@ -60,6 +59,8 @@ from constants import (
     CLAUDE_MAX_CONTEXT_TOKENS,
     CLAUDE_MAX_OUTPUT_TOKENS,
     DEFAULT_UPSTREAM_TIMEOUT_SECONDS,
+    LEGACY_BILLING_TOKEN_FILE,
+    LEGACY_PREMIUM_PLAN_CONFIG_FILE,
     REQUEST_TRACE_LOG_FILE,
     REQUEST_TRACE_HISTORY_LIMIT,
     REQUEST_TRACE_RETENTION_SLACK,
@@ -160,15 +161,11 @@ client_proxy_config_service = ProxyClientConfigService(
     )
 )
 model_routing_config_service = ModelRoutingConfigService(ModelRoutingConfig())
-premium_plan_config_service = premium_plan_config.PremiumPlanConfigService(
-    premium_plan_config.PremiumPlanConfig()
-)
 bridge_planner = ProtocolBridgePlanner(model_routing_config_service)
 
 dashboard_service = dashboard_module.create_dashboard_service(
     dependencies=dashboard_module.DashboardDependencies(
         load_api_key_payload=auth.load_api_key_payload,
-        load_premium_plan_config=premium_plan_config_service.load_settings,
         snapshot_all_usage_events=usage_tracker.snapshot_all_usage_events,
         snapshot_usage_events=usage_tracker.snapshot_usage_events,
         load_safeguard_trigger_stats=safeguard_event_store.load_stats,
@@ -1486,11 +1483,6 @@ async def dashboard_stream(request: Request):
 
 # ─── Config API routes ────────────────────────────────────────────────────────
 
-@app.get("/api/config/premium-plan")
-async def premium_plan_status_api():
-    return JSONResponse(content=premium_plan_config_service.config_payload())
-
-
 @app.get("/api/config/safeguard")
 async def safeguard_status_api():
     return JSONResponse(content=safeguard_config_service.config_payload())
@@ -1509,19 +1501,6 @@ async def safeguard_config_api(request: Request):
     else:
         result = safeguard_config_service.save_settings(payload)
     _apply_safeguard_settings(result)
-    return JSONResponse(content=result)
-
-
-@app.post("/api/config/premium-plan")
-async def premium_plan_config_api(request: Request):
-    payload = await parse_json_request(request)
-    if not isinstance(payload, dict):
-        raise HTTPException(status_code=400, detail="Request body must be an object")
-
-    if bool(payload.get("clear")):
-        result = premium_plan_config_service.clear_settings()
-    else:
-        result = premium_plan_config_service.save_settings(payload)
     return JSONResponse(content=result)
 
 
@@ -1794,6 +1773,18 @@ async def anthropic_messages(request: Request):
 # ─── Entrypoint ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    # Best-effort cleanup of legacy on-disk state from the pre-header-driven
+    # quota implementation. Safe to remove unconditionally; if the user never
+    # configured them, the unlinks are no-ops.
+    for legacy_path in (
+        LEGACY_PREMIUM_PLAN_CONFIG_FILE,
+        LEGACY_BILLING_TOKEN_FILE,
+    ):
+        try:
+            os.remove(legacy_path)
+        except OSError:
+            pass
+
     # Step 1: Run auth interactively in the terminal BEFORE the server starts.
     # If no token exists this will print the device flow prompt and block until
     # the user authorizes (or the script exits on failure).

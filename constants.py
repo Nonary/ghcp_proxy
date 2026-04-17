@@ -24,10 +24,10 @@ DEFAULT_UPSTREAM_TIMEOUT_SECONDS = 300
 
 TOKEN_DIR         = os.path.expanduser("~/.config/ghcp_proxy")
 ACCESS_TOKEN_FILE = os.path.join(TOKEN_DIR, "access-token")
-BILLING_TOKEN_FILE = os.path.join(TOKEN_DIR, "billing-token")
 API_KEY_FILE      = os.path.join(TOKEN_DIR, "api-key.json")
 MODEL_ROUTING_CONFIG_FILE = os.path.join(TOKEN_DIR, "model-routing.json")
-PREMIUM_PLAN_CONFIG_FILE = os.path.join(TOKEN_DIR, "premium-plan.json")
+LEGACY_PREMIUM_PLAN_CONFIG_FILE = os.path.join(TOKEN_DIR, "premium-plan.json")
+LEGACY_BILLING_TOKEN_FILE = os.path.join(TOKEN_DIR, "billing-token")
 SAFEGUARD_CONFIG_FILE = os.path.join(TOKEN_DIR, "safeguard.json")
 USAGE_LOG_FILE    = os.path.join(TOKEN_DIR, "usage-log.jsonl")
 REQUEST_ERROR_LOG_FILE = os.path.join(TOKEN_DIR, "request-errors.log")
@@ -227,9 +227,6 @@ Immediate next steps:
 ---
 
 Please write the summary now, following the structure and guidelines above. Be concise where possible, but don't sacrifice important context for brevity."""
-
-# ─── Premium request tracking ────────────────────────────────────────────────
-PREMIUM_CACHE_TTL_SECONDS = 60.0
 
 # ─── Model pricing & SKU tables ──────────────────────────────────────────────
 MODEL_PRICING = {
@@ -471,12 +468,3 @@ PREMIUM_REQUEST_MULTIPLIERS = {
 SAFEGUARD_DEFAULT_COOLDOWN_SECONDS = 15.0
 SAFEGUARD_MIN_COOLDOWN_SECONDS = 0.0
 SAFEGUARD_MAX_COOLDOWN_SECONDS = 600.0
-
-SKU_PREMIUM_ALLOWANCES = {
-    "copilot_free": 50,
-    "free": 50,
-    "pro": 300,
-    "business": 300,
-    "enterprise": 1000,
-    "plus": 1500,
-}

@@ -10,4 +10,3 @@ from test_request_headers import *    # noqa: F401,F403
 from test_proxy_routes import *       # noqa: F401,F403
 from test_dashboard import *          # noqa: F401,F403
 from test_client_config import *      # noqa: F401,F403
-from test_premium_plan_config import *  # noqa: F401,F403

@@ -923,6 +923,93 @@ class UsageTracker:
             if content_type:
                 finished_event["response_content_type"] = content_type
 
+            # Copilot upstream emits x-quota-snapshot-{chat,completions,premium_interactions}
+            # with URL-encoded "ent=...&ov=...&ovPerm=...&rem=...&rst=..." values:
+            #   ent     = monthly entitlement (-1 means unlimited)
+            #   ov      = current overage (absolute count)
+            #   ovPerm  = whether overage is permitted
+            #   rem     = REMAINING PERCENT (0..100), NOT an absolute count
+            #   rst     = reset timestamp (ISO-8601 UTC)
+            # This is more authoritative than the user-scoped /settings/billing endpoint
+            # (which often 403s for ghu_* device-flow tokens) because it ships on every
+            # successful chat completion.
+            quota_snapshots: dict[str, dict[str, object]] = {}
+            from urllib.parse import parse_qs, unquote
+            for header_name, header_value in upstream.headers.items():
+                lowered = header_name.lower()
+                if not lowered.startswith("x-quota-snapshot-"):
+                    continue
+                bucket = lowered[len("x-quota-snapshot-"):]
+                if not bucket:
+                    continue
+                raw: dict[str, str] = {}
+                for key, values in parse_qs(unquote(header_value), keep_blank_values=True).items():
+                    if values:
+                        raw[key] = values[0]
+
+                def _to_float(val: str | None) -> float | None:
+                    if val is None:
+                        return None
+                    try:
+                        return float(val)
+                    except (TypeError, ValueError):
+                        return None
+
+                ent_value = _to_float(raw.get("ent"))
+                rem_percent = _to_float(raw.get("rem"))
+                overage = _to_float(raw.get("ov"))
+                overage_permitted = (raw.get("ovPerm", "").lower() == "true") if "ovPerm" in raw else None
+                reset_at = raw.get("rst")
+                unlimited = ent_value is not None and ent_value < 0
+                included: int | None = (
+                    int(ent_value) if (ent_value is not None and not unlimited) else None
+                )
+
+                percent_remaining: float | None = None
+                percent_used: float | None = None
+                if rem_percent is not None:
+                    percent_remaining = round(max(0.0, min(rem_percent, 100.0)), 2)
+                    percent_used = round(100.0 - percent_remaining, 2)
+
+                absolute_remaining: float | None = None
+                absolute_used: float | None = None
+                if included is not None and percent_remaining is not None:
+                    absolute_remaining = round(included * percent_remaining / 100.0, 2)
+                    absolute_used = round(included - absolute_remaining, 2)
+
+                quota_snapshots[bucket] = {
+                    "included": included,
+                    "unlimited": unlimited,
+                    "percent_remaining": percent_remaining,
+                    "percent_used": percent_used,
+                    "absolute_remaining": absolute_remaining,
+                    "absolute_used": absolute_used,
+                    "overage": overage,
+                    "overage_permitted": overage_permitted,
+                    "reset_at": reset_at,
+                    "raw": raw,
+                }
+            if quota_snapshots:
+                finished_event["quota_snapshots"] = quota_snapshots
+
+            # Also keep generic x-ratelimit-* if any upstream variant ever emits them.
+            rate_limit_fields = {}
+            for header_name in (
+                "x-ratelimit-limit",
+                "x-ratelimit-remaining",
+                "x-ratelimit-reset",
+                "x-ratelimit-used",
+                "x-ratelimit-resource",
+                "retry-after",
+            ):
+                header_value = upstream.headers.get(header_name)
+                if header_value is None:
+                    continue
+                short_key = header_name.replace("x-ratelimit-", "").replace("-", "_")
+                rate_limit_fields[short_key] = header_value
+            if rate_limit_fields:
+                finished_event["rate_limit"] = rate_limit_fields
+
         if isinstance(response_payload, dict):
             payload_response_id = response_payload.get("id")
             if isinstance(payload_response_id, str):
