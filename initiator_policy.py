@@ -568,6 +568,12 @@ def _determine_anthropic_candidate(messages) -> str:
         if saw_agent_meta and not saw_tool_result and not saw_real_user_content:
             ignorable_meta_messages.add(id(message))
 
+    # Approval-review requests can split the transcript container from the
+    # trailing "review this action" instruction across separate user messages.
+    # Treat any transcript-bearing request as agent traffic up front.
+    if _anthropic_messages_include_transcript_container(messages):
+        return AGENT_INITIATOR
+
     for message in reversed(messages):
         if not isinstance(message, dict):
             continue

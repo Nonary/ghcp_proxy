@@ -393,6 +393,26 @@ def _trace_body_summary(body: dict | None) -> dict | None:
         "stream": body.get("stream"),
     }
 
+    reasoning_effort = body.get("reasoning_effort")
+    if isinstance(reasoning_effort, str) and reasoning_effort:
+        summary["reasoning_effort"] = reasoning_effort
+    reasoning = body.get("reasoning")
+    if isinstance(reasoning, dict):
+        effort = reasoning.get("effort")
+        if isinstance(effort, str) and effort:
+            summary["reasoning_effort"] = effort
+    thinking = body.get("thinking")
+    if isinstance(thinking, dict):
+        snapshot: dict = {}
+        t_type = thinking.get("type")
+        if isinstance(t_type, str):
+            snapshot["type"] = t_type
+        budget = thinking.get("budget_tokens")
+        if isinstance(budget, int):
+            snapshot["budget_tokens"] = budget
+        if snapshot:
+            summary["thinking"] = snapshot
+
     for source_key, target_key in (
         ("session_id", "session_id"),
         ("sessionId", "session_id"),

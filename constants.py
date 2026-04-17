@@ -50,6 +50,11 @@ CLAUDE_MAX_OUTPUT_TOKENS = "64000"
 # already approach/exceed the limit, so we route the compact call to a GPT
 # model instead. Per-mapping override lives in model-routing.json.
 DEFAULT_COMPACT_FALLBACK_MODEL = "gpt-5.4"
+# Default reasoning_effort to forward upstream for Claude-family models when
+# the inbound Anthropic body does not carry an explicit effort selection.
+# Claude Code commonly emits ``thinking: {"type":"adaptive"}`` regardless of
+# the user's picker choice, so translation falls back to this configured level.
+CLAUDE_DEFAULT_REASONING_EFFORT = "medium"
 CODEX_PROXY_CONFIG = """\
 model_provider = "custom"
 model = "gpt-5.4"

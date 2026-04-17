@@ -372,6 +372,45 @@ class InitiatorPolicyTests(unittest.TestCase):
 
         self.assertEqual(initiator, "agent")
 
+    def test_anthropic_transcript_request_with_trailing_review_message_stays_agent_without_safeguard(self):
+        policy = initiator_policy.InitiatorPolicy()
+        start = datetime(2026, 4, 17, 5, 28, 8, tzinfo=timezone.utc)
+        verdict = {}
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "<transcript>\nUser: inspect the file\nAssistant: running checks\n</transcript>"},
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            "Review the classification process and follow it carefully, "
+                            "making sure you deny actions that should be blocked."
+                        ),
+                    },
+                ],
+            },
+        ]
+
+        policy.note_request_started("req-1", "user", started_at=start.replace(second=7))
+        policy.note_request_finished("req-1", finished_at=start.replace(second=8))
+
+        initiator = policy.resolve_anthropic_messages(
+            messages,
+            "claude-opus-4.6",
+            now=start.replace(microsecond=200000),
+            verdict_sink=verdict,
+        )
+
+        self.assertEqual(initiator, "agent")
+        self.assertEqual(verdict["candidate_initiator"], "agent")
+        self.assertIsNone(verdict["safeguard_reason"])
+
     def test_anthropic_system_reminder_with_real_user_text_stays_user(self):
         policy = initiator_policy.InitiatorPolicy()
         messages = [

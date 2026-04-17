@@ -1,0 +1,76 @@
+"""Model-aware reasoning-effort normalization."""
+
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+
+
+_CANONICAL = {"low", "medium", "high", "max"}
+_ALIASES = {
+    "xhigh": "max",
+    "x-high": "max",
+    "extra-high": "max",
+    "extra_high": "max",
+    "minimal": "low",
+    "none": "low",
+}
+
+
+def _canonicalize(effort: str | None) -> str | None:
+    if not isinstance(effort, str):
+        return None
+    normalized = effort.strip().lower()
+    if not normalized:
+        return None
+    if normalized in _CANONICAL:
+        return normalized
+    return _ALIASES.get(normalized)
+
+
+class ModelEffortStrategy(ABC):
+    @abstractmethod
+    def matches(self, normalized_model: str) -> bool:
+        raise NotImplementedError
+
+    @abstractmethod
+    def map(self, canonical_effort: str) -> str | None:
+        raise NotImplementedError
+
+
+class ClaudeOpus47Strategy(ModelEffortStrategy):
+    def matches(self, normalized_model: str) -> bool:
+        return normalized_model == "claude-opus-4.7"
+
+    def map(self, canonical_effort: str) -> str | None:
+        return "medium"
+
+
+class PassthroughStrategy(ModelEffortStrategy):
+    def matches(self, normalized_model: str) -> bool:
+        return True
+
+    def map(self, canonical_effort: str) -> str | None:
+        return canonical_effort
+
+
+_STRATEGIES: list[ModelEffortStrategy] = [
+    ClaudeOpus47Strategy(),
+    PassthroughStrategy(),
+]
+
+
+def _strategy_for(model: str | None) -> ModelEffortStrategy:
+    normalized = (model or "").strip().lower()
+    if normalized.startswith("anthropic/"):
+        normalized = normalized.split("/", 1)[1]
+    for strategy in _STRATEGIES:
+        if strategy.matches(normalized):
+            return strategy
+    return _STRATEGIES[-1]
+
+
+def map_effort_for_model(model: str | None, effort: str | None) -> str | None:
+    canonical = _canonicalize(effort)
+    if canonical is None:
+        return None
+    return _strategy_for(model).map(canonical)

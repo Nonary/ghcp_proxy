@@ -5,6 +5,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
+import effort_mapping
 import format_translation
 from initiator_policy import is_approval_agent_request
 from model_routing_config import ModelRoutingConfigService, model_provider_family, normalize_routing_model_name
@@ -63,6 +64,13 @@ class ResponsesToResponsesStrategy(ProtocolBridgeStrategy):
         del api_base, api_key
         upstream_body = dict(body)
         upstream_body["model"] = resolved_model
+        incoming_reasoning = upstream_body.get("reasoning")
+        if isinstance(incoming_reasoning, dict) and "effort" in incoming_reasoning:
+            mapped_effort = effort_mapping.map_effort_for_model(
+                resolved_model, incoming_reasoning.get("effort")
+            )
+            if mapped_effort is not None:
+                upstream_body["reasoning"] = {**incoming_reasoning, "effort": mapped_effort}
         return BridgeExecutionPlan(
             strategy_name=self.strategy_name,
             inbound_protocol=self.inbound_protocol,

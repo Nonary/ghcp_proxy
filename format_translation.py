@@ -6,6 +6,7 @@ import json
 import httpx
 from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse
+import effort_mapping
 import util
 
 from constants import (
@@ -60,46 +61,56 @@ def _responses_model_disallows_temperature(model_name: str | None) -> bool:
 
 # ─── Anthropic content helpers ────────────────────────────────────────────────
 
+def _anthropic_effort_to_reasoning_effort(output_config) -> str | None:
+    """Extract the selected effort level from Claude Code's output config."""
+    if not isinstance(output_config, dict):
+        return None
+    effort = output_config.get("effort")
+    if not isinstance(effort, str):
+        return None
+    normalized = effort.strip().lower()
+    if normalized in ("low", "medium", "high", "max"):
+        return normalized
+    return None
+
+
 def _anthropic_thinking_to_reasoning_effort(thinking) -> str | None:
     """Translate Anthropic ``thinking`` block into GHCP ``reasoning_effort``.
 
     Copilot's chat/completions endpoint expects a top-level ``reasoning_effort``
-    string (``low``/``medium``/``high``/``max``) rather than Anthropic's
-    ``thinking.budget_tokens`` integer.
+    string (``low``/``medium``/``high``/``max``).
 
-    Matches the native GHCP CLI wire behavior observed in packet captures:
-    every outbound Claude request carries ``reasoning_effort: "medium"`` as
-    a top-level field regardless of whether the Anthropic client advertised
-    an explicit budget. We therefore default to ``"medium"`` whenever the
-    inbound ``thinking`` block is absent, disabled, or uses the opaque
-    ``adaptive`` mode that Claude Code emits by default, and only upgrade
-    when the client requested explicit extended thinking:
+    Claude Code's default Anthropic body often only carries
+    ``thinking: {"type":"adaptive"}``, so we use the configured default
+    effort unless the client explicitly enabled extended thinking with a
+    positive ``budget_tokens``:
 
     - ``think``     → 4000  tokens → ``medium``
     - ``megathink`` → 10000 tokens → ``high``
     - ``ultrathink``→ 31999 tokens → ``max``
     """
-    # No thinking object at all → match GHCP native default.
+    from constants import CLAUDE_DEFAULT_REASONING_EFFORT
+
+    default_effort = CLAUDE_DEFAULT_REASONING_EFFORT or "medium"
+
+    # No thinking object at all → configured default.
     if not isinstance(thinking, dict):
-        return "medium"
+        return default_effort
 
     thinking_type = thinking.get("type")
     normalized_type = thinking_type.lower() if isinstance(thinking_type, str) else None
 
-    # Explicitly disabled or the opaque "adaptive" mode Claude Code emits by
-    # default → emit the GHCP-native default regardless of any stray budget.
-    if normalized_type in ("disabled", "adaptive"):
-        return "medium"
+    # Explicit "enabled" with a positive budget → honor the budget threshold.
+    if normalized_type == "enabled":
+        budget_tokens = thinking.get("budget_tokens")
+        if isinstance(budget_tokens, int) and budget_tokens > 0:
+            if budget_tokens >= 24576:
+                return "max"
+            if budget_tokens >= 8192:
+                return "high"
+            return "medium"
 
-    budget_tokens = thinking.get("budget_tokens")
-    if not isinstance(budget_tokens, int) or budget_tokens <= 0:
-        return "medium"
-
-    if budget_tokens >= 24576:
-        return "max"
-    if budget_tokens >= 8192:
-        return "high"
-    return "medium"
+    return default_effort
 
 
 def _normalize_anthropic_cache_control(value):
@@ -406,7 +417,13 @@ async def anthropic_request_to_chat(body: dict, api_base: str, api_key: str) -> 
         if value is not None:
             payload[target_key] = value
 
-    reasoning_effort = _anthropic_thinking_to_reasoning_effort(body.get("thinking"))
+    reasoning_effort = (
+        _anthropic_effort_to_reasoning_effort(body.get("output_config"))
+        or _anthropic_thinking_to_reasoning_effort(body.get("thinking"))
+    )
+    reasoning_effort = effort_mapping.map_effort_for_model(
+        payload.get("model"), reasoning_effort
+    )
     if reasoning_effort is not None:
         payload["reasoning_effort"] = reasoning_effort
 
@@ -758,6 +775,14 @@ def responses_request_to_chat(body: dict) -> dict:
     if mapped_tool_choice is not None and payload.get("tools"):
         payload["tool_choice"] = mapped_tool_choice
 
+    incoming_reasoning = body.get("reasoning")
+    if isinstance(incoming_reasoning, dict):
+        mapped_effort = effort_mapping.map_effort_for_model(
+            payload.get("model"), incoming_reasoning.get("effort")
+        )
+        if mapped_effort is not None:
+            payload["reasoning_effort"] = mapped_effort
+
     return payload
 
 
@@ -938,7 +963,13 @@ def anthropic_request_to_responses(body: dict) -> dict:
     if mapped_tool_choice is not None:
         payload["tool_choice"] = chat_tool_choice_to_responses(mapped_tool_choice)
 
-    reasoning_effort = _anthropic_thinking_to_reasoning_effort(body.get("thinking"))
+    reasoning_effort = (
+        _anthropic_effort_to_reasoning_effort(body.get("output_config"))
+        or _anthropic_thinking_to_reasoning_effort(body.get("thinking"))
+    )
+    reasoning_effort = effort_mapping.map_effort_for_model(
+        payload.get("model"), reasoning_effort
+    )
     if reasoning_effort is not None:
         payload["reasoning"] = {"effort": reasoning_effort}
 
