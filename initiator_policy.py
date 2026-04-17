@@ -96,6 +96,11 @@ def _is_claude_meta_user_text(text: str) -> bool:
     normalized = text.lstrip()
     if not normalized:
         return False
+    if (
+        normalized.startswith("The user stepped away and is coming back.")
+        and "Recap in under 40 words" in normalized
+    ):
+        return True
     if normalized.startswith((
         "<local-command-caveat>",
         "<local-command-stdout>",

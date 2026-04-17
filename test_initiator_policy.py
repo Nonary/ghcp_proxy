@@ -390,6 +390,30 @@ class InitiatorPolicyTests(unittest.TestCase):
 
         self.assertEqual(initiator, "user")
 
+    def test_anthropic_tool_result_with_step_away_recap_only_is_agent(self):
+        policy = initiator_policy.InitiatorPolicy()
+        messages = [
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "tool-1", "name": "Bash", "input": {}}]},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "tool-1", "content": "done", "is_error": False},
+                    {
+                        "type": "text",
+                        "text": (
+                            "The user stepped away and is coming back. Recap in under 40 words, "
+                            "1-2 plain sentences, no markdown. Lead with the overall goal and "
+                            "current task, then the one next action."
+                        ),
+                    },
+                ],
+            },
+        ]
+
+        initiator = policy.resolve_anthropic_messages(messages, "claude-opus-4.6")
+
+        self.assertEqual(initiator, "agent")
+
     def test_plus_prefix_does_not_override_haiku(self):
         policy = initiator_policy.InitiatorPolicy()
 
