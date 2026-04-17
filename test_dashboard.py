@@ -96,6 +96,50 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(payload["recent_sessions"][0]["source"], "codex")
         self.assertEqual(payload["recent_sessions"][1]["source"], "claude")
 
+    def test_build_dashboard_payload_includes_exact_claude_cost_breakdown(self):
+        fixed_now = datetime(2026, 4, 4, 18, 0, tzinfo=timezone.utc)
+        usage_events = [
+            {
+                "request_id": "claude-req",
+                "session_id": "claude-session",
+                "server_request_id": "claude-chain",
+                "started_at": "2026-04-04T17:50:00+00:00",
+                "finished_at": "2026-04-04T17:51:00+00:00",
+                "requested_model": "claude-opus-4.7",
+                "resolved_model": "claude-opus-4.7",
+                "path": "/v1/messages",
+                "usage": {
+                    "input_tokens": 1_000,
+                    "output_tokens": 1_000,
+                    "cached_input_tokens": 1_000,
+                    "total_tokens": 3_000,
+                },
+            },
+        ]
+
+        service = dashboard.DashboardService(
+            dependencies=dashboard.DashboardDependencies(
+                load_premium_plan_config=lambda: {},
+                snapshot_all_usage_events=lambda: usage_events,
+                snapshot_usage_events=lambda: usage_events,
+                load_safeguard_trigger_stats=lambda _now: {},
+            ),
+            utc_now=lambda: fixed_now,
+        )
+
+        payload = service.build_payload()
+        usage = payload["current_month"]["usage"]
+        claude_usage = usage["sources"]["claude"]
+
+        self.assertAlmostEqual(usage["cost_usd"], 0.0305)
+        self.assertAlmostEqual(usage["cost_breakdown"]["input_fresh"], 0.005)
+        self.assertAlmostEqual(usage["cost_breakdown"]["cached_input"], 0.0005)
+        self.assertAlmostEqual(usage["cost_breakdown"]["cache_creation"], 0.0)
+        self.assertAlmostEqual(usage["cost_breakdown"]["output"], 0.025)
+        self.assertAlmostEqual(claude_usage["cost_breakdown"]["input_fresh"], 0.005)
+        self.assertAlmostEqual(claude_usage["cost_breakdown"]["cached_input"], 0.0005)
+        self.assertAlmostEqual(claude_usage["cost_breakdown"]["output"], 0.025)
+
     def test_build_dashboard_payload_keeps_archived_totals_and_recent_requests_separate(self):
         fixed_now = datetime(2026, 4, 4, 18, 0, tzinfo=timezone.utc)
         archived_event = {

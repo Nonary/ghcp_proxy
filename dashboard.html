@@ -2036,6 +2036,12 @@
         reasoning_output_tokens: 0,
         request_count: 0,
         cost_usd: 0,
+        cost_breakdown: {
+          input_fresh: 0,
+          cached_input: 0,
+          cache_creation: 0,
+          output: 0,
+        },
         sources: {},
       };
     }
@@ -2076,6 +2082,12 @@
       let cacheCreationTokens = 0;
       let outputTokens = 0;
       let reasoningOutputTokens = 0;
+      const costBreakdown = {
+        input_fresh: 0,
+        cached_input: 0,
+        cache_creation: 0,
+        output: 0,
+      };
 
       for (const row of rows || []) {
         if (!row || typeof row !== 'object') continue;
@@ -2087,6 +2099,10 @@
         cacheCreationTokens += Number(row.cache_creation_tokens || 0);
         outputTokens += Number(row.output_tokens || 0);
         reasoningOutputTokens += Number(row.reasoning_output_tokens || 0);
+        costBreakdown.input_fresh += Number(row.cost_breakdown?.input_fresh || 0);
+        costBreakdown.cached_input += Number(row.cost_breakdown?.cached_input || 0);
+        costBreakdown.cache_creation += Number(row.cost_breakdown?.cache_creation || 0);
+        costBreakdown.output += Number(row.cost_breakdown?.output || 0);
 
         const sources = row.sources || {};
         for (const [sourceName, sourceRow] of Object.entries(sources)) {
@@ -2095,10 +2111,20 @@
             cost_usd: 0,
             total_tokens: 0,
             request_count: 0,
+            cost_breakdown: {
+              input_fresh: 0,
+              cached_input: 0,
+              cache_creation: 0,
+              output: 0,
+            },
           };
           current.cost_usd += Number(sourceRow?.cost_usd || 0);
           current.total_tokens += Number(sourceRow?.total_tokens || 0);
           current.request_count += Number(sourceRow?.request_count || 0);
+          current.cost_breakdown.input_fresh += Number(sourceRow?.cost_breakdown?.input_fresh || 0);
+          current.cost_breakdown.cached_input += Number(sourceRow?.cost_breakdown?.cached_input || 0);
+          current.cost_breakdown.cache_creation += Number(sourceRow?.cost_breakdown?.cache_creation || 0);
+          current.cost_breakdown.output += Number(sourceRow?.cost_breakdown?.output || 0);
           sourceMap[sourceName] = current;
         }
       }
@@ -2112,6 +2138,12 @@
         cache_creation_tokens: cacheCreationTokens,
         output_tokens: outputTokens,
         reasoning_output_tokens: reasoningOutputTokens,
+        cost_breakdown: {
+          input_fresh: Number(costBreakdown.input_fresh.toFixed(6)),
+          cached_input: Number(costBreakdown.cached_input.toFixed(6)),
+          cache_creation: Number(costBreakdown.cache_creation.toFixed(6)),
+          output: Number(costBreakdown.output.toFixed(6)),
+        },
         sources: sourceMap,
       };
     }
@@ -2348,17 +2380,38 @@
           const u = this.activeUsage || {};
           const freshInput = Number(u.input_tokens || 0);
           const outputTokens = Number(u.output_tokens || 0) + Number(u.reasoning_output_tokens || 0);
+          const totalCost = Number(u.cost_usd || 0);
           const rows = [
             { label: 'Input (fresh)',    tokens: freshInput,                                     field: 'input_fresh',             color: '#ff8752' },
-            { label: 'Input (cached)',   tokens: Number(u.cached_input_tokens || 0),             field: 'cached_input_tokens',     color: '#6ee7c8' },
-            { label: 'Cache Creation',   tokens: Number(u.cache_creation_tokens || 0),           field: 'cache_creation_tokens',   color: '#f6b16d' },
+            { label: 'Input (cached)',   tokens: Number(u.cached_input_tokens || 0),             field: 'cached_input',            color: '#6ee7c8' },
+            { label: 'Cache Creation',   tokens: Number(u.cache_creation_tokens || 0),           field: 'cache_creation',          color: '#f6b16d' },
             { label: 'Output',           tokens: outputTokens,                                   field: 'output_tokens',           color: '#7eaaff' },
           ].filter(r => r.tokens > 0);
+          const exactCosts = {
+            input_fresh: Number(u.cost_breakdown?.input_fresh || 0),
+            cached_input: Number(u.cost_breakdown?.cached_input || 0),
+            cache_creation: Number(u.cost_breakdown?.cache_creation || 0),
+            output_tokens: Number(u.cost_breakdown?.output || 0),
+          };
+          const exactTotal = Object.values(exactCosts).reduce((sum, value) => sum + value, 0);
+          const exactBreakdownUsable = totalCost <= 0
+            || (exactTotal > 0 && Math.abs(exactTotal - totalCost) <= Math.max(0.005, totalCost * 0.05));
 
-          const totalCost = Number(u.cost_usd || 0);
+          if (exactBreakdownUsable) {
+            return rows.map(r => {
+              const cost = exactCosts[r.field] || 0;
+              return {
+                ...r,
+                cost,
+                costShare: totalCost > 0 ? (cost / totalCost) * 100 : 0,
+              };
+            });
+          }
 
           const weights = {
-            input_fresh: 1, cached_input_tokens: 0.1, cache_creation_tokens: 1.25,
+            input_fresh: 1,
+            cached_input: 0.1,
+            cache_creation: 1.25,
             output_tokens: 5,
           };
           const totalWeighted = rows.reduce((sum, r) => sum + r.tokens * (weights[r.field] || 1), 0);

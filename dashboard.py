@@ -25,7 +25,7 @@ from util import (
     utc_now, utc_now_iso, _parse_iso_datetime,
     normalize_usage_payload, _normalize_model_name,
     _usage_event_model_name, _usage_event_source,
-    _pricing_entry_for_model, _usage_event_cost,
+    _pricing_entry_for_model, _usage_event_cost, _usage_event_cost_breakdown,
     _premium_request_multiplier, _counted_premium_requests,
     _month_key, month_key_for_source_row,
 )
@@ -814,6 +814,12 @@ def _new_usage_aggregate_bucket() -> dict:
         "cache_creation_tokens": 0,
         "reasoning_output_tokens": 0,
         "cost_usd": 0.0,
+        "cost_breakdown": {
+            "input_fresh": 0.0,
+            "cached_input": 0.0,
+            "cache_creation": 0.0,
+            "output": 0.0,
+        },
         "_model_order": [],
         "_models": {},
         "_last_activity_dt": None,
@@ -855,6 +861,7 @@ def _ingest_usage_event(bucket: dict, event: dict):
     cache_creation_tokens = _coerce_int(usage.get("cache_creation_input_tokens"))
     reasoning_output_tokens = _coerce_int(usage.get("reasoning_output_tokens"))
     model_name = _usage_event_model_name(event) or "unknown"
+    cost_breakdown = _usage_event_cost_breakdown(model_name, usage)
 
     bucket["input_tokens"] += input_tokens
     bucket["output_tokens"] += output_tokens
@@ -863,6 +870,12 @@ def _ingest_usage_event(bucket: dict, event: dict):
     bucket["cache_creation_tokens"] += cache_creation_tokens
     bucket["reasoning_output_tokens"] += reasoning_output_tokens
     bucket["cost_usd"] += _coerce_float(event_cost)
+    bucket_cost_breakdown = bucket.setdefault(
+        "cost_breakdown",
+        {"input_fresh": 0.0, "cached_input": 0.0, "cache_creation": 0.0, "output": 0.0},
+    )
+    for key, value in cost_breakdown.items():
+        bucket_cost_breakdown[key] = bucket_cost_breakdown.get(key, 0.0) + _coerce_float(value)
     bucket["request_count"] += 1
 
     model_bucket = bucket["_models"].setdefault(model_name, {"inputTokens": 0})
@@ -885,6 +898,7 @@ def _finalize_usage_bucket(bucket: dict, source: str, *, session_id: str | None 
     effective_display_id = bucket.get("session_display_id")
     if not isinstance(effective_display_id, str) or not effective_display_id:
         effective_display_id = effective_session_id
+    cost_breakdown = bucket.get("cost_breakdown") if isinstance(bucket.get("cost_breakdown"), dict) else {}
     result = {
         "sessionId": effective_session_id,
         "sessionKind": bucket.get("session_kind") or "unknown",
@@ -895,6 +909,12 @@ def _finalize_usage_bucket(bucket: dict, source: str, *, session_id: str | None 
         "outputTokens": bucket.get("output_tokens", 0),
         "totalTokens": bucket.get("total_tokens", 0),
         "requestCount": bucket.get("request_count", 0),
+        "costBreakdown": {
+            "input_fresh": round(_coerce_float(cost_breakdown.get("input_fresh")), 6),
+            "cached_input": round(_coerce_float(cost_breakdown.get("cached_input")), 6),
+            "cache_creation": round(_coerce_float(cost_breakdown.get("cache_creation")), 6),
+            "output": round(_coerce_float(cost_breakdown.get("output")), 6),
+        },
     }
 
     if month is not None:
@@ -1012,6 +1032,18 @@ def _normalize_usage_rollup(source: str, row: dict) -> dict:
         cached_tokens = _coerce_int(row.get("cachedInputTokens"))
         cache_creation_tokens = 0
         reasoning_tokens = _coerce_int(row.get("reasoningOutputTokens"))
+    raw_cost_breakdown = row.get("costBreakdown")
+    cost_breakdown = {
+        "input_fresh": 0.0,
+        "cached_input": 0.0,
+        "cache_creation": 0.0,
+        "output": 0.0,
+    }
+    if isinstance(raw_cost_breakdown, dict):
+        cost_breakdown["input_fresh"] = _coerce_float(raw_cost_breakdown.get("input_fresh"))
+        cost_breakdown["cached_input"] = _coerce_float(raw_cost_breakdown.get("cached_input"))
+        cost_breakdown["cache_creation"] = _coerce_float(raw_cost_breakdown.get("cache_creation"))
+        cost_breakdown["output"] = _coerce_float(raw_cost_breakdown.get("output"))
 
     return {
         "source": source,
@@ -1023,6 +1055,7 @@ def _normalize_usage_rollup(source: str, row: dict) -> dict:
         "reasoning_output_tokens": reasoning_tokens,
         "request_count": _coerce_int(row.get("requestCount")),
         "cost_usd": cost_usd,
+        "cost_breakdown": cost_breakdown,
         "models": models,
     }
 
@@ -1072,6 +1105,12 @@ def _combine_month_rows(rows: list[dict]) -> list[dict]:
                 "reasoning_output_tokens": 0,
                 "request_count": 0,
                 "cost_usd": 0.0,
+                "cost_breakdown": {
+                    "input_fresh": 0.0,
+                    "cached_input": 0.0,
+                    "cache_creation": 0.0,
+                    "output": 0.0,
+                },
                 "sources": {},
             },
         )
@@ -1083,6 +1122,8 @@ def _combine_month_rows(rows: list[dict]) -> list[dict]:
         current["reasoning_output_tokens"] += row.get("reasoning_output_tokens", 0)
         current["request_count"] += row.get("request_count", 0)
         current["cost_usd"] += row.get("cost_usd", 0.0)
+        for key, value in (row.get("cost_breakdown") or {}).items():
+            current["cost_breakdown"][key] = current["cost_breakdown"].get(key, 0.0) + _coerce_float(value)
         current["sources"][row["source"]] = row
 
     return [grouped[key] | {"cost_usd": round(grouped[key]["cost_usd"], 4)} for key in sorted(grouped.keys(), reverse=True)]
@@ -1107,6 +1148,12 @@ def _combine_day_rows(rows: list[dict]) -> list[dict]:
                 "reasoning_output_tokens": 0,
                 "request_count": 0,
                 "cost_usd": 0.0,
+                "cost_breakdown": {
+                    "input_fresh": 0.0,
+                    "cached_input": 0.0,
+                    "cache_creation": 0.0,
+                    "output": 0.0,
+                },
                 "sources": {},
             },
         )
@@ -1118,6 +1165,8 @@ def _combine_day_rows(rows: list[dict]) -> list[dict]:
         current["reasoning_output_tokens"] += row.get("reasoning_output_tokens", 0)
         current["request_count"] += row.get("request_count", 0)
         current["cost_usd"] += row.get("cost_usd", 0.0)
+        for key, value in (row.get("cost_breakdown") or {}).items():
+            current["cost_breakdown"][key] = current["cost_breakdown"].get(key, 0.0) + _coerce_float(value)
         current["sources"][row["source"]] = row
 
     return [grouped[key] | {"cost_usd": round(grouped[key]["cost_usd"], 4)} for key in sorted(grouped.keys())]
@@ -1141,6 +1190,12 @@ def _combine_usage_rows(rows: list[dict], *, month_key: str | None = None) -> di
                 "reasoning_output_tokens": 0,
                 "request_count": 0,
                 "cost_usd": 0.0,
+                "cost_breakdown": {
+                    "input_fresh": 0.0,
+                    "cached_input": 0.0,
+                    "cache_creation": 0.0,
+                    "output": 0.0,
+                },
                 "models": [],
             },
         )
@@ -1152,6 +1207,8 @@ def _combine_usage_rows(rows: list[dict], *, month_key: str | None = None) -> di
         current["reasoning_output_tokens"] += row.get("reasoning_output_tokens", 0)
         current["request_count"] += row.get("request_count", 0)
         current["cost_usd"] += row.get("cost_usd", 0.0)
+        for key, value in (row.get("cost_breakdown") or {}).items():
+            current["cost_breakdown"][key] = current["cost_breakdown"].get(key, 0.0) + _coerce_float(value)
         current["models"] = sorted(set(current["models"]) | set(row.get("models") or []))
 
     combined = {
@@ -1163,8 +1220,23 @@ def _combine_usage_rows(rows: list[dict], *, month_key: str | None = None) -> di
         "reasoning_output_tokens": sum(item.get("reasoning_output_tokens", 0) for item in per_source.values()),
         "request_count": sum(item.get("request_count", 0) for item in per_source.values()),
         "cost_usd": round(sum(item.get("cost_usd", 0.0) for item in per_source.values()), 4),
+        "cost_breakdown": {
+            "input_fresh": round(sum(item.get("cost_breakdown", {}).get("input_fresh", 0.0) for item in per_source.values()), 6),
+            "cached_input": round(sum(item.get("cost_breakdown", {}).get("cached_input", 0.0) for item in per_source.values()), 6),
+            "cache_creation": round(sum(item.get("cost_breakdown", {}).get("cache_creation", 0.0) for item in per_source.values()), 6),
+            "output": round(sum(item.get("cost_breakdown", {}).get("output", 0.0) for item in per_source.values()), 6),
+        },
         "sources": {
-            source: item | {"cost_usd": round(item.get("cost_usd", 0.0), 4)}
+            source: item
+            | {
+                "cost_usd": round(item.get("cost_usd", 0.0), 4),
+                "cost_breakdown": {
+                    "input_fresh": round(item.get("cost_breakdown", {}).get("input_fresh", 0.0), 6),
+                    "cached_input": round(item.get("cost_breakdown", {}).get("cached_input", 0.0), 6),
+                    "cache_creation": round(item.get("cost_breakdown", {}).get("cache_creation", 0.0), 6),
+                    "output": round(item.get("cost_breakdown", {}).get("output", 0.0), 6),
+                },
+            }
             for source, item in per_source.items()
         },
     }
@@ -1222,6 +1294,12 @@ def _empty_day_history_row(day_key: str) -> dict:
         "reasoning_output_tokens": 0,
         "request_count": 0,
         "cost_usd": 0.0,
+        "cost_breakdown": {
+            "input_fresh": 0.0,
+            "cached_input": 0.0,
+            "cache_creation": 0.0,
+            "output": 0.0,
+        },
         "sources": {},
     }
 

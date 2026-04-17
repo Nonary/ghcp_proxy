@@ -285,13 +285,19 @@ def _anthropic_cache_creation_rate_per_million(entry: dict) -> float:
     return round(input_rate * 1.25, 6)
 
 
-def _usage_event_cost(model_name: str | None, usage: dict | None) -> float:
+def _usage_event_cost_breakdown(model_name: str | None, usage: dict | None) -> dict[str, float]:
+    breakdown = {
+        "input_fresh": 0.0,
+        "cached_input": 0.0,
+        "cache_creation": 0.0,
+        "output": 0.0,
+    }
     if not isinstance(usage, dict):
-        return 0.0
+        return breakdown
 
     entry = _pricing_entry_for_model(model_name)
     if not isinstance(entry, dict):
-        return 0.0
+        return breakdown
 
     input_tokens = _coerce_int(usage.get("input_tokens"))
     output_tokens = _coerce_int(usage.get("output_tokens"))
@@ -313,12 +319,15 @@ def _usage_event_cost(model_name: str | None, usage: dict | None) -> float:
         cache_creation_rate = _anthropic_cache_creation_rate_per_million(entry)
 
     billable_output_tokens = output_tokens + reasoning_output_tokens
-    return (
-        (input_tokens * input_rate)
-        + (cached_input_tokens * cached_rate)
-        + (cache_creation_input_tokens * cache_creation_rate)
-        + (billable_output_tokens * output_rate)
-    ) / 1_000_000.0
+    breakdown["input_fresh"] = (input_tokens * input_rate) / 1_000_000.0
+    breakdown["cached_input"] = (cached_input_tokens * cached_rate) / 1_000_000.0
+    breakdown["cache_creation"] = (cache_creation_input_tokens * cache_creation_rate) / 1_000_000.0
+    breakdown["output"] = (billable_output_tokens * output_rate) / 1_000_000.0
+    return breakdown
+
+
+def _usage_event_cost(model_name: str | None, usage: dict | None) -> float:
+    return sum(_usage_event_cost_breakdown(model_name, usage).values())
 
 
 def _premium_request_multiplier(model_name: str | None) -> float:
