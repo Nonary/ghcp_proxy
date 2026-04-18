@@ -1450,6 +1450,26 @@ async def _proxy_bridge_streaming_response(plan: UpstreamRequestPlan, bridge_pla
     )
 
 
+async def _proxy_models_request() -> Response:
+    try:
+        api_key = auth.get_api_key()
+    except Exception:
+        return format_translation.openai_error_response(401, AUTH_FAILURE_MESSAGE)
+
+    upstream_url = f"{auth.get_api_base().rstrip('/')}/models"
+    headers = format_translation.build_copilot_headers(api_key)
+
+    try:
+        async with httpx.AsyncClient(timeout=configured_upstream_timeout_seconds()) as client:
+            request = client.build_request("GET", upstream_url, headers=headers)
+            upstream = await throttled_client_send(client, request)
+    except httpx.RequestError as exc:
+        status_code, message = format_translation.upstream_request_error_status_and_message(exc)
+        return format_translation.openai_error_response(status_code, message)
+
+    return proxy_non_streaming_response(upstream)
+
+
 # ─── Dashboard routes ─────────────────────────────────────────────────────────
 
 
@@ -1606,6 +1626,7 @@ async def client_proxy_install_api(request: Request):
 
 # ─── Route: /v1/responses  (Codex / Responses API) ───────────────────────────
 
+@app.post("/responses")
 @app.post("/v1/responses")
 async def responses(request: Request):
     try:
@@ -1655,6 +1676,7 @@ async def responses(request: Request):
     return await _post_bridge_non_streaming_request(plan, bridge_plan)
 
 
+@app.post("/responses/compact")
 @app.post("/v1/responses/compact")
 async def responses_compact(request: Request):
     try:
@@ -1702,6 +1724,7 @@ async def responses_compact(request: Request):
 
 # ─── Route: /v1/chat/completions  (non-Codex models) ─────────────────────────
 
+@app.post("/chat/completions")
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     """
@@ -1754,6 +1777,12 @@ async def chat_completions(request: Request):
             trace_plan=plan,
         )
     return await _post_non_streaming_request(plan, error_response=format_translation.openai_error_response)
+
+
+@app.get("/models")
+@app.get("/v1/models")
+async def models():
+    return await _proxy_models_request()
 
 
 @app.post("/v1/messages")

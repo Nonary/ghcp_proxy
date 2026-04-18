@@ -31,13 +31,16 @@ class BridgeExecutionPlan:
 class ProtocolBridgeStrategy(ABC):
     strategy_name: str
     inbound_protocol: str
-    target_family: str
+    target_family: str | tuple[str, ...]
     upstream_protocol: str
     header_kind: str
     caller_protocol: str
 
     def matches(self, inbound_protocol: str, target_family: str) -> bool:
-        return self.inbound_protocol == inbound_protocol and self.target_family == target_family
+        supported_families = (
+            self.target_family if isinstance(self.target_family, tuple) else (self.target_family,)
+        )
+        return self.inbound_protocol == inbound_protocol and target_family in supported_families
 
     @abstractmethod
     async def build_plan(
@@ -87,7 +90,7 @@ class ResponsesToResponsesStrategy(ProtocolBridgeStrategy):
 class ResponsesToChatStrategy(ProtocolBridgeStrategy):
     strategy_name = "responses_to_chat"
     inbound_protocol = "responses"
-    target_family = "claude"
+    target_family = ("claude", "gemini", "grok")
     upstream_protocol = "chat"
     header_kind = "chat"
     caller_protocol = "responses"
@@ -113,7 +116,7 @@ class ResponsesToChatStrategy(ProtocolBridgeStrategy):
 class MessagesToChatStrategy(ProtocolBridgeStrategy):
     strategy_name = "messages_to_chat"
     inbound_protocol = "messages"
-    target_family = "claude"
+    target_family = ("claude", "gemini", "grok")
     upstream_protocol = "chat"
     header_kind = "anthropic"
     caller_protocol = "anthropic"
@@ -196,10 +199,11 @@ class ProtocolBridgePlanner:
         if target_family is None:
             raise ValueError(f"Unsupported mapped model family: {resolved_model}")
 
-        # Codex compact requests do not fit in Claude's 128K window; swap to a
-        # configured GPT fallback so the compaction call itself can complete.
-        # The subsequent normal turns remain routed to Claude as configured.
-        if is_compact and target_family == "claude":
+        # Codex compact requests do not fit cleanly through chat-backed target
+        # families; swap to a configured GPT fallback so the compaction call
+        # itself can complete. The subsequent normal turns remain routed to the
+        # configured target model.
+        if is_compact and target_family != "codex":
             fallback = self._routing_config_service.resolve_compact_fallback_model(requested_model)
             if fallback:
                 resolved_model = normalize_routing_model_name(fallback)

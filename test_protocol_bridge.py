@@ -57,6 +57,27 @@ class ProtocolBridgePlannerTests(unittest.TestCase):
         self.assertEqual(plan.upstream_body["messages"][0]["role"], "user")
         self.assertEqual(plan.upstream_body["messages"][0]["content"], "hello")
 
+    def test_planner_selects_responses_to_chat_strategy_when_mapping_targets_gemini(self):
+        planner = ProtocolBridgePlanner(_RoutingConfigStub("gemini-3.1-pro-preview"))
+        body = {
+            "model": "gpt-5.3-codex",
+            "input": [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hello"}]}
+            ],
+            "stream": False,
+        }
+
+        plan = proxy.asyncio.run(
+            planner.plan("responses", body, api_base="https://example.invalid", api_key="test-key")
+        )
+
+        self.assertEqual(plan.strategy_name, "responses_to_chat")
+        self.assertEqual(plan.upstream_path, "/chat/completions")
+        self.assertEqual(plan.header_kind, "chat")
+        self.assertEqual(plan.resolved_model, "gemini-3.1-pro-preview")
+        self.assertEqual(plan.upstream_body["messages"][0]["role"], "user")
+        self.assertEqual(plan.upstream_body["messages"][0]["content"], "hello")
+
     def test_planner_selects_messages_to_responses_strategy_when_mapping_targets_codex(self):
         planner = ProtocolBridgePlanner(_RoutingConfigStub("gpt-5.4"))
         body = {
@@ -76,6 +97,27 @@ class ProtocolBridgePlannerTests(unittest.TestCase):
         self.assertEqual(plan.header_kind, "responses")
         self.assertEqual(plan.upstream_body["input"][0]["role"], "user")
         self.assertEqual(plan.upstream_body["input"][0]["content"][0]["text"], "hello")
+
+    def test_planner_selects_messages_to_chat_strategy_when_mapping_targets_grok(self):
+        planner = ProtocolBridgePlanner(_RoutingConfigStub("grok-code-fast-1"))
+        body = {
+            "model": "claude-opus-4.6",
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "hello"}]},
+            ],
+            "stream": False,
+        }
+
+        plan = proxy.asyncio.run(
+            planner.plan("messages", body, api_base="https://example.invalid", api_key="test-key")
+        )
+
+        self.assertEqual(plan.strategy_name, "messages_to_chat")
+        self.assertEqual(plan.upstream_path, "/chat/completions")
+        self.assertEqual(plan.header_kind, "anthropic")
+        self.assertEqual(plan.resolved_model, "grok-code-fast-1")
+        self.assertEqual(plan.upstream_body["messages"][0]["role"], "user")
+        self.assertEqual(plan.upstream_body["messages"][0]["content"], "hello")
 
     def test_planner_uses_approval_mapping_for_codex_subagent_request(self):
         planner = ProtocolBridgePlanner(
@@ -168,6 +210,46 @@ class ProtocolBridgePlannerTests(unittest.TestCase):
     def test_planner_swaps_to_gpt_fallback_on_compact_against_claude(self):
         planner = ProtocolBridgePlanner(
             _RoutingConfigStub(target_model="claude-opus-4.6", compact_fallback_model="gpt-5.4")
+        )
+        body = {"model": "gpt-5.3-codex", "input": "hello", "stream": False}
+
+        plan = proxy.asyncio.run(
+            planner.plan(
+                "responses",
+                body,
+                api_base="https://example.invalid",
+                api_key="test-key",
+                is_compact=True,
+            )
+        )
+
+        self.assertEqual(plan.strategy_name, "responses_to_responses")
+        self.assertEqual(plan.resolved_model, "gpt-5.4")
+        self.assertEqual(plan.upstream_path, "/responses")
+
+    def test_planner_swaps_to_gpt_fallback_on_compact_against_gemini(self):
+        planner = ProtocolBridgePlanner(
+            _RoutingConfigStub(target_model="gemini-3.1-pro-preview", compact_fallback_model="gpt-5.4")
+        )
+        body = {"model": "gpt-5.3-codex", "input": "hello", "stream": False}
+
+        plan = proxy.asyncio.run(
+            planner.plan(
+                "responses",
+                body,
+                api_base="https://example.invalid",
+                api_key="test-key",
+                is_compact=True,
+            )
+        )
+
+        self.assertEqual(plan.strategy_name, "responses_to_responses")
+        self.assertEqual(plan.resolved_model, "gpt-5.4")
+        self.assertEqual(plan.upstream_path, "/responses")
+
+    def test_planner_swaps_to_gpt_fallback_on_compact_against_grok(self):
+        planner = ProtocolBridgePlanner(
+            _RoutingConfigStub(target_model="grok-code-fast-1", compact_fallback_model="gpt-5.4")
         )
         body = {"model": "gpt-5.3-codex", "input": "hello", "stream": False}
 

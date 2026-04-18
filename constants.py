@@ -46,9 +46,10 @@ CLAUDE_SETTINGS_FILE = os.path.join(CLAUDE_CONFIG_DIR, "settings.json")
 CLAUDE_MAX_CONTEXT_TOKENS = "128000"
 CLAUDE_MAX_OUTPUT_TOKENS = "64000"
 # Default GPT model to fall back to when Codex requests a compact against a
-# Claude target. Claude's 128K window cannot hold Codex compact payloads that
-# already approach/exceed the limit, so we route the compact call to a GPT
-# model instead. Per-mapping override lives in model-routing.json.
+# chat-backed target (Claude/Gemini/Grok). Those targets do not handle Codex
+# compact payloads as cleanly as the native Responses path, so we route the
+# compact call to a GPT model instead. Per-mapping override lives in
+# model-routing.json.
 DEFAULT_COMPACT_FALLBACK_MODEL = "gpt-5.4"
 # Default reasoning_effort to forward upstream for Claude-family models when
 # the inbound Anthropic body does not carry an explicit effort selection.
@@ -403,6 +404,24 @@ MODEL_PRICING = {
         "cached_input_per_million": 0.02,
         "output_per_million": 1.25,
     },
+    "gemini-3-flash-preview": {
+        "provider": "Google",
+        "input_per_million": 0.10,
+        "cached_input_per_million": 0.025,
+        "output_per_million": 0.40,
+    },
+    "gemini-3.1-pro-preview": {
+        "provider": "Google",
+        "input_per_million": 1.75,
+        "cached_input_per_million": 0.175,
+        "output_per_million": 14.00,
+    },
+    "grok-code-fast-1": {
+        "provider": "xAI",
+        "input_per_million": 0.20,
+        "cached_input_per_million": 0.05,
+        "output_per_million": 1.00,
+    },
 }
 
 MODEL_PRICING_ALIASES = {
@@ -464,8 +483,11 @@ PREMIUM_REQUEST_MULTIPLIERS = {
     "gpt-5-mini": 0.0,
     "gemini-2.5-pro": 1.0,
     "gemini-3-flash": 0.33,
+    "gemini-3-flash-preview": 0.33,
     "gemini-3-pro": 1.0,
     "gemini-3.1-pro": 1.0,
+    "gemini-3.1-pro-preview": 1.0,
+    "grok-code-fast-1": 0.33,
     "raptor-mini": 0.0,
 }
 

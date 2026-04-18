@@ -19,6 +19,60 @@ class ProxyRoutesTests(unittest.TestCase):
         proxy.set_initiator_policy(initiator_policy.InitiatorPolicy())
         proxy.usage_tracker.clear_state()
 
+    def test_proxy_registers_copilot_native_root_aliases(self):
+        paths = {route.path for route in proxy.app.routes}
+        self.assertIn("/responses", paths)
+        self.assertIn("/responses/compact", paths)
+        self.assertIn("/chat/completions", paths)
+        self.assertIn("/models", paths)
+        self.assertIn("/v1/responses", paths)
+        self.assertIn("/v1/chat/completions", paths)
+        self.assertIn("/v1/models", paths)
+
+    def test_models_route_proxies_upstream_copilot_models(self):
+        upstream = httpx.Response(
+            200,
+            json={
+                "data": [
+                    {
+                        "id": "gpt-5.4",
+                        "name": "GPT 5.4",
+                        "version": "gpt-5.4-2026-01-01",
+                        "model_picker_enabled": True,
+                        "capabilities": {
+                            "family": "gpt-5",
+                            "limits": {
+                                "max_context_window_tokens": 400000,
+                                "max_output_tokens": 128000,
+                                "max_prompt_tokens": 272000,
+                            },
+                            "supports": {
+                                "streaming": True,
+                                "tool_calls": True,
+                            },
+                        },
+                    }
+                ]
+            },
+            headers={"content-type": "application/json"},
+        )
+
+        with (
+            mock.patch.object(auth, "get_api_key", return_value="test-key"),
+            mock.patch.object(auth, "get_api_base", return_value="https://example.invalid"),
+            mock.patch.object(format_translation, "build_copilot_headers", return_value={"Authorization": "Bearer test-key"}) as build_headers,
+            mock.patch.object(proxy, "throttled_client_send", mock.AsyncMock(return_value=upstream)) as send,
+        ):
+            response = proxy.asyncio.run(proxy.models())
+
+        build_headers.assert_called_once_with("test-key")
+        request = send.await_args.args[1]
+        self.assertEqual(request.method, "GET")
+        self.assertEqual(str(request.url), "https://example.invalid/models")
+        self.assertEqual(request.headers.get("Authorization"), "Bearer test-key")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.body, upstream.content)
+
     def test_anthropic_messages_route_uses_anthropic_headers_and_error_shape(self):
         request = SimpleNamespace(
             url=SimpleNamespace(path="/v1/messages"),

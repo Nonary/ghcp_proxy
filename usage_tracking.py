@@ -158,6 +158,7 @@ def _normalize_recorded_usage_event(payload: dict | None) -> dict | None:
         return None
 
     normalized_event = dict(payload)
+
     native_session_id = _codex_native_session_id_from_request_id(normalized_event.get("request_id"))
     # Backfill native_source for events that were archived before the
     # marker was preserved through compaction. The codex_native ingestor
@@ -1201,3 +1202,7 @@ def log_proxy_request(
     "log_proxy_request")``) don't break.
     """
     pass
+
+
+
+

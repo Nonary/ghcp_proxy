@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import os
 import unittest
+import unittest.mock
 from pathlib import Path
 from uuid import uuid4
 
@@ -21,7 +22,7 @@ import codex_native_ingest
 from util import _usage_event_source
 
 
-def _write_rollout(path: Path, *, session_id: str, model: str = "gpt-5.4") -> None:
+def _write_rollout(path: Path, *, session_id: str, model: str = "gpt-5.4", model_provider: str = "openai") -> None:
     lines = [
         {
             "timestamp": "2026-04-18T15:15:34.519Z",
@@ -33,7 +34,7 @@ def _write_rollout(path: Path, *, session_id: str, model: str = "gpt-5.4") -> No
                 "originator": "codex-tui",
                 "cli_version": "0.121.0",
                 "source": "cli",
-                "model_provider": "openai",
+                "model_provider": model_provider,
             },
         },
         {
@@ -313,5 +314,15 @@ class CodexNativeIngestTests(unittest.TestCase):
         self.assertAlmostEqual(fast_event["cost_usd"], baseline[0]["cost_usd"] * 2, places=6)
 
 
+    def test_skips_proxied_sessions(self):
+        rollout = self.sessions_dir / "rollout-2026-04-18T10-15-05-sess-custom.jsonl"
+        _write_rollout(rollout, session_id="sess-custom", model_provider="custom")
+        
+        emitted: list[dict] = []
+        codex_native_ingest.scan_once(emitted.append)
+        self.assertEqual(len(emitted), 0, "expected 0 turns because model_provider is custom")
+
 if __name__ == "__main__":
     unittest.main()
+
+

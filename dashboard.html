@@ -1727,7 +1727,7 @@
             <button class="primary sm" @click="addModelRoutingMapping" :disabled="savingModelRoutingConfig || loadingModelRoutingConfig || !modelRouting.available_models.length">+ Add</button>
           </div>
           <div class="subtle" style="font-size: 11px; margin-top: 2px;">
-            <strong>Compact fallback</strong> only applies when the target is a Claude model. Codex compact payloads can exceed Claude's 128K window, so <code>/v1/responses/compact</code> is routed to the chosen GPT model; normal turns stay on the Claude target. Leave as <em>auto</em> to use <code>gpt-5.4</code>.
+            <strong>Compact fallback</strong> only applies when the target is a non-Codex model. Codex compact payloads can exceed context limits, so <code>/v1/responses/compact</code> is routed to the chosen GPT model; normal turns stay on the selected target. Leave as <em>auto</em> to use <code>gpt-5.4</code>.
           </div>
 
           <table v-if="modelRouting.mappings.length" class="mapping-table">
@@ -1759,10 +1759,10 @@
                 </td>
                 <td>
                   <select
-                    v-if="isClaudeTargetMapping(mapping)"
+                    v-if="isNonCodexTargetMapping(mapping)"
                     v-model="mapping.compact_fallback_model"
                     :disabled="savingModelRoutingConfig || loadingModelRoutingConfig"
-                    :title="'Codex compact payloads exceed Claude\'s 128K window. Compact calls for this mapping are routed to the selected GPT model; normal turns stay on ' + (mapping.target_model || 'Claude') + '.'"
+                    :title="'Codex compact payloads can exceed context limits. Compact calls for this mapping are routed to the selected GPT model; normal turns stay on ' + (mapping.target_model || 'the target') + '.'"
                   >
                     <option value="">auto (gpt-5.4)</option>
                     <option v-for="option in gptFallbackOptions" :key="`compact-${index}-${option.model}`" :value="option.model">
@@ -3770,10 +3770,10 @@
             compact_fallback_model: '',
           };
         },
-        isClaudeTargetMapping(mapping) {
+        isNonCodexTargetMapping(mapping) {
           if (!mapping || !mapping.target_model) return false;
           const option = (this.modelRouting.available_models || []).find((row) => row.model === mapping.target_model);
-          return option ? option.provider === 'claude' : false;
+          return option ? option.provider !== 'codex' : false;
         },
         addModelRoutingMapping() {
           this.modelRouting.statusMessage = '';
@@ -3843,7 +3843,7 @@
                     source_model: mapping.source_model,
                     target_model: mapping.target_model,
                   };
-                  if (mapping.compact_fallback_model && this.isClaudeTargetMapping(mapping)) {
+                  if (mapping.compact_fallback_model && this.isNonCodexTargetMapping(mapping)) {
                     entry.compact_fallback_model = mapping.compact_fallback_model;
                   }
                   return entry;

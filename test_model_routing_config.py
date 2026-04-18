@@ -42,6 +42,47 @@ class ModelRoutingConfigTests(unittest.TestCase):
         self.assertEqual(payload["mappings"], [])
         self.assertTrue(any(row["model"] == "claude-opus-4.6" for row in payload["available_models"]))
         self.assertTrue(any(row["model"] == "gpt-5.3-codex" for row in payload["available_models"]))
+        self.assertTrue(any(row["model"] == "gemini-3.1-pro-preview" for row in payload["available_models"]))
+        self.assertTrue(any(row["model"] == "gemini-3-flash-preview" for row in payload["available_models"]))
+        self.assertTrue(any(row["model"] == "grok-code-fast-1" for row in payload["available_models"]))
+
+    def test_save_settings_accepts_gemini_and_grok_models(self):
+        config_path = self._make_temp_file_path("model-routing-", ".json")
+        service = self._make_service(str(config_path))
+
+        payload = service.save_settings(
+            {
+                "enabled": True,
+                "mappings": [
+                    {
+                        "source_model": "gemini-3.1-pro-preview",
+                        "target_model": "grok-code-fast-1",
+                    },
+                    {
+                        "source_model": "gemini-3-flash-preview",
+                        "target_model": "gpt-5.4-mini",
+                    },
+                ],
+            }
+        )
+
+        self.assertEqual(
+            payload["mappings"],
+            [
+                {
+                    "source_model": "gemini-3.1-pro-preview",
+                    "source_provider": "gemini",
+                    "target_model": "grok-code-fast-1",
+                    "target_provider": "grok",
+                },
+                {
+                    "source_model": "gemini-3-flash-preview",
+                    "source_provider": "gemini",
+                    "target_model": "gpt-5.4-mini",
+                    "target_provider": "codex",
+                },
+            ],
+        )
 
     def test_save_settings_normalizes_models_and_resolves_target(self):
         config_path = self._make_temp_file_path("model-routing-", ".json")
@@ -204,6 +245,42 @@ class ModelRoutingConfigTests(unittest.TestCase):
                 "enabled": True,
                 "mappings": [
                     {"source_model": "gpt-5.3-codex", "target_model": "claude-opus-4.6"},
+                ],
+            }
+        )
+
+        self.assertEqual(
+            service.resolve_compact_fallback_model("gpt-5.3-codex"),
+            "gpt-5.4",
+        )
+
+    def test_compact_fallback_defaults_to_gpt_5_4_for_gemini_target(self):
+        config_path = self._make_temp_file_path("model-routing-", ".json")
+        service = self._make_service(str(config_path))
+
+        service.save_settings(
+            {
+                "enabled": True,
+                "mappings": [
+                    {"source_model": "gpt-5.3-codex", "target_model": "gemini-3.1-pro-preview"},
+                ],
+            }
+        )
+
+        self.assertEqual(
+            service.resolve_compact_fallback_model("gpt-5.3-codex"),
+            "gpt-5.4",
+        )
+
+    def test_compact_fallback_defaults_to_gpt_5_4_for_grok_target(self):
+        config_path = self._make_temp_file_path("model-routing-", ".json")
+        service = self._make_service(str(config_path))
+
+        service.save_settings(
+            {
+                "enabled": True,
+                "mappings": [
+                    {"source_model": "gpt-5.3-codex", "target_model": "grok-code-fast-1"},
                 ],
             }
         )

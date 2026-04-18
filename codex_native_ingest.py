@@ -244,6 +244,10 @@ def _parse_rollout(
                     continue
                 if inner.get("type") != "token_count":
                     continue
+                # If this session used a proxy, it will be ingested from the proxy logs.
+                # Skip native ingest to avoid double-counting.
+                if meta.model_provider == "custom":
+                    continue
                 # When we're replaying the header from byte 0 because the
                 # cache was cold, skip emitting events we've already persisted.
                 if replay_header_only and line_start < start_offset:
@@ -427,3 +431,4 @@ def start_background_scanner(
     thread = threading.Thread(target=_run, name="codex-native-ingest", daemon=True)
     thread.start()
     return thread
+

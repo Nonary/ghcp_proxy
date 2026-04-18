@@ -34,6 +34,10 @@ def model_provider_family(model_name: str | None) -> str | None:
         return "claude"
     if normalized.startswith("gpt-"):
         return "codex"
+    if normalized.startswith("gemini-"):
+        return "gemini"
+    if normalized.startswith("grok-"):
+        return "grok"
     return None
 
 
@@ -127,9 +131,9 @@ class ModelRoutingConfigService:
 
     def resolve_compact_fallback_model(self, requested_model: str | None) -> str | None:
         """Return the GPT model to use when a compact is requested against a
-        Claude target. Returns None if no remap is active for this model or if
-        the resolved target is not a Claude model (Codex targets don't need a
-        swap). Falls back to DEFAULT_COMPACT_FALLBACK_MODEL when the mapping
+        chat-backed target (Claude/Gemini/Grok). Returns None if no remap is
+        active for this model or if the resolved target is already a Codex
+        model. Falls back to DEFAULT_COMPACT_FALLBACK_MODEL when the mapping
         entry has no explicit override.
         """
         normalized_requested = normalize_routing_model_name(requested_model)
@@ -143,7 +147,7 @@ class ModelRoutingConfigService:
         for mapping in settings["mappings"]:
             if mapping["source_model"] != normalized_requested:
                 continue
-            if mapping.get("target_provider") != "claude":
+            if mapping.get("target_provider") == "codex":
                 return None
             override = mapping.get("compact_fallback_model")
             fallback = override or DEFAULT_COMPACT_FALLBACK_MODEL
