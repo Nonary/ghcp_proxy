@@ -74,10 +74,13 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(payload["current_month"]["usage"]["cost_usd"], 4.0)
         self.assertEqual(payload["current_month"]["usage"]["total_tokens"], 400)
         self.assertEqual(payload["current_month"]["usage"]["request_count"], 2)
+        self.assertEqual(payload["current_month"]["usage"]["premium_requests"], 1.33)
         self.assertEqual(payload["all_time"]["usage"]["request_count"], 2)
+        self.assertEqual(payload["all_time"]["usage"]["premium_requests"], 1.33)
         self.assertEqual(len(payload["current_month"]["daily_history"]), 4)
         self.assertEqual(payload["current_month"]["daily_history"][-1]["day_key"], "2026-04-04")
         self.assertEqual(payload["current_month"]["daily_history"][-1]["cost_usd"], 4.0)
+        self.assertEqual(payload["current_month"]["daily_history"][-1]["premium_requests"], 1.33)
         self.assertEqual(payload["recent_sessions"][0]["source"], "codex")
         self.assertEqual(payload["recent_sessions"][1]["source"], "claude")
 
@@ -409,6 +412,62 @@ class DashboardTests(unittest.TestCase):
         payload = service.build_payload()
         # Reset already passed; days_until_reset should be clamped at 0, not negative.
         self.assertEqual(payload["premium"]["days_until_reset"], 0)
+
+    def test_premium_consumption_summary_rolls_up_today_week_month_and_all_time(self):
+        fixed_now = datetime(2026, 4, 17, 12, 0, tzinfo=timezone.utc)
+        usage_events = [
+            {
+                "request_id": "today",
+                "started_at": "2026-04-17T11:30:00+00:00",
+                "finished_at": "2026-04-17T11:30:01+00:00",
+                "resolved_model": "claude-sonnet-4.6",
+                "premium_requests": 1.0,
+            },
+            {
+                "request_id": "within-week",
+                "started_at": "2026-04-12T09:00:00+00:00",
+                "finished_at": "2026-04-12T09:00:01+00:00",
+                "resolved_model": "gpt-5.4",
+                "premium_requests": 0.33,
+            },
+            {
+                "request_id": "month-only",
+                "started_at": "2026-04-02T09:00:00+00:00",
+                "finished_at": "2026-04-02T09:00:01+00:00",
+                "resolved_model": "gpt-5.4-mini",
+                "premium_requests": 0.1,
+            },
+            {
+                "request_id": "older",
+                "started_at": "2026-03-29T09:00:00+00:00",
+                "finished_at": "2026-03-29T09:00:01+00:00",
+                "resolved_model": "claude-sonnet-4.6",
+                "premium_requests": 1.0,
+            },
+            {
+                "request_id": "not-premium",
+                "started_at": "2026-04-17T10:00:00+00:00",
+                "finished_at": "2026-04-17T10:00:01+00:00",
+                "resolved_model": "gpt-4.1",
+                "premium_requests": 0.0,
+            },
+        ]
+        service = dashboard.DashboardService(
+            dependencies=dashboard.DashboardDependencies(
+                snapshot_all_usage_events=lambda: usage_events,
+                snapshot_usage_events=lambda: usage_events,
+                load_safeguard_trigger_stats=lambda _now: {},
+            ),
+            utc_now=lambda: fixed_now,
+        )
+
+        payload = service.build_payload()
+        consumed = payload["premium"]["consumed"]
+
+        self.assertEqual(consumed["today"], 1.0)
+        self.assertEqual(consumed["last_7_days"], 1.33)
+        self.assertEqual(consumed["current_month"], 1.43)
+        self.assertEqual(consumed["all_time"], 2.43)
 
 
 

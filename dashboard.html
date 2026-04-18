@@ -180,6 +180,293 @@
       color: var(--text);
       word-break: break-all;
     }
+    .premium-shell {
+      display: grid;
+      grid-template-columns: minmax(180px, 220px) minmax(0, 1fr);
+      gap: 16px;
+      align-items: stretch;
+    }
+    .premium-tower {
+      position: relative;
+      display: grid;
+      justify-items: center;
+      align-content: start;
+      gap: 10px;
+      min-height: 100%;
+      padding: 14px 12px;
+      border-radius: 8px;
+      border: 1px solid rgba(200,220,235,.12);
+      background:
+        linear-gradient(180deg, rgba(255,255,255,.04), rgba(255,255,255,.015)),
+        rgba(9, 15, 21, .64);
+    }
+    .premium-tower::before {
+      content: "";
+      position: absolute;
+      inset: 10px;
+      border-radius: 8px;
+      border: 1px solid rgba(255,255,255,.04);
+      pointer-events: none;
+    }
+    .premium-tower-kicker {
+      position: relative;
+      z-index: 1;
+      color: var(--muted);
+      font-size: .7rem;
+      text-transform: uppercase;
+      letter-spacing: .16em;
+    }
+    .premium-battery-cap {
+      width: 36px;
+      height: 10px;
+      margin-bottom: -1px;
+      border-radius: 5px 5px 2px 2px;
+      border: 1px solid rgba(255,255,255,.12);
+      background:
+        linear-gradient(180deg, rgba(255,255,255,.18), rgba(255,255,255,.04)),
+        rgba(255,255,255,.06);
+      position: relative;
+      z-index: 1;
+      box-shadow: inset 0 1px 0 rgba(255,255,255,.12);
+    }
+    .premium-tower-rail {
+      position: relative;
+      width: 92px;
+      height: 258px;
+      padding: 8px;
+      border-radius: 14px;
+      border: 2px solid rgba(255,255,255,.12);
+      background:
+        linear-gradient(180deg, rgba(255,255,255,.08), rgba(255,255,255,.015)),
+        rgba(5,9,14,.78);
+      overflow: hidden;
+      display: flex;
+      align-items: flex-end;
+      box-shadow: inset 0 0 0 1px rgba(255,255,255,.03), 0 18px 40px rgba(0,0,0,.24);
+    }
+    .premium-tower-rail::before {
+      content: "";
+      position: absolute;
+      inset: 8px;
+      border-radius: 8px;
+      background:
+        linear-gradient(180deg, rgba(255,255,255,.05), rgba(255,255,255,.01) 20%, rgba(0,0,0,.14) 100%);
+      opacity: .95;
+      pointer-events: none;
+    }
+    .premium-tower-rail::after {
+      content: "";
+      position: absolute;
+      inset: 8px auto 8px 8px;
+      width: 22%;
+      border-radius: 8px;
+      background: linear-gradient(180deg, rgba(255,255,255,.14), rgba(255,255,255,.01));
+      opacity: .5;
+      pointer-events: none;
+    }
+    .premium-tower-fill {
+      position: relative;
+      z-index: 1;
+      width: 100%;
+      border-radius: 8px;
+      min-height: 10px;
+      transition: height .45s ease, background .25s ease, box-shadow .25s ease;
+      box-shadow: 0 10px 26px rgba(0,0,0,.24);
+    }
+    .premium-tower-fill.tone-green {
+      background: linear-gradient(180deg, #bff7b3 0%, #68d86f 55%, #1f9d57 100%);
+      box-shadow: 0 10px 26px rgba(31,157,87,.28);
+    }
+    .premium-tower-fill.tone-yellow {
+      background: linear-gradient(180deg, #ffeaa0 0%, #ffcb5b 55%, #f39a2b 100%);
+      box-shadow: 0 10px 26px rgba(243,154,43,.28);
+    }
+    .premium-tower-fill.tone-red {
+      background: linear-gradient(180deg, #ffb0a4 0%, #ff7a64 55%, #dd4b39 100%);
+      box-shadow: 0 10px 26px rgba(221,75,57,.3);
+    }
+    .premium-tower-fill.tone-unlimited {
+      background: linear-gradient(180deg, #bff8ef 0%, #6ee7c8 55%, #2cbb9e 100%);
+      box-shadow: 0 10px 26px rgba(44,187,158,.28);
+    }
+    .premium-tower-value {
+      position: relative;
+      z-index: 1;
+      font-size: clamp(1.8rem, 4vw, 2.6rem);
+      font-weight: 800;
+      letter-spacing: -.06em;
+      line-height: .92;
+      text-align: center;
+    }
+    .premium-tower-meta {
+      position: relative;
+      z-index: 1;
+      text-align: center;
+      color: var(--muted);
+      font-size: .8rem;
+      line-height: 1.45;
+      max-width: 180px;
+    }
+    .premium-content {
+      display: grid;
+      gap: 12px;
+      min-width: 0;
+    }
+    .premium-headline {
+      display: grid;
+      gap: 6px;
+      padding: 12px 14px;
+      border-radius: 8px;
+      border: 1px solid rgba(255,255,255,.08);
+      background:
+        linear-gradient(180deg, rgba(255,255,255,.035), rgba(255,255,255,.015)),
+        rgba(255,255,255,.02);
+    }
+    .premium-headline-value {
+      font-size: 1.05rem;
+      font-weight: 700;
+      letter-spacing: -.02em;
+    }
+    .premium-consumed-grid {
+      display: grid;
+      gap: 10px;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+    }
+    .premium-consumed-card {
+      display: grid;
+      gap: 6px;
+      padding: 12px;
+      border-radius: 8px;
+      border: 1px solid rgba(200,220,235,.12);
+      background:
+        linear-gradient(180deg, rgba(255,255,255,.03), rgba(255,255,255,.015)),
+        rgba(255,255,255,.02);
+      min-height: 92px;
+    }
+    .premium-consumed-card.active {
+      border-color: rgba(255,135,82,.24);
+      background:
+        linear-gradient(180deg, rgba(255,135,82,.12), rgba(255,255,255,.015)),
+        rgba(255,255,255,.025);
+    }
+    .premium-consumed-label {
+      color: var(--muted);
+      font-size: .72rem;
+      text-transform: uppercase;
+      letter-spacing: .12em;
+    }
+    .premium-consumed-value {
+      font-size: clamp(1.2rem, 2.6vw, 1.7rem);
+      font-weight: 760;
+      letter-spacing: -.05em;
+      line-height: .95;
+    }
+    .premium-details {
+      border-radius: 8px;
+      border: 1px solid rgba(200,220,235,.12);
+      background: rgba(255,255,255,.02);
+      overflow: hidden;
+    }
+    .premium-details > summary {
+      list-style: none;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 12px 14px;
+      cursor: pointer;
+      user-select: none;
+    }
+    .premium-details > summary::-webkit-details-marker { display: none; }
+    .premium-details-summary {
+      display: grid;
+      gap: 4px;
+    }
+    .premium-details-title {
+      font-size: .9rem;
+      font-weight: 650;
+      letter-spacing: -.02em;
+    }
+    .premium-details-icon {
+      color: var(--muted);
+      transition: transform .18s ease;
+      font-size: .88rem;
+    }
+    .premium-details[open] .premium-details-icon { transform: rotate(180deg); }
+    .premium-details-body {
+      display: grid;
+      gap: 12px;
+      padding: 0 14px 14px;
+      border-top: 1px solid rgba(255,255,255,.06);
+    }
+    .premium-week-grid {
+      display: grid;
+      gap: 8px;
+      grid-template-columns: repeat(7, minmax(0, 1fr));
+    }
+    .premium-day {
+      display: grid;
+      gap: 6px;
+      align-content: start;
+      min-height: 108px;
+      padding: 10px;
+      border-radius: 8px;
+      border: 1px solid rgba(200,220,235,.1);
+      background: rgba(255,255,255,.02);
+    }
+    .premium-day.is-today {
+      border-color: rgba(255,135,82,.26);
+      background: linear-gradient(180deg, rgba(255,135,82,.1), rgba(255,255,255,.02));
+    }
+    .premium-day.is-active {
+      box-shadow: inset 0 0 0 1px rgba(255,255,255,.03);
+    }
+    .premium-day-top {
+      display: flex;
+      align-items: start;
+      justify-content: space-between;
+      gap: 8px;
+    }
+    .premium-day-name {
+      color: var(--muted);
+      font-size: .68rem;
+      text-transform: uppercase;
+      letter-spacing: .14em;
+    }
+    .premium-day-date {
+      font-size: .84rem;
+      font-weight: 650;
+    }
+    .premium-day-value {
+      font-size: 1.15rem;
+      font-weight: 760;
+      letter-spacing: -.04em;
+    }
+    .premium-day-bar {
+      height: 6px;
+      border-radius: 999px;
+      overflow: hidden;
+      background: rgba(255,255,255,.06);
+    }
+    .premium-day-bar > span {
+      display: block;
+      height: 100%;
+      border-radius: 999px;
+      background: linear-gradient(90deg, #68d86f, #ffcb5b 58%, #ff7a64 100%);
+    }
+    .premium-week-foot {
+      display: grid;
+      gap: 8px;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+    .premium-week-stat {
+      display: grid;
+      gap: 4px;
+      padding: 10px 12px;
+      border-radius: 8px;
+      border: 1px solid rgba(200,220,235,.1);
+      background: rgba(255,255,255,.02);
+    }
     .panel-head {
       display: flex;
       justify-content: space-between;
@@ -885,6 +1172,10 @@
       .proxy-grid { grid-template-columns: 1fr; }
       .request-layout, .detail-grid, .request-meta { grid-template-columns: 1fr; }
       .source-period-grid, .source-duel-grid { grid-template-columns: 1fr; }
+      .premium-shell { grid-template-columns: 1fr; }
+      .premium-consumed-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .premium-week-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+      .premium-week-foot { grid-template-columns: 1fr; }
       .source-spotlight-head { flex-direction: column; }
       .source-lead-note { max-width: none; text-align: left; }
       .chart-summary { text-align: left; justify-items: start; }
@@ -895,6 +1186,8 @@
       .summary-grid { grid-template-columns: 1fr; }
       .source-context-pill { width: 100%; justify-items: start; }
       .panel-head { align-items: start; }
+      .premium-consumed-grid { grid-template-columns: 1fr; }
+      .premium-week-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     }
   </style>
 </head>
@@ -923,19 +1216,91 @@
             <div class="subtle">{{ premiumPlanStatusLabel }}</div>
           </div>
         </div>
-        <div class="sync-guide">
-          <div v-if="!premium.configured" class="subtle">
-            Make a request through the proxy to see your live premium quota. Counts come straight from upstream response headers — no token or plan picker needed.
+        <div class="premium-shell">
+          <div class="premium-tower">
+            <div class="premium-tower-kicker">Quota</div>
+            <div class="premium-battery-cap"></div>
+            <div class="premium-tower-rail">
+              <div
+                :class="['premium-tower-fill', premiumGaugeToneClass]"
+                :style="{ height: `${premiumGaugePercent}%` }"
+              ></div>
+            </div>
+            <div class="premium-tower-value">{{ premiumGaugeLabel }}</div>
+            <div class="premium-tower-meta">{{ premiumGaugeMeta }}</div>
           </div>
-          <div v-else>
-            <div class="subtle" v-if="premium.unlimited">
-              <strong>Unlimited plan</strong> — no premium quota cap.
+
+          <div class="premium-content">
+            <div class="premium-headline">
+              <div v-if="!premium.configured" class="subtle">
+                Make a request through the proxy to see your live premium quota. Counts come straight from upstream response headers.
+              </div>
+              <template v-else>
+                <div class="premium-headline-value" v-if="premium.unlimited">Unlimited plan</div>
+                <div class="premium-headline-value" v-else>{{ premiumUsageLine }}</div>
+                <div class="subtle">{{ premiumResetLine }}</div>
+                <div class="subtle" v-if="premiumOverageLine">{{ premiumOverageLine }}</div>
+              </template>
             </div>
-            <div class="subtle" v-else>
-              <strong>{{ premiumUsageLine }}</strong>
+
+            <div class="premium-consumed-grid">
+              <div
+                v-for="item in premiumConsumedCards"
+                :key="item.key"
+                :class="['premium-consumed-card', { active: item.key === 'last_7_days' }]"
+              >
+                <div class="premium-consumed-label">{{ item.label }}</div>
+                <div class="premium-consumed-value">{{ item.value }}</div>
+                <div class="subtle">{{ item.meta }}</div>
+              </div>
             </div>
-            <div class="subtle">{{ premiumResetLine }}</div>
-            <div class="subtle" v-if="premiumOverageLine">{{ premiumOverageLine }}</div>
+
+            <details class="premium-details">
+              <summary>
+                <div class="premium-details-summary">
+                  <span class="premium-details-title">7-Day Premium Breakdown</span>
+                  <span class="subtle">{{ premiumWeekSummaryLine }}</span>
+                </div>
+                <span class="premium-details-icon">▼</span>
+              </summary>
+              <div class="premium-details-body">
+                <div class="premium-week-grid">
+                  <div
+                    v-for="day in premiumLast7Days"
+                    :key="day.day_key"
+                    :class="['premium-day', { 'is-today': day.is_today, 'is-active': day.premium_requests > 0 }]"
+                  >
+                    <div class="premium-day-top">
+                      <div>
+                        <div class="premium-day-name">{{ day.weekday }}</div>
+                        <div class="premium-day-date">{{ day.dayNumber }}</div>
+                      </div>
+                      <span class="badge" v-if="day.is_today">today</span>
+                    </div>
+                    <div class="premium-day-value">{{ premiumCount(day.premium_requests) }}</div>
+                    <div class="premium-day-bar"><span :style="{ width: `${day.fill_percent}%` }"></span></div>
+                    <div class="subtle">{{ day.requestLabel }}</div>
+                  </div>
+                </div>
+                <div class="premium-week-foot">
+                  <div class="premium-week-stat">
+                    <div class="premium-consumed-label">Week Total</div>
+                    <div class="premium-consumed-value">{{ premiumCount(premiumWeekTotal) }}</div>
+                    <div class="subtle">Premium requests in the last 7 days</div>
+                  </div>
+                  <div class="premium-week-stat">
+                    <div class="premium-consumed-label">Daily Average</div>
+                    <div class="premium-consumed-value">{{ premiumCount(premiumWeekAverage) }}</div>
+                    <div class="subtle">Average per day across the last week</div>
+                  </div>
+                  <div class="premium-week-stat">
+                    <div class="premium-consumed-label">Peak Day</div>
+                    <div class="premium-consumed-value">{{ premiumWeekPeakLabel }}</div>
+                    <div class="subtle">{{ premiumWeekPeakMeta }}</div>
+                  </div>
+                </div>
+              </div>
+            </details>
           </div>
         </div>
       </article>
@@ -2009,6 +2374,7 @@
         cache_creation_tokens: 0,
         reasoning_output_tokens: 0,
         request_count: 0,
+        premium_requests: 0,
         cost_usd: 0,
         cost_breakdown: {
           input_fresh: 0,
@@ -2049,6 +2415,7 @@
       let cacheCreationTokens = 0;
       let outputTokens = 0;
       let reasoningOutputTokens = 0;
+      let premiumRequests = 0;
       const costBreakdown = {
         input_fresh: 0,
         cached_input: 0,
@@ -2066,6 +2433,7 @@
         cacheCreationTokens += Number(row.cache_creation_tokens || 0);
         outputTokens += Number(row.output_tokens || 0);
         reasoningOutputTokens += Number(row.reasoning_output_tokens || 0);
+        premiumRequests += Number(row.premium_requests || 0);
         costBreakdown.input_fresh += Number(row.cost_breakdown?.input_fresh || 0);
         costBreakdown.cached_input += Number(row.cost_breakdown?.cached_input || 0);
         costBreakdown.cache_creation += Number(row.cost_breakdown?.cache_creation || 0);
@@ -2105,6 +2473,7 @@
         cache_creation_tokens: cacheCreationTokens,
         output_tokens: outputTokens,
         reasoning_output_tokens: reasoningOutputTokens,
+        premium_requests: Number(premiumRequests.toFixed(2)),
         cost_breakdown: {
           input_fresh: Number(costBreakdown.input_fresh.toFixed(6)),
           cached_input: Number(costBreakdown.cached_input.toFixed(6)),
@@ -2789,6 +3158,46 @@
           if (source) return source;
           return 'Premium source pending';
         },
+        premiumGaugePercent() {
+          if (this.premium.unlimited) return 100;
+          const percentRemaining = this._asPremiumNumber(this.premium.percent_remaining);
+          if (Number.isFinite(percentRemaining)) {
+            return Math.max(6, Math.min(100, percentRemaining));
+          }
+          const percentUsed = this._asPremiumNumber(this.premium.percent_used);
+          if (Number.isFinite(percentUsed)) {
+            return Math.max(6, Math.min(100, 100 - percentUsed));
+          }
+          const included = this._asPremiumNumber(this.premium.included);
+          const monthConsumed = Number(this.currentMonth?.premium_requests || 0);
+          if (Number.isFinite(included) && included > 0 && Number.isFinite(monthConsumed)) {
+            return Math.max(6, Math.min(100, ((included - monthConsumed) / included) * 100));
+          }
+          return 6;
+        },
+        premiumGaugeToneClass() {
+          if (this.premium.unlimited) return 'tone-unlimited';
+          const percent = this.premiumGaugePercent;
+          if (percent <= 15) return 'tone-red';
+          if (percent <= 40) return 'tone-yellow';
+          return 'tone-green';
+        },
+        premiumGaugeLabel() {
+          if (this.premium.unlimited) return 'Unlimited';
+          const percentRemaining = this._asPremiumNumber(this.premium.percent_remaining);
+          if (Number.isFinite(percentRemaining)) return `${this._formatPercent(percentRemaining)}% left`;
+          return this.premium.configured ? `${this.premiumCount(this.currentMonth?.premium_requests)} used` : 'Pending';
+        },
+        premiumGaugeMeta() {
+          if (!this.premium.configured) return 'Live quota appears after the first proxied request.';
+          if (this.premium.unlimited) return 'No premium ceiling is enforced for this plan.';
+          const used = this._asPremiumNumber(this.premium.used);
+          const remaining = this._asPremiumNumber(this.premium.remaining);
+          if (Number.isFinite(used) && Number.isFinite(remaining)) {
+            return `${this.premiumCount(used)} used · ${this.premiumCount(remaining)} left`;
+          }
+          return 'Using live upstream quota snapshots.';
+        },
         premiumRemainingLabel() {
           if (this.premium.unlimited) return 'Unlimited';
           const percentUsed = this._asPremiumNumber(this.premium.percent_used);
@@ -2852,6 +3261,66 @@
           const included = this._asPremiumNumber(this.premium.included);
           if (Number.isFinite(included)) return `${this.integer(included)} premium requests included this period`;
           return 'Live premium quota from upstream headers';
+        },
+        premiumConsumedCards() {
+          const todayConsumed = Number(this.premiumLast7Days[this.premiumLast7Days.length - 1]?.premium_requests || 0);
+          return [
+            { key: 'today', label: 'Today', value: this.premiumCount(todayConsumed), meta: 'Same local day shown in the expanded view' },
+            { key: 'last_7_days', label: '7 Days', value: this.premiumCount(this.premiumWeekTotal), meta: 'Rolling seven-day total' },
+            { key: 'current_month', label: 'Month', value: this.premiumCount(this.currentMonth?.premium_requests), meta: 'Current month so far' },
+            { key: 'all_time', label: 'All-Time', value: this.premiumCount(this.allTime?.premium_requests), meta: 'All recorded premium requests' },
+          ];
+        },
+        premiumLast7Days() {
+          const byDay = new Map((this.dailyHistory || []).map((row) => [String(row?.day_key || ''), row]));
+          const today = new Date();
+          const days = [];
+          for (let offset = 6; offset >= 0; offset -= 1) {
+            const date = addCalendarDays(today, -offset);
+            const dayKey = dayKeyFromDate(date);
+            const row = byDay.get(dayKey) || emptyUsageRow(dayKey);
+            const premiumRequests = Number(row?.premium_requests || 0);
+            days.push({
+              ...row,
+              day_key: dayKey,
+              is_today: offset === 0,
+              weekday: date ? date.toLocaleDateString([], { weekday: 'short' }) : '-',
+              dayNumber: date ? date.toLocaleDateString([], { month: 'short', day: 'numeric' }) : dayKey,
+              premium_requests: Number(premiumRequests.toFixed(2)),
+            });
+          }
+          const maxPremium = Math.max(...days.map((row) => Number(row.premium_requests || 0)), 0);
+          return days.map((row) => ({
+            ...row,
+            fill_percent: maxPremium > 0 ? Math.max(8, (Number(row.premium_requests || 0) / maxPremium) * 100) : 0,
+            requestLabel: Number(row.premium_requests || 0) > 0
+              ? `${this.integer(row.request_count || 0)} proxy call${Number(row.request_count || 0) === 1 ? '' : 's'}`
+              : 'No premium activity',
+          }));
+        },
+        premiumWeekTotal() {
+          return this.premiumLast7Days.reduce((sum, row) => sum + Number(row.premium_requests || 0), 0);
+        },
+        premiumWeekAverage() {
+          return this.premiumLast7Days.length ? this.premiumWeekTotal / this.premiumLast7Days.length : 0;
+        },
+        premiumWeekPeakDay() {
+          return this.premiumLast7Days.reduce((best, row) => (
+            Number(row.premium_requests || 0) > Number(best?.premium_requests || 0) ? row : best
+          ), null);
+        },
+        premiumWeekPeakLabel() {
+          const peak = this.premiumWeekPeakDay;
+          if (!peak || Number(peak.premium_requests || 0) <= 0) return 'Quiet';
+          return this.premiumCount(peak.premium_requests);
+        },
+        premiumWeekPeakMeta() {
+          const peak = this.premiumWeekPeakDay;
+          if (!peak || Number(peak.premium_requests || 0) <= 0) return 'No premium requests this week';
+          return `${peak.weekday} ${peak.dayNumber} · ${this.integer(peak.request_count || 0)} proxy call${Number(peak.request_count || 0) === 1 ? '' : 's'}`;
+        },
+        premiumWeekSummaryLine() {
+          return `${this.premiumCount(this.premiumWeekTotal)} total · ${this.premiumCount(this.premiumWeekAverage)} avg/day`;
         },
         safeguardConfigStatusLabel() {
           const seconds = Number(this.safeguardConfig.cooldownSeconds);
@@ -2929,6 +3398,14 @@
           const numeric = Number(value);
           if (!Number.isFinite(numeric)) return 'Unknown';
           return new Intl.NumberFormat('en-US', { maximumFractionDigits: 3 }).format(numeric);
+        },
+        premiumCount(value) {
+          const numeric = Number(value);
+          if (!Number.isFinite(numeric)) return '-';
+          return new Intl.NumberFormat('en-US', {
+            minimumFractionDigits: numeric % 1 === 0 ? 0 : 2,
+            maximumFractionDigits: 2,
+          }).format(numeric);
         },
         _formatPercent(value) {
           const numeric = Number(value);
