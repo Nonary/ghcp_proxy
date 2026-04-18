@@ -113,6 +113,20 @@ def request_session_id(request: Request, request_body: dict | None = None) -> st
     return None
 
 
+def _display_model_name(model_name: str | None) -> str | None:
+    normalized = _normalize_model_name(model_name)
+    if normalized is None:
+        return model_name
+
+    try:
+        import format_translation
+
+        resolved = format_translation.resolve_copilot_model_name(normalized)
+    except Exception:
+        resolved = normalized
+    return _normalize_model_name(resolved) or normalized
+
+
 def _claude_session_scope_key(
     client_request_id: str | None,
     subagent: str | None,
@@ -760,15 +774,20 @@ class UsageTracker:
         initiator_verdict: dict | None = None,
     ) -> dict:
         # Log the proxy request (absorbed from log_proxy_request)
+        display_requested_model = _display_model_name(requested_model)
+        display_resolved_model = _display_model_name(resolved_model)
         parts = [
             "INFO:",
             f"Proxy request ({_initiator_log_label(initiator)}):",
             f"{request.method} {request.url.path}",
         ]
-        if requested_model is not None:
-            parts.append(f"requested_model={requested_model}")
-        if resolved_model is not None and resolved_model != requested_model:
-            parts.append(f"resolved_model={resolved_model}")
+        if display_requested_model is not None:
+            parts.append(f"requested_model={display_requested_model}")
+        if (
+            display_resolved_model is not None
+            and display_resolved_model != display_requested_model
+        ):
+            parts.append(f"resolved_model={display_resolved_model}")
         print(" ".join(parts), flush=True)
 
         event_request_id = request_id or uuid4().hex

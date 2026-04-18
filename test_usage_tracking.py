@@ -139,6 +139,48 @@ class UsageTrackingTests(unittest.TestCase):
         self.assertEqual(event["session_id"], "session-123")
         self.assertEqual(event["client_request_id"], "session-123")
 
+    def test_start_usage_event_logs_canonical_requested_model_without_duplicate_resolved_model(self):
+        tracker = self._make_usage_tracker()
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/messages"),
+            method="POST",
+            headers={},
+        )
+
+        with mock.patch("builtins.print") as print_mock:
+            tracker.start_event(
+                request,
+                requested_model="claude-opus-4-7",
+                resolved_model="claude-opus-4.7",
+                initiator="agent",
+            )
+
+        print_mock.assert_called_once()
+        logged_line = print_mock.call_args.args[0]
+        self.assertIn("requested_model=claude-opus-4.7", logged_line)
+        self.assertNotIn("resolved_model=", logged_line)
+
+    def test_start_usage_event_logs_resolved_model_when_real_remap_occurs(self):
+        tracker = self._make_usage_tracker()
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/messages"),
+            method="POST",
+            headers={},
+        )
+
+        with mock.patch("builtins.print") as print_mock:
+            tracker.start_event(
+                request,
+                requested_model="gpt-5.4",
+                resolved_model="claude-opus-4.7",
+                initiator="agent",
+            )
+
+        print_mock.assert_called_once()
+        logged_line = print_mock.call_args.args[0]
+        self.assertIn("requested_model=gpt-5.4", logged_line)
+        self.assertIn("resolved_model=claude-opus-4.7", logged_line)
+
     def test_start_usage_event_uses_claude_code_session_header(self):
         tracker = self._make_usage_tracker()
         request = SimpleNamespace(
