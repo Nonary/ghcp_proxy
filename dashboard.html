@@ -658,10 +658,14 @@
       letter-spacing: -.02em;
     }
     .source-period-card .badge {
+      padding-block: 4px;
       padding-inline: 8px;
       font-size: .68rem;
       align-self: start;
-      white-space: nowrap;
+      white-space: normal;
+      text-align: right;
+      word-break: break-word;
+      line-height: 1.2;
     }
     .source-period-value {
       font-size: clamp(1.35rem, 3vw, 2rem);
@@ -678,7 +682,6 @@
     .source-metric-track {
       display: flex;
       gap: 3px;
-      overflow: hidden;
     }
     .source-period-track,
     .source-share-bar {
@@ -686,12 +689,14 @@
       border-radius: 999px;
       background: rgba(255,255,255,.05);
       padding: 2px;
+      overflow: hidden;
     }
     .source-metric-track {
       height: 8px;
       border-radius: 999px;
       background: rgba(255,255,255,.05);
       padding: 1px;
+      overflow: hidden;
     }
     .source-period-segment,
     .source-share-segment,
@@ -783,6 +788,7 @@
       border-radius: 8px;
       border: 1px solid rgba(200,220,235,.12);
       background: rgba(255,255,255,.03);
+      overflow: hidden;
     }
     .source-detail-card.tone-codex { background: linear-gradient(180deg, rgba(110,231,200,.11), rgba(255,255,255,.025)); }
     .source-detail-card.tone-claude { background: linear-gradient(180deg, rgba(255,135,82,.13), rgba(255,255,255,.025)); }
@@ -812,6 +818,7 @@
       font-weight: 780;
       letter-spacing: -.06em;
       line-height: .92;
+      overflow-wrap: break-word;
     }
     .source-detail-meta {
       color: var(--muted);
@@ -2980,7 +2987,10 @@
             }))
             .sort((a, b) => b.cost_usd - a.cost_usd);
           if (!rows.length || rows[0].cost_usd <= 0) return 'No spend';
-          return `${this.sourceLabel(rows[0].source)} lead`;
+          const label = this.sourceLabel(rows[0].source);
+          // If it's a long label like Codex (proxied), just return the label. Otherwise append 'lead'.
+          if (label.length > 10) return label;
+          return `${label} lead`;
         },
         periodSegments(usage) {
           const total = Number(usage?.cost_usd || 0);
