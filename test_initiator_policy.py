@@ -288,6 +288,29 @@ class InitiatorPolicyTests(unittest.TestCase):
 
         self.assertEqual(initiator, "agent")
 
+    def test_anthropic_native_compaction_prompt_is_agent(self):
+        policy = initiator_policy.InitiatorPolicy()
+        messages = [
+            {"role": "assistant", "content": [{"type": "text", "text": "previous answer"}]},
+            {
+                "role": "user",
+                "content": (
+                    "1. Primary Request and Intent: Capture all of the user's explicit requests and intents in detail\n"
+                    "6. All user messages: List ALL user messages that are not tool results. These are critical for understanding the users' feedback and changing intent.\n"
+                    "8. Current Work: Describe in detail precisely what was being worked on immediately before this summary request.\n"
+                    "REMINDER: Do NOT call any tools. Respond with plain text only — an <analysis> block followed by a <summary> block."
+                ),
+            },
+        ]
+
+        initiator = policy.resolve_anthropic_messages(
+            messages,
+            "claude-opus-4.7",
+            system="You are a helpful AI assistant tasked with summarizing conversations.",
+        )
+
+        self.assertEqual(initiator, "agent")
+
     def test_anthropic_local_command_wrapper_is_agent(self):
         policy = initiator_policy.InitiatorPolicy()
         messages = [

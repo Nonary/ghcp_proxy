@@ -14,6 +14,9 @@ REQUEST_FINISH_GUARD_SECONDS = 15.0
 _SECURITY_MONITOR_PROMPT_MARKERS = (
     "you are a security monitor for autonomous ai coding agents",
 )
+_CONVERSATION_SUMMARIZER_PROMPT_MARKERS = (
+    "you are a helpful ai assistant tasked with summarizing conversations.",
+)
 
 
 def utc_now() -> datetime:
@@ -91,6 +94,15 @@ def _is_claude_compaction_summary_text(text: str) -> bool:
     return normalized.startswith(
         "This session is being continued from a previous conversation that ran out of context."
     )
+
+
+def _contains_conversation_summarizer_prompt(text: str | None) -> bool:
+    if not isinstance(text, str):
+        return False
+    normalized = " ".join(text.lower().split())
+    if not normalized:
+        return False
+    return any(marker in normalized for marker in _CONVERSATION_SUMMARIZER_PROMPT_MARKERS)
 
 
 def _is_claude_meta_user_text(text: str) -> bool:
@@ -281,7 +293,8 @@ def _responses_system_prompt_includes_security_monitor_prompt(input_param) -> bo
         role = str(item.get("role", "")).lower()
         if role not in {"system", "developer"}:
             continue
-        if _contains_security_monitor_prompt(_responses_item_text(item)):
+        text = _responses_item_text(item)
+        if _contains_security_monitor_prompt(text) or _contains_conversation_summarizer_prompt(text):
             return True
     return False
 
@@ -607,7 +620,10 @@ def _determine_anthropic_candidate(messages, *, system=None) -> str:
 
 def _anthropic_system_includes_security_monitor_prompt(system) -> bool:
     if isinstance(system, str):
-        return _contains_security_monitor_prompt(system)
+        return (
+            _contains_security_monitor_prompt(system)
+            or _contains_conversation_summarizer_prompt(system)
+        )
     if not isinstance(system, list):
         return False
     text_parts: list[str] = []
@@ -621,7 +637,11 @@ def _anthropic_system_includes_security_monitor_prompt(system) -> bool:
             text_parts.append(text)
     if not text_parts:
         return False
-    return _contains_security_monitor_prompt(" ".join(text_parts))
+    combined = " ".join(text_parts)
+    return (
+        _contains_security_monitor_prompt(combined)
+        or _contains_conversation_summarizer_prompt(combined)
+    )
 
 
 def _request_includes_security_monitor_prompt(
