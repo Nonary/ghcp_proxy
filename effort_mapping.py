@@ -45,6 +45,14 @@ class ClaudeOpus47Strategy(ModelEffortStrategy):
         return "medium"
 
 
+class ClaudeHaiku45Strategy(ModelEffortStrategy):
+    def matches(self, normalized_model: str) -> bool:
+        return normalized_model == "claude-haiku-4.5"
+
+    def map(self, canonical_effort: str) -> str | None:
+        return None
+
+
 class PassthroughStrategy(ModelEffortStrategy):
     def matches(self, normalized_model: str) -> bool:
         return True
@@ -55,6 +63,7 @@ class PassthroughStrategy(ModelEffortStrategy):
 
 _STRATEGIES: list[ModelEffortStrategy] = [
     ClaudeOpus47Strategy(),
+    ClaudeHaiku45Strategy(),
     PassthroughStrategy(),
 ]
 

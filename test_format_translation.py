@@ -205,6 +205,28 @@ class FormatTranslationTests(unittest.TestCase):
         outbound = format_translation.anthropic_request_to_responses(body)
         self.assertEqual(outbound["reasoning"], {"effort": "medium"})
 
+    def test_haiku_45_omits_reasoning_effort_in_chat(self):
+        body = {
+            "model": "claude-haiku-4.5",
+            "output_config": {"effort": "medium"},
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+        outbound = proxy.asyncio.run(
+            format_translation.anthropic_request_to_chat(
+                body, "https://example.invalid", "test-key"
+            )
+        )
+        self.assertNotIn("reasoning_effort", outbound)
+
+    def test_haiku_45_omits_reasoning_effort_in_responses(self):
+        body = {
+            "model": "claude-haiku-4.5",
+            "output_config": {"effort": "medium"},
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+        outbound = format_translation.anthropic_request_to_responses(body)
+        self.assertNotIn("reasoning", outbound)
+
     def test_anthropic_request_to_chat_preserves_cache_control_on_tool_results(self):
         body = {
             "model": "claude-sonnet-4.6",

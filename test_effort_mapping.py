@@ -44,6 +44,17 @@ class EffortMappingTests(unittest.TestCase):
             "medium",
         )
 
+    def test_haiku_45_omits_reasoning_effort(self):
+        for effort in ("low", "medium", "high", "max", "xhigh"):
+            self.assertIsNone(
+                effort_mapping.map_effort_for_model("claude-haiku-4.5", effort)
+            )
+
+    def test_haiku_45_with_anthropic_prefix_omits_reasoning_effort(self):
+        self.assertIsNone(
+            effort_mapping.map_effort_for_model("anthropic/claude-haiku-4.5", "high")
+        )
+
     def test_other_claude_sku_not_clamped(self):
         self.assertEqual(
             effort_mapping.map_effort_for_model("claude-opus-4.6", "high"),
