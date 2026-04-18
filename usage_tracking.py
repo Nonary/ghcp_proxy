@@ -173,6 +173,13 @@ def _normalize_recorded_usage_event(payload: dict | None) -> dict | None:
             or path == "/native/codex/responses"
         ):
             normalized_event["native_source"] = "codex_native"
+    native_model_provider = normalized_event.get("native_model_provider")
+    if (
+        normalized_event.get("native_source") == "codex_native"
+        and isinstance(native_model_provider, str)
+        and native_model_provider.strip().lower() == "custom"
+    ):
+        return None
     if not normalized_event.get("session_id") and native_session_id:
         normalized_event["session_id"] = native_session_id
         normalized_event.setdefault("session_id_origin", "codex_native_request_id")

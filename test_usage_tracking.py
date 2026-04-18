@@ -182,6 +182,25 @@ class UsageTrackingTests(unittest.TestCase):
         self.assertEqual(normalized["native_service_tier_source"], "codex_logs_response_completed")
         self.assertAlmostEqual(normalized["cost_usd"], baseline * 2, places=8)
 
+    def test_normalize_recorded_usage_event_drops_proxied_codex_native_rows(self):
+        normalized = usage_tracking._normalize_recorded_usage_event(
+            {
+                "request_id": "codex-native:session-custom:1",
+                "path": "/native/codex/responses",
+                "native_source": "codex_native",
+                "native_model_provider": "custom",
+                "requested_model": "gpt-5.4",
+                "usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 10,
+                    "cached_input_tokens": 20,
+                    "total_tokens": 110,
+                },
+            }
+        )
+
+        self.assertIsNone(normalized)
+
     def test_normalize_recorded_usage_event_overrides_stale_native_tier_with_codex_logs(self):
         with mock.patch(
             "usage_tracking._codex_logs_service_tiers",

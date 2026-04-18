@@ -87,6 +87,8 @@ class _FileState:
     current_model: str | None
     current_effort: str | None
     current_turn_id: str | None
+    last_token_turn_id: str | None
+    last_token_signature: tuple | None
     turn_index: int
     last_offset: int
 
@@ -108,6 +110,40 @@ class _SessionMeta:
     model_provider: str | None = None
     model: str | None = None  # falls back to turn_context.model
     started_at: str | None = None  # ISO8601 from session_meta.payload.timestamp
+
+
+def _is_proxied_rollout(meta: "_SessionMeta") -> bool:
+    provider = meta.model_provider
+    if not isinstance(provider, str):
+        return False
+    return provider.strip().lower() == "custom"
+
+
+def _token_count_signature(payload: dict | None) -> tuple | None:
+    if not isinstance(payload, dict):
+        return None
+    info = payload.get("info")
+    if not isinstance(info, dict):
+        return None
+    total_usage = info.get("total_token_usage")
+    if isinstance(total_usage, dict):
+        return (
+            int(total_usage.get("input_tokens", 0) or 0),
+            int(total_usage.get("cached_input_tokens", 0) or 0),
+            int(total_usage.get("output_tokens", 0) or 0),
+            int(total_usage.get("reasoning_output_tokens", 0) or 0),
+            int(total_usage.get("total_tokens", 0) or 0),
+        )
+    last_usage = info.get("last_token_usage")
+    if not isinstance(last_usage, dict):
+        return None
+    return (
+        int(last_usage.get("input_tokens", 0) or 0),
+        int(last_usage.get("cached_input_tokens", 0) or 0),
+        int(last_usage.get("output_tokens", 0) or 0),
+        int(last_usage.get("reasoning_output_tokens", 0) or 0),
+        int(last_usage.get("total_tokens", 0) or 0),
+    )
 
 
 def _normalize_token_count_payload(payload: dict | None) -> dict | None:
@@ -134,10 +170,11 @@ def _normalize_token_count_payload(payload: dict | None) -> dict | None:
     if cached > raw_input:
         cached = raw_input
     fresh_input = raw_input - cached
+    output_tokens = int(last.get("output_tokens", 0) or 0)
     return {
         "input_tokens": fresh_input,
-        "output_tokens": int(last.get("output_tokens", 0) or 0),
-        "total_tokens": int(last.get("total_tokens", 0) or 0),
+        "output_tokens": output_tokens,
+        "total_tokens": fresh_input + output_tokens,
         "cached_input_tokens": cached,
         "cache_creation_input_tokens": 0,
         "reasoning_output_tokens": int(last.get("reasoning_output_tokens", 0) or 0),
@@ -176,6 +213,8 @@ def _parse_rollout(
         current_model = cached.current_model
         current_effort = cached.current_effort
         current_turn_id = cached.current_turn_id
+        last_token_turn_id = cached.last_token_turn_id
+        last_token_signature = cached.last_token_signature
         turn_index = cached.turn_index
         seek_to = start_offset
         replay_header_only = False
@@ -187,6 +226,8 @@ def _parse_rollout(
         current_model = None
         current_effort = None
         current_turn_id = None
+        last_token_turn_id = None
+        last_token_signature = None
         turn_index = 0
         seek_to = 0
         replay_header_only = True
@@ -246,11 +287,22 @@ def _parse_rollout(
                     continue
                 # If this session used a proxy, it will be ingested from the proxy logs.
                 # Skip native ingest to avoid double-counting.
-                if meta.model_provider == "custom":
+                if _is_proxied_rollout(meta):
+                    continue
+                token_signature = _token_count_signature(inner)
+                if (
+                    isinstance(current_turn_id, str)
+                    and current_turn_id
+                    and current_turn_id == last_token_turn_id
+                    and token_signature is not None
+                    and token_signature == last_token_signature
+                ):
                     continue
                 # When we're replaying the header from byte 0 because the
                 # cache was cold, skip emitting events we've already persisted.
                 if replay_header_only and line_start < start_offset:
+                    last_token_turn_id = current_turn_id
+                    last_token_signature = token_signature
                     turn_index += 1
                     continue
 
@@ -259,6 +311,8 @@ def _parse_rollout(
                     continue
                 if usage["total_tokens"] == 0:
                     continue
+                last_token_turn_id = current_turn_id
+                last_token_signature = token_signature
 
                 model_name = current_model or meta.model or "gpt-5"
                 normalized_model = _normalize_model_name(model_name) or model_name
@@ -327,6 +381,8 @@ def _parse_rollout(
             current_model=current_model,
             current_effort=current_effort,
             current_turn_id=current_turn_id,
+            last_token_turn_id=last_token_turn_id,
+            last_token_signature=last_token_signature,
             turn_index=turn_index,
             last_offset=new_offset,
         )

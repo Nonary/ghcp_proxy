@@ -188,6 +188,7 @@ class CodexNativeIngestTests(unittest.TestCase):
         self.assertEqual(first["usage"]["input_tokens"], 800)  # 1000 total - 200 cached
         self.assertEqual(first["usage"]["cached_input_tokens"], 200)
         self.assertEqual(first["usage"]["output_tokens"], 50)
+        self.assertEqual(first["usage"]["total_tokens"], 850)
         self.assertEqual(first["usage"]["reasoning_output_tokens"], 10)
         self.assertGreater(first["cost_usd"], 0.0, "should compute non-zero cost from gpt-5.4 pricing")
         self.assertEqual(first["native_plan_type"], "pro")
@@ -252,6 +253,7 @@ class CodexNativeIngestTests(unittest.TestCase):
         # input=100, cached=0 — fresh stays at 100 with no clamping.
         self.assertEqual(more[0]["usage"]["input_tokens"], 100)
         self.assertEqual(more[0]["usage"]["cached_input_tokens"], 0)
+        self.assertEqual(more[0]["usage"]["total_tokens"], 105)
 
     def test_cost_does_not_double_count_cached_tokens(self):
         """Regression: input_tokens reported by Codex is fresh+cached. The
@@ -313,6 +315,37 @@ class CodexNativeIngestTests(unittest.TestCase):
         self.assertTrue(baseline)
         self.assertAlmostEqual(fast_event["cost_usd"], baseline[0]["cost_usd"] * 2, places=6)
 
+
+    def test_dedupes_repeated_token_count_snapshot_for_same_turn(self):
+        rollout = self.sessions_dir / "rollout-2026-04-18T10-15-05-sess-dup.jsonl"
+        _write_rollout(rollout, session_id="sess-dup", model_provider="openai")
+        duplicate = {
+            "timestamp": "2026-04-18T15:15:50.200Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {
+                        "input_tokens": 1500, "cached_input_tokens": 800,
+                        "output_tokens": 80, "reasoning_output_tokens": 15,
+                        "total_tokens": 1580,
+                    },
+                    "last_token_usage": {
+                        "input_tokens": 500, "cached_input_tokens": 600,
+                        "output_tokens": 30, "reasoning_output_tokens": 5,
+                        "total_tokens": 530,
+                    },
+                },
+                "rate_limits": {"plan_type": "pro", "limit_id": "codex"},
+            },
+        }
+        with rollout.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(duplicate))
+            f.write("\n")
+
+        emitted: list[dict] = []
+        codex_native_ingest.scan_once(emitted.append)
+        self.assertEqual(len(emitted), 2)
 
     def test_skips_proxied_sessions(self):
         rollout = self.sessions_dir / "rollout-2026-04-18T10-15-05-sess-custom.jsonl"
