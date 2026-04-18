@@ -96,16 +96,45 @@ class ProtocolBridgePlannerTests(unittest.TestCase):
         self.assertEqual(plan.resolved_model, "gpt-5.4-mini")
         self.assertEqual(plan.strategy_name, "responses_to_responses")
 
-    def test_planner_uses_approval_mapping_for_claude_transcript_container(self):
+    def test_planner_uses_approval_mapping_for_responses_security_monitor_system_prompt(self):
+        planner = ProtocolBridgePlanner(
+            _RoutingConfigStub(target_model="claude-opus-4.6", approval_target_model="gpt-5.4-mini")
+        )
+        body = {
+            "model": "gpt-5.4",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "developer",
+                    "content": "You are a security monitor for autonomous AI coding agents.",
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": "review this action",
+                },
+            ],
+            "stream": False,
+        }
+
+        plan = proxy.asyncio.run(
+            planner.plan("responses", body, api_base="https://example.invalid", api_key="test-key")
+        )
+
+        self.assertEqual(plan.resolved_model, "gpt-5.4-mini")
+        self.assertEqual(plan.strategy_name, "responses_to_responses")
+
+    def test_planner_uses_approval_mapping_for_messages_security_monitor_system_prompt(self):
         planner = ProtocolBridgePlanner(
             _RoutingConfigStub(target_model="gpt-5.4", approval_target_model="claude-haiku-4.5")
         )
         body = {
             "model": "claude-sonnet-4.6",
+            "system": "You are a security monitor for autonomous AI coding agents.",
             "messages": [
                 {
                     "role": "user",
-                    "content": [{"type": "text", "text": "<transcript>\nblah\n</transcript>"}],
+                    "content": [{"type": "text", "text": "review this action"}],
                 }
             ],
             "stream": False,

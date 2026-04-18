@@ -463,6 +463,51 @@ class RequestHeadersTests(unittest.TestCase):
         self.assertEqual(headers["X-Initiator"], "user")
         self.assertEqual(body["messages"][1]["content"][0]["text"], "hello")
 
+    def test_anthropic_security_monitor_system_prompt_sets_agent_initiator(self):
+        request = SimpleNamespace(url=SimpleNamespace(path="/v1/messages"), headers={})
+        body = {
+            "model": "claude-sonnet-4.6",
+            "system": "You are a security monitor for autonomous AI coding agents.",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "review this action"}],
+                }
+            ],
+        }
+
+        headers = format_translation.build_anthropic_headers_for_request(
+            request, body, "test-key",
+            initiator_policy=proxy._initiator_policy,
+            session_id_resolver=usage_tracking.request_session_id,
+        )
+
+        self.assertEqual(headers["X-Initiator"], "agent")
+
+    def test_anthropic_security_monitor_system_prompt_with_header_blocks_sets_agent_initiator(self):
+        request = SimpleNamespace(url=SimpleNamespace(path="/v1/messages"), headers={})
+        body = {
+            "model": "claude-sonnet-4.6",
+            "system": [
+                {"type": "text", "text": "Approval rubric"},
+                {"type": "text", "text": "You are a security monitor for autonomous AI coding agents."},
+            ],
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "review this action"}],
+                }
+            ],
+        }
+
+        headers = format_translation.build_anthropic_headers_for_request(
+            request, body, "test-key",
+            initiator_policy=proxy._initiator_policy,
+            session_id_resolver=usage_tracking.request_session_id,
+        )
+
+        self.assertEqual(headers["X-Initiator"], "agent")
+
     def test_anthropic_tool_result_follow_up_stays_agent(self):
         request = SimpleNamespace(url=SimpleNamespace(path="/v1/messages"), headers={})
         body = {

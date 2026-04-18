@@ -11,6 +11,9 @@ AGENT_INITIATOR_PREFIX = "_"
 USER_INITIATOR_PREFIX = "+"
 _EXPLICIT_USER_INITIATOR = "__explicit_user__"
 REQUEST_FINISH_GUARD_SECONDS = 15.0
+_SECURITY_MONITOR_PROMPT_MARKERS = (
+    "you are a security monitor for autonomous ai coding agents",
+)
 
 
 def utc_now() -> datetime:
@@ -118,50 +121,13 @@ def _is_claude_meta_user_text(text: str) -> bool:
     return _is_claude_compaction_summary_text(normalized)
 
 
-def _is_claude_transcript_container(content) -> bool:
-    """Detect Claude Code approval agent transcript messages.
-
-    Approval agents send a user message that either starts with a
-    ``<transcript>`` block or contains one alongside the approval-review
-    prompt text. Some clients prepend wrapper text such as
-    ``<user_claude_md>`` before the transcript block, so we handle that
-    shape too without treating every literal ``<transcript>`` mention as
-    agent traffic.
-    """
-    approval_markers = (
-        "<block>",
-        "Err on the side of blocking",
-        "Review the classification process and follow it carefully",
-        "Stage 1 does NOT apply user intent or ALLOW exceptions",
-    )
-
-    def _looks_like_approval_text(text: str) -> bool:
-        normalized = text.lstrip()
-        if normalized.startswith("<transcript>"):
-            return True
-        if "<transcript>" not in normalized:
-            return False
-        return any(marker in normalized for marker in approval_markers)
-
-    if isinstance(content, str):
-        return _looks_like_approval_text(content)
-    if not isinstance(content, list):
+def _contains_security_monitor_prompt(text: str | None) -> bool:
+    if not isinstance(text, str):
         return False
-    joined_text_parts: list[str] = []
-    for item in content:
-        if not isinstance(item, dict):
-            continue
-        if str(item.get("type", "")).lower() != "text":
-            continue
-        text = item.get("text")
-        if not isinstance(text, str):
-            continue
-        if text.lstrip().startswith("<transcript>"):
-            return True
-        joined_text_parts.append(text)
-    if joined_text_parts:
-        return _looks_like_approval_text("".join(joined_text_parts))
-    return False
+    normalized = " ".join(text.lower().split())
+    if not normalized:
+        return False
+    return any(marker in normalized for marker in _SECURITY_MONITOR_PROMPT_MARKERS)
 
 
 def _strip_explicit_initiator_prefix_from_item(item, *, default_initiator: str | None = USER_INITIATOR) -> str | None:
@@ -304,6 +270,20 @@ def _responses_item_text(item) -> str:
         if isinstance(value, str):
             return value
     return ""
+
+
+def _responses_system_prompt_includes_security_monitor_prompt(input_param) -> bool:
+    if not isinstance(input_param, list):
+        return False
+    for item in input_param:
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role", "")).lower()
+        if role not in {"system", "developer"}:
+            continue
+        if _contains_security_monitor_prompt(_responses_item_text(item)):
+            return True
+    return False
 
 
 def _is_codex_meta_user_text(text: str) -> bool:
@@ -465,6 +445,21 @@ def _is_codex_title_generation_mini_request(input_param, model_name: str | None)
     return saw_developer_or_system and saw_environment_context
 
 
+def _chat_system_prompt_includes_security_monitor_prompt(messages) -> bool:
+    if not isinstance(messages, list):
+        return False
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role", "")).lower()
+        if role not in {"system", "developer"}:
+            continue
+        content = message.get("content")
+        if isinstance(content, str) and _contains_security_monitor_prompt(content):
+            return True
+    return False
+
+
 def _determine_chat_candidate(messages) -> str:
     if not isinstance(messages, list):
         return AGENT_INITIATOR
@@ -534,17 +529,12 @@ def _anthropic_user_message_traits(message) -> tuple[bool, bool, bool]:
         stripped = content.strip()
         if not stripped:
             return False, False, False
-        if _is_claude_transcript_container(content):
-            return False, True, False
         if _is_claude_meta_user_text(content):
             return False, True, False
         return False, False, True
 
     if not isinstance(content, list):
         return False, False, False
-
-    if _is_claude_transcript_container(content):
-        return False, True, False
 
     saw_tool_result = False
     saw_agent_meta = False
@@ -573,7 +563,9 @@ def _anthropic_user_message_traits(message) -> tuple[bool, bool, bool]:
     return saw_tool_result, saw_agent_meta, saw_real_user_content
 
 
-def _determine_anthropic_candidate(messages) -> str:
+def _determine_anthropic_candidate(messages, *, system=None) -> str:
+    if _anthropic_system_includes_security_monitor_prompt(system):
+        return AGENT_INITIATOR
     if not isinstance(messages, list):
         return AGENT_INITIATOR
 
@@ -595,19 +587,11 @@ def _determine_anthropic_candidate(messages) -> str:
         if saw_agent_meta and not saw_tool_result and not saw_real_user_content:
             ignorable_meta_messages.add(id(message))
 
-    # Approval-review requests can split the transcript container from the
-    # trailing "review this action" instruction across separate user messages.
-    # Treat any transcript-bearing request as agent traffic up front.
-    if _anthropic_messages_include_transcript_container(messages):
-        return AGENT_INITIATOR
-
     for message in reversed(messages):
         if not isinstance(message, dict):
             continue
         role = str(message.get("role", "")).lower()
         if role == "user":
-            if _is_claude_transcript_container(message.get("content")):
-                return AGENT_INITIATOR
             if id(message) in ignorable_meta_messages:
                 continue
             if id(message) in explicit_initiators:
@@ -619,6 +603,41 @@ def _determine_anthropic_candidate(messages) -> str:
         if role:
             return AGENT_INITIATOR
     return AGENT_INITIATOR
+
+
+def _anthropic_system_includes_security_monitor_prompt(system) -> bool:
+    if isinstance(system, str):
+        return _contains_security_monitor_prompt(system)
+    if not isinstance(system, list):
+        return False
+    text_parts: list[str] = []
+    for item in system:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("type", "")).lower() != "text":
+            continue
+        text = item.get("text")
+        if isinstance(text, str) and text:
+            text_parts.append(text)
+    if not text_parts:
+        return False
+    return _contains_security_monitor_prompt(" ".join(text_parts))
+
+
+def _request_includes_security_monitor_prompt(
+    *,
+    inbound_protocol: str | None = None,
+    body: dict | None = None,
+) -> bool:
+    if not isinstance(body, dict):
+        return False
+    if inbound_protocol == "responses":
+        return _responses_system_prompt_includes_security_monitor_prompt(body.get("input"))
+    if inbound_protocol == "messages":
+        return _anthropic_system_includes_security_monitor_prompt(body.get("system"))
+    if inbound_protocol == "chat":
+        return _chat_system_prompt_includes_security_monitor_prompt(body.get("messages"))
+    return False
 
 
 class InitiatorPolicy:
@@ -686,6 +705,8 @@ class InitiatorPolicy:
         verdict_sink: dict | None = None,
     ) -> tuple[object, str]:
         normalized_input, candidate = _determine_responses_candidate(input_param)
+        if _responses_system_prompt_includes_security_monitor_prompt(normalized_input):
+            candidate = AGENT_INITIATOR
         forced_by_codex_mini = False
         if (
             _is_codex_bootstrap_mini_request(normalized_input, model_name)
@@ -718,6 +739,8 @@ class InitiatorPolicy:
         verdict_sink: dict | None = None,
     ) -> str:
         candidate = _determine_chat_candidate(messages)
+        if _chat_system_prompt_includes_security_monitor_prompt(messages):
+            candidate = AGENT_INITIATOR
         return self.resolve_initiator(
             candidate,
             model_name,
@@ -733,13 +756,14 @@ class InitiatorPolicy:
         messages,
         model_name: str | None,
         *,
+        system=None,
         subagent: str | None = None,
         force_initiator: str | None = None,
         now: datetime | None = None,
         request_id: str | None = None,
         verdict_sink: dict | None = None,
     ) -> str:
-        candidate = _determine_anthropic_candidate(messages)
+        candidate = _determine_anthropic_candidate(messages, system=system)
         return self.resolve_initiator(
             candidate,
             model_name,
@@ -917,21 +941,6 @@ class InitiatorPolicy:
                 "type": "started",
             }
         )
-
-
-def _anthropic_messages_include_transcript_container(messages) -> bool:
-    if not isinstance(messages, list):
-        return False
-    for message in messages:
-        if not isinstance(message, dict):
-            continue
-        if str(message.get("role", "")).lower() != "user":
-            continue
-        if _is_claude_transcript_container(message.get("content")):
-            return True
-    return False
-
-
 def is_approval_agent_request(
     *,
     subagent: str | None = None,
@@ -943,12 +952,12 @@ def is_approval_agent_request(
     Covers two patterns:
       * Codex sends ``x-openai-subagent: <name>`` (e.g. ``guardian``) for
         approval / review spawns; callers surface that header via ``subagent``.
-      * Claude Code approval agents wrap the conversation in a ``<transcript>``
-        user-message container (see :func:`_is_claude_transcript_container`).
+      * Approval/security-monitor prompts identify themselves explicitly in the
+        system/developer instructions.
     """
     if _is_subagent_request(subagent):
         return True
-    if inbound_protocol == "messages" and isinstance(body, dict):
-        if _anthropic_messages_include_transcript_container(body.get("messages")):
-            return True
-    return False
+    return _request_includes_security_monitor_prompt(
+        inbound_protocol=inbound_protocol,
+        body=body,
+    )

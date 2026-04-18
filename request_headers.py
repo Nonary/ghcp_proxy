@@ -218,6 +218,7 @@ def build_anthropic_headers_for_request(
     initiator = initiator_policy.resolve_anthropic_messages(
         messages,
         body.get("model"),
+        system=body.get("system"),
         subagent=request.headers.get("x-openai-subagent"),
         request_id=request_id,
         verdict_sink=verdict_sink,

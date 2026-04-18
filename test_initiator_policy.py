@@ -340,172 +340,106 @@ class InitiatorPolicyTests(unittest.TestCase):
 
         self.assertEqual(initiator, "agent")
 
-    def test_anthropic_transcript_container_is_agent(self):
-        """Claude Code approval agents wrap the conversation in a <transcript> block.
-
-        Even with a genuine-looking user preamble (e.g. CLAUDE.md configuration)
-        earlier in the messages list, the trailing transcript container is
-        agent-generated and must be classified as agent. Regression test for
-        a classifier gap uncovered by real /v1/messages captures.
-        """
-        policy = initiator_policy.InitiatorPolicy()
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "The following is the user's CLAUDE.md configuration."},
-                ],
-            },
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "<transcript>\n"},
-                    {"type": "text", "text": "User: something the user said earlier\n"},
-                    {"type": "text", "text": "Assistant: earlier reply\n"},
-                    {"type": "text", "text": "</transcript>\n"},
-                    {"type": "text", "text": "Err on the side of blocking."},
-                ],
-            },
-        ]
-
-        initiator = policy.resolve_anthropic_messages(messages, "claude-sonnet-4.6")
-
-        self.assertEqual(initiator, "agent")
-
-    def test_anthropic_transcript_request_with_trailing_review_message_stays_agent_without_safeguard(self):
-        policy = initiator_policy.InitiatorPolicy()
-        start = datetime(2026, 4, 17, 5, 28, 8, tzinfo=timezone.utc)
-        verdict = {}
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "<transcript>\nUser: inspect the file\nAssistant: running checks\n</transcript>"},
-                ],
-            },
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": (
-                            "Review the classification process and follow it carefully, "
-                            "making sure you deny actions that should be blocked."
-                        ),
-                    },
-                ],
-            },
-        ]
-
-        policy.note_request_started("req-1", "user", started_at=start.replace(second=7))
-        policy.note_request_finished("req-1", finished_at=start.replace(second=8))
-
-        initiator = policy.resolve_anthropic_messages(
-            messages,
-            "claude-opus-4.6",
-            now=start.replace(microsecond=200000),
-            verdict_sink=verdict,
-        )
-
-        self.assertEqual(initiator, "agent")
-        self.assertEqual(verdict["candidate_initiator"], "agent")
-        self.assertIsNone(verdict["safeguard_reason"])
-
-    def test_anthropic_transcript_after_user_claude_md_wrapper_stays_agent(self):
+    def test_responses_security_monitor_system_prompt_is_agent(self):
         policy = initiator_policy.InitiatorPolicy()
         verdict = {}
-        messages = [
+        input_items = [
             {
+                "type": "message",
+                "role": "system",
+                "content": "You are a security monitor for autonomous AI coding agents.",
+            },
+            {
+                "type": "message",
                 "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": (
-                            "The following is the user's CLAUDE.md configuration.\n\n"
-                            "<user_claude_md>\nProxy instructions\n</user_claude_md>"
-                        ),
-                    },
-                    {
-                        "type": "text",
-                        "text": (
-                            "<transcript>\nUser: inspect the trace\nAssistant: running checks\n</transcript>"
-                        ),
-                    },
-                    {
-                        "type": "text",
-                        "text": "Err on the side of blocking. <block> immediately.",
-                    },
-                ],
+                "content": "review this action",
             },
         ]
 
-        initiator = policy.resolve_anthropic_messages(
-            messages,
-            "claude-opus-4.6",
+        _normalized, initiator = policy.resolve_responses_input(
+            input_items,
+            "gpt-5.4",
             verdict_sink=verdict,
         )
 
         self.assertEqual(initiator, "agent")
         self.assertEqual(verdict["candidate_initiator"], "agent")
 
-    def test_anthropic_string_transcript_wrapper_is_agent(self):
+    def test_chat_security_monitor_system_prompt_is_agent(self):
         policy = initiator_policy.InitiatorPolicy()
         verdict = {}
         messages = [
             {
+                "role": "system",
+                "content": "You are a security monitor for autonomous AI coding agents.",
+            },
+            {
                 "role": "user",
-                "content": (
-                    "The following is the user's CLAUDE.md configuration.\n\n"
-                    "<user_claude_md>\nProxy instructions\n</user_claude_md>\n\n"
-                    "<transcript>\nUser: inspect the trace\nAssistant: running checks\n</transcript>\n\n"
-                    "Review the classification process and follow it carefully, "
-                    "making sure you deny actions that should be blocked. "
-                    "Use <thinking> before responding with <block>."
-                ),
+                "content": "review this action",
             },
         ]
 
-        initiator = policy.resolve_anthropic_messages(
+        initiator = policy.resolve_chat_messages(
             messages,
-            "claude-opus-4.6",
+            "gpt-5.4",
             verdict_sink=verdict,
         )
 
         self.assertEqual(initiator, "agent")
         self.assertEqual(verdict["candidate_initiator"], "agent")
 
-    def test_anthropic_user_claude_md_wrapper_without_transcript_stays_user(self):
+    def test_anthropic_security_monitor_system_prompt_is_agent(self):
         policy = initiator_policy.InitiatorPolicy()
         verdict = {}
         messages = [
             {
                 "role": "user",
-                "content": (
-                    "The following is the user's CLAUDE.md configuration.\n\n"
-                    "<user_claude_md>\nProxy instructions\n</user_claude_md>\n\n"
-                    "Can you review whether this config looks correct?"
-                ),
+                "content": [{"type": "text", "text": "review this action"}],
             },
         ]
 
         initiator = policy.resolve_anthropic_messages(
             messages,
             "claude-opus-4.6",
+            system="You are a security monitor for autonomous AI coding agents.",
             verdict_sink=verdict,
         )
 
-        self.assertEqual(initiator, "user")
-        self.assertEqual(verdict["candidate_initiator"], "user")
+        self.assertEqual(initiator, "agent")
+        self.assertEqual(verdict["candidate_initiator"], "agent")
 
-    def test_anthropic_literal_transcript_tag_without_approval_markers_stays_user(self):
+    def test_anthropic_security_monitor_system_prompt_with_header_blocks_is_agent(self):
+        policy = initiator_policy.InitiatorPolicy()
+        verdict = {}
+        messages = [
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": "review this action"}],
+            },
+        ]
+
+        initiator = policy.resolve_anthropic_messages(
+            messages,
+            "claude-opus-4.6",
+            system=[
+                {"type": "text", "text": "Approval rubric"},
+                {"type": "text", "text": "You are a security monitor for autonomous AI coding agents."},
+            ],
+            verdict_sink=verdict,
+        )
+
+        self.assertEqual(initiator, "agent")
+        self.assertEqual(verdict["candidate_initiator"], "agent")
+
+    def test_anthropic_user_message_with_security_monitor_phrase_stays_user(self):
         policy = initiator_policy.InitiatorPolicy()
         verdict = {}
         messages = [
             {
                 "role": "user",
                 "content": (
-                    "I found the literal string <transcript> in a file. "
-                    "Can you explain what it means?"
+                    'The system prompt says "You are a security monitor for autonomous AI coding agents." '
+                    "Can you explain what that means?"
                 ),
             },
         ]
