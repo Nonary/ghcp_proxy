@@ -518,6 +518,47 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(row["session_kind"], "session")
         self.assertEqual(row["session_display_id"], "claude-req")
 
+    def test_collect_local_dashboard_usage_groups_codex_native_turns_by_session(self):
+        usage = dashboard.collect_local_dashboard_usage(
+            [
+                {
+                    "request_id": "codex-native:native-session-123:49",
+                    "server_request_id": "native-session-123",
+                    "started_at": "2026-04-05T01:30:00+00:00",
+                    "finished_at": "2026-04-05T01:31:00+00:00",
+                    "requested_model": "gpt-5.4",
+                    "native_source": "codex_native",
+                    "usage": {
+                        "input_tokens": 100,
+                        "output_tokens": 20,
+                        "cached_input_tokens": 30,
+                        "total_tokens": 120,
+                    },
+                },
+                {
+                    "request_id": "codex-native:native-session-123:50",
+                    "server_request_id": "native-session-123",
+                    "started_at": "2026-04-05T01:32:00+00:00",
+                    "finished_at": "2026-04-05T01:33:00+00:00",
+                    "requested_model": "gpt-5.4",
+                    "native_source": "codex_native",
+                    "usage": {
+                        "input_tokens": 200,
+                        "output_tokens": 40,
+                        "cached_input_tokens": 10,
+                        "total_tokens": 240,
+                    },
+                },
+            ]
+        )
+
+        row = usage["recent_sessions"][0]
+        self.assertEqual(row["source"], "codex_native")
+        self.assertEqual(row["session_id"], "native-session-123")
+        self.assertEqual(row["session_display_id"], "native-session-123")
+        self.assertEqual(row["request_count"], 2)
+        self.assertEqual(row["total_tokens"], 360)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -254,6 +254,80 @@ class InitiatorPolicyTests(unittest.TestCase):
         self.assertEqual(messages[1]["content"][-1]["text"], "new prompt")
         self.assertEqual(initiator, "user")
 
+    def test_trailing_underscore_marker_with_prompt_after_reminders_forces_agent(self):
+        # Regression: Claude Code appends <system-reminder> blocks AFTER the
+        # user's typed prompt in the same content string, so the marker ends
+        # up at the START of the LAST line — followed by the actual prompt.
+        policy = initiator_policy.InitiatorPolicy()
+        appended_text = (
+            "<system-reminder>\nAuto Mode Active\n</system-reminder>\n"
+            "<system-reminder>\nclaudeMd contents\n</system-reminder>\n"
+            "_ what do you mean entire last line?"
+        )
+        messages = [
+            {"role": "assistant", "content": [{"type": "text", "text": "previous answer"}]},
+            {"role": "user", "content": [{"type": "text", "text": appended_text}]},
+        ]
+
+        initiator = policy.resolve_anthropic_messages(messages, "claude-sonnet-4.6")
+
+        self.assertEqual(initiator, "agent")
+        final_text = messages[-1]["content"][-1]["text"]
+        # Marker stripped; user's prompt survives on the same final line.
+        self.assertTrue(final_text.endswith("what do you mean entire last line?"))
+        self.assertNotIn("\n_ ", final_text)
+
+    def test_trailing_underscore_marker_no_space_also_strips(self):
+        # User types "_whats..." (no space after the marker).
+        policy = initiator_policy.InitiatorPolicy()
+        appended_text = (
+            "<system-reminder>\nstuff\n</system-reminder>\n"
+            "_whats the simplest fix?"
+        )
+        messages = [
+            {"role": "assistant", "content": [{"type": "text", "text": "prev"}]},
+            {"role": "user", "content": [{"type": "text", "text": appended_text}]},
+        ]
+
+        initiator = policy.resolve_anthropic_messages(messages, "claude-sonnet-4.6")
+
+        self.assertEqual(initiator, "agent")
+        final_text = messages[-1]["content"][-1]["text"]
+        self.assertTrue(final_text.endswith("whats the simplest fix?"))
+        self.assertNotIn("_whats", final_text)
+
+    def test_trailing_lone_underscore_marker_strips(self):
+        # Marker on its own final line, no following text.
+        policy = initiator_policy.InitiatorPolicy()
+        appended_text = (
+            "<system-reminder>\nstuff\n</system-reminder>\n"
+            "_"
+        )
+        messages = [
+            {"role": "assistant", "content": [{"type": "text", "text": "prev"}]},
+            {"role": "user", "content": [{"type": "text", "text": appended_text}]},
+        ]
+
+        initiator = policy.resolve_anthropic_messages(messages, "claude-sonnet-4.6")
+
+        self.assertEqual(initiator, "agent")
+        self.assertFalse(messages[-1]["content"][-1]["text"].rstrip().endswith("_"))
+
+    def test_trailing_underscore_in_single_line_message_does_not_match(self):
+        # No newline ⇒ "last line" is the whole text. The leading-prefix
+        # check already handled that, so a trailing "_" inside an identifier
+        # at the end of a single-line message must NOT be treated as a marker.
+        policy = initiator_policy.InitiatorPolicy()
+        messages = [
+            {"role": "assistant", "content": [{"type": "text", "text": "prev"}]},
+            {"role": "user", "content": [{"type": "text", "text": "rename foo_bar to baz_"}]},
+        ]
+
+        initiator = policy.resolve_anthropic_messages(messages, "claude-sonnet-4.6")
+
+        self.assertEqual(initiator, "user")
+        self.assertEqual(messages[-1]["content"][-1]["text"], "rename foo_bar to baz_")
+
     def test_anthropic_tool_result_with_empty_text_tail_is_agent(self):
         policy = initiator_policy.InitiatorPolicy()
         messages = [

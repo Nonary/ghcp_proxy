@@ -118,6 +118,138 @@ class UsageTrackingTests(unittest.TestCase):
         self.assertEqual(event["session_id"], "session-123")
         self.assertEqual(outbound_headers["session_id"], "session-123")
 
+    def test_normalize_recorded_usage_event_backfills_codex_native_session_and_chain(self):
+        normalized = usage_tracking._normalize_recorded_usage_event(
+            {
+                "request_id": "codex-native:session-native:49",
+                "path": "/native/codex/responses",
+                "requested_model": "gpt-5.4",
+                "usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 10,
+                    "cached_input_tokens": 20,
+                    "total_tokens": 130,
+                },
+            }
+        )
+
+        self.assertIsNotNone(normalized)
+        self.assertEqual(normalized["native_source"], "codex_native")
+        self.assertEqual(normalized["session_id"], "session-native")
+        self.assertEqual(normalized["session_id_origin"], "codex_native_request_id")
+        self.assertEqual(normalized["server_request_id"], "session-native")
+
+    def test_normalize_recorded_usage_event_backfills_requested_fast_tier_and_doubles_cost(self):
+        with mock.patch(
+            "usage_tracking._codex_logs_service_tiers",
+            return_value={
+                "requested": "priority",
+                "requested_source": "codex_logs_request",
+                "effective": "default",
+                "effective_source": "codex_logs_response_completed",
+            },
+        ):
+            normalized = usage_tracking._normalize_recorded_usage_event(
+                {
+                    "request_id": "codex-native:session-fast:1",
+                    "path": "/native/codex/responses",
+                    "requested_model": "gpt-5.4",
+                    "native_source": "codex_native",
+                    "native_turn_id": "turn-fast-1",
+                    "native_reasoning_effort": "high",
+                    "usage": {
+                        "input_tokens": 100,
+                        "output_tokens": 10,
+                        "cached_input_tokens": 20,
+                        "total_tokens": 130,
+                    },
+                    "cost_usd": 0.0,
+                }
+            )
+
+        baseline = usage_tracking._usage_event_cost(
+            "gpt-5.4",
+            {
+                "input_tokens": 100,
+                "output_tokens": 10,
+                "cached_input_tokens": 20,
+                "total_tokens": 130,
+            },
+        )
+        self.assertEqual(normalized["native_requested_service_tier"], "priority")
+        self.assertEqual(normalized["native_requested_service_tier_source"], "codex_logs_request")
+        self.assertEqual(normalized["native_service_tier"], "default")
+        self.assertEqual(normalized["native_service_tier_source"], "codex_logs_response_completed")
+        self.assertAlmostEqual(normalized["cost_usd"], baseline * 2, places=8)
+
+    def test_normalize_recorded_usage_event_overrides_stale_native_tier_with_codex_logs(self):
+        with mock.patch(
+            "usage_tracking._codex_logs_service_tiers",
+            return_value={
+                "effective": "default",
+                "effective_source": "codex_logs_response_completed",
+            },
+        ):
+            normalized = usage_tracking._normalize_recorded_usage_event(
+                {
+                    "request_id": "codex-native:session-default:1",
+                    "path": "/native/codex/responses",
+                    "requested_model": "gpt-5.4",
+                    "native_source": "codex_native",
+                    "native_turn_id": "turn-default-1",
+                    "native_service_tier": "fast",
+                    "native_reasoning_effort": "high",
+                    "usage": {
+                        "input_tokens": 100,
+                        "output_tokens": 10,
+                        "cached_input_tokens": 20,
+                        "total_tokens": 130,
+                    },
+                    "cost_usd": 999.0,
+                }
+            )
+
+        baseline = usage_tracking._usage_event_cost(
+            "gpt-5.4",
+            {
+                "input_tokens": 100,
+                "output_tokens": 10,
+                "cached_input_tokens": 20,
+                "total_tokens": 130,
+            },
+        )
+        self.assertEqual(normalized["native_service_tier"], "default")
+        self.assertEqual(normalized["native_service_tier_source"], "codex_logs_response_completed")
+        self.assertAlmostEqual(normalized["cost_usd"], baseline, places=8)
+
+    def test_normalize_recorded_usage_event_clears_stale_native_tiers_when_logs_are_missing(self):
+        with mock.patch("usage_tracking._codex_logs_service_tiers", return_value={}):
+            normalized = usage_tracking._normalize_recorded_usage_event(
+                {
+                    "request_id": "codex-native:session-missing:1",
+                    "path": "/native/codex/responses",
+                    "requested_model": "gpt-5.4",
+                    "native_source": "codex_native",
+                    "native_turn_id": "turn-missing-1",
+                    "native_requested_service_tier": "priority",
+                    "native_requested_service_tier_source": "config",
+                    "native_service_tier": "fast",
+                    "native_reasoning_effort": "high",
+                    "usage": {
+                        "input_tokens": 100,
+                        "output_tokens": 10,
+                        "cached_input_tokens": 20,
+                        "total_tokens": 130,
+                    },
+                    "cost_usd": 999.0,
+                }
+            )
+
+        self.assertNotIn("native_requested_service_tier", normalized)
+        self.assertNotIn("native_requested_service_tier_source", normalized)
+        self.assertNotIn("native_service_tier", normalized)
+        self.assertNotIn("native_service_tier_source", normalized)
+
     def test_start_usage_event_uses_outbound_client_request_id_when_present(self):
         tracker = self._make_usage_tracker()
         request = SimpleNamespace(

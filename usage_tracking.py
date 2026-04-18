@@ -25,8 +25,9 @@ from util import (
     utc_now, utc_now_iso,
     normalize_usage_payload, _normalize_model_name,
     _usage_event_model_name, _usage_event_source,
-    _usage_event_cost, _premium_request_multiplier, _counted_premium_requests,
-    _server_request_chain_key, _is_claude_request,
+    _usage_event_cost, _usage_event_estimated_cost,
+    _premium_request_multiplier, _counted_premium_requests,
+    _server_request_chain_key, _codex_native_session_id_from_request_id, _codex_logs_service_tiers, _is_claude_request,
     extract_item_text, _parse_iso_datetime,
     _extract_payload_usage,
 )
@@ -157,10 +158,62 @@ def _normalize_recorded_usage_event(payload: dict | None) -> dict | None:
         return None
 
     normalized_event = dict(payload)
+    native_session_id = _codex_native_session_id_from_request_id(normalized_event.get("request_id"))
+    # Backfill native_source for events that were archived before the
+    # marker was preserved through compaction. The codex_native ingestor
+    # uses request_ids of the form "codex-native:<session>:<turn>" and the
+    # synthetic path "/native/codex/responses", so either is a reliable
+    # signal that this row originated from a Codex CLI rollout file.
+    if not normalized_event.get("native_source"):
+        request_id = normalized_event.get("request_id")
+        path = normalized_event.get("path")
+        if (
+            (isinstance(request_id, str) and request_id.startswith("codex-native:"))
+            or path == "/native/codex/responses"
+        ):
+            normalized_event["native_source"] = "codex_native"
+    if not normalized_event.get("session_id") and native_session_id:
+        normalized_event["session_id"] = native_session_id
+        normalized_event.setdefault("session_id_origin", "codex_native_request_id")
+    if not normalized_event.get("server_request_id"):
+        effective_native_session_id = normalized_event.get("session_id") or native_session_id
+        if (
+            normalized_event.get("native_source") == "codex_native"
+            and isinstance(effective_native_session_id, str)
+            and effective_native_session_id
+        ):
+            normalized_event["server_request_id"] = effective_native_session_id
+    if normalized_event.get("native_source") == "codex_native":
+        native_service_tiers = _codex_logs_service_tiers(
+            normalized_event.get("session_id") or native_session_id,
+            normalized_event.get("native_turn_id"),
+            normalized_event.get("started_at"),
+        )
+        requested_native_service_tier = native_service_tiers.get("requested")
+        if isinstance(requested_native_service_tier, str) and requested_native_service_tier:
+            normalized_event["native_requested_service_tier"] = requested_native_service_tier
+            normalized_event["native_requested_service_tier_source"] = native_service_tiers.get("requested_source")
+        elif normalized_event.get("native_requested_service_tier_source") != "codex_logs_request":
+            normalized_event.pop("native_requested_service_tier", None)
+            normalized_event.pop("native_requested_service_tier_source", None)
+
+        exact_native_service_tier = native_service_tiers.get("effective")
+        if isinstance(exact_native_service_tier, str) and exact_native_service_tier:
+            normalized_event["native_service_tier"] = exact_native_service_tier
+            normalized_event["native_service_tier_source"] = native_service_tiers.get("effective_source")
+        elif not str(normalized_event.get("native_service_tier_source") or "").startswith("codex_logs_response"):
+            normalized_event.pop("native_service_tier", None)
+            normalized_event.pop("native_service_tier_source", None)
+
     normalized_usage = normalize_usage_payload(normalized_event.get("usage"))
     if isinstance(normalized_usage, dict):
         normalized_event["usage"] = normalized_usage
-        if normalized_event.get("cost_usd") is None:
+        # codex_native cost always reflects the current service-tier multiplier
+        # (logs may have updated since archival); for non-native events, only
+        # backfill when missing.
+        if normalized_event.get("native_source") == "codex_native":
+            normalized_event["cost_usd"] = _usage_event_estimated_cost(normalized_event, usage=normalized_usage)
+        elif normalized_event.get("cost_usd") is None:
             normalized_event["cost_usd"] = _usage_event_cost(_usage_event_model_name(normalized_event), normalized_usage)
     _apply_missing_claude_session_context(normalized_event)
     return normalized_event
@@ -185,6 +238,26 @@ def _usage_event_archive_summary(event: dict) -> dict:
         "premium_requests": _counted_premium_requests(event),
         "cost_usd": round(_coerce_float(event.get("cost_usd")), 6),
     }
+
+    # Preserve native-source markers across compaction so codex_native (and
+    # any future ingested-source) traffic doesn't silently fall back to the
+    # model-name heuristic in _usage_event_source after archival.
+    for native_key in (
+        "native_source",
+        "native_origin",
+        "native_cli_version",
+        "native_model_provider",
+        "native_plan_type",
+        "native_requested_service_tier",
+        "native_requested_service_tier_source",
+        "native_service_tier",
+        "native_service_tier_source",
+        "native_reasoning_effort",
+        "native_turn_id",
+    ):
+        value = event.get(native_key)
+        if value is not None:
+            summary[native_key] = value
 
     normalized_usage = normalize_usage_payload(event.get("usage"))
     if isinstance(normalized_usage, dict):
@@ -1050,7 +1123,11 @@ class UsageTracker:
             or finished_event.get("resolved_model")
             or finished_event.get("requested_model")
         )
-        finished_event["cost_usd"] = _usage_event_cost(model_name, derived_usage)
+        finished_event["cost_usd"] = _usage_event_estimated_cost(
+            finished_event,
+            model_name=model_name,
+            usage=derived_usage,
+        )
         finished_event["premium_requests"] = _counted_premium_requests(
             {
                 **finished_event,

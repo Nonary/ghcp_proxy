@@ -217,6 +217,19 @@ usage_tracker.load_history()
 _initiator_policy.seed_from_usage_events(usage_tracker.snapshot_usage_events())
 dashboard_module.initialize()
 
+# Ingest native Codex CLI traffic (sessions/*/rollout-*.jsonl) so it shows
+# up in the dashboard alongside proxied traffic, tagged as `codex_native`.
+try:
+    import codex_native_ingest
+    _codex_native_interval = float(os.environ.get("GHCP_CODEX_NATIVE_INGEST_INTERVAL", "5") or 5)
+    if _codex_native_interval > 0:
+        codex_native_ingest.start_background_scanner(
+            usage_tracker.record_usage_event,
+            interval_seconds=_codex_native_interval,
+        )
+except Exception as _codex_ingest_exc:  # pragma: no cover - best effort
+    print(f"codex_native_ingest: disabled ({_codex_ingest_exc})", flush=True)
+
 
 # ─── Upstream response helpers ────────────────────────────────────────────────
 

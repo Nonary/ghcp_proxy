@@ -110,6 +110,10 @@
     .chip.good { color: var(--accent-2); border-color: rgba(110,231,200,.16); background: rgba(110,231,200,.08); }
     .chip.warn { color: #ffd27f; border-color: rgba(255,210,127,.18); background: rgba(255,210,127,.08); }
     .badge { color: var(--accent-2); border-color: rgba(110,231,200,.16); background: rgba(110,231,200,.08); text-transform: uppercase; letter-spacing: .08em; }
+    .badge-effort-fast,
+    .badge-tier-fast { color: #ffd27f; border-color: rgba(255,210,127,.28); background: rgba(255,210,127,.10); }
+    .badge-effort-other { color: #d8ccff; border-color: rgba(124,92,255,.28); background: rgba(124,92,255,.12); }
+    .badge-tier-other { color: #9dd8ff; border-color: rgba(107,175,255,.26); background: rgba(107,175,255,.12); }
     .metric .value { font-size: clamp(1.3rem, 2.8vw, 2rem); font-weight: 700; letter-spacing: -.06em; margin: 4px 0; }
     .metric-card { min-height: 110px; display: grid; gap: 6px; align-content: start; }
     .metric-card[data-tone="accent"] { background: linear-gradient(160deg, rgba(255,135,82,.11), transparent 38%), var(--panel); }
@@ -712,6 +716,11 @@
     .source-metric-fill.tone-other {
       background: linear-gradient(90deg, #d3dde7, #8ea3b5);
     }
+    .source-period-segment.tone-codex-native,
+    .source-share-segment.tone-codex-native,
+    .source-metric-fill.tone-codex-native {
+      background: linear-gradient(90deg, #c7b6ff, #7c5cff);
+    }
     .source-spotlight {
       display: grid;
       gap: 12px;
@@ -760,6 +769,7 @@
     .source-dot.tone-codex { background: var(--accent-2); box-shadow: 0 0 0 3px rgba(110,231,200,.16); }
     .source-dot.tone-claude { background: var(--accent); box-shadow: 0 0 0 3px rgba(255,135,82,.16); }
     .source-dot.tone-other { background: #b9c9d6; box-shadow: 0 0 0 3px rgba(185,201,214,.16); }
+    .source-dot.tone-codex-native { background: #7c5cff; box-shadow: 0 0 0 3px rgba(124,92,255,.16); }
     .source-duel-grid {
       display: grid;
       gap: 10px;
@@ -777,6 +787,7 @@
     .source-detail-card.tone-codex { background: linear-gradient(180deg, rgba(110,231,200,.11), rgba(255,255,255,.025)); }
     .source-detail-card.tone-claude { background: linear-gradient(180deg, rgba(255,135,82,.13), rgba(255,255,255,.025)); }
     .source-detail-card.tone-other { background: linear-gradient(180deg, rgba(173,191,205,.1), rgba(255,255,255,.025)); }
+    .source-detail-card.tone-codex-native { background: linear-gradient(180deg, rgba(124,92,255,.13), rgba(255,255,255,.025)); }
     .source-detail-head,
     .source-metric-head {
       display: flex;
@@ -1390,7 +1401,8 @@
           <select v-model="sourceFilter">
             <option value="all">All sources</option>
             <option value="claude">Claude</option>
-            <option value="codex">Codex</option>
+            <option value="codex">Codex (proxied)</option>
+            <option value="codex_native">Codex (native)</option>
             <option value="proxy">Proxy</option>
           </select>
           <select v-model="initiatorFilter" v-if="activeTab === 'requests'">
@@ -1464,7 +1476,27 @@
                   @click="selectedRequestKey = requestKey(row)"
                 >
                   <div class="request-row-head">
-                    <span class="badge">{{ row.initiator || 'unknown' }}</span>
+                    <div style="display:flex; gap:6px; flex-wrap:wrap; align-items:center">
+                      <span class="badge">{{ row.initiator || 'unknown' }}</span>
+                      <span
+                        v-if="requestFastModeLabel(row)"
+                        :class="['badge', requestServiceTierBadgeClass(row)]"
+                      >
+                        {{ requestFastModeLabel(row) }}
+                      </span>
+                      <span
+                        v-else-if="requestServiceTierLabel(row) && requestServiceTierLabel(row) !== 'default'"
+                        :class="['badge', requestServiceTierBadgeClass(row)]"
+                      >
+                        {{ requestServiceTierLabel(row) }}
+                      </span>
+                      <span
+                        v-if="requestEffortLabel(row)"
+                        :class="['badge', requestEffortBadgeClass(row)]"
+                      >
+                        {{ requestEffortLabel(row) }}
+                      </span>
+                    </div>
                     <div class="request-title">{{ row.resolved_model || row.requested_model || '-' }}</div>
                     <div class="subtle">{{ stamp(row.finished_at || row.started_at) }}</div>
                   </div>
@@ -1478,6 +1510,9 @@
                     <div class="mono">{{ shortId(row.session_id || row.client_request_id || row.request_id) }}</div>
                     <div>{{ tokenSummary(row) }}</div>
                     <div>{{ row.time_to_first_token_ms != null ? `${row.time_to_first_token_ms} ms first token` : 'No token timing' }}</div>
+                    <div v-if="requestFastModeSummary(row)">{{ requestFastModeSummary(row) }}</div>
+                    <div v-if="requestServiceTierSummary(row) && (requestFastModeLabel(row) || requestServiceTierLabel(row) !== 'default')">{{ requestServiceTierSummary(row) }}</div>
+                    <div v-if="requestEffortSummary(row)">{{ requestEffortSummary(row) }}</div>
                     <div>{{ money(row.cost_usd) }}</div>
                   </div>
                 </button>
@@ -1537,6 +1572,30 @@
                     <div class="detail-label">Estimated Cost</div>
                     <div class="detail-value">{{ money(selectedRequest.cost_usd) }}</div>
                   </div>
+                  <div v-if="requestFastModeSummary(selectedRequest)">
+                    <div class="detail-label">Fast Mode</div>
+                    <div class="detail-value">{{ requestFastModeSummary(selectedRequest) }}</div>
+                  </div>
+                  <div v-if="requestRequestedServiceTierLabel(selectedRequest)">
+                    <div class="detail-label">Requested Tier</div>
+                    <div class="detail-value">{{ requestRequestedServiceTierLabel(selectedRequest) }}</div>
+                  </div>
+                  <div v-if="requestServiceTierSummary(selectedRequest)">
+                    <div class="detail-label">Served Tier</div>
+                    <div class="detail-value">{{ requestServiceTierSummary(selectedRequest) }}</div>
+                  </div>
+                  <div v-if="requestRequestedServiceTierSourceLabel(selectedRequest)">
+                    <div class="detail-label">Tier Request Source</div>
+                    <div class="detail-value">{{ requestRequestedServiceTierSourceLabel(selectedRequest) }}</div>
+                  </div>
+                  <div v-if="requestServiceTierSourceLabel(selectedRequest)">
+                    <div class="detail-label">Tier Response Source</div>
+                    <div class="detail-value">{{ requestServiceTierSourceLabel(selectedRequest) }}</div>
+                  </div>
+                  <div v-if="requestEffortSummary(selectedRequest)">
+                    <div class="detail-label">Reasoning Effort</div>
+                    <div class="detail-value">{{ requestEffortSummary(selectedRequest) }}</div>
+                  </div>
                   <div>
                     <div class="detail-label">Request ID</div>
                     <div class="detail-value mono">{{ selectedRequest.request_id || '-' }}</div>
@@ -1580,7 +1639,7 @@
 
               <article class="detail-block" v-if="requestChainUsage(selectedRequest)">
                 <div class="detail-label">Chain Usage</div>
-                <div class="subtle">{{ requestChainCount(selectedRequest) }} proxied requests in this chain · {{ money(requestChainUsage(selectedRequest).cost_usd) }}</div>
+                <div class="subtle">{{ requestChainCount(selectedRequest) }} requests in this chain · {{ money(requestChainUsage(selectedRequest).cost_usd) }}</div>
                 <div class="detail-grid" style="margin-top:10px">
                   <div>
                     <div class="detail-label">Input Tokens</div>
@@ -2887,7 +2946,8 @@
         sourceLabel(source) {
           const normalized = String(source || 'unknown').trim().toLowerCase();
           if (normalized === 'claude') return 'Claude';
-          if (normalized === 'codex') return 'Codex';
+          if (normalized === 'codex') return 'Codex (proxied)';
+          if (normalized === 'codex_native') return 'Codex (native)';
           if (!normalized) return 'Unknown';
           return normalized.charAt(0).toUpperCase() + normalized.slice(1);
         },
@@ -2895,6 +2955,7 @@
           const normalized = String(source || 'unknown').trim().toLowerCase();
           if (normalized === 'claude') return 'tone-claude';
           if (normalized === 'codex') return 'tone-codex';
+          if (normalized === 'codex_native') return 'tone-codex-native';
           return 'tone-other';
         },
         shareValue(row) {
@@ -3329,16 +3390,16 @@
           return `Cooldown of ${this.integer(seconds)}s after each proxied request`;
         },
         filteredSessions() {
-          const rows = (this.data.recent_sessions || []).filter((row) => this.allowSource(row.source) && this.matches(row));
+          const rows = (this.data.recent_sessions || []).filter((row) => this.allowRequestSource(row.source) && this.matches(row));
           return this.sortRows(rows, 'last_activity');
         },
         filteredRequests() {
           const rows = (this.data.recent_requests || []).map((row) => ({
             ...row,
-            source: 'proxy',
+            source: this.deriveRequestSource(row),
             total_tokens: Number(row?.usage?.total_tokens || row?.total_tokens || 0),
           })).filter((row) => {
-            if (!this.allowSource(row.source)) return false;
+            if (!this.allowRequestSource(row.source)) return false;
             if (!this.matches(row)) return false;
             if (this.initiatorFilter !== 'all' && String(row.initiator || '').toLowerCase() !== this.initiatorFilter) return false;
             if (this.safeguardFilter === 'triggered' && !row.safeguard_triggered) return false;
@@ -3427,6 +3488,63 @@
           return row?.request_id || row?.client_request_id || row?.started_at || '';
         },
         shortId(value) { return !value ? '-' : (value.length > 36 ? value.slice(-36) : value); },
+        _lowerField(row, key) {
+          const value = row?.[key];
+          if (!value) return '';
+          return String(value).trim().toLowerCase();
+        },
+        requestRequestedServiceTierLabel(row) {
+          return this._lowerField(row, 'native_requested_service_tier');
+        },
+        requestServiceTierLabel(row) {
+          return this._lowerField(row, 'native_service_tier');
+        },
+        requestFastModeLabel(row) {
+          const requested = this.requestRequestedServiceTierLabel(row);
+          if (requested === 'priority' || requested === 'fast') return 'fast';
+          const served = this.requestServiceTierLabel(row);
+          if (served === 'priority' || served === 'fast') return 'fast';
+          return '';
+        },
+        requestServiceTierBadgeClass(row) {
+          const tier = this.requestFastModeLabel(row) || this.requestServiceTierLabel(row);
+          return tier === 'fast' || tier === 'priority' ? 'badge-tier-fast' : 'badge-tier-other';
+        },
+        requestFastModeSummary(row) {
+          if (!this.requestFastModeLabel(row)) return '';
+          const requested = this.requestRequestedServiceTierLabel(row);
+          const verb = (requested === 'priority' || requested === 'fast') ? 'requested' : 'served';
+          return `fast ${verb} · 2x estimated cost`;
+        },
+        requestServiceTierSummary(row) {
+          const normalized = this.requestServiceTierLabel(row);
+          return normalized ? `served ${normalized}` : '';
+        },
+        _tierSourceLabel(source) {
+          if (!source) return '';
+          const map = {
+            codex_logs_request: 'Codex request logs',
+            codex_logs_response_completed: 'Codex completed response',
+            codex_logs_response_progress: 'Codex response progress',
+            codex_logs: 'Codex response logs',
+          };
+          return map[source] || String(source).trim().replaceAll('_', ' ');
+        },
+        requestRequestedServiceTierSourceLabel(row) {
+          return this._tierSourceLabel(row?.native_requested_service_tier_source);
+        },
+        requestServiceTierSourceLabel(row) {
+          return this._tierSourceLabel(row?.native_service_tier_source);
+        },
+        requestEffortLabel(row) {
+          return this._lowerField(row, 'native_reasoning_effort');
+        },
+        requestEffortBadgeClass(row) {
+          return this.requestEffortLabel(row) === 'fast' ? 'badge-effort-fast' : 'badge-effort-other';
+        },
+        requestEffortSummary(row) {
+          return this.requestEffortLabel(row);
+        },
         sessionKindLabel(kind) {
           if (kind === 'synthetic_chain' || kind === 'client_request' || kind === 'request') return '';
           return kind || '';
@@ -3860,6 +3978,31 @@
           }
         },
         allowSource(source) { return this.sourceFilter === 'all' || this.sourceFilter === source; },
+        // Mirror of util._usage_event_source for the JS side. Used by the
+        // requests tab so each row carries its real source (claude / codex /
+        // codex_native), not a hard-coded "proxy" tag.
+        deriveRequestSource(row) {
+          if (!row || typeof row !== 'object') return 'codex';
+          const native = String(row.native_source || '').trim().toLowerCase();
+          if (native) return native;
+          const requested = String(row.requested_model || '').trim().toLowerCase();
+          if (requested.startsWith('claude-')) return 'claude';
+          if (requested.startsWith('gpt-')) return 'codex';
+          const resolved = String(row.resolved_model || row.response_model || '').trim().toLowerCase();
+          if (resolved.startsWith('claude-')) return 'claude';
+          if (resolved.startsWith('gpt-')) return 'codex';
+          const path = String(row.path || '');
+          if (path.endsWith('/messages')) return 'claude';
+          if (path.endsWith('/responses') || path.endsWith('/chat/completions')) return 'codex';
+          return 'codex';
+        },
+        // The "proxy" filter option is the legacy "anything that went through
+        // the proxy" catch-all — i.e. claude OR codex but NOT codex_native.
+        allowRequestSource(source) {
+          if (this.sourceFilter === 'all') return true;
+          if (this.sourceFilter === 'proxy') return source === 'claude' || source === 'codex';
+          return this.sourceFilter === source;
+        },
         matches(row) { return !this.search || JSON.stringify(row).toLowerCase().includes(this.search.toLowerCase()); },
         openDebugModal(row) {
           if (!row) return;

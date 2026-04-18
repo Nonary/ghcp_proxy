@@ -51,22 +51,54 @@ def _parse_event_time(value: str | None) -> datetime | None:
         return None
 
 
-def _strip_explicit_initiator_prefix(text: str) -> tuple[str, str | None]:
-    if not isinstance(text, str):
-        return text, None
+def _match_initiator_marker(stripped: str) -> tuple[str, str | None]:
+    """Match a leading initiator marker in `stripped` (whitespace already removed
+    from the left). Returns (remainder, initiator) on match, else (stripped, None).
 
-    stripped = text.lstrip()
+    A trailing single space after the marker is consumed if present, mirroring
+    what users naturally type ("_ foo" vs "_foo" both yield "foo").
+    """
     if stripped.startswith(AGENT_INITIATOR_PREFIX):
         initiator = AGENT_INITIATOR
     elif stripped.startswith(USER_INITIATOR_PREFIX):
         initiator = _EXPLICIT_USER_INITIATOR
     else:
+        return stripped, None
+    remainder = stripped[1:]
+    if remainder.startswith(" "):
+        remainder = remainder[1:]
+    return remainder, initiator
+
+
+def _strip_explicit_initiator_prefix(text: str) -> tuple[str, str | None]:
+    if not isinstance(text, str):
         return text, None
 
-    normalized = stripped[1:]
-    if normalized.startswith(" "):
-        normalized = normalized[1:]
-    return normalized, initiator
+    remainder, initiator = _match_initiator_marker(text.lstrip())
+    if initiator is not None:
+        return remainder, initiator
+    # Trailing marker on its own line: handles harnesses (e.g. Claude Code)
+    # that append <system-reminder> blocks AFTER the user's typed prompt
+    # in the same content string.
+    return _strip_explicit_initiator_marker_on_last_line(text)
+
+
+def _strip_explicit_initiator_marker_on_last_line(text: str) -> tuple[str, str | None]:
+    rstripped = text.rstrip()
+    if not rstripped:
+        return text, None
+
+    last_newline = rstripped.rfind("\n")
+    if last_newline == -1:
+        # Single-line input — already handled by the leading-prefix check.
+        return text, None
+
+    prefix = rstripped[: last_newline + 1]
+    last_line = rstripped[last_newline + 1 :]
+    remainder, initiator = _match_initiator_marker(last_line.lstrip())
+    if initiator is None:
+        return text, None
+    return prefix + remainder, initiator
 
 
 def _is_user_candidate(candidate_initiator: str | None) -> bool:

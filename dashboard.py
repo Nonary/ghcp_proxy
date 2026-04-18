@@ -28,8 +28,9 @@ from util import (
     normalize_usage_payload, _normalize_model_name,
     _usage_event_model_name, _usage_event_source,
     _pricing_entry_for_model, _usage_event_cost, _usage_event_cost_breakdown,
+    _usage_event_cost_multiplier,
     _premium_request_multiplier, _counted_premium_requests,
-    _month_key, month_key_for_source_row,
+    _month_key, month_key_for_source_row, _codex_native_session_id_from_request_id,
 )
 
 
@@ -452,7 +453,10 @@ def _usage_event_session_descriptor(event: dict | None) -> dict[str, str]:
     source, group_id = _usage_event_group_key(event)
 
     actual_session_id = event.get("session_id") if isinstance(event, dict) else None
+    if (not isinstance(actual_session_id, str) or not actual_session_id) and isinstance(event, dict):
+        actual_session_id = _codex_native_session_id_from_request_id(event.get("request_id"))
     if isinstance(actual_session_id, str) and actual_session_id:
+        group_id = actual_session_id
         return {
             "source": source,
             "group_id": group_id,
@@ -562,8 +566,9 @@ def _ingest_usage_event(bucket: dict, event: dict):
 
     usage = normalize_usage_payload(event.get("usage")) or {}
     event_cost = event.get("cost_usd")
+    cost_multiplier = _usage_event_cost_multiplier(event)
     if not isinstance(event_cost, (int, float)) or not event_cost:
-        recomputed_cost = _usage_event_cost(_usage_event_model_name(event), usage)
+        recomputed_cost = _usage_event_cost(_usage_event_model_name(event), usage) * cost_multiplier
         if recomputed_cost:
             event_cost = recomputed_cost
         elif not isinstance(event_cost, (int, float)):
@@ -587,6 +592,8 @@ def _ingest_usage_event(bucket: dict, event: dict):
     reasoning_output_tokens = _coerce_int(usage.get("reasoning_output_tokens"))
     model_name = _usage_event_model_name(event) or "unknown"
     cost_breakdown = _usage_event_cost_breakdown(model_name, usage)
+    if cost_multiplier != 1.0:
+        cost_breakdown = {key: value * cost_multiplier for key, value in cost_breakdown.items()}
 
     bucket["input_tokens"] += input_tokens
     bucket["output_tokens"] += output_tokens

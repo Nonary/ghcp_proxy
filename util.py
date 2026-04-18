@@ -1,8 +1,11 @@
 """Pure stateless utility functions for ghcp_proxy."""
 
+import glob
 import gzip
 import json
 import os
+import re
+import sqlite3
 import time
 import zlib
 
@@ -204,6 +207,181 @@ def _server_request_chain_key(
     return (scope, normalized_subagent)
 
 
+def _codex_native_session_id_from_request_id(request_id: str | None) -> str | None:
+    if not isinstance(request_id, str):
+        return None
+    prefix = "codex-native:"
+    if not request_id.startswith(prefix):
+        return None
+    remainder = request_id[len(prefix):]
+    if not remainder:
+        return None
+    session_id, separator, turn_id = remainder.rpartition(":")
+    if not separator or not session_id or not turn_id:
+        return None
+    return session_id
+
+
+FAST_SERVICE_TIERS = frozenset({"fast", "priority"})
+
+
+_CODEX_LOGS_SERVICE_TIER_CACHE: dict[str, object] = {
+    "path": None,
+    "mtime": None,
+    "size": None,
+    "values": {},
+}
+_CODEX_LOGS_SERVICE_TIER_RE = re.compile(r'"service_tier"\s*:\s*"([^"]+)"')
+
+
+def _codex_logs_db_path(codex_home: str | None = None) -> str | None:
+    home = codex_home or os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
+    if not isinstance(home, str) or not home:
+        return None
+
+    candidates: list[str] = []
+    for pattern in ("logs_*.sqlite", "logs.sqlite"):
+        candidates.extend(glob.glob(os.path.join(home, pattern)))
+    if not candidates:
+        return None
+
+    def _sort_key(path: str) -> float:
+        try:
+            return os.path.getmtime(path)
+        except OSError:
+            return 0.0
+
+    return max(candidates, key=_sort_key)
+
+
+def _extract_codex_log_service_tier(feedback_log_body: str | None) -> str | None:
+    if not isinstance(feedback_log_body, str) or not feedback_log_body:
+        return None
+    match = _CODEX_LOGS_SERVICE_TIER_RE.search(feedback_log_body)
+    if not match:
+        return None
+    tier = match.group(1).strip().lower()
+    return tier or None
+
+
+def _codex_logs_service_tiers(
+    session_id: str | None,
+    turn_id: str | None = None,
+    started_at: str | None = None,
+    logs_db_path: str | None = None,
+) -> dict[str, str | None]:
+    empty = {
+        "requested": None,
+        "requested_source": None,
+        "effective": None,
+        "effective_source": None,
+    }
+    if not isinstance(session_id, str) or not session_id:
+        return dict(empty)
+
+    db_path = logs_db_path or _codex_logs_db_path()
+    if not isinstance(db_path, str) or not db_path:
+        return dict(empty)
+
+    try:
+        mtime = os.path.getmtime(db_path)
+        size = os.path.getsize(db_path)
+    except OSError:
+        return dict(empty)
+
+    cache_values = _CODEX_LOGS_SERVICE_TIER_CACHE.get("values")
+    if not isinstance(cache_values, dict):
+        cache_values = {}
+    if (
+        _CODEX_LOGS_SERVICE_TIER_CACHE.get("path") != db_path
+        or _CODEX_LOGS_SERVICE_TIER_CACHE.get("mtime") != mtime
+        or _CODEX_LOGS_SERVICE_TIER_CACHE.get("size") != size
+    ):
+        cache_values = {}
+        _CODEX_LOGS_SERVICE_TIER_CACHE["path"] = db_path
+        _CODEX_LOGS_SERVICE_TIER_CACHE["mtime"] = mtime
+        _CODEX_LOGS_SERVICE_TIER_CACHE["size"] = size
+        _CODEX_LOGS_SERVICE_TIER_CACHE["values"] = cache_values
+
+    event_dt = _parse_iso_datetime(started_at)
+    event_ts = int(event_dt.timestamp()) if event_dt else None
+    cache_key = (session_id, turn_id or "", event_ts)
+    if cache_key in cache_values:
+        cached = cache_values.get(cache_key)
+        return dict(cached) if isinstance(cached, dict) else dict(empty)
+
+    def _lookup(query_turn_id: str | None) -> dict[str, str | None]:
+        params: list[object] = [session_id]
+        where_parts = [
+            "thread_id = ?",
+            "target = 'codex_api::endpoint::responses_websocket'",
+            "instr(feedback_log_body, '\"service_tier\"') > 0",
+            "("
+            "instr(feedback_log_body, 'stream_request:model_client.stream_responses_websocket') > 0 "
+            "or instr(feedback_log_body, 'websocket event: {\"type\":\"response.created\"') > 0 "
+            "or instr(feedback_log_body, 'websocket event: {\"type\":\"response.in_progress\"') > 0 "
+            "or instr(feedback_log_body, 'websocket event: {\"type\":\"response.completed\"') > 0"
+            ")",
+        ]
+        if isinstance(query_turn_id, str) and query_turn_id:
+            where_parts.append("feedback_log_body like ?")
+            params.append(f"%turn.id={query_turn_id}%")
+
+        order_clause = "ts ASC, ts_nanos ASC, id ASC"
+        if query_turn_id is None and event_ts is not None:
+            order_clause = "abs(ts - ?) ASC, ts ASC, ts_nanos ASC, id ASC"
+            params.append(event_ts)
+
+        sql = (
+            "SELECT feedback_log_body FROM logs "
+            f"WHERE {' AND '.join(where_parts)} "
+            f"ORDER BY {order_clause} LIMIT 50"
+        )
+        resolved = dict(empty)
+        try:
+            with sqlite3.connect(db_path, timeout=1.0) as conn:
+                conn.execute("PRAGMA query_only = ON")
+                for (feedback_log_body,) in conn.execute(sql, params):
+                    tier = _extract_codex_log_service_tier(feedback_log_body)
+                    if not tier:
+                        continue
+                    body = feedback_log_body or ""
+                    if (
+                        '"stream":true' in body
+                        and "stream_request:model_client.stream_responses_websocket" in body
+                    ):
+                        resolved["requested"] = tier
+                        resolved["requested_source"] = "codex_logs_request"
+                        continue
+                    if 'websocket event: {"type":"response.completed"' in body:
+                        resolved["effective"] = tier
+                        resolved["effective_source"] = "codex_logs_response_completed"
+                        continue
+                    if (
+                        resolved["effective"] is None
+                        and (
+                            'websocket event: {"type":"response.in_progress"' in body
+                            or 'websocket event: {"type":"response.created"' in body
+                        )
+                    ):
+                        resolved["effective"] = tier
+                        resolved["effective_source"] = "codex_logs_response_progress"
+        except sqlite3.Error:
+            return dict(empty)
+        return resolved
+
+    resolved_tiers = _lookup(turn_id)
+    if (
+        resolved_tiers["requested"] is None
+        and resolved_tiers["effective"] is None
+        and turn_id
+    ):
+        resolved_tiers = _lookup(None)
+
+    cache_values[cache_key] = dict(resolved_tiers)
+    return dict(resolved_tiers)
+
+
 def _is_claude_request(request: Request | None) -> bool:
     path = str(request.url.path if request is not None and hasattr(request, "url") else "")
     return path == "/v1/messages"
@@ -240,6 +418,13 @@ def _usage_event_model_name(event: dict | None) -> str | None:
 def _usage_event_source(event: dict | None) -> str:
     if not isinstance(event, dict):
         return "codex"
+
+    # Explicit native_source wins over heuristic detection. Used by
+    # ingestors (e.g. codex_native_ingest) to mark traffic that did not flow
+    # through this proxy but should still be counted toward expense.
+    native_source = event.get("native_source")
+    if isinstance(native_source, str) and native_source.strip():
+        return native_source.strip()
 
     # Derive source from the originally requested model so that remapped
     # requests (e.g. Codex -> Claude) keep their original source identity.
@@ -328,6 +513,33 @@ def _usage_event_cost_breakdown(model_name: str | None, usage: dict | None) -> d
 
 def _usage_event_cost(model_name: str | None, usage: dict | None) -> float:
     return sum(_usage_event_cost_breakdown(model_name, usage).values())
+
+
+def _usage_event_cost_multiplier(event: dict | None) -> float:
+    if not isinstance(event, dict):
+        return 1.0
+    requested_service_tier = event.get("native_requested_service_tier")
+    if isinstance(requested_service_tier, str) and requested_service_tier.strip().lower() in FAST_SERVICE_TIERS:
+        return 2.0
+    service_tier = event.get("native_service_tier")
+    if isinstance(service_tier, str) and service_tier.strip().lower() in FAST_SERVICE_TIERS:
+        return 2.0
+    return 1.0
+
+
+def _usage_event_estimated_cost(
+    event: dict | None,
+    *,
+    model_name: str | None = None,
+    usage: dict | None = None,
+) -> float:
+    resolved_model_name = model_name
+    if resolved_model_name is None and isinstance(event, dict):
+        resolved_model_name = _usage_event_model_name(event)
+    resolved_usage = usage
+    if resolved_usage is None and isinstance(event, dict):
+        resolved_usage = event.get("usage")
+    return _usage_event_cost(resolved_model_name, resolved_usage) * _usage_event_cost_multiplier(event)
 
 
 def _premium_request_multiplier(model_name: str | None) -> float:
