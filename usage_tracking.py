@@ -19,6 +19,7 @@ from fastapi import Request
 from constants import (
     TOKEN_DIR, USAGE_LOG_FILE, REQUEST_ERROR_LOG_FILE,
     DETAILED_REQUEST_HISTORY_LIMIT,
+    RESPONSE_REASONING_PREVIEW_MAX_CHARS,
 )
 from util import (
     _json_default, _coerce_float, _coerce_int,
@@ -984,6 +985,7 @@ class UsageTracker:
         upstream: httpx.Response | None = None,
         response_payload: dict | None = None,
         response_text: str | None = None,
+        reasoning_text: str | None = None,
         usage: dict | None = None,
     ):
         if not isinstance(event, dict):
@@ -1117,6 +1119,15 @@ class UsageTracker:
             payload_model = response_payload.get("model")
             if isinstance(payload_model, str):
                 finished_event["response_model"] = payload_model
+
+        if isinstance(reasoning_text, str) and reasoning_text:
+            # Mirror how response_text-style fields are surfaced: keep a bounded
+            # excerpt so dashboards / trace viewers can show what the model was
+            # actually thinking without retaining megabytes of reasoning.
+            finished_event["reasoning_text"] = reasoning_text[:RESPONSE_REASONING_PREVIEW_MAX_CHARS]
+            if len(reasoning_text) > RESPONSE_REASONING_PREVIEW_MAX_CHARS:
+                finished_event["reasoning_text_truncated"] = True
+                finished_event["reasoning_text_chars"] = len(reasoning_text)
 
         derived_usage = usage
         if isinstance(derived_usage, dict):

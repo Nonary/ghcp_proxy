@@ -764,6 +764,7 @@ def _finish_usage_and_trace(
     upstream: httpx.Response | None = None,
     response_payload: dict | None = None,
     response_text: str | None = None,
+    reasoning_text: str | None = None,
     usage: dict | None = None,
 ) -> None:
     if isinstance(plan, UpstreamRequestPlan):
@@ -773,6 +774,7 @@ def _finish_usage_and_trace(
             upstream=upstream,
             response_payload=response_payload,
             response_text=response_text,
+            reasoning_text=reasoning_text,
             usage=usage,
         )
         force_trace = _should_force_failure_trace(plan, status_code)
@@ -785,7 +787,10 @@ def _finish_usage_and_trace(
                 "resolved_model": plan.resolved_model,
                 "response": _trace_response_summary(upstream=upstream, response_payload=response_payload, usage=usage),
                 "response_text_present": isinstance(response_text, str) and bool(response_text),
+                "reasoning_text_present": isinstance(reasoning_text, str) and bool(reasoning_text),
             }
+            if isinstance(reasoning_text, str) and reasoning_text:
+                trace_payload["reasoning_text"] = _trim_trace_text(reasoning_text)
             if status_code >= 400:
                 trace_payload["source_body"] = _trim_trace_field(
                     plan.source_body if isinstance(plan.source_body, dict) else plan.body
@@ -805,6 +810,7 @@ def _finish_usage_and_trace(
         upstream=upstream,
         response_payload=response_payload,
         response_text=response_text,
+        reasoning_text=reasoning_text,
         usage=usage,
     )
 
@@ -1260,6 +1266,7 @@ async def proxy_anthropic_streaming_response(
                 upstream=upstream,
                 response_payload=response_payload,
                 response_text=translator.response_text,
+                reasoning_text=translator.thinking_text,
                 usage=response_payload["usage"],
             )
             await upstream.aclose()
@@ -1321,8 +1328,9 @@ async def proxy_responses_from_chat_streaming_response(
             fallback_model,
             mark_first_output=lambda: usage_tracker.mark_first_output(usage_event),
         )
+        upstream_iter = upstream.aiter_bytes()
         try:
-            async for event in translator.translate(upstream.aiter_bytes()):
+            async for event in translator.translate(upstream_iter):
                 yield event
         finally:
             response_payload = translator.build_response_payload()
@@ -1332,6 +1340,7 @@ async def proxy_responses_from_chat_streaming_response(
                 upstream=upstream,
                 response_payload=response_payload,
                 response_text=translator.response_text,
+                reasoning_text=translator.reasoning_text or None,
                 usage=response_payload["usage"],
             )
             await upstream.aclose()
@@ -1410,6 +1419,7 @@ async def proxy_anthropic_from_responses_streaming_response(
                 upstream=upstream,
                 response_payload=response_payload,
                 response_text=translator.response_text,
+                reasoning_text=translator.thinking_text,
                 usage=response_payload["usage"],
             )
             await upstream.aclose()

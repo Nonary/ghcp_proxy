@@ -213,6 +213,7 @@ class ProxyRoutesTests(unittest.TestCase):
             upstream=None,
             response_payload=None,
             response_text="Upstream connection failed",
+            reasoning_text=None,
             usage=None,
         )
         self.assertEqual(response.status_code, 502)
@@ -285,6 +286,7 @@ class ProxyRoutesTests(unittest.TestCase):
             upstream=None,
             response_payload=None,
             response_text="Upstream connection failed",
+            reasoning_text=None,
             usage=None,
         )
         self.assertEqual(response.status_code, 502)
@@ -831,6 +833,7 @@ class ProxyRoutesTests(unittest.TestCase):
             upstream=None,
             response_payload=None,
             response_text="Upstream connection failed",
+            reasoning_text=None,
             usage=None,
         )
         fake_client.aclose.assert_awaited_once()

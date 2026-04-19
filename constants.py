@@ -94,6 +94,10 @@ REQUEST_TRACE_BODY_MAX_BYTES = 8192
 # usage events and the request trace so the dashboard can surface a
 # human-readable preview without retaining full upstream payloads.
 REQUEST_PROMPT_PREVIEW_MAX_CHARS = 4000
+# Maximum characters of the assistant's reasoning ("thinking") text retained on
+# the finished usage event so dashboards can surface the first portion of the
+# model's chain of thought without bloating per-request rows.
+RESPONSE_REASONING_PREVIEW_MAX_CHARS = 1000
 FORWARDED_REQUEST_HEADERS = (
     "x-client-request-id",
     "x-openai-subagent",

@@ -151,5 +151,45 @@ class ProxyTracingTests(unittest.TestCase):
         self.assertEqual(trace_payload["response_text"], "unsupported field: tool_choice")
 
 
+    def test_finish_usage_and_trace_records_reasoning_text_on_success(self):
+        plan = proxy.UpstreamRequestPlan(
+            request_id="req_999",
+            upstream_url="https://example.invalid/chat/completions",
+            headers={"X-Initiator": "agent"},
+            body={"model": "claude-opus-4.7"},
+            usage_event={"request_id": "req_999"},
+            requested_model="claude-opus-4.7",
+            resolved_model="claude-opus-4.7",
+            source_body={"model": "claude-opus-4.7"},
+            trace_context={"request_id": "req_999"},
+        )
+        upstream = httpx.Response(200, text="")
+
+        captured: dict = {}
+
+        def _capture(_event, _status, **kwargs):
+            captured.update(kwargs)
+
+        with (
+            mock.patch.object(proxy.usage_tracker, "finish_event", side_effect=_capture),
+            mock.patch.object(proxy, "request_tracing_enabled", return_value=True),
+            mock.patch.object(proxy, "_append_request_trace") as append_trace,
+        ):
+            proxy._finish_usage_and_trace(
+                plan,
+                200,
+                upstream=upstream,
+                response_payload={"id": "resp_1"},
+                response_text="answer",
+                reasoning_text="thinking step by step",
+            )
+
+        self.assertEqual(captured["reasoning_text"], "thinking step by step")
+        append_trace.assert_called_once()
+        trace_payload = append_trace.call_args.args[0]
+        self.assertTrue(trace_payload["reasoning_text_present"])
+        self.assertEqual(trace_payload["reasoning_text"], "thinking step by step")
+
+
 if __name__ == "__main__":
     unittest.main()
