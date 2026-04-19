@@ -61,8 +61,6 @@ DEFAULT_COMPACT_FALLBACK_MODEL = "gpt-5.4"
 CLAUDE_DEFAULT_REASONING_EFFORT = "medium"
 CODEX_PROXY_CONFIG = """\
 model_provider = "custom"
-model = "gpt-5.4"
-model_reasoning_effort = "high"
 approvals_reviewer = "user"
 
 [model_providers.custom]

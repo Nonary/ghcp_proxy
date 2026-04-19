@@ -64,8 +64,6 @@ The managed Codex config written by the dashboard is:
 
 ```toml
 model_provider = "custom"
-model = "gpt-5.4"
-model_reasoning_effort = "high"
 approvals_reviewer = "user"
 model_catalog_json = "~/.codex/ghcp-proxy-models.json"
 model_context_window = 184000
