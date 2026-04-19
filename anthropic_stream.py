@@ -17,6 +17,12 @@ class TextBlockState:
 
 
 @dataclass
+class ThinkingBlockState:
+    anthropic_index: int
+    closed: bool = False
+
+
+@dataclass
 class ToolBlockState:
     anthropic_index: int
     id: str
@@ -48,15 +54,23 @@ class AnthropicStreamTranslator:
         self._last_message_start_usage: dict | None = None
         self._next_block_index = 0
         self._text_block: TextBlockState | None = None
+        self._thinking_block: ThinkingBlockState | None = None
         self._tool_blocks: dict[int, ToolBlockState] = {}
         self._active_block: tuple[str, int] | None = None
         self._response_text_parts: list[str] = []
+        self._thinking_text_parts: list[str] = []
 
     @property
     def response_text(self) -> str | None:
         if not self._response_text_parts:
             return None
         return "".join(self._response_text_parts)
+
+    @property
+    def thinking_text(self) -> str | None:
+        if not self._thinking_text_parts:
+            return None
+        return "".join(self._thinking_text_parts)
 
     def build_response_payload(self) -> dict:
         return {
@@ -99,7 +113,7 @@ class AnthropicStreamTranslator:
             },
         )
 
-    def _emit_block_stop(self, block: TextBlockState | ToolBlockState | None) -> list[bytes]:
+    def _emit_block_stop(self, block: TextBlockState | ThinkingBlockState | ToolBlockState | None) -> list[bytes]:
         if block is None or block.closed:
             return []
         block.closed = True
@@ -121,6 +135,8 @@ class AnthropicStreamTranslator:
         self._active_block = None
         if block_type == "text":
             return self._emit_block_stop(self._text_block)
+        if block_type == "thinking":
+            return self._emit_block_stop(self._thinking_block)
         return self._emit_block_stop(self._tool_blocks.get(block_key))
 
     def _ensure_message_started(self) -> list[bytes]:
@@ -158,6 +174,27 @@ class AnthropicStreamTranslator:
                     "type": "content_block_start",
                     "index": self._text_block.anthropic_index,
                     "content_block": {"type": "text", "text": ""},
+                },
+            )
+        )
+        return events
+
+    def _ensure_thinking_block(self) -> list[bytes]:
+        if self._thinking_block is not None and not self._thinking_block.closed:
+            self._active_block = ("thinking", self._thinking_block.anthropic_index)
+            return []
+
+        events = self._close_active_block()
+        self._thinking_block = ThinkingBlockState(anthropic_index=self._next_block_index)
+        self._next_block_index += 1
+        self._active_block = ("thinking", self._thinking_block.anthropic_index)
+        events.append(
+            format_translation.sse_encode(
+                "content_block_start",
+                {
+                    "type": "content_block_start",
+                    "index": self._thinking_block.anthropic_index,
+                    "content_block": {"type": "thinking", "thinking": ""},
                 },
             )
         )
@@ -278,6 +315,22 @@ class AnthropicStreamTranslator:
             choices = payload.get("choices")
             first_choice = choices[0] if isinstance(choices, list) and choices else {}
             delta = first_choice.get("delta") if isinstance(first_choice, dict) else {}
+
+            thinking_delta = format_translation.extract_reasoning_from_chat_delta(delta)
+            if thinking_delta:
+                self._thinking_text_parts.append(thinking_delta)
+                if self._mark_first_output is not None:
+                    self._mark_first_output()
+                for event in self._ensure_thinking_block():
+                    yield event
+                yield format_translation.sse_encode(
+                    "content_block_delta",
+                    {
+                        "type": "content_block_delta",
+                        "index": self._thinking_block.anthropic_index,
+                        "delta": {"type": "thinking_delta", "thinking": thinking_delta},
+                    },
+                )
 
             text_delta = format_translation.extract_text_from_chat_delta(delta)
             if text_delta:

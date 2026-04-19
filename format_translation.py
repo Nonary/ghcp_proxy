@@ -1519,6 +1519,51 @@ def extract_text_from_chat_delta(delta) -> str:
     return ""
 
 
+def extract_reasoning_from_chat_delta(delta) -> str:
+    """Extract incremental reasoning/thinking text from a chat completion delta.
+
+    Different upstream providers expose Claude/Gemini-style chain-of-thought via
+    different field names on the streaming ``delta`` object. The Copilot chat
+    completions endpoint, mirroring what vscode-copilot-chat consumes, surfaces
+    Anthropic thinking_delta events as ``delta.thinking`` (string). Some
+    OpenAI-compatible providers (DeepSeek, Together, OpenRouter, Groq, etc.)
+    use ``delta.reasoning_content`` or ``delta.reasoning``. Copilot's
+    Anthropic-fronting endpoint emits ``delta.reasoning_text`` (singular
+    string per chunk). Accept any of them
+    so the upstream "in-progress thoughts" can be relayed downstream regardless
+    of which provider Copilot is fronting.
+
+    Returns the concatenated reasoning text fragment, or an empty string if
+    the delta carries no reasoning payload.
+    """
+    if not isinstance(delta, dict):
+        return ""
+
+    parts: list[str] = []
+    for key in ("thinking", "reasoning_content", "reasoning_text", "reasoning"):
+        value = delta.get(key)
+        if isinstance(value, str) and value:
+            parts.append(value)
+        elif isinstance(value, dict):
+            # Some providers wrap the chunk as {"text": "..."} or
+            # {"summary": [{"text": "..."}]}.
+            text = value.get("text")
+            if isinstance(text, str) and text:
+                parts.append(text)
+            summary = value.get("summary")
+            if isinstance(summary, list):
+                for item in summary:
+                    if isinstance(item, dict) and isinstance(item.get("text"), str):
+                        parts.append(item["text"])
+        elif isinstance(value, list):
+            for item in value:
+                if isinstance(item, str):
+                    parts.append(item)
+                elif isinstance(item, dict) and isinstance(item.get("text"), str):
+                    parts.append(item["text"])
+    return "".join(parts)
+
+
 def extract_tool_call_deltas(delta) -> list[dict]:
     if not isinstance(delta, dict):
         return []

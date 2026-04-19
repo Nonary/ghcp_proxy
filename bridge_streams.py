@@ -29,6 +29,16 @@ class _ToolItemState:
     closed: bool = False
 
 
+@dataclass
+class _ReasoningItemState:
+    """Tracks a Responses-style reasoning output item being streamed."""
+
+    output_index: int
+    item_id: str = ""
+    started: bool = False
+    closed: bool = False
+
+
 class ChatToResponsesStreamTranslator:
     """Translate upstream chat-completions SSE into Responses SSE."""
 
@@ -48,13 +58,35 @@ class ChatToResponsesStreamTranslator:
         self._text_item: _TextItemState | None = None
         self._tool_items: dict[int, _ToolItemState] = {}
         self._text_parts: list[str] = []
+        self._reasoning_item: _ReasoningItemState | None = None
+        self._reasoning_parts: list[str] = []
+        self._next_output_index = 0
 
     @property
     def response_text(self) -> str:
         return "".join(self._text_parts)
 
+    @property
+    def reasoning_text(self) -> str:
+        return "".join(self._reasoning_parts)
+
     def build_response_payload(self) -> dict:
         output = []
+        if self.reasoning_text:
+            reasoning_id = (
+                self._reasoning_item.item_id
+                if self._reasoning_item is not None and self._reasoning_item.item_id
+                else f"rs_{uuid4().hex}"
+            )
+            output.append(
+                {
+                    "type": "reasoning",
+                    "id": reasoning_id,
+                    "summary": [{"type": "summary_text", "text": self.reasoning_text}],
+                    "content": [{"type": "reasoning_text", "text": self.reasoning_text}],
+                    "encrypted_content": None,
+                }
+            )
         if self.response_text:
             output.append(
                 {
@@ -117,13 +149,15 @@ class ChatToResponsesStreamTranslator:
     def _ensure_text_item(self) -> list[bytes]:
         if self._text_item is not None and self._text_item.started and not self._text_item.closed:
             return []
-        self._text_item = _TextItemState(output_index=0, started=True)
+        output_index = self._next_output_index
+        self._next_output_index += 1
+        self._text_item = _TextItemState(output_index=output_index, started=True)
         return [
             format_translation.sse_encode(
                 "response.output_item.added",
                 {
                     "type": "response.output_item.added",
-                    "output_index": 0,
+                    "output_index": output_index,
                     "item": {
                         "type": "message",
                         "role": "assistant",
@@ -135,11 +169,37 @@ class ChatToResponsesStreamTranslator:
                 "response.content_part.added",
                 {
                     "type": "response.content_part.added",
-                    "output_index": 0,
+                    "output_index": output_index,
                     "content_index": 0,
                     "part": {
                         "type": "output_text",
                         "text": "",
+                    },
+                },
+            ),
+        ]
+
+    def _ensure_reasoning_item(self) -> list[bytes]:
+        if self._reasoning_item is not None and self._reasoning_item.started and not self._reasoning_item.closed:
+            return []
+        output_index = self._next_output_index
+        self._next_output_index += 1
+        item_id = f"rs_{uuid4().hex}"
+        self._reasoning_item = _ReasoningItemState(
+            output_index=output_index, item_id=item_id, started=True
+        )
+        return [
+            format_translation.sse_encode(
+                "response.output_item.added",
+                {
+                    "type": "response.output_item.added",
+                    "output_index": output_index,
+                    "item": {
+                        "type": "reasoning",
+                        "id": item_id,
+                        "summary": [],
+                        "content": [],
+                        "encrypted_content": None,
                     },
                 },
             ),
@@ -150,10 +210,11 @@ class ChatToResponsesStreamTranslator:
         state = self._tool_items.get(openai_index)
         if state is None:
             state = _ToolItemState(
-                output_index=openai_index + 1,
+                output_index=self._next_output_index,
                 call_id=tool_delta.get("id") if isinstance(tool_delta.get("id"), str) else f"call_{uuid4().hex}",
             )
             self._tool_items[openai_index] = state
+            self._next_output_index += 1
 
         function = tool_delta.get("function") if isinstance(tool_delta.get("function"), dict) else {}
         if isinstance(tool_delta.get("id"), str):
@@ -200,6 +261,39 @@ class ChatToResponsesStreamTranslator:
             first_choice = choices[0] if isinstance(choices, list) and choices else {}
             delta = first_choice.get("delta") if isinstance(first_choice, dict) else {}
 
+            reasoning_delta = format_translation.extract_reasoning_from_chat_delta(delta)
+            if reasoning_delta:
+                if self._mark_first_output is not None:
+                    self._mark_first_output()
+                # Codex's `new_reasoning_summary_block` drops cells whose text
+                # has no `**bold**` header; Claude's reasoning_text doesn't
+                # include one, so prepend a synthetic "**Thinking**" header.
+                first_chunk_needs_header = not self._reasoning_parts
+                for event in self._ensure_reasoning_item():
+                    yield event
+                if first_chunk_needs_header:
+                    header = "**Thinking**\n\n"
+                    self._reasoning_parts.append(header)
+                    yield format_translation.sse_encode(
+                        "response.reasoning_summary_text.delta",
+                        {
+                            "type": "response.reasoning_summary_text.delta",
+                            "output_index": self._reasoning_item.output_index,
+                            "summary_index": 0,
+                            "delta": header,
+                        },
+                    )
+                self._reasoning_parts.append(reasoning_delta)
+                yield format_translation.sse_encode(
+                    "response.reasoning_summary_text.delta",
+                    {
+                        "type": "response.reasoning_summary_text.delta",
+                        "output_index": self._reasoning_item.output_index,
+                        "summary_index": 0,
+                        "delta": reasoning_delta,
+                    },
+                )
+
             text_delta = format_translation.extract_text_from_chat_delta(delta)
             if text_delta:
                 self._text_parts.append(text_delta)
@@ -211,7 +305,7 @@ class ChatToResponsesStreamTranslator:
                     "response.output_text.delta",
                     {
                         "type": "response.output_text.delta",
-                        "output_index": 0,
+                        "output_index": self._text_item.output_index,
                         "content_index": 0,
                         "delta": text_delta,
                     },
@@ -239,13 +333,41 @@ class ChatToResponsesStreamTranslator:
         for event in self._ensure_response_started():
             yield event
 
+        if self._reasoning_item is not None and not self._reasoning_item.closed:
+            self._reasoning_item.closed = True
+            reasoning_text = self.reasoning_text
+            yield format_translation.sse_encode(
+                "response.reasoning_summary_text.done",
+                {
+                    "type": "response.reasoning_summary_text.done",
+                    "output_index": self._reasoning_item.output_index,
+                    "summary_index": 0,
+                    "text": reasoning_text,
+                },
+            )
+            yield format_translation.sse_encode(
+                "response.output_item.done",
+                {
+                    "type": "response.output_item.done",
+                    "output_index": self._reasoning_item.output_index,
+                    "item": {
+                        "type": "reasoning",
+                        "id": self._reasoning_item.item_id,
+                        "summary": [{"type": "summary_text", "text": reasoning_text}],
+                        "content": [{"type": "reasoning_text", "text": reasoning_text}],
+                        "encrypted_content": None,
+                    },
+                },
+            )
+
         if self._text_item is not None and not self._text_item.closed:
             self._text_item.closed = True
+            text_output_index = self._text_item.output_index
             yield format_translation.sse_encode(
                 "response.output_text.done",
                 {
                     "type": "response.output_text.done",
-                    "output_index": 0,
+                    "output_index": text_output_index,
                     "content_index": 0,
                     "text": self.response_text,
                 },
@@ -254,7 +376,7 @@ class ChatToResponsesStreamTranslator:
                 "response.content_part.done",
                 {
                     "type": "response.content_part.done",
-                    "output_index": 0,
+                    "output_index": text_output_index,
                     "content_index": 0,
                     "part": {"type": "output_text", "text": self.response_text},
                 },
@@ -263,7 +385,7 @@ class ChatToResponsesStreamTranslator:
                 "response.output_item.done",
                 {
                     "type": "response.output_item.done",
-                    "output_index": 0,
+                    "output_index": text_output_index,
                     "item": {
                         "type": "message",
                         "role": "assistant",
@@ -332,8 +454,11 @@ class ResponsesToAnthropicStreamTranslator:
         self._next_block_index = 0
         self._text_block_index: int | None = None
         self._text_block_closed = False
+        self._thinking_block_index: int | None = None
+        self._thinking_block_closed = False
         self._tool_blocks: dict[int, _ToolItemState] = {}
         self._text_parts: list[str] = []
+        self._thinking_parts: list[str] = []
 
     @property
     def response_text(self) -> str | None:
@@ -341,8 +466,16 @@ class ResponsesToAnthropicStreamTranslator:
             return None
         return "".join(self._text_parts)
 
+    @property
+    def thinking_text(self) -> str | None:
+        if not self._thinking_parts:
+            return None
+        return "".join(self._thinking_parts)
+
     def build_response_payload(self) -> dict:
         content = []
+        if self.thinking_text:
+            content.append({"type": "thinking", "thinking": self.thinking_text})
         if self.response_text:
             content.append({"type": "text", "text": self.response_text})
         for output_index in sorted(self._tool_blocks):
@@ -399,16 +532,49 @@ class ResponsesToAnthropicStreamTranslator:
     def _ensure_text_block(self) -> list[bytes]:
         if self._text_block_index is not None and not self._text_block_closed:
             return []
+        events = self._close_thinking_block()
         self._text_block_index = self._next_block_index
         self._next_block_index += 1
         self._text_block_closed = False
-        return [
+        events.append(
             format_translation.sse_encode(
                 "content_block_start",
                 {
                     "type": "content_block_start",
                     "index": self._text_block_index,
                     "content_block": {"type": "text", "text": ""},
+                },
+            )
+        )
+        return events
+
+    def _ensure_thinking_block(self) -> list[bytes]:
+        if self._thinking_block_index is not None and not self._thinking_block_closed:
+            return []
+        self._thinking_block_index = self._next_block_index
+        self._next_block_index += 1
+        self._thinking_block_closed = False
+        return [
+            format_translation.sse_encode(
+                "content_block_start",
+                {
+                    "type": "content_block_start",
+                    "index": self._thinking_block_index,
+                    "content_block": {"type": "thinking", "thinking": ""},
+                },
+            )
+        ]
+
+    def _close_thinking_block(self) -> list[bytes]:
+        if self._thinking_block_index is None or self._thinking_block_closed:
+            return []
+        self._thinking_block_closed = True
+        return [
+            format_translation.sse_encode(
+                "content_block_stop",
+                {
+                    "type": "content_block_stop",
+                    "index": self._thinking_block_index,
                 },
             )
         ]
@@ -488,6 +654,51 @@ class ResponsesToAnthropicStreamTranslator:
                         self._mark_first_output()
                     for event in self._ensure_tool_block(output_index, item):
                         yield event
+                elif str(item.get("type", "")).lower() == "reasoning":
+                    # Some providers emit a reasoning item with the full summary
+                    # already populated. Forward any inline summary text now.
+                    summary = item.get("summary")
+                    if isinstance(summary, list):
+                        for entry in summary:
+                            text = entry.get("text") if isinstance(entry, dict) else None
+                            if isinstance(text, str) and text:
+                                self._thinking_parts.append(text)
+                                if self._mark_first_output is not None:
+                                    self._mark_first_output()
+                                for event in self._ensure_thinking_block():
+                                    yield event
+                                yield format_translation.sse_encode(
+                                    "content_block_delta",
+                                    {
+                                        "type": "content_block_delta",
+                                        "index": self._thinking_block_index,
+                                        "delta": {"type": "thinking_delta", "thinking": text},
+                                    },
+                                )
+                continue
+
+            if event_type in (
+                "response.reasoning_summary_text.delta",
+                "response.reasoning_text.delta",
+                "response.reasoning.delta",
+            ):
+                reasoning_delta = payload.get("delta")
+                if isinstance(reasoning_delta, dict):
+                    reasoning_delta = reasoning_delta.get("text")
+                if isinstance(reasoning_delta, str) and reasoning_delta:
+                    self._thinking_parts.append(reasoning_delta)
+                    if self._mark_first_output is not None:
+                        self._mark_first_output()
+                    for event in self._ensure_thinking_block():
+                        yield event
+                    yield format_translation.sse_encode(
+                        "content_block_delta",
+                        {
+                            "type": "content_block_delta",
+                            "index": self._thinking_block_index,
+                            "delta": {"type": "thinking_delta", "thinking": reasoning_delta},
+                        },
+                    )
                 continue
 
             if event_type == "response.function_call_arguments.delta":
@@ -529,6 +740,9 @@ class ResponsesToAnthropicStreamTranslator:
         for event in self._ensure_message_started():
             yield event
         for event in self._refresh_message_started_usage():
+            yield event
+
+        for event in self._close_thinking_block():
             yield event
 
         if self._text_block_index is not None and not self._text_block_closed:
