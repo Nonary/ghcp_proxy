@@ -10,6 +10,7 @@ import effort_mapping
 import util
 
 from constants import (
+    CLAUDE_DEFAULT_REASONING_EFFORT,
     FAKE_COMPACTION_PREFIX, FAKE_COMPACTION_SUMMARY_LABEL,
     COMPACTION_SUMMARY_PROMPT,
 )
@@ -858,12 +859,24 @@ def responses_request_to_chat(body: dict) -> dict:
         payload["tool_choice"] = mapped_tool_choice
 
     incoming_reasoning = body.get("reasoning")
-    if isinstance(incoming_reasoning, dict):
-        mapped_effort = effort_mapping.map_effort_for_model(
-            payload.get("model"), incoming_reasoning.get("effort")
-        )
-        if mapped_effort is not None:
-            payload["reasoning_effort"] = mapped_effort
+    incoming_effort = (
+        incoming_reasoning.get("effort")
+        if isinstance(incoming_reasoning, dict)
+        else None
+    )
+    resolved_model = payload.get("model")
+    # Codex omits `reasoning` (or sends `effort=null`) when its local catalog
+    # doesn't advertise reasoning summary support; without an explicit effort
+    # Copilot's Anthropic-fronted upstream silently disables extended thinking.
+    if (
+        incoming_effort is None
+        and isinstance(resolved_model, str)
+        and resolved_model.lower().startswith("claude-")
+    ):
+        incoming_effort = CLAUDE_DEFAULT_REASONING_EFFORT or "medium"
+    mapped_effort = effort_mapping.map_effort_for_model(resolved_model, incoming_effort)
+    if mapped_effort is not None:
+        payload["reasoning_effort"] = mapped_effort
 
     return payload
 

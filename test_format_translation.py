@@ -313,6 +313,32 @@ class FormatTranslationTests(unittest.TestCase):
 
         self.assertEqual(translated["reasoning_effort"], "max")
 
+    def test_responses_request_to_chat_defaults_claude_reasoning_when_missing(self):
+        # Codex omits the `reasoning` field entirely when its local model
+        # catalog does not advertise reasoning summary support. The proxy must
+        # still enable extended thinking for Claude models so Opus/Sonnet
+        # actually return `delta.thinking` chunks.
+        from constants import CLAUDE_DEFAULT_REASONING_EFFORT as _default
+
+        for body in (
+            {"model": "anthropic/claude-opus-4.7", "input": "hi"},
+            {"model": "claude-opus-4.7", "input": "hi", "reasoning": None},
+            {"model": "claude-sonnet-4.6", "input": "hi", "reasoning": {"effort": None}},
+        ):
+            translated = format_translation.responses_request_to_chat(body)
+            expected = "medium" if translated["model"] == "claude-opus-4.7" else _default
+            self.assertEqual(translated.get("reasoning_effort"), expected, body)
+
+    def test_responses_request_to_chat_default_omits_reasoning_for_haiku(self):
+        body = {"model": "claude-haiku-4.5", "input": "hi"}
+        translated = format_translation.responses_request_to_chat(body)
+        self.assertNotIn("reasoning_effort", translated)
+
+    def test_responses_request_to_chat_does_not_default_for_non_claude(self):
+        body = {"model": "openai/gpt-5.4", "input": "hi"}
+        translated = format_translation.responses_request_to_chat(body)
+        self.assertNotIn("reasoning_effort", translated)
+
     def test_anthropic_request_to_chat_preserves_cache_control_on_tool_results(self):
         body = {
             "model": "claude-sonnet-4.6",
