@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import deque
 from datetime import datetime, timezone
+import re
 from threading import Lock
 from typing import Callable
 
@@ -16,6 +17,11 @@ _SECURITY_MONITOR_PROMPT_MARKERS = (
 )
 _CONVERSATION_SUMMARIZER_PROMPT_MARKERS = (
     "you are a helpful ai assistant tasked with summarizing conversations.",
+)
+_SKILL_DOLLAR_INVOCATION_RE = re.compile(r"(?<![\w`])\$[A-Za-z][A-Za-z0-9-]{1,63}\b")
+_SKILL_PHRASE_INVOCATION_RE = re.compile(
+    r"\b(?:apply|use|run|invoke|load|open)\s+(?:the\s+)?[A-Za-z][A-Za-z0-9-]{1,63}\s+skill\b",
+    re.IGNORECASE,
 )
 
 
@@ -279,10 +285,18 @@ def _responses_item_candidate(item, *, explicit_initiators: dict[int, str] | Non
 def _determine_responses_candidate(input_param) -> tuple[object, str]:
     if isinstance(input_param, str):
         normalized_input, explicit_initiator = _strip_explicit_initiator_prefix(input_param)
+        if explicit_initiator == _EXPLICIT_USER_INITIATOR:
+            return normalized_input, explicit_initiator
+        if _contains_skill_invocation_text(normalized_input):
+            return normalized_input, AGENT_INITIATOR
         return normalized_input, explicit_initiator or USER_INITIATOR
 
     if isinstance(input_param, list):
         explicit_initiators = _explicit_initiators_for_responses_input(input_param)
+        if _trailing_user_messages_include_explicit_user(input_param, explicit_initiators):
+            return input_param, _EXPLICIT_USER_INITIATOR
+        if _trailing_user_messages_contain_skill_invocation(input_param):
+            return input_param, AGENT_INITIATOR
         ignorable_meta_messages: set[int] = set()
         for item in input_param:
             if not isinstance(item, dict):
@@ -296,6 +310,8 @@ def _determine_responses_candidate(input_param) -> tuple[object, str]:
                 ignorable_meta_messages.add(id(item))
         for item in reversed(input_param):
             if isinstance(item, dict) and id(item) in ignorable_meta_messages:
+                if _contains_skill_block_marker(_responses_item_text(item)):
+                    return input_param, AGENT_INITIATOR
                 continue
             candidate = _responses_item_candidate(item, explicit_initiators=explicit_initiators)
             if candidate is not None:
@@ -354,6 +370,80 @@ def _contains_skill_block_marker(text: str) -> bool:
     # rides alongside the typed prompt we want the whole turn classified as
     # agent so the safeguard does not have to rescue it via cooldown.
     return "<skill>" in text or "</skill>" in text
+
+
+def _contains_skill_invocation_text(text: str) -> bool:
+    if not isinstance(text, str) or not text:
+        return False
+    return (
+        _contains_skill_block_marker(text)
+        or _SKILL_DOLLAR_INVOCATION_RE.search(text) is not None
+        or _SKILL_PHRASE_INVOCATION_RE.search(text) is not None
+    )
+
+
+def _trailing_user_messages_contain_skill_invocation(messages) -> bool:
+    if not isinstance(messages, list):
+        return False
+
+    saw_user_message = False
+    for message in reversed(messages):
+        if not isinstance(message, dict):
+            if saw_user_message:
+                break
+            continue
+
+        role = str(message.get("role", "")).lower()
+        item_type = str(message.get("type", "")).lower()
+
+        if role == "user":
+            saw_user_message = True
+            if _contains_skill_invocation_text(_responses_item_text(message)):
+                return True
+            continue
+
+        if not saw_user_message:
+            continue
+
+        if role in {"system", "developer"}:
+            continue
+        if item_type in {"reasoning", "item_reference", "compaction"}:
+            continue
+        break
+
+    return False
+
+
+def _trailing_user_messages_include_explicit_user(messages, explicit_initiators: dict[int, str]) -> bool:
+    if not isinstance(messages, list) or not explicit_initiators:
+        return False
+
+    saw_user_message = False
+    for message in reversed(messages):
+        if not isinstance(message, dict):
+            if saw_user_message:
+                break
+            continue
+
+        role = str(message.get("role", "")).lower()
+        item_type = str(message.get("type", "")).lower()
+
+        if role == "user":
+            saw_user_message = True
+            if explicit_initiators.get(id(message)) == _EXPLICIT_USER_INITIATOR:
+                return True
+            continue
+
+        if not saw_user_message:
+            continue
+
+        if role in {"system", "developer"}:
+            continue
+        if item_type in {"reasoning", "item_reference", "compaction"}:
+            continue
+        break
+
+    return False
 
 
 def _is_codex_meta_user_text(text: str) -> bool:
@@ -547,6 +637,11 @@ def _determine_chat_candidate(messages) -> str:
         if explicit_initiator is not None:
             explicit_initiators[id(message)] = explicit_initiator
 
+    if _trailing_user_messages_include_explicit_user(messages, explicit_initiators):
+        return _EXPLICIT_USER_INITIATOR
+    if _trailing_user_messages_contain_skill_invocation(messages):
+        return AGENT_INITIATOR
+
     for message in reversed(messages):
         if not isinstance(message, dict):
             continue
@@ -682,12 +777,19 @@ def _determine_anthropic_candidate(messages, *, system=None) -> str:
         if saw_agent_meta and not saw_tool_result and not saw_real_user_content:
             ignorable_meta_messages.add(id(message))
 
+    if _trailing_user_messages_include_explicit_user(messages, explicit_initiators):
+        return _EXPLICIT_USER_INITIATOR
+    if _trailing_user_messages_contain_skill_invocation(messages):
+        return AGENT_INITIATOR
+
     for message in reversed(messages):
         if not isinstance(message, dict):
             continue
         role = str(message.get("role", "")).lower()
         if role == "user":
             if id(message) in ignorable_meta_messages:
+                if _anthropic_message_contains_skill_block(message):
+                    return AGENT_INITIATOR
                 continue
             if id(message) in explicit_initiators:
                 return explicit_initiators[id(message)]

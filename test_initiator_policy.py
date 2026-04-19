@@ -229,6 +229,26 @@ class InitiatorPolicyTests(unittest.TestCase):
         self.assertEqual(messages[-1]["content"], "new prompt")
         self.assertEqual(initiator, "user")
 
+    def test_plus_prefixed_skill_invocation_stays_user_for_responses_input(self):
+        policy = initiator_policy.InitiatorPolicy()
+
+        normalized_input, initiator = policy.resolve_responses_input("+ $superthinker debug this", "gpt-5.4")
+
+        self.assertEqual(normalized_input, "$superthinker debug this")
+        self.assertEqual(initiator, "user")
+
+    def test_plus_prefixed_skill_invocation_stays_user_for_chat_messages(self):
+        policy = initiator_policy.InitiatorPolicy()
+        messages = [
+            {"role": "assistant", "content": "previous answer"},
+            {"role": "user", "content": "+ $superthinker debug this"},
+        ]
+
+        initiator = policy.resolve_chat_messages(messages, "gpt-5.4")
+
+        self.assertEqual(messages[-1]["content"], "$superthinker debug this")
+        self.assertEqual(initiator, "user")
+
     def test_plus_prefix_forces_user_for_anthropic_messages(self):
         policy = initiator_policy.InitiatorPolicy()
         messages = [
@@ -239,6 +259,18 @@ class InitiatorPolicyTests(unittest.TestCase):
         initiator = policy.resolve_anthropic_messages(messages, "claude-sonnet-4.6")
 
         self.assertEqual(messages[-1]["content"][-1]["text"], "new prompt")
+        self.assertEqual(initiator, "user")
+
+    def test_plus_prefixed_skill_invocation_stays_user_for_anthropic_messages(self):
+        policy = initiator_policy.InitiatorPolicy()
+        messages = [
+            {"role": "assistant", "content": [{"type": "text", "text": "previous answer"}]},
+            {"role": "user", "content": [{"type": "text", "text": "+ $superthinker debug this"}]},
+        ]
+
+        initiator = policy.resolve_anthropic_messages(messages, "claude-sonnet-4.6")
+
+        self.assertEqual(messages[-1]["content"][-1]["text"], "$superthinker debug this")
         self.assertEqual(initiator, "user")
 
     def test_plus_prefixed_anthropic_user_message_wins_over_trailing_task_notification(self):
@@ -687,6 +719,87 @@ class InitiatorPolicyTests(unittest.TestCase):
         ]
         _normalized, initiator = policy.resolve_responses_input(input_items, "gpt-5.4-mini")
         self.assertEqual(initiator, "agent")
+
+    def test_trailing_skill_only_responses_user_message_forces_agent(self):
+        policy = initiator_policy.InitiatorPolicy()
+        input_items = [
+            {"type": "message", "role": "developer", "content": "developer instructions"},
+            {"type": "message", "role": "user", "content": "The stubborn problem is a premium charge mismatch."},
+            {
+                "type": "message",
+                "role": "user",
+                "content": "<skill>\nApply the superthinker skill.\n</skill>",
+            },
+        ]
+
+        normalized_input, initiator = policy.resolve_responses_input(input_items, "claude-opus-4.7")
+
+        self.assertIs(normalized_input, input_items)
+        self.assertEqual(initiator, "agent")
+
+    def test_trailing_skill_only_anthropic_user_message_forces_agent(self):
+        policy = initiator_policy.InitiatorPolicy()
+        messages = [
+            {"role": "assistant", "content": [{"type": "text", "text": "previous answer"}]},
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": "Investigate the premium charge mismatch."}],
+            },
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": "<skill>\nApply the superthinker skill.\n</skill>"}],
+            },
+        ]
+
+        initiator = policy.resolve_anthropic_messages(messages, "claude-opus-4.7")
+
+        self.assertEqual(initiator, "agent")
+
+    def test_skill_phrase_invocation_forces_agent_for_responses_input(self):
+        policy = initiator_policy.InitiatorPolicy()
+        input_items = [
+            {"type": "message", "role": "assistant", "content": "previous answer"},
+            {"type": "message", "role": "user", "content": "Use the superthinker skill for this billing bug."},
+        ]
+
+        normalized_input, initiator = policy.resolve_responses_input(input_items, "claude-opus-4.7")
+
+        self.assertIs(normalized_input, input_items)
+        self.assertEqual(initiator, "agent")
+
+    def test_plus_prefixed_prompt_overrides_trailing_skill_block_for_responses_input(self):
+        policy = initiator_policy.InitiatorPolicy()
+        input_items = [
+            {"type": "message", "role": "developer", "content": "developer instructions"},
+            {"type": "message", "role": "user", "content": "+ Investigate the billing bug."},
+            {
+                "type": "message",
+                "role": "user",
+                "content": "<skill>\nApply the superthinker skill.\n</skill>",
+            },
+        ]
+
+        normalized_input, initiator = policy.resolve_responses_input(input_items, "claude-opus-4.7")
+
+        self.assertIs(normalized_input, input_items)
+        self.assertEqual(input_items[1]["content"], "Investigate the billing bug.")
+        self.assertEqual(initiator, "user")
+
+    def test_plus_prefixed_prompt_overrides_trailing_skill_block_for_anthropic_messages(self):
+        policy = initiator_policy.InitiatorPolicy()
+        messages = [
+            {"role": "assistant", "content": [{"type": "text", "text": "previous answer"}]},
+            {"role": "user", "content": [{"type": "text", "text": "+ Investigate the billing bug."}]},
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": "<skill>\nApply the superthinker skill.\n</skill>"}],
+            },
+        ]
+
+        initiator = policy.resolve_anthropic_messages(messages, "claude-opus-4.7")
+
+        self.assertEqual(messages[1]["content"][-1]["text"], "Investigate the billing bug.")
+        self.assertEqual(initiator, "user")
 
     def test_plus_prefix_bypasses_cooldown_for_plain_responses_input(self):
         policy = initiator_policy.InitiatorPolicy()

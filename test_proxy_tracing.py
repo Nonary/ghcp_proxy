@@ -104,6 +104,23 @@ class ProxyTracingTests(unittest.TestCase):
         self.assertTrue(plan.trace_context["bridge"])
         self.assertEqual(plan.trace_context["strategy_name"], "responses_to_chat")
 
+    def test_header_trace_subset_keeps_subagent_header(self):
+        subset = proxy._header_trace_subset(
+            {
+                "X-OpenAI-Subagent": "collab_spawn",
+                "X-Initiator": "agent",
+                "Authorization": "secret",
+            }
+        )
+
+        self.assertEqual(
+            subset,
+            {
+                "X-OpenAI-Subagent": "collab_spawn",
+                "X-Initiator": "agent",
+            },
+        )
+
     def test_finish_usage_and_trace_emits_failure_diagnostic_for_bridge_request(self):
         plan = proxy.UpstreamRequestPlan(
             request_id="req_123",

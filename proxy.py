@@ -95,6 +95,7 @@ _TRACE_HEADER_ALLOWLIST = {
     "anthropic-beta",
     "session_id",
     "x-client-request-id",
+    "x-openai-subagent",
     "x-request-id",
     "x-github-request-id",
 }
