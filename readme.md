@@ -53,14 +53,23 @@ http://localhost:8000/
 
 ## Configure Codex
 
-Update `~/.codex/config.toml` so Codex points at the proxy:
+Enable Codex from the dashboard when the proxy is running. Activation writes proxy-managed files under `~/.codex`:
+
+- `managed_config.toml`
+- `ghcp-proxy-models.json`
+
+This leaves the user's real `~/.codex/config.toml` untouched.
+
+The managed Codex config written by the dashboard is:
 
 ```toml
-# Primary Model Configuration
 model_provider = "custom"
 model = "gpt-5.4"
 model_reasoning_effort = "high"
 approvals_reviewer = "user"
+model_catalog_json = "~/.codex/ghcp-proxy-models.json"
+model_context_window = 184000
+model_auto_compact_token_limit = 120000
 
 [model_providers.custom]
 name = "OpenAI"
@@ -165,9 +174,11 @@ The dashboard activation controls are meant to behave like a light switch.
 
 - enabling a client that is already enabled is a no-op
 - disabling a client that is already disabled is a no-op
-- an existing config is backed up only when the proxy first replaces it
-- disabling restores the latest backup when one exists
-- if no backup exists, disabling removes the proxy-managed config
+- Codex activation writes `~/.codex/managed_config.toml` and `~/.codex/ghcp-proxy-models.json`
+- Codex activation does not edit `~/.codex/config.toml`
+- an existing managed config is backed up only when the proxy first replaces it
+- disabling restores the latest managed-config backup when one exists
+- if no backup exists, disabling removes the proxy-managed files
 
 ## Dashboard Data Sources
 

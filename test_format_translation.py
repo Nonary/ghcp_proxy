@@ -227,6 +227,28 @@ class FormatTranslationTests(unittest.TestCase):
         outbound = format_translation.anthropic_request_to_responses(body)
         self.assertNotIn("reasoning", outbound)
 
+    def test_responses_request_to_chat_preserves_xhigh_for_gpt_models(self):
+        body = {
+            "model": "openai/gpt-5.4",
+            "input": "hi",
+            "reasoning": {"effort": "xhigh"},
+        }
+
+        translated = format_translation.responses_request_to_chat(body)
+
+        self.assertEqual(translated["reasoning_effort"], "xhigh")
+
+    def test_responses_request_to_chat_maps_xhigh_to_max_for_claude_models(self):
+        body = {
+            "model": "anthropic/claude-sonnet-4.6",
+            "input": "hi",
+            "reasoning": {"effort": "xhigh"},
+        }
+
+        translated = format_translation.responses_request_to_chat(body)
+
+        self.assertEqual(translated["reasoning_effort"], "max")
+
     def test_anthropic_request_to_chat_preserves_cache_control_on_tool_results(self):
         body = {
             "model": "claude-sonnet-4.6",

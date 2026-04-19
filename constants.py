@@ -40,7 +40,10 @@ SQLITE_CACHE_FILE = os.path.join(
     os.path.expanduser(os.environ.get("GHCP_CACHE_DB_PATH", os.path.join(TOKEN_DIR, ".ghcp_proxy-cache-v2.sqlite3")))
 )
 CODEX_CONFIG_DIR    = os.path.expanduser("~/.codex")
-CODEX_CONFIG_FILE   = os.path.join(CODEX_CONFIG_DIR, "config.toml")
+CODEX_MANAGED_CONFIG_FILE = os.path.join(CODEX_CONFIG_DIR, "managed_config.toml")
+CODEX_PROXY_MODEL_CATALOG_FILE = os.path.join(CODEX_CONFIG_DIR, "ghcp-proxy-models.json")
+CODEX_PROXY_MODEL_CONTEXT_WINDOW = 184000
+CODEX_PROXY_MODEL_AUTO_COMPACT_TOKEN_LIMIT = 120000
 CLAUDE_CONFIG_DIR   = os.path.expanduser("~/.claude")
 CLAUDE_SETTINGS_FILE = os.path.join(CLAUDE_CONFIG_DIR, "settings.json")
 CLAUDE_MAX_CONTEXT_TOKENS = "128000"
@@ -236,53 +239,17 @@ Please write the summary now, following the structure and guidelines above. Be c
 
 # ─── Model pricing & SKU tables ──────────────────────────────────────────────
 MODEL_PRICING = {
-    "claude-haiku-3": {
-        "provider": "Anthropic",
-        "input_per_million": 0.25,
-        "cached_input_per_million": 0.025,
-        "output_per_million": 1.25,
-    },
-    "claude-haiku-3-5": {
-        "provider": "Anthropic",
-        "input_per_million": 0.80,
-        "cached_input_per_million": 0.08,
-        "output_per_million": 4.00,
-    },
     "claude-haiku-4-5": {
         "provider": "Anthropic",
         "input_per_million": 1.00,
         "cached_input_per_million": 0.10,
         "output_per_million": 5.00,
     },
-    "claude-sonnet-3-5": {
-        "provider": "Anthropic",
-        "input_per_million": 3.00,
-        "cached_input_per_million": 0.30,
-        "output_per_million": 15.00,
-    },
-    "claude-sonnet-3-7": {
-        "provider": "Anthropic",
-        "input_per_million": 3.00,
-        "cached_input_per_million": 0.30,
-        "output_per_million": 15.00,
-    },
     "claude-sonnet-4.6": {
         "provider": "Anthropic",
         "input_per_million": 3.00,
         "cached_input_per_million": 0.30,
         "output_per_million": 15.00,
-    },
-    "claude-opus-3": {
-        "provider": "Anthropic",
-        "input_per_million": 15.00,
-        "cached_input_per_million": 1.50,
-        "output_per_million": 75.00,
-    },
-    "claude-opus-4.1": {
-        "provider": "Anthropic",
-        "input_per_million": 15.00,
-        "cached_input_per_million": 1.50,
-        "output_per_million": 75.00,
     },
     "claude-opus-4.6": {
         "provider": "Anthropic",
@@ -302,18 +269,6 @@ MODEL_PRICING = {
         "cached_input_per_million": 0.50,
         "output_per_million": 8.00,
     },
-    "gpt-4.1-mini": {
-        "provider": "OpenAI",
-        "input_per_million": 0.40,
-        "cached_input_per_million": 0.10,
-        "output_per_million": 1.60,
-    },
-    "gpt-4.1-nano": {
-        "provider": "OpenAI",
-        "input_per_million": 0.10,
-        "cached_input_per_million": 0.025,
-        "output_per_million": 0.40,
-    },
     "gpt-4o": {
         "provider": "OpenAI",
         "input_per_million": 2.50,
@@ -326,43 +281,7 @@ MODEL_PRICING = {
         "cached_input_per_million": 0.075,
         "output_per_million": 0.60,
     },
-    "gpt-5": {
-        "provider": "OpenAI",
-        "input_per_million": 1.25,
-        "cached_input_per_million": 0.125,
-        "output_per_million": 10.00,
-    },
     "gpt-5-mini": {
-        "provider": "OpenAI",
-        "input_per_million": 0.25,
-        "cached_input_per_million": 0.025,
-        "output_per_million": 2.00,
-    },
-    "gpt-5-nano": {
-        "provider": "OpenAI",
-        "input_per_million": 0.05,
-        "cached_input_per_million": 0.005,
-        "output_per_million": 0.40,
-    },
-    "gpt-5.1": {
-        "provider": "OpenAI",
-        "input_per_million": 1.25,
-        "cached_input_per_million": 0.125,
-        "output_per_million": 10.00,
-    },
-    "gpt-5.1-codex": {
-        "provider": "OpenAI",
-        "input_per_million": 1.25,
-        "cached_input_per_million": 0.125,
-        "output_per_million": 10.00,
-    },
-    "gpt-5.1-codex-max": {
-        "provider": "OpenAI",
-        "input_per_million": 1.25,
-        "cached_input_per_million": 0.125,
-        "output_per_million": 10.00,
-    },
-    "gpt-5.1-codex-mini": {
         "provider": "OpenAI",
         "input_per_million": 0.25,
         "cached_input_per_million": 0.025,
@@ -398,12 +317,6 @@ MODEL_PRICING = {
         "cached_input_per_million": 0.075,
         "output_per_million": 4.50,
     },
-    "gpt-5.4-nano": {
-        "provider": "OpenAI",
-        "input_per_million": 0.20,
-        "cached_input_per_million": 0.02,
-        "output_per_million": 1.25,
-    },
     "gemini-3-flash-preview": {
         "provider": "Google",
         "input_per_million": 0.10,
@@ -425,40 +338,20 @@ MODEL_PRICING = {
 }
 
 MODEL_PRICING_ALIASES = {
-    "anthropic/claude-haiku-3": "claude-haiku-3",
-    "anthropic/claude-haiku-3.5": "claude-haiku-3-5",
     "anthropic/claude-haiku-4.5": "claude-haiku-4-5",
-    "anthropic/claude-opus-3": "claude-opus-3",
-    "anthropic/claude-opus-4": "claude-opus-4.1",
-    "anthropic/claude-opus-4.0": "claude-opus-4.1",
-    "anthropic/claude-opus-4.1": "claude-opus-4.1",
     "anthropic/claude-opus-4.5": "claude-opus-4.6",
-    "anthropic/claude-sonnet-3.5": "claude-sonnet-3-5",
-    "anthropic/claude-sonnet-3.7": "claude-sonnet-3-7",
     "anthropic/claude-sonnet-4": "claude-sonnet-4.6",
     "anthropic/claude-sonnet-4.5": "claude-sonnet-4.6",
     "claude-haiku-4.5": "claude-haiku-4-5",
-    "claude-haiku-3.5": "claude-haiku-3-5",
-    "claude-haiku-3": "claude-haiku-3",
-    "claude-opus-4": "claude-opus-4.1",
-    "claude-opus-4.0": "claude-opus-4.1",
-    "claude-opus-4.1": "claude-opus-4.1",
     "claude-opus-4.5": "claude-opus-4.6",
     "claude-opus-4-6": "claude-opus-4.6",
-    "claude-opus-3": "claude-opus-3",
-    "claude-sonnet-3.5": "claude-sonnet-3-5",
-    "claude-sonnet-3.7": "claude-sonnet-3-7",
     "claude-sonnet-4": "claude-sonnet-4.6",
     "claude-sonnet-4.5": "claude-sonnet-4.6",
     "claude-sonnet-4-6": "claude-sonnet-4.6",
     "gpt-5.4 mini": "gpt-5.4-mini",
     "gpt-5.4-mini": "gpt-5.4-mini",
-    "gpt-5.4 nano": "gpt-5.4-nano",
-    "gpt-5.4-nano": "gpt-5.4-nano",
     "gpt-5 mini": "gpt-5-mini",
     "gpt-5-mini": "gpt-5-mini",
-    "gpt-5 nano": "gpt-5-nano",
-    "gpt-5-nano": "gpt-5-nano",
 }
 
 PREMIUM_REQUEST_MULTIPLIERS = {
@@ -471,10 +364,6 @@ PREMIUM_REQUEST_MULTIPLIERS = {
     "claude-sonnet-4.6": 1.0,
     "gpt-4.1": 0.0,
     "gpt-4o": 0.0,
-    "gpt-5.1": 1.0,
-    "gpt-5.1-codex": 1.0,
-    "gpt-5.1-codex-max": 1.0,
-    "gpt-5.1-codex-mini": 0.33,
     "gpt-5.2": 1.0,
     "gpt-5.2-codex": 1.0,
     "gpt-5.3-codex": 1.0,

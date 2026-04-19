@@ -11,13 +11,19 @@ class EffortMappingTests(unittest.TestCase):
                 effort,
             )
 
-    def test_xhigh_alias_maps_to_max(self):
+    def test_xhigh_is_preserved_for_gpt_models(self):
         self.assertEqual(
             effort_mapping.map_effort_for_model("gpt-5.4", "xhigh"),
+            "xhigh",
+        )
+
+    def test_xhigh_alias_maps_to_max_for_claude_models(self):
+        self.assertEqual(
+            effort_mapping.map_effort_for_model("claude-sonnet-4.6", "xhigh"),
             "max",
         )
         self.assertEqual(
-            effort_mapping.map_effort_for_model("gpt-5.4", "x-high"),
+            effort_mapping.map_effort_for_model("claude-sonnet-4.6", "x-high"),
             "max",
         )
 

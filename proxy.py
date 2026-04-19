@@ -52,8 +52,11 @@ from proxy_client_config import (
 from constants import (
     DASHBOARD_FILE,
     DETAILED_REQUEST_HISTORY_LIMIT,
-    CODEX_CONFIG_FILE,
+    CODEX_MANAGED_CONFIG_FILE,
+    CODEX_PROXY_MODEL_CATALOG_FILE,
     CODEX_PROXY_CONFIG,
+    CODEX_PROXY_MODEL_CONTEXT_WINDOW,
+    CODEX_PROXY_MODEL_AUTO_COMPACT_TOKEN_LIMIT,
     CLAUDE_SETTINGS_FILE,
     CLAUDE_PROXY_SETTINGS,
     CLAUDE_MAX_CONTEXT_TOKENS,
@@ -152,13 +155,17 @@ usage_tracker = usage_tracking.UsageTracker(
 
 client_proxy_config_service = ProxyClientConfigService(
     ProxyClientConfig(
-        codex_config_file=CODEX_CONFIG_FILE,
+        codex_managed_config_file=CODEX_MANAGED_CONFIG_FILE,
+        codex_model_catalog_file=CODEX_PROXY_MODEL_CATALOG_FILE,
         codex_proxy_config=CODEX_PROXY_CONFIG,
+        codex_model_context_window=CODEX_PROXY_MODEL_CONTEXT_WINDOW,
+        codex_model_auto_compact_token_limit=CODEX_PROXY_MODEL_AUTO_COMPACT_TOKEN_LIMIT,
         claude_settings_file=CLAUDE_SETTINGS_FILE,
         claude_proxy_settings=CLAUDE_PROXY_SETTINGS,
         claude_max_context_tokens=CLAUDE_MAX_CONTEXT_TOKENS,
         claude_max_output_tokens=CLAUDE_MAX_OUTPUT_TOKENS,
-    )
+    ),
+    model_capabilities_provider=lambda: fetch_copilot_model_capabilities(),
 )
 model_routing_config_service = ModelRoutingConfigService(ModelRoutingConfig())
 bridge_planner = ProtocolBridgePlanner(model_routing_config_service)
@@ -1448,6 +1455,92 @@ async def _proxy_bridge_streaming_response(plan: UpstreamRequestPlan, bridge_pla
         usage_event=plan.usage_event,
         trace_plan=plan,
     )
+
+
+_COPILOT_MODEL_CAPS_CACHE: dict[str, object] = {"key": None, "ts": 0.0, "data": {}}
+_COPILOT_MODEL_CAPS_TTL_SECONDS = 300.0
+# Capability fetch is best-effort and used during client-config writes (codex
+# `enable_target`). Use a tight timeout so a slow/unreachable upstream does not
+# stall proxy initialization — defaults still work without it.
+_COPILOT_MODEL_CAPS_FETCH_TIMEOUT_SECONDS = 5.0
+
+
+def fetch_copilot_model_capabilities() -> dict[str, dict]:
+    """Best-effort fetch of upstream Copilot /models capabilities.
+
+    Returns a mapping ``{model_id: capabilities_dict}`` enriched into the
+    shape consumed by ``ProxyClientConfigService``. Any failure (missing
+    auth, network error, parse error) returns an empty dict so the caller
+    falls back to defaults.
+    """
+    try:
+        api_base = auth.get_api_base().rstrip("/")
+    except Exception:
+        return {}
+
+    now = time.monotonic()
+    cache = _COPILOT_MODEL_CAPS_CACHE
+    if (
+        cache.get("key") == api_base
+        and isinstance(cache.get("data"), dict)
+        and cache["data"]
+        and (now - float(cache.get("ts", 0.0))) < _COPILOT_MODEL_CAPS_TTL_SECONDS
+    ):
+        return dict(cache["data"])  # type: ignore[arg-type]
+
+    try:
+        api_key = auth.get_api_key()
+    except Exception:
+        return {}
+
+    headers = format_translation.build_copilot_headers(api_key)
+    url = f"{api_base}/models"
+    try:
+        with httpx.Client(timeout=_COPILOT_MODEL_CAPS_FETCH_TIMEOUT_SECONDS) as client:
+            response = client.get(url, headers=headers)
+            response.raise_for_status()
+            payload = response.json()
+    except Exception:
+        return {}
+
+    raw_entries = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(raw_entries, list):
+        return {}
+
+    result: dict[str, dict] = {}
+    for entry in raw_entries:
+        if not isinstance(entry, dict):
+            continue
+        model_id = entry.get("id")
+        if not isinstance(model_id, str) or not model_id:
+            continue
+        caps = entry.get("capabilities") if isinstance(entry.get("capabilities"), dict) else {}
+        limits = caps.get("limits") if isinstance(caps.get("limits"), dict) else {}
+        supports = caps.get("supports") if isinstance(caps.get("supports"), dict) else {}
+
+        ctx = limits.get("max_context_window_tokens") or limits.get("max_prompt_tokens")
+        reasoning_efforts = supports.get("reasoning_effort") if isinstance(supports.get("reasoning_effort"), list) else None
+        vision_flag = bool(supports.get("vision"))
+        parallel = supports.get("parallel_tool_calls")
+        input_modalities = ["text", "image"] if vision_flag else ["text"]
+
+        enriched: dict[str, object] = {
+            "input_modalities": input_modalities,
+            "vision": vision_flag,
+        }
+        if isinstance(ctx, int) and ctx > 0:
+            enriched["context_window"] = ctx
+            enriched["max_context_window"] = ctx
+        if reasoning_efforts is not None:
+            enriched["reasoning_efforts"] = reasoning_efforts
+        if isinstance(parallel, bool):
+            enriched["parallel_tool_calls"] = parallel
+        result[model_id] = enriched
+
+    cache["key"] = api_base
+    cache["ts"] = now
+    cache["data"] = result
+    return dict(result)
 
 
 async def _proxy_models_request() -> Response:

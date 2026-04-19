@@ -459,7 +459,7 @@ def _is_codex_bootstrap_mini_request(input_param, model_name: str | None) -> boo
 
 def _is_codex_title_generation_mini_request(input_param, model_name: str | None) -> bool:
     normalized_model = _normalize_model_name(model_name)
-    if normalized_model not in {"gpt-5.4-mini", "gpt-5.1-codex-mini"}:
+    if normalized_model not in {"gpt-5.4-mini"}:
         return False
     if not isinstance(input_param, list):
         return False

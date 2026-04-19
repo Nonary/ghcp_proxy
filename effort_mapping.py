@@ -5,26 +5,40 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 
 
-_CANONICAL = {"low", "medium", "high", "max"}
-_ALIASES = {
+_CANONICAL = {"low", "medium", "high", "max", "xhigh"}
+_COMMON_ALIASES = {
+    "minimal": "low",
+    "none": "low",
+}
+_CLAUDE_ALIASES = {
     "xhigh": "max",
     "x-high": "max",
     "extra-high": "max",
     "extra_high": "max",
-    "minimal": "low",
-    "none": "low",
 }
 
 
-def _canonicalize(effort: str | None) -> str | None:
+def _normalize_model(model: str | None) -> str:
+    normalized = (model or "").strip().lower()
+    if normalized.startswith("anthropic/"):
+        normalized = normalized.split("/", 1)[1]
+    return normalized
+
+
+def _canonicalize(model: str | None, effort: str | None) -> str | None:
     if not isinstance(effort, str):
         return None
     normalized = effort.strip().lower()
     if not normalized:
         return None
+    normalized_model = _normalize_model(model)
+    if normalized_model.startswith("claude-"):
+        mapped = _CLAUDE_ALIASES.get(normalized)
+        if mapped is not None:
+            return mapped
     if normalized in _CANONICAL:
         return normalized
-    return _ALIASES.get(normalized)
+    return _COMMON_ALIASES.get(normalized)
 
 
 class ModelEffortStrategy(ABC):
@@ -69,9 +83,7 @@ _STRATEGIES: list[ModelEffortStrategy] = [
 
 
 def _strategy_for(model: str | None) -> ModelEffortStrategy:
-    normalized = (model or "").strip().lower()
-    if normalized.startswith("anthropic/"):
-        normalized = normalized.split("/", 1)[1]
+    normalized = _normalize_model(model)
     for strategy in _STRATEGIES:
         if strategy.matches(normalized):
             return strategy
@@ -79,7 +91,7 @@ def _strategy_for(model: str | None) -> ModelEffortStrategy:
 
 
 def map_effort_for_model(model: str | None, effort: str | None) -> str | None:
-    canonical = _canonicalize(effort)
+    canonical = _canonicalize(model, effort)
     if canonical is None:
         return None
     return _strategy_for(model).map(canonical)

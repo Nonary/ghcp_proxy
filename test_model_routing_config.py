@@ -301,7 +301,7 @@ class ModelRoutingConfigTests(unittest.TestCase):
                     {
                         "source_model": "gpt-5.3-codex",
                         "target_model": "claude-opus-4.6",
-                        "compact_fallback_model": "gpt-5.1-codex-max",
+                        "compact_fallback_model": "gpt-5.2-codex",
                     },
                 ],
             }
@@ -309,16 +309,16 @@ class ModelRoutingConfigTests(unittest.TestCase):
 
         self.assertEqual(
             payload["mappings"][0]["compact_fallback_model"],
-            "gpt-5.1-codex-max",
+            "gpt-5.2-codex",
         )
         self.assertEqual(
             service.resolve_compact_fallback_model("gpt-5.3-codex"),
-            "gpt-5.1-codex-max",
+            "gpt-5.2-codex",
         )
         written = json.loads(config_path.read_text(encoding="utf-8"))
         self.assertEqual(
             written["mappings"][0]["compact_fallback_model"],
-            "gpt-5.1-codex-max",
+            "gpt-5.2-codex",
         )
 
     def test_compact_fallback_rejects_non_gpt_override(self):
