@@ -41,6 +41,21 @@ def _is_subagent_request(subagent: str | None) -> bool:
     return isinstance(subagent, str) and bool(subagent.strip())
 
 
+# Codex tags every spawned subagent with `x-openai-subagent: <name>`. Only
+# the `guardian` subagent is the approval / security-monitor flow whose
+# model we want to override via the routing-config approval mapping. Other
+# named subagents (e.g. `review`, `general-purpose`, `explorer`) are
+# user-initiated helpers that should keep using the user's selected model.
+# We still treat them as agent-initiated traffic for safeguard purposes.
+_APPROVAL_SUBAGENT_NAMES = frozenset({"guardian"})
+
+
+def _is_approval_subagent(subagent: str | None) -> bool:
+    if not isinstance(subagent, str):
+        return False
+    return subagent.strip().lower() in _APPROVAL_SUBAGENT_NAMES
+
+
 def _parse_event_time(value: str | None) -> datetime | None:
     if not isinstance(value, str) or not value:
         return None
@@ -331,9 +346,17 @@ def _responses_system_prompt_includes_security_monitor_prompt(input_param) -> bo
     return False
 
 
+def _contains_skill_block_marker(text: str) -> bool:
+    if not isinstance(text, str) or not text:
+        return False
+    # Skill bodies that get auto-attached to a user turn (Codex, Claude Code,
+    # opencode, etc.) are wrapped in <skill>...</skill>. When such a block
+    # rides alongside the typed prompt we want the whole turn classified as
+    # agent so the safeguard does not have to rescue it via cooldown.
+    return "<skill>" in text or "</skill>" in text
+
+
 def _is_codex_meta_user_text(text: str) -> bool:
-    if isinstance(text, str) and '<skill>' in text:
-        return True
     if not isinstance(text, str):
         return False
     normalized = text.lstrip()
@@ -379,6 +402,9 @@ def _responses_user_message_traits(item) -> tuple[bool, bool]:
         return False, False
 
     if _is_environment_context_message(item) or _is_task_title_generation_message(item):
+        return True, False
+
+    if _responses_item_text(item) and _contains_skill_block_marker(_responses_item_text(item)):
         return True, False
 
     content = item.get("content")
@@ -567,9 +593,31 @@ def _strip_explicit_initiator_prefix_from_anthropic_message(
     return default_initiator
 
 
+def _anthropic_message_contains_skill_block(message) -> bool:
+    if not isinstance(message, dict):
+        return False
+    content = message.get("content")
+    if isinstance(content, str):
+        return _contains_skill_block_marker(content)
+    if not isinstance(content, list):
+        return False
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("type", "")).lower() != "text":
+            continue
+        text = item.get("text")
+        if _contains_skill_block_marker(text):
+            return True
+    return False
+
+
 def _anthropic_user_message_traits(message) -> tuple[bool, bool, bool]:
     if not isinstance(message, dict):
         return False, False, False
+
+    if _anthropic_message_contains_skill_block(message):
+        return False, True, False
 
     content = message.get("content")
     if isinstance(content, str):
@@ -1004,12 +1052,14 @@ def is_approval_agent_request(
     """Detect whether an incoming request originates from an approval agent.
 
     Covers two patterns:
-      * Codex sends ``x-openai-subagent: <name>`` (e.g. ``guardian``) for
-        approval / review spawns; callers surface that header via ``subagent``.
+      * Codex sends ``x-openai-subagent: guardian`` for approval /
+        security-monitor spawns; callers surface that header via ``subagent``.
+        Other subagent names (e.g. ``review``, ``general-purpose``) are user-
+        initiated helpers and keep the user's selected model.
       * Approval/security-monitor prompts identify themselves explicitly in the
         system/developer instructions.
     """
-    if _is_subagent_request(subagent):
+    if _is_approval_subagent(subagent):
         return True
     return _request_includes_security_monitor_prompt(
         inbound_protocol=inbound_protocol,

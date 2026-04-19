@@ -227,6 +227,41 @@ class ProtocolBridgePlannerTests(unittest.TestCase):
 
         self.assertEqual(plan.resolved_model, "claude-opus-4.6")
 
+    def test_planner_does_not_use_approval_mapping_for_review_subagent(self):
+        planner = ProtocolBridgePlanner(
+            _RoutingConfigStub(target_model="claude-opus-4.7", approval_target_model="gpt-5.4-mini")
+        )
+        body = {"model": "claude-opus-4.7", "input": "hello", "stream": False}
+
+        plan = proxy.asyncio.run(
+            planner.plan(
+                "responses",
+                body,
+                api_base="https://example.invalid",
+                api_key="test-key",
+                subagent="review",
+            )
+        )
+
+        self.assertEqual(plan.resolved_model, "claude-opus-4.7")
+
+    def test_planner_does_not_use_approval_mapping_for_general_purpose_subagent(self):
+        planner = ProtocolBridgePlanner(
+            _RoutingConfigStub(target_model="claude-opus-4.7", approval_target_model="gpt-5.4-mini")
+        )
+        body = {"model": "claude-opus-4.7", "input": "hello", "stream": False}
+
+        plan = proxy.asyncio.run(
+            planner.plan(
+                "responses",
+                body,
+                api_base="https://example.invalid",
+                api_key="test-key",
+                subagent="general-purpose",
+            )
+        )
+
+        self.assertEqual(plan.resolved_model, "claude-opus-4.7")
     def test_planner_swaps_to_gpt_fallback_on_compact_against_claude(self):
         planner = ProtocolBridgePlanner(
             _RoutingConfigStub(target_model="claude-opus-4.6", compact_fallback_model="gpt-5.4")
