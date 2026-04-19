@@ -499,6 +499,8 @@ class ProxyClientConfigService:
         top_level_lines.extend(
             [
                 f"model_catalog_json = {_toml_basic_string(self._config.codex_model_catalog_file)}",
+                f"model_context_window = {self._config.codex_model_context_window}",
+                f"model_auto_compact_token_limit = {self._config.codex_model_auto_compact_token_limit}",
             ]
         )
         lines = [*top_level_lines, ""]

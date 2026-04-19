@@ -8,6 +8,69 @@ import proxy
 
 
 class ProxyTracingTests(unittest.TestCase):
+    def test_prepare_upstream_request_keeps_full_prompt_preview_for_user_initiator(self):
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/responses"),
+            method="POST",
+            headers={},
+        )
+        long_system = "system-" + ("s" * 5000)
+        long_user = "user-" + ("u" * 5000)
+        source_body = {
+            "model": "gpt-5.4",
+            "messages": [
+                {"role": "system", "content": long_system},
+                {"role": "user", "content": long_user},
+            ],
+        }
+
+        with (
+            mock.patch.object(proxy, "request_tracing_enabled", return_value=True),
+            mock.patch.object(proxy.usage_tracker, "start_event", return_value={"request_id": "req_123"}) as start_event,
+            mock.patch.object(proxy, "_append_request_trace") as append_trace,
+        ):
+            plan, error_response = proxy._prepare_upstream_request(
+                request,
+                body=source_body,
+                requested_model="gpt-5.4",
+                resolved_model="gpt-5.4",
+                upstream_path="/chat/completions",
+                upstream_url="https://example.invalid/chat/completions",
+                header_builder=lambda _api_key, _request_id: {"X-Initiator": "user"},
+                error_response=proxy.format_translation.openai_error_response,
+                api_key="test-key",
+            )
+
+        self.assertIsNone(error_response)
+        self.assertIsNotNone(plan)
+
+        prompt_preview = start_event.call_args.kwargs["prompt_preview"]
+        self.assertEqual(prompt_preview["system"], long_system)
+        self.assertEqual(prompt_preview["user"], long_user)
+        self.assertNotIn("system_truncated", prompt_preview)
+        self.assertNotIn("user_truncated", prompt_preview)
+
+        trace_payload = append_trace.call_args.args[0]
+        self.assertEqual(trace_payload["request_prompt"]["system"], long_system)
+        self.assertEqual(trace_payload["request_prompt"]["user"], long_user)
+
+    def test_extract_prompt_preview_truncates_agent_requests_normally(self):
+        long_system = "system-" + ("s" * 5000)
+        long_user = "user-" + ("u" * 5000)
+        body = {
+            "messages": [
+                {"role": "system", "content": long_system},
+                {"role": "user", "content": long_user},
+            ]
+        }
+
+        preview = proxy._extract_prompt_preview(body)
+
+        self.assertTrue(preview["system_truncated"])
+        self.assertTrue(preview["user_truncated"])
+        self.assertIn("…[truncated; original ", preview["system"])
+        self.assertIn("…[truncated; original ", preview["user"])
+
     def test_prepare_upstream_request_keeps_source_body_for_bridge_traces(self):
         request = SimpleNamespace(
             url=SimpleNamespace(path="/v1/responses"),

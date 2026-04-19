@@ -610,6 +610,7 @@ def _trim_trace_text(value, *, max_chars: int = REQUEST_TRACE_BODY_MAX_BYTES):
 def _extract_prompt_preview(
     body: dict | None,
     *,
+    truncate: bool = True,
     max_chars: int = REQUEST_PROMPT_PREVIEW_MAX_CHARS,
 ) -> dict | None:
     """Pull a human-readable prompt preview out of a request body.
@@ -669,7 +670,7 @@ def _extract_prompt_preview(
         # Keep the most recent context for user prompts (tail) and the
         # leading context for system prompts (head) since the head carries
         # the instructions.
-        if len(combined) <= max_chars:
+        if not truncate or max_chars <= 0 or len(combined) <= max_chars:
             return combined, False
         return combined[:max_chars] + f"\n…[truncated; original {len(combined)} chars]", True
 
@@ -677,7 +678,7 @@ def _extract_prompt_preview(
     # For user prompts, prefer the latest turn when truncating.
     user_combined = "\n\n".join(part.strip() for part in user_parts if isinstance(part, str) and part.strip())
     user_truncated = False
-    if len(user_combined) > max_chars:
+    if truncate and max_chars > 0 and len(user_combined) > max_chars:
         user_combined = "…[truncated; original " + str(len(user_combined)) + " chars]\n" + user_combined[-max_chars:]
         user_truncated = True
 
@@ -705,6 +706,7 @@ def _emit_request_trace_start(
     upstream_body: dict | None,
     outbound_headers: dict | None,
     trace_metadata: dict | None = None,
+    prompt_preview: dict | None = None,
 ) -> dict:
     parsed_upstream = urlsplit(upstream_url)
     context = {
@@ -733,9 +735,10 @@ def _emit_request_trace_start(
         "outbound_headers": _header_trace_subset(outbound_headers),
         "trace": trace_metadata or {},
     }
-    prompt_preview = _extract_prompt_preview(
-        request_body if isinstance(request_body, dict) else upstream_body
-    )
+    if prompt_preview is None:
+        prompt_preview = _extract_prompt_preview(
+            request_body if isinstance(request_body, dict) else upstream_body
+        )
     if prompt_preview:
         payload["request_prompt"] = prompt_preview
         context["request_prompt"] = prompt_preview
@@ -829,11 +832,13 @@ def _prepare_upstream_request(
             return None, error_response(401, AUTH_FAILURE_MESSAGE)
 
     headers = header_builder(effective_api_key, request_id)
+    initiator = str(headers.get("X-Initiator", "")).strip().lower()
     initiator_verdict = None
     if isinstance(trace_metadata, dict):
         initiator_verdict = trace_metadata.get("initiator_verdict")
     prompt_preview = _extract_prompt_preview(
-        source_body if isinstance(source_body, dict) else body
+        source_body if isinstance(source_body, dict) else body,
+        truncate=initiator != "user",
     )
     usage_event = usage_tracker.start_event(
         request,
@@ -867,6 +872,7 @@ def _prepare_upstream_request(
             upstream_body=body,
             outbound_headers=headers,
             trace_metadata=trace_metadata,
+            prompt_preview=prompt_preview,
         )
     return (
         UpstreamRequestPlan(

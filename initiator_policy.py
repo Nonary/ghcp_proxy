@@ -332,6 +332,8 @@ def _responses_system_prompt_includes_security_monitor_prompt(input_param) -> bo
 
 
 def _is_codex_meta_user_text(text: str) -> bool:
+    if isinstance(text, str) and '<skill>' in text:
+        return True
     if not isinstance(text, str):
         return False
     normalized = text.lstrip()
