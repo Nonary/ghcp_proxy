@@ -148,6 +148,70 @@ class FormatTranslationTests(unittest.TestCase):
         outbound = proxy.asyncio.run(format_translation.anthropic_request_to_chat(body, "https://example.invalid", "test-key"))
         self.assertEqual(outbound["reasoning_effort"], _default)
 
+    def test_anthropic_request_to_chat_ignores_assistant_thinking_blocks(self):
+        body = {
+            "model": "claude-sonnet-4.6",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "internal"},
+                        {"type": "redacted_thinking", "data": "opaque"},
+                        {"type": "text", "text": "visible answer"},
+                    ],
+                },
+            ],
+        }
+
+        outbound = proxy.asyncio.run(
+            format_translation.anthropic_request_to_chat(
+                body, "https://example.invalid", "test-key"
+            )
+        )
+
+        self.assertEqual(
+            outbound["messages"],
+            [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "visible answer"},
+            ],
+        )
+
+    def test_anthropic_request_to_responses_ignores_assistant_thinking_blocks(self):
+        body = {
+            "model": "gpt-5.4",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "internal"},
+                        {"type": "redacted_thinking", "data": "opaque"},
+                        {"type": "text", "text": "visible answer"},
+                    ],
+                },
+            ],
+        }
+
+        outbound = format_translation.anthropic_request_to_responses(body)
+
+        self.assertEqual(
+            outbound["input"],
+            [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "hi"}],
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "visible answer"}],
+                },
+            ],
+        )
+
     def test_anthropic_effort_to_reasoning_effort_helper(self):
         self.assertEqual(
             format_translation._anthropic_effort_to_reasoning_effort({"effort": "low"}),

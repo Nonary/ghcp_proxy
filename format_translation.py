@@ -181,6 +181,17 @@ def _anthropic_text_or_image_block_to_chat(item: dict) -> dict | None:
     return None
 
 
+def _anthropic_block_type_is_ignorable(item_type: str) -> bool:
+    """Return True for Anthropic block types that should not be replayed upstream.
+
+    Claude Code may resend assistant ``thinking`` / ``redacted_thinking`` blocks
+    from prior turns. GHCP's chat/responses schemas have no equivalent inbound
+    field, and those blocks are not needed to preserve the actual visible/tool
+    conversation state, so we drop them instead of rejecting the whole request.
+    """
+    return item_type in {"thinking", "redacted_thinking"}
+
+
 def _anthropic_system_to_chat_content(system):
     if isinstance(system, str):
         return system
@@ -283,6 +294,8 @@ def anthropic_message_to_chat_messages(message: dict) -> list[dict]:
             if item_type == "tool_use":
                 tool_calls.append(_anthropic_tool_use_to_chat_tool_call(item))
                 continue
+            if _anthropic_block_type_is_ignorable(item_type):
+                continue
             content_item = _anthropic_text_or_image_block_to_chat(item)
             if content_item is None:
                 raise ValueError(f"Unsupported Anthropic content block type: {item_type}")
@@ -315,6 +328,8 @@ def anthropic_message_to_chat_messages(message: dict) -> list[dict]:
             if cache_control is not None:
                 tool_message["copilot_cache_control"] = cache_control
             buffered_tool_messages.append(tool_message)
+            continue
+        if _anthropic_block_type_is_ignorable(item_type):
             continue
         content_item = _anthropic_text_or_image_block_to_chat(item)
         if content_item is None:
@@ -960,6 +975,8 @@ def anthropic_request_to_responses(body: dict) -> dict:
                         }
                     )
                     continue
+                if _anthropic_block_type_is_ignorable(item_type):
+                    continue
                 content_item = _anthropic_text_or_image_block_to_chat(item)
                 if content_item is None:
                     raise ValueError(f"Unsupported Anthropic content block type: {item_type}")
@@ -990,6 +1007,8 @@ def anthropic_request_to_responses(body: dict) -> dict:
                         "output": _anthropic_tool_result_content_to_text(item.get("content", "")),
                     }
                 )
+                continue
+            if _anthropic_block_type_is_ignorable(item_type):
                 continue
             content_item = _anthropic_text_or_image_block_to_chat(item)
             if content_item is None:
