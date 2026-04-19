@@ -37,6 +37,26 @@ class ProtocolBridgePlannerTests(unittest.TestCase):
         self.assertEqual(plan.header_kind, "responses")
         self.assertEqual(plan.resolved_model, "gpt-5.4")
 
+    def test_planner_strips_unsupported_image_generation_tools_for_native_responses(self):
+        planner = ProtocolBridgePlanner(_RoutingConfigStub())
+        body = {
+            "model": "gpt-5.4",
+            "input": "hello",
+            "stream": False,
+            "tools": [{"type": "image_generation"}],
+            "tool_choice": {"type": "image_generation"},
+            "parallel_tool_calls": True,
+        }
+
+        plan = proxy.asyncio.run(
+            planner.plan("responses", body, api_base="https://example.invalid", api_key="test-key")
+        )
+
+        self.assertEqual(plan.strategy_name, "responses_to_responses")
+        self.assertNotIn("tools", plan.upstream_body)
+        self.assertNotIn("tool_choice", plan.upstream_body)
+        self.assertNotIn("parallel_tool_calls", plan.upstream_body)
+
     def test_planner_selects_responses_to_chat_strategy_when_mapping_targets_claude(self):
         planner = ProtocolBridgePlanner(_RoutingConfigStub("claude-opus-4.6"))
         body = {

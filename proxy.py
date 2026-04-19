@@ -153,6 +153,7 @@ usage_tracker = usage_tracking.UsageTracker(
     on_usage_event_recorded=lambda _event: dashboard_service.notify_dashboard_stream_listeners(),
 )
 
+model_routing_config_service = ModelRoutingConfigService(ModelRoutingConfig())
 client_proxy_config_service = ProxyClientConfigService(
     ProxyClientConfig(
         codex_managed_config_file=CODEX_MANAGED_CONFIG_FILE,
@@ -166,8 +167,8 @@ client_proxy_config_service = ProxyClientConfigService(
         claude_max_output_tokens=CLAUDE_MAX_OUTPUT_TOKENS,
     ),
     model_capabilities_provider=lambda: fetch_copilot_model_capabilities(),
+    model_routing_settings_provider=lambda: model_routing_config_service.load_settings(),
 )
-model_routing_config_service = ModelRoutingConfigService(ModelRoutingConfig())
 bridge_planner = ProtocolBridgePlanner(model_routing_config_service)
 
 dashboard_service = dashboard_module.create_dashboard_service(
@@ -1671,7 +1672,9 @@ async def model_routing_status_api():
 @app.post("/api/config/model-routing")
 async def model_routing_config_api(request: Request):
     payload = await parse_json_request(request)
-    return JSONResponse(content=model_routing_config_service.save_settings(payload))
+    result = model_routing_config_service.save_settings(payload)
+    client_proxy_config_service.refresh_codex_model_catalog()
+    return JSONResponse(content=result)
 
 
 @app.post("/api/config/client-proxy")

@@ -59,6 +59,9 @@ def _responses_model_disallows_temperature(model_name: str | None) -> bool:
     return normalized == "gpt-5.4-mini"
 
 
+_COPILOT_UNSUPPORTED_RESPONSES_TOOL_TYPES = {"image_generation"}
+
+
 # ─── Anthropic content helpers ────────────────────────────────────────────────
 
 def _anthropic_effort_to_reasoning_effort(output_config) -> str | None:
@@ -564,6 +567,70 @@ def _responses_tool_to_chat(tool: dict) -> dict | None:
             chat_tool["copilot_cache_control"] = cache_control
             break
     return chat_tool
+
+
+def _responses_tool_choice_targets_removed_tool(tool_choice, removed_types: set[str], removed_names: set[str]) -> bool:
+    if not isinstance(tool_choice, dict):
+        return False
+
+    choice_type = str(tool_choice.get("type", "")).strip().lower()
+    if choice_type and choice_type in removed_types:
+        return True
+
+    function = tool_choice.get("function") if isinstance(tool_choice.get("function"), dict) else tool_choice
+    name = function.get("name")
+    if isinstance(name, str) and name.strip().lower() in (removed_names | removed_types):
+        return True
+
+    return False
+
+
+def sanitize_responses_tools_for_copilot(body: dict) -> dict:
+    if not isinstance(body, dict):
+        return body
+
+    tools = body.get("tools")
+    if not isinstance(tools, list):
+        return body
+
+    filtered_tools = []
+    removed_types: set[str] = set()
+    removed_names: set[str] = set()
+
+    for tool in tools:
+        if not isinstance(tool, dict):
+            filtered_tools.append(tool)
+            continue
+
+        tool_type = str(tool.get("type", "")).strip().lower()
+        if tool_type in _COPILOT_UNSUPPORTED_RESPONSES_TOOL_TYPES:
+            removed_types.add(tool_type)
+            name = tool.get("name")
+            if isinstance(name, str) and name.strip():
+                removed_names.add(name.strip().lower())
+            continue
+
+        filtered_tools.append(tool)
+
+    if not removed_types:
+        return body
+
+    sanitized = dict(body)
+    if filtered_tools:
+        sanitized["tools"] = filtered_tools
+    else:
+        sanitized.pop("tools", None)
+        sanitized.pop("parallel_tool_calls", None)
+
+    if (
+        not filtered_tools
+        or _responses_tool_choice_targets_removed_tool(
+            sanitized.get("tool_choice"), removed_types, removed_names
+        )
+    ):
+        sanitized.pop("tool_choice", None)
+
+    return sanitized
 
 
 def responses_tool_choice_to_chat(tool_choice):

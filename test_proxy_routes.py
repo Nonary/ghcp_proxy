@@ -73,6 +73,30 @@ class ProxyRoutesTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.body, upstream.content)
 
+    def test_model_routing_config_route_refreshes_codex_catalog(self):
+        request = SimpleNamespace()
+        payload = {"enabled": True, "mappings": [{"source_model": "gpt-5.4", "target_model": "claude-sonnet-4.6"}]}
+        saved = {
+            "enabled": True,
+            "mappings": [{"source_model": "gpt-5.4", "target_model": "claude-sonnet-4.6"}],
+            "approval_enabled": False,
+            "approval_mappings": [],
+            "available_models": [],
+            "path": "ignored",
+        }
+
+        with (
+            mock.patch.object(proxy, "parse_json_request", mock.AsyncMock(return_value=payload)),
+            mock.patch.object(proxy.model_routing_config_service, "save_settings", return_value=saved) as save_settings,
+            mock.patch.object(proxy.client_proxy_config_service, "refresh_codex_model_catalog", return_value=True) as refresh_catalog,
+        ):
+            response = proxy.asyncio.run(proxy.model_routing_config_api(request))
+
+        save_settings.assert_called_once_with(payload)
+        refresh_catalog.assert_called_once_with()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(json.loads(response.body), saved)
+
     def test_anthropic_messages_route_uses_anthropic_headers_and_error_shape(self):
         request = SimpleNamespace(
             url=SimpleNamespace(path="/v1/messages"),
@@ -614,6 +638,82 @@ class ProxyRoutesTests(unittest.TestCase):
         response_payload = json.loads(response.body)
         self.assertEqual(response_payload["id"], "resp_123")
         self.assertEqual(response_payload["output"][0]["content"][0]["text"], "done")
+
+    def test_responses_route_strips_unsupported_image_generation_tool(self):
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/responses"),
+            method="POST",
+            headers={},
+        )
+        body = {
+            "model": "gpt-5.4",
+            "tools": [
+                {"type": "image_generation"},
+                {
+                    "type": "function",
+                    "name": "Read",
+                    "description": "Read a file",
+                    "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+                },
+            ],
+            "tool_choice": "auto",
+            "parallel_tool_calls": True,
+            "stream": False,
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "hello"}],
+                }
+            ],
+        }
+        upstream = httpx.Response(
+            200,
+            json={
+                "id": "resp_123",
+                "model": "gpt-5.4",
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "done"}],
+                    }
+                ],
+                "usage": {
+                    "input_tokens": 24,
+                    "output_tokens": 5,
+                    "total_tokens": 29,
+                },
+            },
+            headers={"content-type": "application/json"},
+        )
+
+        with (
+            mock.patch.object(proxy, "parse_json_request", mock.AsyncMock(return_value=body)),
+            mock.patch.object(auth, "get_api_key", return_value="test-key"),
+            mock.patch.object(auth, "get_api_base", return_value="https://example.invalid"),
+            mock.patch.object(proxy.model_routing_config_service, "resolve_target_model", return_value="gpt-5.4"),
+            mock.patch.object(proxy.usage_tracker, "start_event", return_value=None),
+            mock.patch.object(proxy.usage_tracker, "finish_event"),
+            mock.patch.object(proxy, "throttled_client_post", mock.AsyncMock(return_value=upstream)) as post,
+        ):
+            response = proxy.asyncio.run(proxy.responses(request))
+
+        forwarded_body = post.await_args.kwargs["json"]
+        self.assertEqual(
+            forwarded_body["tools"],
+            [
+                {
+                    "type": "function",
+                    "name": "Read",
+                    "description": "Read a file",
+                    "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+                }
+            ],
+        )
+        self.assertEqual(forwarded_body["tool_choice"], "auto")
+        self.assertTrue(forwarded_body["parallel_tool_calls"])
+        self.assertEqual(response.status_code, 200)
 
     def test_responses_compact_preserves_cache_affinity_fields(self):
         request = SimpleNamespace(

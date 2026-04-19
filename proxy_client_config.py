@@ -96,15 +96,26 @@ class ProxyClientConfigService:
         config: ProxyClientConfig,
         *,
         model_capabilities_provider: Callable[[], Mapping[str, Mapping[str, object]]] | None = None,
+        model_routing_settings_provider: Callable[[], Mapping[str, object]] | None = None,
     ):
         self._config = config
         self._model_capabilities_provider = model_capabilities_provider
+        self._model_routing_settings_provider = model_routing_settings_provider
 
     def _model_capabilities(self) -> Mapping[str, Mapping[str, object]]:
         if self._model_capabilities_provider is None:
             return {}
         try:
             data = self._model_capabilities_provider()
+        except Exception:
+            return {}
+        return data if isinstance(data, Mapping) else {}
+
+    def _model_routing_settings(self) -> Mapping[str, object]:
+        if self._model_routing_settings_provider is None:
+            return {}
+        try:
+            data = self._model_routing_settings_provider()
         except Exception:
             return {}
         return data if isinstance(data, Mapping) else {}
@@ -228,6 +239,16 @@ class ProxyClientConfigService:
         status["backup_path"] = backup_path
         status["status_message"] = "installed proxy config"
         return status
+
+    def refresh_codex_model_catalog(self) -> bool:
+        if not os.path.exists(self._config.codex_model_catalog_file):
+            return False
+        os.makedirs(self._config.codex_config_dir, exist_ok=True)
+        self._write_json_atomic(
+            self._config.codex_model_catalog_file,
+            self._build_codex_model_catalog_payload(),
+        )
+        return True
 
     def write_claude_proxy_settings(self) -> dict[str, bool | str | None]:
         status = self.claude_proxy_status()
@@ -509,6 +530,8 @@ class ProxyClientConfigService:
 
     def _build_codex_model_catalog_payload(self) -> dict[str, object]:
         capabilities = self._model_capabilities()
+        routing_settings = self._model_routing_settings()
+        remapped_targets = self._catalog_remap_targets(routing_settings)
         default_context = self._config.codex_model_context_window
         default_compact = self._config.codex_model_auto_compact_token_limit
         available_ids = (
@@ -516,11 +539,12 @@ class ProxyClientConfigService:
         )
         models = []
         for priority, model_name in enumerate(
-            self._sorted_catalog_model_names(available_ids)
+            self._sorted_catalog_model_names(available_ids, remapped_targets)
         ):
-            provider = str(MODEL_PRICING.get(model_name, {}).get("provider") or "Unknown")
-            family = self._model_family(model_name)
-            caps = capabilities.get(model_name) if isinstance(capabilities, Mapping) else None
+            routed_model_name = remapped_targets.get(model_name, model_name)
+            provider = str(MODEL_PRICING.get(routed_model_name, {}).get("provider") or "Unknown")
+            family = self._model_family(routed_model_name)
+            caps = capabilities.get(routed_model_name) if isinstance(capabilities, Mapping) else None
             caps = caps if isinstance(caps, Mapping) else {}
 
             context_window = self._coerce_int(caps.get("context_window"), default_context)
@@ -541,7 +565,7 @@ class ProxyClientConfigService:
                 default=family == "gpt" and bool(supported_levels),
             )
             supports_verbosity = family == "gpt"
-            multiplier = PREMIUM_REQUEST_MULTIPLIERS.get(model_name, 1.0)
+            multiplier = PREMIUM_REQUEST_MULTIPLIERS.get(routed_model_name, 1.0)
             if multiplier == 1.0:
                 premium_text = "1 premium request"
             else:
@@ -549,9 +573,15 @@ class ProxyClientConfigService:
                     f"{multiplier:.2f}".rstrip("0").rstrip(".")
                 )
                 premium_text = f"{multiplier_str} premium requests"
-            description = (
-                f"{provider} \u00b7 {context_window:,} token context \u00b7 {premium_text}."
-            )
+            if routed_model_name == model_name:
+                description = (
+                    f"{provider} \u00b7 {context_window:,} token context \u00b7 {premium_text}."
+                )
+            else:
+                description = (
+                    f"Routed to {routed_model_name} ({provider}) \u00b7 "
+                    f"{context_window:,} token context \u00b7 {premium_text}."
+                )
 
             entry: dict[str, object] = {
                 "slug": model_name,
@@ -686,7 +716,9 @@ class ProxyClientConfigService:
         return (levels, default_level)
 
     def _sorted_catalog_model_names(
-        self, available_ids: "set[str] | None" = None
+        self,
+        available_ids: "set[str] | None" = None,
+        remapped_targets: Mapping[str, str] | None = None,
     ) -> list[str]:
         family_order = {"gpt": 0, "claude": 1, "gemini": 2, "grok": 3}
         preferred_order = {
@@ -710,10 +742,41 @@ class ProxyClientConfigService:
         # If the capability fetch returned nothing (auth/network blip), fall
         # back to the full pricing list rather than wiping the catalog.
         if available_ids:
-            filtered = [name for name in model_names if name in available_ids]
+            filtered = [
+                name
+                for name in model_names
+                if name in available_ids
+                or (
+                    isinstance(remapped_targets, Mapping)
+                    and remapped_targets.get(name) in available_ids
+                )
+            ]
             if filtered:
                 model_names = filtered
         return sorted(model_names, key=lambda model_name: (family_key(model_name), preferred_order.get(model_name, 0), model_name))
+
+    def _catalog_remap_targets(self, routing_settings: Mapping[str, object]) -> dict[str, str]:
+        if not bool(routing_settings.get("enabled")):
+            return {}
+        raw_mappings = routing_settings.get("mappings")
+        if not isinstance(raw_mappings, list):
+            return {}
+
+        remapped_targets: dict[str, str] = {}
+        for entry in raw_mappings:
+            if not isinstance(entry, Mapping):
+                continue
+            source_model = entry.get("source_model")
+            target_model = entry.get("target_model")
+            if (
+                isinstance(source_model, str)
+                and source_model
+                and isinstance(target_model, str)
+                and target_model
+                and target_model in MODEL_PRICING
+            ):
+                remapped_targets[source_model] = target_model
+        return remapped_targets
 
     def _remove_file_if_exists(self, path: str):
         if os.path.exists(path):

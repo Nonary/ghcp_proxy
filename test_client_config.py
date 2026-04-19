@@ -39,6 +39,7 @@ class ClientConfigTests(unittest.TestCase):
         codex_model_catalog_file: str | None = None,
         claude_settings_file: str | None = None,
         model_capabilities_provider=None,
+        model_routing_settings_provider=None,
     ) -> ProxyClientConfigService:
         return ProxyClientConfigService(
             ProxyClientConfig(
@@ -53,6 +54,7 @@ class ClientConfigTests(unittest.TestCase):
                 claude_max_output_tokens=CLAUDE_MAX_OUTPUT_TOKENS,
             ),
             model_capabilities_provider=model_capabilities_provider,
+            model_routing_settings_provider=model_routing_settings_provider,
         )
 
     def test_enabling_codex_proxy_is_idempotent_when_already_enabled(self):
@@ -208,6 +210,106 @@ class ClientConfigTests(unittest.TestCase):
         claude_efforts = [lvl["effort"] for lvl in models["claude-sonnet-4.6"]["supported_reasoning_levels"]]
         self.assertNotIn("xhigh", claude_efforts)
         self.assertIn("high", claude_efforts)
+
+    def test_codex_catalog_projects_remapped_target_metadata_onto_source_model(self):
+        temp_dir = self._make_temp_dir("codex-remap-")
+        managed_config_path = temp_dir / "managed_config.toml"
+        catalog_path = temp_dir / "ghcp-proxy-models.json"
+        capabilities = {
+            "gpt-5.4": {
+                "context_window": 400000,
+                "max_context_window": 400000,
+                "reasoning_efforts": ["low", "medium", "high", "xhigh"],
+                "parallel_tool_calls": True,
+                "input_modalities": ["text", "image"],
+            },
+            "claude-sonnet-4.6": {
+                "context_window": 200000,
+                "max_context_window": 200000,
+                "reasoning_efforts": ["low", "medium", "high"],
+                "parallel_tool_calls": False,
+                "input_modalities": ["text"],
+            },
+        }
+        routing_settings = {
+            "enabled": True,
+            "mappings": [
+                {
+                    "source_model": "gpt-5.4",
+                    "target_model": "claude-sonnet-4.6",
+                }
+            ],
+        }
+        service = self._make_client_proxy_service(
+            codex_managed_config_file=str(managed_config_path),
+            codex_model_catalog_file=str(catalog_path),
+            model_capabilities_provider=lambda: capabilities,
+            model_routing_settings_provider=lambda: routing_settings,
+        )
+
+        service.write_codex_proxy_config()
+
+        catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+        models = {entry["slug"]: entry for entry in catalog["models"]}
+        remapped = models["gpt-5.4"]
+        self.assertEqual(remapped["display_name"], "gpt-5.4")
+        self.assertEqual(remapped["context_window"], 200000)
+        self.assertEqual(remapped["max_context_window"], 200000)
+        self.assertIn("Routed to claude-sonnet-4.6 (Anthropic)", remapped["description"])
+        self.assertFalse(remapped["supports_parallel_tool_calls"])
+        self.assertFalse(remapped["support_verbosity"])
+        self.assertEqual(remapped["input_modalities"], ["text"])
+        remapped_efforts = [lvl["effort"] for lvl in remapped["supported_reasoning_levels"]]
+        self.assertEqual(remapped_efforts, ["low", "medium", "high"])
+
+    def test_refresh_codex_model_catalog_rewrites_existing_catalog_for_updated_remaps(self):
+        temp_dir = self._make_temp_dir("codex-refresh-")
+        managed_config_path = temp_dir / "managed_config.toml"
+        catalog_path = temp_dir / "ghcp-proxy-models.json"
+        routing_settings = {"enabled": False, "mappings": []}
+        capabilities = {
+            "gpt-5.4": {
+                "context_window": 400000,
+                "max_context_window": 400000,
+                "reasoning_efforts": ["low", "medium", "high", "xhigh"],
+                "parallel_tool_calls": True,
+                "input_modalities": ["text", "image"],
+            },
+            "claude-sonnet-4.6": {
+                "context_window": 200000,
+                "max_context_window": 200000,
+                "reasoning_efforts": ["low", "medium", "high"],
+                "parallel_tool_calls": False,
+                "input_modalities": ["text"],
+            },
+        }
+        service = self._make_client_proxy_service(
+            codex_managed_config_file=str(managed_config_path),
+            codex_model_catalog_file=str(catalog_path),
+            model_capabilities_provider=lambda: capabilities,
+            model_routing_settings_provider=lambda: routing_settings,
+        )
+
+        service.write_codex_proxy_config()
+        initial_catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+        initial_models = {entry["slug"]: entry for entry in initial_catalog["models"]}
+        self.assertEqual(initial_models["gpt-5.4"]["context_window"], 400000)
+
+        routing_settings["enabled"] = True
+        routing_settings["mappings"] = [
+            {
+                "source_model": "gpt-5.4",
+                "target_model": "claude-sonnet-4.6",
+            }
+        ]
+
+        refreshed = service.refresh_codex_model_catalog()
+
+        self.assertTrue(refreshed)
+        updated_catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+        updated_models = {entry["slug"]: entry for entry in updated_catalog["models"]}
+        self.assertEqual(updated_models["gpt-5.4"]["context_window"], 200000)
+        self.assertIn("Routed to claude-sonnet-4.6 (Anthropic)", updated_models["gpt-5.4"]["description"])
 
     def test_claude_proxy_status_requires_token_caps(self):
         temp_dir = self._make_temp_dir("claude-status-")
