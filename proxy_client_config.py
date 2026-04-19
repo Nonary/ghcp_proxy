@@ -560,9 +560,18 @@ class ProxyClientConfigService:
                 caps.get("parallel_tool_calls"),
                 default=family == "gpt",
             )
+            # The proxy's chat→responses translator relays reasoning summary
+            # deltas for every upstream provider it bridges (Copilot's
+            # `delta.reasoning_text`, Anthropic-style `delta.thinking`,
+            # OpenAI-style `delta.reasoning_content`, etc.) — see
+            # `extract_reasoning_from_chat_delta` in `format_translation.py`.
+            # If a model advertises any reasoning levels at all, treat that as
+            # sufficient evidence that summaries can be surfaced, so Codex
+            # both (a) builds `reasoning`-aware requests for the model and
+            # (b) renders the incoming summary deltas in the TUI.
             supports_reasoning_summaries = self._resolve_bool(
                 caps.get("supports_reasoning_summaries"),
-                default=family == "gpt" and bool(supported_levels),
+                default=bool(supported_levels),
             )
             supports_verbosity = family == "gpt"
             multiplier = PREMIUM_REQUEST_MULTIPLIERS.get(routed_model_name, 1.0)

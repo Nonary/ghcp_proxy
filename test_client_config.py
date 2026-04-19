@@ -210,6 +210,12 @@ class ClientConfigTests(unittest.TestCase):
         claude_efforts = [lvl["effort"] for lvl in models["claude-sonnet-4.6"]["supported_reasoning_levels"]]
         self.assertNotIn("xhigh", claude_efforts)
         self.assertIn("high", claude_efforts)
+        # Claude models must advertise reasoning summary support so Codex (a)
+        # builds reasoning-aware requests and (b) renders the relayed
+        # `response.reasoning_summary_text.delta` events in the TUI.
+        self.assertTrue(models["claude-sonnet-4.6"]["supports_reasoning_summaries"])
+        self.assertEqual(models["claude-sonnet-4.6"]["default_reasoning_summary"], "auto")
+        self.assertTrue(models["gpt-5.4"]["supports_reasoning_summaries"])
 
     def test_codex_catalog_projects_remapped_target_metadata_onto_source_model(self):
         temp_dir = self._make_temp_dir("codex-remap-")
