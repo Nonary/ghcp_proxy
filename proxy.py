@@ -1538,7 +1538,8 @@ def fetch_copilot_model_capabilities() -> dict[str, dict]:
         limits = caps.get("limits") if isinstance(caps.get("limits"), dict) else {}
         supports = caps.get("supports") if isinstance(caps.get("supports"), dict) else {}
 
-        ctx = limits.get("max_context_window_tokens") or limits.get("max_prompt_tokens")
+        max_context_window = limits.get("max_context_window_tokens")
+        max_prompt_tokens = limits.get("max_prompt_tokens")
         reasoning_efforts = supports.get("reasoning_effort") if isinstance(supports.get("reasoning_effort"), list) else None
         vision_flag = bool(supports.get("vision"))
         parallel = supports.get("parallel_tool_calls")
@@ -1548,9 +1549,14 @@ def fetch_copilot_model_capabilities() -> dict[str, dict]:
             "input_modalities": input_modalities,
             "vision": vision_flag,
         }
-        if isinstance(ctx, int) and ctx > 0:
-            enriched["context_window"] = ctx
-            enriched["max_context_window"] = ctx
+        if isinstance(max_prompt_tokens, int) and max_prompt_tokens > 0:
+            enriched["context_window"] = max_prompt_tokens
+        elif isinstance(max_context_window, int) and max_context_window > 0:
+            enriched["context_window"] = max_context_window
+        if isinstance(max_context_window, int) and max_context_window > 0:
+            enriched["max_context_window"] = max_context_window
+        elif isinstance(max_prompt_tokens, int) and max_prompt_tokens > 0:
+            enriched["max_context_window"] = max_prompt_tokens
         if reasoning_efforts is not None:
             enriched["reasoning_efforts"] = reasoning_efforts
         if isinstance(parallel, bool):

@@ -171,11 +171,8 @@ class ClientConfigTests(unittest.TestCase):
         self.assertEqual(primary_config_parsed["approval_policy"], "on-request")
         self.assertEqual(primary_config_parsed["model_provider"], "custom")
         self.assertEqual(primary_config_parsed["model_catalog_json"], str(catalog_path))
-        self.assertEqual(primary_config_parsed["model_context_window"], CODEX_PROXY_MODEL_CONTEXT_WINDOW)
-        self.assertEqual(
-            primary_config_parsed["model_auto_compact_token_limit"],
-            CODEX_PROXY_MODEL_AUTO_COMPACT_TOKEN_LIMIT,
-        )
+        self.assertNotIn("model_context_window", primary_config_parsed)
+        self.assertNotIn("model_auto_compact_token_limit", primary_config_parsed)
         self.assertNotIn("model_catalog_json", primary_config_parsed["model_providers"]["custom"])
         self.assertEqual(
             primary_config_parsed["projects"]["D:\\sources\\ghcp_proxy"]["trust_level"],
@@ -193,6 +190,33 @@ class ClientConfigTests(unittest.TestCase):
         self.assertTrue(catalog["models"])
         self.assertEqual(catalog["models"][0]["slug"], "gpt-5.4")
         self.assertEqual(catalog["models"][0]["context_window"], CODEX_PROXY_MODEL_CONTEXT_WINDOW)
+
+    def test_write_codex_proxy_config_removes_legacy_primary_context_keys(self):
+        temp_dir = self._make_temp_dir("codex-write-legacy-")
+        user_config_path = temp_dir / "config.toml"
+        managed_config_path = temp_dir / "managed_config.toml"
+        catalog_path = temp_dir / "ghcp-proxy-models.json"
+        user_config_path.write_text(
+            (
+                'model = "gpt-5.4"\n'
+                'approval_policy = "on-request"\n'
+                'model_context_window = 184000\n'
+                'model_auto_compact_token_limit = 120000\n'
+            ),
+            encoding="utf-8",
+        )
+        service = self._make_client_proxy_service(
+            codex_primary_config_file=str(user_config_path),
+            codex_managed_config_file=str(managed_config_path),
+            codex_model_catalog_file=str(catalog_path),
+        )
+
+        service.write_codex_proxy_config()
+
+        primary_config_parsed = tomllib.loads(user_config_path.read_text(encoding="utf-8"))
+        self.assertNotIn("model_context_window", primary_config_parsed)
+        self.assertNotIn("model_auto_compact_token_limit", primary_config_parsed)
+        self.assertEqual(primary_config_parsed["model_catalog_json"], str(catalog_path))
 
     def test_codex_catalog_uses_provider_capabilities_per_model(self):
         temp_dir = self._make_temp_dir("codex-caps-")

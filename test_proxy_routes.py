@@ -18,6 +18,7 @@ class ProxyRoutesTests(unittest.TestCase):
     def setUp(self):
         proxy.set_initiator_policy(initiator_policy.InitiatorPolicy())
         proxy.usage_tracker.clear_state()
+        proxy._COPILOT_MODEL_CAPS_CACHE.update({"key": None, "ts": 0.0, "data": {}})
 
     def test_proxy_registers_copilot_native_root_aliases(self):
         paths = {route.path for route in proxy.app.routes}
@@ -72,6 +73,81 @@ class ProxyRoutesTests(unittest.TestCase):
         self.assertEqual(request.headers.get("Authorization"), "Bearer test-key")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.body, upstream.content)
+
+    def test_fetch_copilot_model_capabilities_uses_prompt_window_for_all_400k_models(self):
+        upstream = mock.Mock()
+        upstream.raise_for_status.return_value = None
+        upstream.json.return_value = {
+            "data": [
+                {
+                    "id": "gpt-5.4",
+                    "capabilities": {
+                        "limits": {
+                            "max_context_window_tokens": 400000,
+                            "max_prompt_tokens": 272000,
+                        },
+                        "supports": {
+                            "reasoning_effort": ["low", "medium", "high", "xhigh"],
+                            "parallel_tool_calls": True,
+                        },
+                    },
+                },
+                {
+                    "id": "gpt-5.4-mini",
+                    "capabilities": {
+                        "limits": {
+                            "max_context_window_tokens": 400000,
+                            "max_prompt_tokens": 272000,
+                        },
+                        "supports": {
+                            "reasoning_effort": ["low", "medium", "high"],
+                            "parallel_tool_calls": True,
+                        },
+                    },
+                },
+                {
+                    "id": "gpt-5.3-codex",
+                    "capabilities": {
+                        "limits": {
+                            "max_context_window_tokens": 400000,
+                            "max_prompt_tokens": 272000,
+                        },
+                        "supports": {
+                            "reasoning_effort": ["low", "medium", "high", "xhigh"],
+                            "parallel_tool_calls": True,
+                        },
+                    },
+                },
+                {
+                    "id": "gpt-4.1",
+                    "capabilities": {
+                        "limits": {
+                            "max_context_window_tokens": 128000,
+                        },
+                        "supports": {
+                            "parallel_tool_calls": True,
+                        },
+                    },
+                },
+            ]
+        }
+        client = mock.MagicMock()
+        client.__enter__.return_value = client
+        client.get.return_value = upstream
+
+        with (
+            mock.patch.object(auth, "get_api_key", return_value="test-key"),
+            mock.patch.object(auth, "get_api_base", return_value="https://example.invalid"),
+            mock.patch.object(format_translation, "build_copilot_headers", return_value={"Authorization": "Bearer test-key"}),
+            mock.patch.object(proxy.httpx, "Client", return_value=client),
+        ):
+            caps = proxy.fetch_copilot_model_capabilities()
+
+        for model_name in ("gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex"):
+            self.assertEqual(caps[model_name]["context_window"], 272000)
+            self.assertEqual(caps[model_name]["max_context_window"], 400000)
+        self.assertEqual(caps["gpt-4.1"]["context_window"], 128000)
+        self.assertEqual(caps["gpt-4.1"]["max_context_window"], 128000)
 
     def test_model_routing_config_route_refreshes_codex_catalog(self):
         request = SimpleNamespace()

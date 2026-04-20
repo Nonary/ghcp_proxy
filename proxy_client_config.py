@@ -557,8 +557,10 @@ class ProxyClientConfigService:
             "model_provider": _toml_basic_string("custom"),
             "approvals_reviewer": _toml_basic_string("user"),
             "model_catalog_json": _toml_basic_string(self._config.codex_model_catalog_file),
-            "model_context_window": str(self._config.codex_model_context_window),
-            "model_auto_compact_token_limit": str(self._config.codex_model_auto_compact_token_limit),
+        }
+        legacy_keys_to_remove = {
+            "model_context_window",
+            "model_auto_compact_token_limit",
         }
         provider_keys = {
             "name": _toml_basic_string("OpenAI"),
@@ -595,7 +597,7 @@ class ProxyClientConfigService:
         filtered_preamble: list[str] = []
         for line in preamble:
             key = self._toml_assignment_key(line)
-            if key in top_level_keys:
+            if key in top_level_keys or key in legacy_keys_to_remove:
                 continue
             filtered_preamble.append(line)
 
