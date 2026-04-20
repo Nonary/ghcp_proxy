@@ -58,7 +58,10 @@ Enable Codex from the dashboard when the proxy is running. Activation writes pro
 - `managed_config.toml`
 - `ghcp-proxy-models.json`
 
-This leaves the user's real `~/.codex/config.toml` untouched.
+If `~/.codex/config.toml` already exists, activation also injects the proxy's
+provider/catalog wiring there so Codex loads the generated model catalog while
+preserving the user's selected `model`, reasoning effort, approvals, and
+project trust entries.
 
 The managed Codex config written by the dashboard is:
 
@@ -173,7 +176,7 @@ The dashboard activation controls are meant to behave like a light switch.
 - enabling a client that is already enabled is a no-op
 - disabling a client that is already disabled is a no-op
 - Codex activation writes `~/.codex/managed_config.toml` and `~/.codex/ghcp-proxy-models.json`
-- Codex activation does not edit `~/.codex/config.toml`
+- if `~/.codex/config.toml` exists, Codex activation injects the proxy/provider/catalog keys there too
 - an existing managed config is backed up only when the proxy first replaces it
 - disabling restores the latest managed-config backup when one exists
 - if no backup exists, disabling removes the proxy-managed files

@@ -52,6 +52,7 @@ from proxy_client_config import (
 from constants import (
     DASHBOARD_FILE,
     DETAILED_REQUEST_HISTORY_LIMIT,
+    CODEX_PRIMARY_CONFIG_FILE,
     CODEX_MANAGED_CONFIG_FILE,
     CODEX_PROXY_MODEL_CATALOG_FILE,
     CODEX_PROXY_CONFIG,
@@ -157,6 +158,7 @@ usage_tracker = usage_tracking.UsageTracker(
 model_routing_config_service = ModelRoutingConfigService(ModelRoutingConfig())
 client_proxy_config_service = ProxyClientConfigService(
     ProxyClientConfig(
+        codex_primary_config_file=CODEX_PRIMARY_CONFIG_FILE,
         codex_managed_config_file=CODEX_MANAGED_CONFIG_FILE,
         codex_model_catalog_file=CODEX_PROXY_MODEL_CATALOG_FILE,
         codex_proxy_config=CODEX_PROXY_CONFIG,

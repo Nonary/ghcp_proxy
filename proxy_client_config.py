@@ -39,6 +39,7 @@ def _toml_basic_string(value: str) -> str:
 
 @dataclass(frozen=True)
 class ProxyClientConfig:
+    codex_primary_config_file: str
     codex_managed_config_file: str
     codex_model_catalog_file: str
     codex_proxy_config: str
@@ -51,7 +52,7 @@ class ProxyClientConfig:
 
     @property
     def codex_config_dir(self) -> str:
-        return os.path.dirname(self.codex_managed_config_file)
+        return os.path.dirname(self.codex_primary_config_file or self.codex_managed_config_file)
 
     @property
     def claude_config_dir(self) -> str:
@@ -225,18 +226,34 @@ class ProxyClientConfigService:
             status["status_message"] = "proxy already enabled"
             return status
 
+        existing_primary_config = ""
+        primary_config_exists = os.path.exists(self._config.codex_primary_config_file)
+        if primary_config_exists:
+            try:
+                with open(self._config.codex_primary_config_file, encoding="utf-8") as f:
+                    existing_primary_config = f.read()
+            except OSError as exc:
+                status["error"] = f"failed to read {self._config.codex_primary_config_file}: {exc}"
+                return status
+
         backup_path = self._backup_config_file(self._config.codex_managed_config_file)
+        primary_backup_path = self._backup_config_file(self._config.codex_primary_config_file)
         os.makedirs(self._config.codex_config_dir, exist_ok=True)
         self._write_json_atomic(
             self._config.codex_model_catalog_file,
             self._build_codex_model_catalog_payload(),
         )
+        if primary_config_exists:
+            self._write_text_atomic(
+                self._config.codex_primary_config_file,
+                self._merged_codex_primary_config(existing_primary_config),
+            )
         self._write_text_atomic(
             self._config.codex_managed_config_file,
             self._render_codex_proxy_config(),
         )
         status = self.codex_proxy_status()
-        status["backup_path"] = backup_path
+        status["backup_path"] = primary_backup_path or backup_path
         status["status_message"] = "installed proxy config"
         return status
 
@@ -284,6 +301,7 @@ class ProxyClientConfigService:
         managed_config_exists = os.path.exists(self._config.codex_managed_config_file)
         catalog_exists = os.path.exists(self._config.codex_model_catalog_file)
         backup_path = self._latest_backup_path(self._config.codex_managed_config_file)
+        primary_backup_path = self._latest_backup_path(self._config.codex_primary_config_file)
         managed_targets_proxy = False
         if managed_config_exists:
             try:
@@ -301,6 +319,12 @@ class ProxyClientConfigService:
         restored_from_backup = False
         operation_message = "removed proxy-managed Codex files"
         try:
+            if primary_backup_path:
+                shutil.copy2(primary_backup_path, self._config.codex_primary_config_file)
+                try:
+                    os.remove(primary_backup_path)
+                except OSError:
+                    pass
             if managed_targets_proxy and backup_path:
                 shutil.copy2(backup_path, self._config.codex_managed_config_file)
                 restored_from_backup = True
@@ -320,7 +344,7 @@ class ProxyClientConfigService:
             return status
 
         status = self.codex_proxy_status()
-        status["backup_path"] = backup_path
+        status["backup_path"] = primary_backup_path or backup_path
         status["restored_from_backup"] = restored_from_backup
         status["status_message"] = operation_message
         return status
@@ -527,6 +551,110 @@ class ProxyClientConfigService:
         lines = [*top_level_lines, ""]
         lines.extend(section_lines)
         return "\n".join(line for line in lines if line is not None).rstrip() + "\n"
+
+    def _merged_codex_primary_config(self, existing_content: str) -> str:
+        top_level_keys = {
+            "model_provider": _toml_basic_string("custom"),
+            "approvals_reviewer": _toml_basic_string("user"),
+            "model_catalog_json": _toml_basic_string(self._config.codex_model_catalog_file),
+            "model_context_window": str(self._config.codex_model_context_window),
+            "model_auto_compact_token_limit": str(self._config.codex_model_auto_compact_token_limit),
+        }
+        provider_keys = {
+            "name": _toml_basic_string("OpenAI"),
+            "base_url": _toml_basic_string(CODEX_PROXY_BASE_URL),
+            "wire_api": _toml_basic_string("responses"),
+        }
+        provider_section_name = "model_providers.custom"
+        lines = existing_content.splitlines()
+        preamble: list[str] = []
+        sections: list[tuple[str, list[str]]] = []
+        current_section_name: str | None = None
+        current_lines: list[str] = []
+
+        def flush_current():
+            nonlocal current_section_name, current_lines
+            if current_section_name is not None:
+                sections.append((current_section_name, current_lines))
+            current_section_name = None
+            current_lines = []
+
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith("[") and stripped.endswith("]"):
+                flush_current()
+                current_section_name = stripped[1:-1].strip()
+                current_lines = [line]
+                continue
+            if current_section_name is None:
+                preamble.append(line)
+            else:
+                current_lines.append(line)
+        flush_current()
+
+        filtered_preamble: list[str] = []
+        for line in preamble:
+            key = self._toml_assignment_key(line)
+            if key in top_level_keys:
+                continue
+            filtered_preamble.append(line)
+
+        if filtered_preamble and filtered_preamble[-1].strip():
+            filtered_preamble.append("")
+        filtered_preamble.extend(
+            [
+                f"{key} = {value}"
+                for key, value in top_level_keys.items()
+            ]
+        )
+
+        rendered_sections: list[str] = []
+        provider_section_found = False
+        for section_name, section_lines in sections:
+            if section_name != provider_section_name:
+                rendered_sections.extend(section_lines)
+                continue
+
+            provider_section_found = True
+            provider_body: list[str] = [section_lines[0]]
+            for line in section_lines[1:]:
+                key = self._toml_assignment_key(line)
+                if key in provider_keys or key in top_level_keys:
+                    continue
+                provider_body.append(line)
+            if provider_body and provider_body[-1].strip():
+                provider_body.append("")
+            provider_body.extend(
+                [
+                    f"{key} = {value}"
+                    for key, value in provider_keys.items()
+                ]
+            )
+            rendered_sections.extend(provider_body)
+
+        if not provider_section_found:
+            if filtered_preamble and filtered_preamble[-1].strip():
+                filtered_preamble.append("")
+            rendered_sections.extend(
+                [
+                    f"[{provider_section_name}]",
+                    *(f"{key} = {value}" for key, value in provider_keys.items()),
+                ]
+            )
+
+        output_lines = filtered_preamble[:]
+        if rendered_sections:
+            if output_lines and output_lines[-1].strip():
+                output_lines.append("")
+            output_lines.extend(rendered_sections)
+        return "\n".join(output_lines).rstrip() + "\n"
+
+    def _toml_assignment_key(self, line: str) -> str | None:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            return None
+        key = stripped.split("=", 1)[0].strip()
+        return key if key and " " not in key else None
 
     def _build_codex_model_catalog_payload(self) -> dict[str, object]:
         capabilities = self._model_capabilities()

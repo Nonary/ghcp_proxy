@@ -9,6 +9,7 @@ from constants import (
     CLAUDE_MAX_CONTEXT_TOKENS,
     CLAUDE_MAX_OUTPUT_TOKENS,
     CLAUDE_PROXY_SETTINGS,
+    CODEX_PRIMARY_CONFIG_FILE,
     CODEX_MANAGED_CONFIG_FILE,
     CODEX_PROXY_CONFIG,
     CODEX_PROXY_MODEL_AUTO_COMPACT_TOKEN_LIMIT,
@@ -35,14 +36,19 @@ class ClientConfigTests(unittest.TestCase):
     def _make_client_proxy_service(
         self,
         *,
+        codex_primary_config_file: str | None = None,
         codex_managed_config_file: str | None = None,
         codex_model_catalog_file: str | None = None,
         claude_settings_file: str | None = None,
         model_capabilities_provider=None,
         model_routing_settings_provider=None,
     ) -> ProxyClientConfigService:
+        resolved_primary_config_file = codex_primary_config_file
+        if resolved_primary_config_file is None and codex_managed_config_file:
+            resolved_primary_config_file = str(Path(codex_managed_config_file).with_name("config.toml"))
         return ProxyClientConfigService(
             ProxyClientConfig(
+                codex_primary_config_file=resolved_primary_config_file or CODEX_PRIMARY_CONFIG_FILE,
                 codex_managed_config_file=codex_managed_config_file or CODEX_MANAGED_CONFIG_FILE,
                 codex_model_catalog_file=codex_model_catalog_file or CODEX_PROXY_MODEL_CATALOG_FILE,
                 codex_proxy_config=CODEX_PROXY_CONFIG,
@@ -125,32 +131,56 @@ class ClientConfigTests(unittest.TestCase):
         self.assertFalse(managed_config_path.exists())
         self.assertFalse(catalog_path.exists())
 
-    def test_write_codex_proxy_config_writes_managed_files_without_touching_user_config(self):
+    def test_write_codex_proxy_config_injects_proxy_catalog_into_primary_config(self):
         temp_dir = self._make_temp_dir("codex-write-")
         user_config_path = temp_dir / "config.toml"
         managed_config_path = temp_dir / "managed_config.toml"
         catalog_path = temp_dir / "ghcp-proxy-models.json"
         user_config_contents = (
             'model = "gpt-5.4-mini"\n'
+            'model_reasoning_effort = "low"\n'
             'approval_policy = "on-request"\n'
+            '\n'
+            "[model_providers.custom]\n"
+            'name = "OpenAI"\n'
+            'base_url = "http://localhost:8000/v1"\n'
+            'model_catalog_json = "/tmp/wrong-place.json"\n'
+            'wire_api = "responses"\n'
             '\n'
             "[projects.'D:\\sources\\ghcp_proxy']\n"
             'trust_level = "trusted"\n'
         )
         user_config_path.write_text(user_config_contents, encoding="utf-8")
         service = self._make_client_proxy_service(
+            codex_primary_config_file=str(user_config_path),
             codex_managed_config_file=str(managed_config_path),
             codex_model_catalog_file=str(catalog_path),
         )
 
         status = service.write_codex_proxy_config()
 
+        primary_config = user_config_path.read_text(encoding="utf-8")
+        primary_config_parsed = tomllib.loads(primary_config)
         managed_config = managed_config_path.read_text(encoding="utf-8")
         managed_config_parsed = tomllib.loads(managed_config)
         catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
         self.assertTrue(status["configured"])
         self.assertEqual(status["status_message"], "installed proxy config")
-        self.assertEqual(user_config_path.read_text(encoding="utf-8"), user_config_contents)
+        self.assertEqual(primary_config_parsed["model"], "gpt-5.4-mini")
+        self.assertEqual(primary_config_parsed["model_reasoning_effort"], "low")
+        self.assertEqual(primary_config_parsed["approval_policy"], "on-request")
+        self.assertEqual(primary_config_parsed["model_provider"], "custom")
+        self.assertEqual(primary_config_parsed["model_catalog_json"], str(catalog_path))
+        self.assertEqual(primary_config_parsed["model_context_window"], CODEX_PROXY_MODEL_CONTEXT_WINDOW)
+        self.assertEqual(
+            primary_config_parsed["model_auto_compact_token_limit"],
+            CODEX_PROXY_MODEL_AUTO_COMPACT_TOKEN_LIMIT,
+        )
+        self.assertNotIn("model_catalog_json", primary_config_parsed["model_providers"]["custom"])
+        self.assertEqual(
+            primary_config_parsed["projects"]["D:\\sources\\ghcp_proxy"]["trust_level"],
+            "trusted",
+        )
         self.assertIn('model_provider = "custom"', managed_config)
         self.assertEqual(managed_config_parsed["model_catalog_json"], str(catalog_path))
         self.assertIn(f"model_context_window = {CODEX_PROXY_MODEL_CONTEXT_WINDOW}", managed_config)

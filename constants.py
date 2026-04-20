@@ -40,6 +40,7 @@ SQLITE_CACHE_FILE = os.path.join(
     os.path.expanduser(os.environ.get("GHCP_CACHE_DB_PATH", os.path.join(TOKEN_DIR, ".ghcp_proxy-cache-v2.sqlite3")))
 )
 CODEX_CONFIG_DIR    = os.path.expanduser("~/.codex")
+CODEX_PRIMARY_CONFIG_FILE = os.path.join(CODEX_CONFIG_DIR, "config.toml")
 CODEX_MANAGED_CONFIG_FILE = os.path.join(CODEX_CONFIG_DIR, "managed_config.toml")
 CODEX_PROXY_MODEL_CATALOG_FILE = os.path.join(CODEX_CONFIG_DIR, "ghcp-proxy-models.json")
 CODEX_PROXY_MODEL_CONTEXT_WINDOW = 184000

@@ -1883,7 +1883,7 @@
             <div>
               <div class="eyebrow">Local Clients</div>
               <h3>Client Proxy Configuration</h3>
-              <div class="subtle">Install or verify local proxy settings for Codex and Claude Code. Codex uses <code>managed_config.toml</code> and leaves the user's <code>config.toml</code> alone.</div>
+              <div class="subtle">Install or verify local proxy settings for Codex and Claude Code. Codex writes <code>managed_config.toml</code> plus the generated model catalog, and syncs the required proxy/catalog keys into <code>config.toml</code> when that file already exists.</div>
             </div>
           </div>
           <div class="proxy-grid">
