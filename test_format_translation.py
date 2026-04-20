@@ -1504,6 +1504,28 @@ class FormatTranslationTests(unittest.TestCase):
         self.assertIsInstance(user_content, list)
         self.assertEqual(user_content[0]["copilot_cache_control"], {"type": "ephemeral"})
 
+    def test_iter_sse_messages_handles_split_utf8_code_point_across_chunks(self):
+        payload = (
+            'event: message\n'
+            'data: {"choices":[{"delta":{"content":"hello – world"}}]}\n\n'
+        ).encode("utf-8")
+        split_at = payload.index("–".encode("utf-8")) + 1
+        chunks = [payload[:split_at], payload[split_at:]]
+
+        async def byte_iter():
+            for chunk in chunks:
+                yield chunk
+
+        async def collect():
+            return [message async for message in format_translation.iter_sse_messages(byte_iter())]
+
+        messages = proxy.asyncio.run(collect())
+
+        self.assertEqual(
+            messages,
+            [("message", '{"choices":[{"delta":{"content":"hello – world"}}]}')],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

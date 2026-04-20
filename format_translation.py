@@ -1,6 +1,7 @@
 """Request/response format translation between Anthropic Messages API, OpenAI Chat Completions API, and OpenAI Responses API formats."""
 
 import base64
+import codecs
 import json
 
 import httpx
@@ -1482,9 +1483,10 @@ def parse_sse_block(raw_block: str) -> tuple[str | None, str | None]:
 
 async def iter_sse_messages(byte_iter):
     buffer = ""
+    decoder = codecs.getincrementaldecoder("utf-8")()
     async for chunk in byte_iter:
         if isinstance(chunk, bytes):
-            buffer += chunk.decode("utf-8")
+            buffer += decoder.decode(chunk)
         else:
             buffer += str(chunk)
 
@@ -1495,6 +1497,8 @@ async def iter_sse_messages(byte_iter):
             if data is not None:
                 yield event_name, data
         buffer = normalized
+
+    buffer += decoder.decode(b"", final=True)
 
     trailing = buffer.strip()
     if trailing:
