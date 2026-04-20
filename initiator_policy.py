@@ -418,12 +418,31 @@ def _trailing_user_messages_include_explicit_user(messages, explicit_initiators:
     if not isinstance(messages, list) or not explicit_initiators:
         return False
 
+    # The explicit-user ("+") prefix must only bypass safeguards on the FRESH
+    # user turn — i.e. the user message the harness just appended to the end
+    # of the input list. On follow-up Responses API turns the entire history
+    # is replayed, so the original "+"-prefixed user message is still the
+    # most-recent role:"user" item, but it is now followed by agent-produced
+    # items (function_call, function_call_output, assistant, reasoning that
+    # references tool work, etc.). Walking past those items would let the
+    # bypass fire on every continuation request — which is exactly the bug
+    # this guard is meant to prevent (charging agent traffic as user).
+    #
+    # Only skip the small set of items that legitimately sit between the
+    # tail of the list and a freshly-typed user message: system/developer
+    # prompts, item_reference handoffs, compaction markers, and pre-turn
+    # reasoning. Anything else means the user turn is in the past.
+    skippable_roles = {"system", "developer"}
+    skippable_item_types = {"item_reference", "compaction"}
+
     saw_user_message = False
     for message in reversed(messages):
         if not isinstance(message, dict):
             if saw_user_message:
                 break
-            continue
+            # Non-dict entries at the tail are not user turns; treat them
+            # the same as agent-produced items and stop scanning.
+            return False
 
         role = str(message.get("role", "")).lower()
         item_type = str(message.get("type", "")).lower()
@@ -434,14 +453,28 @@ def _trailing_user_messages_include_explicit_user(messages, explicit_initiators:
                 return True
             continue
 
-        if not saw_user_message:
-            continue
+        if saw_user_message:
+            # Already past the trailing user block — stop.
+            if role in skippable_roles:
+                continue
+            if item_type in skippable_item_types:
+                continue
+            break
 
-        if role in {"system", "developer"}:
+        # Pre-user (i.e. items at the END of the list, before we have seen
+        # a user message walking backwards).
+        if role in skippable_roles:
             continue
-        if item_type in {"reasoning", "item_reference", "compaction"}:
+        if item_type in skippable_item_types:
             continue
-        break
+        # Reasoning at the very tail is fine only if it precedes the fresh
+        # user turn with no intervening tool calls. Allow it through.
+        if item_type == "reasoning":
+            continue
+        # Anything else (function_call, function_call_output, custom_tool_*,
+        # assistant message, etc.) means the most-recent user turn is no
+        # longer fresh — do NOT honour the explicit-user bypass.
+        return False
 
     return False
 

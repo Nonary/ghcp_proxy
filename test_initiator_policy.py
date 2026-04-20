@@ -217,6 +217,74 @@ class InitiatorPolicyTests(unittest.TestCase):
         self.assertEqual(input_items[-1]["content"], "new prompt")
         self.assertEqual(initiator, "user")
 
+    def test_plus_prefix_does_not_bypass_safeguard_on_replayed_codex_followup(self):
+        # Regression: Codex replays the entire input list on every follow-up
+        # Responses API turn. The original "+"-prefixed user message is still
+        # the most-recent role:"user" item, but it is now followed by tool
+        # calls and tool outputs. The explicit-user bypass must NOT fire on
+        # those continuation turns — otherwise every follow-up gets billed
+        # as a user premium request even though the harness, not the human,
+        # initiated it.
+        policy = initiator_policy.InitiatorPolicy()
+        input_items = [
+            {"type": "message", "role": "user", "content": "+ investigate the bug"},
+            {"type": "function_call", "name": "shell", "arguments": "{}", "call_id": "c1"},
+            {"type": "function_call_output", "call_id": "c1", "output": "ok"},
+            {"type": "reasoning", "summary": []},
+        ]
+
+        # First turn: pretend the user just sent it. "+" must force user.
+        # We exercise the on-the-wire shape directly via the candidate helper.
+        normalized_input, candidate = initiator_policy._determine_responses_candidate(
+            [{"type": "message", "role": "user", "content": "+ investigate the bug"}]
+        )
+        self.assertEqual(candidate, initiator_policy._EXPLICIT_USER_INITIATOR)
+
+        # Follow-up: same user message replayed with tool calls trailing it.
+        normalized_input, candidate = initiator_policy._determine_responses_candidate(input_items)
+        # Candidate should fall back to plain agent — the trailing function_call /
+        # function_call_output items prove this is an agent-initiated continuation,
+        # so the safeguard can clamp it.
+        self.assertEqual(candidate, "agent")
+
+    def test_plus_prefix_does_not_bypass_safeguard_with_trailing_assistant(self):
+        policy = initiator_policy.InitiatorPolicy()
+        input_items = [
+            {"type": "message", "role": "user", "content": "+ kick this off"},
+            {"type": "message", "role": "assistant", "content": "working on it"},
+        ]
+
+        normalized_input, candidate = initiator_policy._determine_responses_candidate(input_items)
+        self.assertEqual(candidate, "agent")
+
+    def test_plus_prefix_does_not_bypass_safeguard_on_replayed_anthropic_followup(self):
+        # Anthropic equivalent of the Codex-replay bug. On follow-up turns the
+        # harness appends an assistant message containing tool_use blocks and
+        # then a new user message containing tool_result blocks. The original
+        # "+"-prefixed user turn is no longer fresh and must NOT trigger the
+        # explicit-user safeguard bypass.
+        messages = [
+            {"role": "user", "content": [{"type": "text", "text": "+ investigate the bug"}]},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "tool_use", "id": "tu1", "name": "Bash", "input": {"command": "ls"}},
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "tu1", "content": "ok"},
+                ],
+            },
+        ]
+
+        candidate = initiator_policy._determine_anthropic_candidate(messages)
+        # Should fall back to agent — the trailing assistant tool_use + user
+        # tool_result prove this is an agent-initiated continuation. The "+"
+        # bypass must not fire on the original (now-stale) user turn.
+        self.assertEqual(candidate, "agent")
+
     def test_plus_prefix_forces_user_for_chat_messages(self):
         policy = initiator_policy.InitiatorPolicy()
         messages = [
