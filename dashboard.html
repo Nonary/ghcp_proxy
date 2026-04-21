@@ -184,6 +184,136 @@
       color: var(--text);
       word-break: break-all;
     }
+    .auth-panel {
+      display: grid;
+      gap: 14px;
+      margin-bottom: 14px;
+      background:
+        linear-gradient(145deg, rgba(255,135,82,.09), transparent 42%),
+        linear-gradient(180deg, rgba(255,255,255,.03), transparent 30%),
+        var(--panel);
+    }
+    .auth-grid {
+      display: grid;
+      grid-template-columns: minmax(220px, 280px) minmax(0, 1fr);
+      gap: 14px;
+      align-items: start;
+    }
+    .auth-code-card {
+      display: grid;
+      gap: 10px;
+      padding: 14px;
+      border-radius: 12px;
+      border: 1px solid rgba(255,255,255,.08);
+      background: rgba(6, 12, 18, .48);
+    }
+    .auth-code {
+      font-family: "Cascadia Code", Consolas, monospace;
+      font-size: clamp(1.2rem, 3vw, 2rem);
+      font-weight: 700;
+      letter-spacing: .18em;
+      line-height: 1;
+      color: var(--accent-2);
+      word-break: break-word;
+    }
+    .auth-copy {
+      display: grid;
+      gap: 10px;
+      align-content: start;
+    }
+    .auth-steps {
+      display: grid;
+      gap: 4px;
+    }
+    .button-link {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 38px;
+      padding: 8px 14px;
+      border-radius: 10px;
+      border: 1px solid rgba(255,255,255,.08);
+      background: rgba(255,255,255,.04);
+      color: var(--text);
+      text-decoration: none;
+      font-size: .9rem;
+      line-height: 1;
+    }
+    .button-link:hover {
+      border-color: rgba(255,255,255,.16);
+      background: rgba(255,255,255,.08);
+    }
+
+    /* Setup mode: only the GHCP sign-in card is shown until auth completes. */
+    .app.setup-mode {
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      padding: 32px 20px;
+    }
+    .app.setup-mode .auth-panel {
+      width: min(960px, 100%);
+      margin: 0 auto;
+      padding: 28px 32px;
+      border-radius: 18px;
+      border: 1px solid rgba(255,135,82,.22);
+      box-shadow:
+        0 18px 48px rgba(0,0,0,.45),
+        0 0 0 1px rgba(255,135,82,.08) inset;
+      background:
+        radial-gradient(120% 80% at 0% 0%, rgba(255,135,82,.18), transparent 55%),
+        radial-gradient(80% 60% at 100% 100%, rgba(64,150,255,.12), transparent 60%),
+        var(--panel);
+    }
+    .app.setup-mode .auth-panel .panel-head h3 {
+      font-size: 1.45rem;
+      letter-spacing: .01em;
+    }
+    .app.setup-mode .auth-panel .panel-head .eyebrow {
+      letter-spacing: .18em;
+      color: var(--accent-2);
+      font-weight: 600;
+    }
+    .app.setup-mode .auth-panel .auth-grid {
+      grid-template-columns: minmax(240px, 320px) minmax(0, 1fr);
+      gap: 22px;
+      margin-top: 8px;
+    }
+    .app.setup-mode .auth-panel .auth-code-card {
+      padding: 18px;
+      background: rgba(4, 9, 14, .6);
+      border-color: rgba(255,135,82,.22);
+    }
+    .app.setup-mode .auth-panel .auth-code {
+      font-size: clamp(1.6rem, 4vw, 2.4rem);
+      letter-spacing: .22em;
+    }
+    .app.setup-mode .auth-panel .auth-steps {
+      padding: 12px 14px;
+      border-radius: 10px;
+      background: rgba(255,255,255,.03);
+      border: 1px solid rgba(255,255,255,.06);
+      gap: 6px;
+    }
+    .app.setup-mode .auth-panel .toolbar {
+      gap: 10px;
+    }
+    .setup-brand {
+      display: grid;
+      gap: 6px;
+      margin-bottom: 18px;
+      text-align: left;
+    }
+    .setup-brand-title {
+      font-size: 1.05rem;
+      font-weight: 700;
+      letter-spacing: .02em;
+      color: var(--text);
+    }
+    .setup-brand-sub {
+      font-size: .85rem;
+      color: var(--muted);
+    }
     .premium-shell {
       display: grid;
       grid-template-columns: minmax(180px, 220px) minmax(0, 1fr);
@@ -1202,6 +1332,7 @@
     }
     @media (max-width: 760px) {
       .summary-grid { grid-template-columns: 1fr; }
+      .auth-grid { grid-template-columns: 1fr; }
       .source-context-pill { width: 100%; justify-items: start; }
       .panel-head { align-items: start; }
       .premium-consumed-grid { grid-template-columns: 1fr; }
@@ -1210,7 +1341,51 @@
   </style>
 </head>
 <body>
-  <div id="app" class="app">
+  <div id="app" class="app" :class="{ 'setup-mode': showAuthPanel }">
+    <section v-if="showAuthPanel" class="panel auth-panel">
+      <div class="setup-brand">
+        <div class="setup-brand-title">GHCP Proxy</div>
+        <div class="setup-brand-sub">Local GitHub Copilot bridge · awaiting authorization</div>
+      </div>
+      <div class="panel-head">
+        <div>
+          <div class="eyebrow">Required · Setup</div>
+          <h3>GitHub Copilot Sign-In</h3>
+          <div class="subtle">{{ authStatus.message || 'A local GHCP token is required before the dashboard can serve traffic. Complete sign-in to unlock the rest of the page.' }}</div>
+        </div>
+        <span v-if="authStatus.state === 'pending'" class="badge">waiting</span>
+      </div>
+      <div class="auth-grid">
+        <div class="auth-code-card">
+          <div class="subtle">Device code</div>
+          <div class="auth-code">{{ authStatus.user_code || 'Start sign-in to request a code' }}</div>
+          <div class="subtle" v-if="authStatus.expires_at">Expires {{ stamp(authStatus.expires_at) }}</div>
+          <div class="subtle" v-else>The code appears here after sign-in starts.</div>
+        </div>
+        <div class="auth-copy">
+          <div class="subtle">
+            Fresh setups now keep the dashboard running while GitHub authorization happens. Start sign-in here, open GitHub, enter the code, and the page will detect completion automatically.
+          </div>
+          <div class="toolbar">
+            <button class="primary" @click="startAuthFlow" :disabled="startingAuthFlow || authStatus.state === 'starting' || authStatus.state === 'pending'">
+              {{ authPrimaryButtonLabel }}
+            </button>
+            <a v-if="authVerificationUri" class="button-link" :href="authVerificationUri" target="_blank" rel="noreferrer">Open GitHub</a>
+            <button v-if="authStatus.user_code" @click="copyAuthCode">Copy code</button>
+            <button @click="loadAuthStatus" :disabled="loadingAuthStatus">Refresh</button>
+          </div>
+          <div class="auth-steps subtle">
+            <div>1. Click Start sign-in to request a GitHub device code.</div>
+            <div>2. Click Open GitHub and paste the code shown on this page.</div>
+            <div>3. Return here after approval; the dashboard will keep polling until auth completes.</div>
+          </div>
+          <div v-if="authStatus.error" class="status error">{{ authStatus.error }}</div>
+          <div v-else-if="authStatus.warning" class="status warn">{{ authStatus.warning }}</div>
+        </div>
+      </div>
+    </section>
+
+    <template v-else>
     <section class="hero summary-hero panel">
       <summary-explorer-card
         :all-time="allTime"
@@ -1952,6 +2127,7 @@
         </div>
       </div>
     </div>
+    </template>
   </div>
 
   <template id="metric-card-template">
@@ -3031,12 +3207,28 @@
       data() {
         return {
           autoRefreshTimer: null,
+          authStatusTimer: null,
+          loadingAuthStatus: false,
+          startingAuthFlow: false,
           loadingClientProxyStatus: false,
           savingProxyConfig: false,
           loadingModelRoutingConfig: false,
           savingModelRoutingConfig: false,
           proxyConfigError: '',
           proxyConfigStatusMessage: '',
+          authStatus: {
+            authenticated: false,
+            state: 'unauthenticated',
+            message: '',
+            error: '',
+            warning: '',
+            verification_uri: '',
+            verification_uri_complete: '',
+            user_code: '',
+            started_at: '',
+            expires_at: '',
+            poll_interval_seconds: null,
+          },
           clientProxyStatus: {
             codex: {
               client: 'codex',
@@ -3111,6 +3303,15 @@
         };
       },
       computed: {
+        showAuthPanel() { return !this.authStatus.authenticated; },
+        authVerificationUri() {
+          return this.authStatus.verification_uri_complete || this.authStatus.verification_uri || '';
+        },
+        authPrimaryButtonLabel() {
+          if (this.authStatus.state === 'starting') return 'Starting sign-in...';
+          if (this.authStatus.state === 'pending') return 'Sign-in requested';
+          return 'Start GitHub Sign-In';
+        },
         premium() { return this.data.premium || {}; },
         safeguardStats() { return this.data.safeguard || {}; },
         gptFallbackOptions() {
@@ -3493,6 +3694,124 @@
           if (!value) return '-';
           const date = new Date(value);
           return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
+        },
+        _normalizeAuthStatus(payload) {
+          if (!payload || typeof payload !== 'object') {
+            return {
+              authenticated: false,
+              state: 'error',
+              message: '',
+              error: 'Invalid auth status response.',
+              warning: '',
+              verification_uri: '',
+              verification_uri_complete: '',
+              user_code: '',
+              started_at: '',
+              expires_at: '',
+              poll_interval_seconds: null,
+            };
+          }
+          return {
+            authenticated: Boolean(payload.authenticated),
+            state: payload.state || 'unauthenticated',
+            message: payload.message || '',
+            error: payload.error || '',
+            warning: payload.warning || '',
+            verification_uri: payload.verification_uri || '',
+            verification_uri_complete: payload.verification_uri_complete || '',
+            user_code: payload.user_code || '',
+            started_at: payload.started_at || '',
+            expires_at: payload.expires_at || '',
+            poll_interval_seconds: payload.poll_interval_seconds ?? null,
+          };
+        },
+        _syncAuthStatusPolling() {
+          const shouldPoll = !this.authStatus.authenticated;
+          const intervalMs = ['starting', 'pending'].includes(this.authStatus.state) ? 3000 : 5000;
+          if (shouldPoll) {
+            if (this.authStatusTimer && this._authStatusTimerInterval !== intervalMs) {
+              window.clearInterval(this.authStatusTimer);
+              this.authStatusTimer = null;
+            }
+            if (!this.authStatusTimer) {
+              this._authStatusTimerInterval = intervalMs;
+              this.authStatusTimer = window.setInterval(() => {
+                this.loadAuthStatus();
+              }, intervalMs);
+            }
+            return;
+          }
+          if (this.authStatusTimer) {
+            window.clearInterval(this.authStatusTimer);
+            this.authStatusTimer = null;
+            this._authStatusTimerInterval = null;
+          }
+        },
+        async loadAuthStatus() {
+          this.loadingAuthStatus = true;
+          const wasAuthenticated = Boolean(this.authStatus.authenticated);
+          try {
+            const response = await fetch('/api/auth/status', { cache: 'no-store' });
+            if (!response.ok) throw new Error(`auth status request failed: ${response.status}`);
+            const payload = await response.json();
+            this.authStatus = this._normalizeAuthStatus(payload);
+            this._syncAuthStatusPolling();
+            if (!wasAuthenticated && this.authStatus.authenticated) {
+              this.load(true);
+              this.loadClientProxyStatus();
+              this.loadModelRoutingConfig();
+            }
+          } catch (error) {
+            this.authStatus = {
+              ...this.authStatus,
+              authenticated: false,
+              state: 'error',
+              error: error?.message || 'Failed to load auth status.',
+            };
+            this._syncAuthStatusPolling();
+          } finally {
+            this.loadingAuthStatus = false;
+          }
+        },
+        async startAuthFlow() {
+          if (this.startingAuthFlow || this.authStatus.state === 'pending') return;
+          this.startingAuthFlow = true;
+          try {
+            const response = await fetch('/api/auth/device', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+            });
+            if (!response.ok) throw new Error(`auth start request failed: ${response.status}`);
+            const payload = await response.json();
+            this.authStatus = this._normalizeAuthStatus(payload);
+            this._syncAuthStatusPolling();
+          } catch (error) {
+            this.authStatus = {
+              ...this.authStatus,
+              authenticated: false,
+              state: 'error',
+              error: error?.message || 'Failed to start GitHub sign-in.',
+            };
+            this._syncAuthStatusPolling();
+          } finally {
+            this.startingAuthFlow = false;
+          }
+        },
+        async copyAuthCode() {
+          const code = this.authStatus.user_code;
+          if (!code) return;
+          try {
+            await navigator.clipboard.writeText(code);
+          } catch (_err) {
+            const textarea = document.createElement('textarea');
+            textarea.value = code;
+            textarea.style.position = 'fixed';
+            textarea.style.opacity = '0';
+            document.body.appendChild(textarea);
+            textarea.select();
+            try { document.execCommand('copy'); } catch (_) { /* noop */ }
+            document.body.removeChild(textarea);
+          }
         },
         requestKey(row) {
           return row?.request_id || row?.client_request_id || row?.started_at || '';
@@ -4172,6 +4491,7 @@
         },
       },
       mounted() {
+        this.loadAuthStatus();
         this.load(true);
         this.loadSafeguardConfig();
         this.loadClientProxyStatus();
@@ -4191,6 +4511,10 @@
         if (this.autoRefreshTimer) {
           window.clearInterval(this.autoRefreshTimer);
           this.autoRefreshTimer = null;
+        }
+        if (this.authStatusTimer) {
+          window.clearInterval(this.authStatusTimer);
+          this.authStatusTimer = null;
         }
         this.stopDashboardStream();
         if (this._debugModalKeyHandler) {

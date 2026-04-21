@@ -7,7 +7,7 @@ Local reverse proxy for Codex and Claude Code using GitHub Copilot upstream.
 - Serves a local OpenAI-compatible endpoint at `http://localhost:8000/v1`
 - Proxies Codex Responses API traffic to GitHub Copilot
 - Also works with Claude Code
-- Handles GitHub Copilot auth automatically on startup
+- Supports GitHub Copilot auth from the local dashboard on first run
 - Exposes a local dashboard at `http://localhost:8000/`
 - Shows tracked GitHub premium request usage for traffic that passes through the proxy
 - Tracks session, token, and estimated cost data from the proxy's own request log
@@ -37,7 +37,7 @@ python3 proxy.py
 
 `GHCP_UPSTREAM_TIMEOUT_SECONDS` applies to upstream non-streaming requests, including `/v1/responses/compact`. The default is `300` seconds.
 
-On first run, if no valid Copilot token is cached, the proxy will automatically start the GitHub device-flow login and prompt you in the terminal. After authorization, it caches the token and continues serving.
+On first run, if no valid Copilot token is cached, the proxy still starts the local server immediately. Open the dashboard, start GitHub sign-in there, then click through to GitHub and enter the device code shown on the page. After authorization, the proxy caches the token and starts serving authenticated upstream traffic without needing a terminal prompt.
 
 When running correctly, the proxy binds only to loopback and listens on:
 

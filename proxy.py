@@ -100,7 +100,7 @@ _TRACE_HEADER_ALLOWLIST = {
     "x-request-id",
     "x-github-request-id",
 }
-AUTH_FAILURE_MESSAGE = "GHCP auth failed"
+AUTH_FAILURE_MESSAGE = "GitHub Copilot authorization required. Open /ui to sign in."
 INVALID_BRIDGE_REQUEST_MESSAGE = "Invalid request"
 
 safeguard_event_store = dashboard_module.create_safeguard_event_store()
@@ -1653,6 +1653,25 @@ async def dashboard_stream(request: Request):
     )
 
 
+# ─── Auth routes ──────────────────────────────────────────────────────────────
+
+
+@app.get("/api/auth/status")
+async def auth_status_api():
+    return JSONResponse(
+        content=auth.auth_status(),
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.post("/api/auth/device")
+async def auth_device_api():
+    return JSONResponse(
+        content=auth.begin_device_flow(),
+        headers={"Cache-Control": "no-store"},
+    )
+
+
 # ─── Config API routes ────────────────────────────────────────────────────────
 
 @app.get("/api/config/safeguard")
@@ -1968,16 +1987,15 @@ if __name__ == "__main__":
         except OSError:
             pass
 
-    # Step 1: Run auth interactively in the terminal BEFORE the server starts.
-    # If no token exists this will print the device flow prompt and block until
-    # the user authorizes (or the script exits on failure).
-    auth.ensure_authenticated()
-
-    # Step 2: Start the server in the foreground on this terminal.
+    # Start the server immediately so first-run setup can complete from the
+    # browser dashboard instead of blocking on a terminal prompt.
     print("Starting GHCP proxy on http://localhost:8000 (loopback only)", flush=True)
     print("  Responses API : POST /v1/responses", flush=True)
     print("  Compaction    : POST /v1/responses/compact", flush=True)
     print("  Chat API      : POST /v1/chat/completions", flush=True)
+    print("  Dashboard     : GET  /ui", flush=True)
+    print("", flush=True)
+    print("  If this is a fresh setup, open /ui and complete GitHub sign-in there.", flush=True)
     print("", flush=True)
     print("  Set in your shell:", flush=True)
     print("    export OPENAI_BASE_URL=http://localhost:8000/v1", flush=True)

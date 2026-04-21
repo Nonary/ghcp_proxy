@@ -74,6 +74,28 @@ class ProxyRoutesTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.body, upstream.content)
 
+    def test_auth_status_api_disables_http_caching(self):
+        payload = {"authenticated": False, "state": "unauthenticated"}
+
+        with mock.patch.object(auth, "auth_status", return_value=payload) as auth_status:
+            response = proxy.asyncio.run(proxy.auth_status_api())
+
+        auth_status.assert_called_once_with()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["cache-control"], "no-store")
+        self.assertEqual(json.loads(response.body), payload)
+
+    def test_auth_device_api_starts_browser_auth_flow(self):
+        payload = {"authenticated": False, "state": "pending", "user_code": "ABCD-EFGH"}
+
+        with mock.patch.object(auth, "begin_device_flow", return_value=payload) as begin_device_flow:
+            response = proxy.asyncio.run(proxy.auth_device_api())
+
+        begin_device_flow.assert_called_once_with()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["cache-control"], "no-store")
+        self.assertEqual(json.loads(response.body), payload)
+
     def test_fetch_copilot_model_capabilities_uses_prompt_window_for_all_400k_models(self):
         upstream = mock.Mock()
         upstream.raise_for_status.return_value = None
