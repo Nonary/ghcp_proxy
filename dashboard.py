@@ -1131,7 +1131,7 @@ def _burn_event_model_label(event: dict) -> str | None:
     for key in ("response_model", "resolved_model", "requested_model"):
         value = event.get(key)
         if isinstance(value, str) and value.strip():
-            return value.strip()
+            return _normalize_model_name(value) or value.strip()
     return None
 
 

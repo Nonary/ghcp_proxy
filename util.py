@@ -400,6 +400,12 @@ def _normalize_model_name(model_name: str | None) -> str | None:
     if normalized.startswith("openai/"):
         normalized = normalized.split("/", 1)[1]
     normalized = MODEL_PRICING_ALIASES.get(normalized, normalized)
+    if normalized not in MODEL_PRICING:
+        undated = re.sub(r"-\d{4}-\d{2}-\d{2}$", "", normalized)
+        if undated != normalized:
+            candidate = MODEL_PRICING_ALIASES.get(undated, undated)
+            if candidate in MODEL_PRICING:
+                normalized = candidate
     return normalized
 
 

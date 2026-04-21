@@ -795,6 +795,22 @@ class DashboardTests(unittest.TestCase):
         # claude-opus-4.7: 1.0% over 500k => 2.0% / 1M, so it sorts ahead of gpt-5-mini.
         self.assertEqual(burn["session"]["models"][0]["model"], "claude-opus-4.7")
 
+    def test_burn_rate_normalizes_dated_model_revisions(self):
+        reset = "2026-04-21T18:00:00Z"
+        events = [
+            self._burn_event("2026-04-21T10:00:00+00:00", "gpt-5.4", 0.0, reset),
+            self._burn_event("2026-04-21T10:01:00+00:00", "gpt-5.4-2026-03-05", 1.0, reset, input_tokens=500_000),
+            self._burn_event("2026-04-21T10:02:00+00:00", "gpt-5.4", 2.0, reset, input_tokens=500_000),
+        ]
+
+        burn = dashboard._build_burn_rate_summary(events)
+        models = {row["model"]: row for row in burn["session"]["models"]}
+
+        self.assertIn("gpt-5.4", models)
+        self.assertNotIn("gpt-5.4-2026-03-05", models)
+        self.assertEqual(models["gpt-5.4"]["samples"], 2)
+        self.assertAlmostEqual(models["gpt-5.4"]["limit_percent_per_target_tokens"], 2.0, places=4)
+
 
 
 if __name__ == "__main__":
