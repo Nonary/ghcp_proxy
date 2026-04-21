@@ -1092,6 +1092,248 @@ def _latest_quota_snapshots(events: list[dict]) -> dict | None:
     }
 
 
+def _latest_usage_ratelimits(events: list[dict]) -> dict | None:
+    """Return the most recent x-usage-ratelimit-* payload captured on a successful event.
+
+    Copilot upstream emits per-window gauges (session, weekly) on every successful chat
+    completion. UsageTrackingService parses them into event["usage_ratelimits"]; this
+    finds the newest event that has any.
+    """
+    best_at = ""
+    best: dict | None = None
+    best_event_id: str | None = None
+    for event in events:
+        windows = event.get("usage_ratelimits")
+        if not isinstance(windows, dict) or not windows:
+            continue
+        recorded_at = event.get("finished_at") or event.get("started_at") or ""
+        if not isinstance(recorded_at, str):
+            continue
+        if recorded_at <= best_at:
+            continue
+        best_at = recorded_at
+        best = windows
+        best_event_id = event.get("request_id") if isinstance(event.get("request_id"), str) else None
+    if best is None:
+        return None
+    return {
+        "captured_at": best_at,
+        "request_id": best_event_id,
+        "windows": best,
+    }
+
+
+_BURN_TOKEN_FIELDS = ("input_tokens", "cached_input_tokens", "output_tokens", "reasoning_output_tokens")
+
+
+def _burn_event_model_label(event: dict) -> str | None:
+    for key in ("response_model", "resolved_model", "requested_model"):
+        value = event.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _burn_event_tokens(event: dict) -> dict:
+    usage = event.get("usage") if isinstance(event.get("usage"), dict) else {}
+    tokens = {field: _coerce_float(usage.get(field)) for field in _BURN_TOKEN_FIELDS}
+    # Two upstream conventions:
+    #   * OpenAI/Codex: `input_tokens` is the GROSS prompt count, `cached_input_tokens`
+    #     is a subset of it (so fresh = input - cached).
+    #   * Anthropic/Claude: `input_tokens` is already the FRESH count and
+    #     `cached_input_tokens` is a separate counter (so fresh = input).
+    # Detect by checking whether cached <= input.
+    if tokens["cached_input_tokens"] > tokens["input_tokens"]:
+        fresh_input = tokens["input_tokens"]
+    else:
+        fresh_input = max(0.0, tokens["input_tokens"] - tokens["cached_input_tokens"])
+    tokens["fresh_input_tokens"] = fresh_input
+    # "Billable" approximation: fresh input + output + reasoning output.
+    # Cached inputs are deeply discounted in $ but still consume request budget;
+    # we surface a separate cached-input ratio so the dashboard can show whether
+    # cached prefill is what's burning the meter.
+    tokens["billable_tokens"] = fresh_input + tokens["output_tokens"] + tokens["reasoning_output_tokens"]
+    return tokens
+
+
+def _build_window_burn_breakdown(events_for_window: list[dict]) -> dict:
+    """Compute per-model burn rate for one window.
+
+    `events_for_window` is the time-ordered list of events that carry usage gauges
+    for this window. We walk consecutive pairs that share the same `reset_at`
+    epoch and attribute the delta in `percent_used` to the *later* event's model.
+    """
+    per_model: dict[str, dict] = {}
+    sample_count = 0
+    prev: dict | None = None
+    prev_reset: str | None = None
+    for event in events_for_window:
+        window_payload = event["__window_payload"]
+        reset_at = window_payload.get("reset_at") if isinstance(window_payload.get("reset_at"), str) else None
+        percent_used = _coerce_float(window_payload.get("percent_used"))
+        if not isinstance(percent_used, (int, float)):
+            prev = None
+            prev_reset = reset_at
+            continue
+        if prev is None or prev_reset != reset_at:
+            prev = {"percent_used": percent_used}
+            prev_reset = reset_at
+            continue
+        delta = percent_used - prev["percent_used"]
+        prev = {"percent_used": percent_used}
+        prev_reset = reset_at
+        if delta <= 0:
+            # Could happen if requests interleave; skip ambiguous attribution.
+            continue
+        model = _burn_event_model_label(event) or "unknown"
+        tokens = _burn_event_tokens(event)
+        bucket = per_model.setdefault(
+            model,
+            {
+                "model": model,
+                "samples": 0,
+                "delta_percent": 0.0,
+                "tokens": {field: 0.0 for field in _BURN_TOKEN_FIELDS + ("fresh_input_tokens", "billable_tokens")},
+            },
+        )
+        bucket["samples"] += 1
+        bucket["delta_percent"] += float(delta)
+        for field, value in tokens.items():
+            bucket["tokens"][field] += float(value)
+        sample_count += 1
+    rows: list[dict] = []
+    for bucket in per_model.values():
+        delta_percent = round(bucket["delta_percent"], 4)
+        token_totals = {field: round(bucket["tokens"][field], 2) for field in bucket["tokens"]}
+
+        def _per_100k(total_tokens: float) -> float | None:
+            if total_tokens <= 0:
+                return None
+            return round((delta_percent / total_tokens) * 100_000, 4)
+
+        rows.append({
+            "model": bucket["model"],
+            "samples": bucket["samples"],
+            "delta_percent": delta_percent,
+            "tokens": token_totals,
+            "percent_per_100k": {
+                "billable": _per_100k(token_totals["billable_tokens"]),
+                "fresh_input": _per_100k(token_totals["fresh_input_tokens"]),
+                "cached_input": _per_100k(token_totals["cached_input_tokens"]),
+                "output": _per_100k(token_totals["output_tokens"]),
+                "reasoning_output": _per_100k(token_totals["reasoning_output_tokens"]),
+            },
+        })
+
+    # Mark the fastest burner by billable rate (excluding rows with no billable signal).
+    burnable = [r for r in rows if r["percent_per_100k"]["billable"] is not None]
+    if burnable:
+        fastest = max(burnable, key=lambda r: r["percent_per_100k"]["billable"])
+        for r in rows:
+            r["fastest_burner"] = (r is fastest)
+    else:
+        for r in rows:
+            r["fastest_burner"] = False
+
+    rows.sort(
+        key=lambda r: (
+            r["percent_per_100k"]["billable"] is None,
+            -(r["percent_per_100k"]["billable"] or 0.0),
+            -r["delta_percent"],
+            r["model"],
+        )
+    )
+
+    return {"samples": sample_count, "models": rows}
+
+
+def _build_burn_rate_summary(usage_events: list[dict]) -> dict:
+    """Return per-window burn-rate breakdown keyed by window name."""
+    # Pre-sort once chronologically so each window walk is consistent.
+    timed_events: list[tuple[str, dict]] = []
+    for event in usage_events:
+        windows = event.get("usage_ratelimits")
+        if not isinstance(windows, dict) or not windows:
+            continue
+        ts = event.get("finished_at") or event.get("started_at") or ""
+        if not isinstance(ts, str):
+            continue
+        timed_events.append((ts, event))
+    timed_events.sort(key=lambda item: item[0])
+
+    out: dict[str, dict] = {}
+    window_names: set[str] = set()
+    for _ts, event in timed_events:
+        windows = event["usage_ratelimits"]
+        if isinstance(windows, dict):
+            window_names.update(name for name in windows.keys() if isinstance(name, str))
+    for window_name in window_names:
+        events_for_window: list[dict] = []
+        for _ts, event in timed_events:
+            window_payload = event.get("usage_ratelimits", {}).get(window_name)
+            if not isinstance(window_payload, dict):
+                continue
+            decorated = dict(event)
+            decorated["__window_payload"] = window_payload
+            events_for_window.append(decorated)
+        if not events_for_window:
+            continue
+        out[window_name] = _build_window_burn_breakdown(events_for_window)
+    return out
+
+
+def _build_usage_ratelimits_summary(
+    usage_events: list[dict],
+    *,
+    now: datetime,
+) -> dict:
+    """Build the dashboard's `usage_ratelimits` block from the most recent gauges.
+
+    Each window (typically `session` and `weekly`) is reported with its remaining
+    percentage and reset timestamp. Returns an `awaiting-first-request` placeholder
+    when no completion has been seen yet.
+
+    Also produces a `burn_rate` analysis: for every window, attributes successive
+    deltas in `percent_used` (within the same `reset_at` epoch) to the model that
+    served the request, then divides by tokens to surface "% per 100k tokens" by
+    token category — making it obvious which model burns the meter fastest.
+    """
+    latest = _latest_usage_ratelimits(usage_events)
+    burn_rate = _build_burn_rate_summary(usage_events)
+    if latest is None:
+        return {
+            "configured": False,
+            "source": "awaiting-first-request",
+            "message": "Make a request through the proxy to populate the live session/weekly limits.",
+            "captured_at": None,
+            "windows": {},
+            "burn_rate": burn_rate,
+        }
+    windows_in = latest["windows"] if isinstance(latest.get("windows"), dict) else {}
+    windows_out: dict[str, dict] = {}
+    for name, payload in windows_in.items():
+        if not isinstance(payload, dict):
+            continue
+        reset_at = payload.get("reset_at") if isinstance(payload.get("reset_at"), str) else None
+        seconds_until_reset = _seconds_until(reset_at, now)
+        windows_out[name] = {
+            "percent_remaining": payload.get("percent_remaining"),
+            "percent_used": payload.get("percent_used"),
+            "overage": payload.get("overage"),
+            "overage_permitted": payload.get("overage_permitted"),
+            "reset_at": reset_at,
+            "seconds_until_reset": seconds_until_reset,
+        }
+    return {
+        "configured": True,
+        "source": "upstream-usage-ratelimit-headers",
+        "captured_at": latest.get("captured_at"),
+        "request_id": latest.get("request_id"),
+        "windows": windows_out,
+        "burn_rate": burn_rate,
+    }
+
+
 def _build_premium_usage_summary(
     usage_events: list[dict],
     *,
@@ -1184,6 +1426,15 @@ def _build_premium_consumption_summary(
     }
 
 
+def _seconds_until(reset_at: str | None, now: datetime) -> int | None:
+    parsed = _parse_iso_datetime(reset_at) if isinstance(reset_at, str) else None
+    if parsed is None:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return max(0, int((parsed - now).total_seconds()))
+
+
 def _days_until(reset_at: str | None, now: datetime) -> int | None:
     parsed = _parse_iso_datetime(reset_at) if isinstance(reset_at, str) else None
     if parsed is None:
@@ -1239,6 +1490,7 @@ class DashboardService:
 
         premium_summary = _build_premium_usage_summary(usage_events, now=now)
         premium_summary["consumed"] = _build_premium_consumption_summary(usage_events, now=now)
+        usage_ratelimits_summary = _build_usage_ratelimits_summary(usage_events, now=now)
 
         local_usage = collect_local_dashboard_usage(usage_events)
         month_rows = list(local_usage.get("month_rows") or [])
@@ -1273,6 +1525,7 @@ class DashboardService:
         return {
             "generated_at": now.isoformat(),
             "premium": premium_summary,
+            "usage_ratelimits": usage_ratelimits_summary,
             "safeguard": {
                 "today_count": int(safeguard_stats.get("today_count") or 0),
                 "current_month_count": int(safeguard_stats.get("current_month_count") or 0),

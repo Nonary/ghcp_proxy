@@ -560,5 +560,200 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(row["total_tokens"], 360)
 
 
+    def test_usage_ratelimits_summary_derived_from_headers(self):
+        fixed_now = datetime(2026, 4, 21, 4, 22, 37, tzinfo=timezone.utc)
+        usage_events = [
+            {
+                "request_id": "req-rl-1",
+                "started_at": "2026-04-21T01:47:53+00:00",
+                "finished_at": "2026-04-21T01:47:54+00:00",
+                "usage_ratelimits": {
+                    "session": {
+                        "percent_remaining": 93.2,
+                        "percent_used": 6.8,
+                        "entitlement": 0,
+                        "overage": 0.0,
+                        "overage_permitted": False,
+                        "reset_at": "2026-04-21T06:22:37Z",
+                        "raw": {"rem": "93.2"},
+                    },
+                    "weekly": {
+                        "percent_remaining": 99.0,
+                        "percent_used": 1.0,
+                        "entitlement": 0,
+                        "overage": 0.0,
+                        "overage_permitted": False,
+                        "reset_at": "2026-04-27T00:00:00Z",
+                        "raw": {"rem": "99.0"},
+                    },
+                },
+            },
+        ]
+        service = dashboard.DashboardService(
+            dependencies=dashboard.DashboardDependencies(
+                snapshot_all_usage_events=lambda: usage_events,
+                snapshot_usage_events=lambda: usage_events,
+                load_safeguard_trigger_stats=lambda _now: {},
+            ),
+            utc_now=lambda: fixed_now,
+        )
+
+        block = service.build_payload()["usage_ratelimits"]
+        self.assertTrue(block["configured"])
+        self.assertEqual(block["source"], "upstream-usage-ratelimit-headers")
+        self.assertEqual(block["request_id"], "req-rl-1")
+        self.assertEqual(block["windows"]["session"]["percent_remaining"], 93.2)
+        # 2026-04-21T06:22:37Z is exactly two hours after fixed_now -> 7200s.
+        self.assertEqual(block["windows"]["session"]["seconds_until_reset"], 7200)
+        self.assertEqual(block["windows"]["weekly"]["percent_remaining"], 99.0)
+        self.assertGreater(block["windows"]["weekly"]["seconds_until_reset"], 0)
+
+    def test_usage_ratelimits_summary_uses_latest_event(self):
+        fixed_now = datetime(2026, 4, 21, 12, 0, tzinfo=timezone.utc)
+
+        def _windows(rem):
+            return {
+                "session": {
+                    "percent_remaining": rem,
+                    "percent_used": round(100.0 - rem, 2),
+                    "entitlement": 0,
+                    "overage": 0.0,
+                    "overage_permitted": False,
+                    "reset_at": "2026-04-21T18:00:00Z",
+                    "raw": {},
+                },
+            }
+
+        usage_events = [
+            {"request_id": "older", "finished_at": "2026-04-21T10:00:00+00:00",
+             "usage_ratelimits": _windows(80.0)},
+            {"request_id": "newer", "finished_at": "2026-04-21T11:30:00+00:00",
+             "usage_ratelimits": _windows(40.0)},
+        ]
+        service = dashboard.DashboardService(
+            dependencies=dashboard.DashboardDependencies(
+                snapshot_all_usage_events=lambda: usage_events,
+                snapshot_usage_events=lambda: usage_events,
+                load_safeguard_trigger_stats=lambda _now: {},
+            ),
+            utc_now=lambda: fixed_now,
+        )
+        block = service.build_payload()["usage_ratelimits"]
+        self.assertEqual(block["request_id"], "newer")
+        self.assertEqual(block["windows"]["session"]["percent_remaining"], 40.0)
+
+    def test_usage_ratelimits_summary_awaiting_first_request(self):
+        fixed_now = datetime(2026, 4, 21, 12, 0, tzinfo=timezone.utc)
+        service = dashboard.DashboardService(
+            dependencies=dashboard.DashboardDependencies(
+                snapshot_all_usage_events=lambda: [],
+                snapshot_usage_events=lambda: [],
+                load_safeguard_trigger_stats=lambda _now: {},
+            ),
+            utc_now=lambda: fixed_now,
+        )
+        block = service.build_payload()["usage_ratelimits"]
+        self.assertFalse(block["configured"])
+        self.assertEqual(block["source"], "awaiting-first-request")
+        self.assertEqual(block["windows"], {})
+
+    def _burn_event(self, ts, model, percent_used, reset_at, *, input_tokens=0, cached_input_tokens=0, output_tokens=0, reasoning=0, window="session"):
+        return {
+            "request_id": ts,
+            "finished_at": ts,
+            "response_model": model,
+            "usage": {
+                "input_tokens": input_tokens,
+                "cached_input_tokens": cached_input_tokens,
+                "output_tokens": output_tokens,
+                "reasoning_output_tokens": reasoning,
+            },
+            "usage_ratelimits": {
+                window: {
+                    "percent_remaining": round(100.0 - percent_used, 4),
+                    "percent_used": percent_used,
+                    "entitlement": 0,
+                    "overage": 0.0,
+                    "overage_permitted": False,
+                    "reset_at": reset_at,
+                    "raw": {},
+                },
+            },
+        }
+
+    def test_burn_rate_attributes_delta_to_later_event_model(self):
+        reset = "2026-04-21T18:00:00Z"
+        events = [
+            self._burn_event("2026-04-21T10:00:00+00:00", "gpt-5-mini", 5.0, reset, input_tokens=1000, output_tokens=500),
+            self._burn_event("2026-04-21T10:01:00+00:00", "claude-opus-4.7", 9.0, reset, input_tokens=2000, output_tokens=2000),
+        ]
+        burn = dashboard._build_burn_rate_summary(events)
+        self.assertIn("session", burn)
+        models = {row["model"]: row for row in burn["session"]["models"]}
+        # Only the later event gets attribution (one delta = 4.0%).
+        self.assertEqual(burn["session"]["samples"], 1)
+        self.assertIn("claude-opus-4.7", models)
+        self.assertNotIn("gpt-5-mini", models)
+        opus = models["claude-opus-4.7"]
+        self.assertAlmostEqual(opus["delta_percent"], 4.0, places=4)
+        # OpenAI/Codex convention: fresh = input - cached. cached=0 so fresh=2000.
+        self.assertEqual(opus["tokens"]["fresh_input_tokens"], 2000.0)
+        # billable = fresh + output + reasoning = 2000 + 2000 + 0 = 4000
+        self.assertEqual(opus["tokens"]["billable_tokens"], 4000.0)
+        # 4.0% / 4000 tokens * 100k = 100.0 %/100k
+        self.assertAlmostEqual(opus["percent_per_100k"]["billable"], 100.0, places=2)
+        self.assertTrue(opus["fastest_burner"])
+
+    def test_burn_rate_handles_anthropic_token_convention(self):
+        reset = "2026-04-21T18:00:00Z"
+        events = [
+            self._burn_event("2026-04-21T10:00:00+00:00", "claude-opus-4.7", 1.0, reset),
+            # Anthropic shape: cached > input means input is already fresh-only.
+            self._burn_event(
+                "2026-04-21T10:01:00+00:00",
+                "claude-opus-4.7",
+                3.0,
+                reset,
+                input_tokens=1000,
+                cached_input_tokens=20000,
+                output_tokens=500,
+            ),
+        ]
+        burn = dashboard._build_burn_rate_summary(events)
+        opus = burn["session"]["models"][0]
+        # Fresh input == input_tokens (not subtracted) under Anthropic shape.
+        self.assertEqual(opus["tokens"]["fresh_input_tokens"], 1000.0)
+        self.assertEqual(opus["tokens"]["cached_input_tokens"], 20000.0)
+        # billable = 1000 + 500 = 1500
+        self.assertEqual(opus["tokens"]["billable_tokens"], 1500.0)
+
+    def test_burn_rate_skips_delta_across_reset_boundary(self):
+        events = [
+            self._burn_event("2026-04-21T10:00:00+00:00", "gpt-5-mini", 90.0, "2026-04-21T11:00:00Z", input_tokens=500, output_tokens=500),
+            # Window reset; new reset_at -> previous sample discarded, no attribution.
+            self._burn_event("2026-04-21T11:05:00+00:00", "gpt-5-mini", 5.0, "2026-04-21T18:00:00Z", input_tokens=500, output_tokens=500),
+        ]
+        burn = dashboard._build_burn_rate_summary(events)
+        self.assertEqual(burn["session"]["samples"], 0)
+        self.assertEqual(burn["session"]["models"], [])
+
+    def test_burn_rate_marks_fastest_billable_burner(self):
+        reset = "2026-04-21T18:00:00Z"
+        events = [
+            self._burn_event("2026-04-21T10:00:00+00:00", "gpt-5-mini", 0.0, reset),
+            # gpt-5-mini: 1% / 10k billable -> 10 %/100k
+            self._burn_event("2026-04-21T10:01:00+00:00", "gpt-5-mini", 1.0, reset, input_tokens=5000, output_tokens=5000),
+            # claude-opus-4.7: 1% / 1k billable -> 100 %/100k (fastest)
+            self._burn_event("2026-04-21T10:02:00+00:00", "claude-opus-4.7", 2.0, reset, input_tokens=500, output_tokens=500),
+        ]
+        burn = dashboard._build_burn_rate_summary(events)
+        models = {row["model"]: row for row in burn["session"]["models"]}
+        self.assertTrue(models["claude-opus-4.7"]["fastest_burner"])
+        self.assertFalse(models["gpt-5-mini"]["fastest_burner"])
+        # Sorted descending by billable rate: opus first.
+        self.assertEqual(burn["session"]["models"][0]["model"], "claude-opus-4.7")
+
+
+
 if __name__ == "__main__":
     unittest.main()

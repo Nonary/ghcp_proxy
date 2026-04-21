@@ -1035,8 +1035,17 @@ class UsageTracker:
             # This is more authoritative than the user-scoped /settings/billing endpoint
             # (which often 403s for ghu_* device-flow tokens) because it ships on every
             # successful chat completion.
-            quota_snapshots: dict[str, dict[str, object]] = {}
             from urllib.parse import parse_qs, unquote
+
+            def _to_float(val: str | None) -> float | None:
+                if val is None:
+                    return None
+                try:
+                    return float(val)
+                except (TypeError, ValueError):
+                    return None
+
+            quota_snapshots: dict[str, dict[str, object]] = {}
             for header_name, header_value in upstream.headers.items():
                 lowered = header_name.lower()
                 if not lowered.startswith("x-quota-snapshot-"):
@@ -1048,14 +1057,6 @@ class UsageTracker:
                 for key, values in parse_qs(unquote(header_value), keep_blank_values=True).items():
                     if values:
                         raw[key] = values[0]
-
-                def _to_float(val: str | None) -> float | None:
-                    if val is None:
-                        return None
-                    try:
-                        return float(val)
-                    except (TypeError, ValueError):
-                        return None
 
                 ent_value = _to_float(raw.get("ent"))
                 rem_percent = _to_float(raw.get("rem"))
@@ -1093,6 +1094,50 @@ class UsageTracker:
                 }
             if quota_snapshots:
                 finished_event["quota_snapshots"] = quota_snapshots
+
+            # Copilot CLI's chat completions also emit per-window usage gauges:
+            #   x-usage-ratelimit-session: ent=0&ov=0.0&ovPerm=false&rem=93.2&rst=2026-04-21T06:22:37Z
+            #   x-usage-ratelimit-weekly:  ent=0&ov=0.0&ovPerm=false&rem=99.0&rst=2026-04-27T00:00:00Z
+            # `rem` is REMAINING PERCENT (0..100) for that rolling window, `rst` the reset
+            # timestamp. We surface them so the dashboard can show the live session/weekly
+            # throttles GitHub uses to slow Copilot down before the monthly premium cap bites.
+            usage_ratelimits: dict[str, dict[str, object]] = {}
+            for header_name, header_value in upstream.headers.items():
+                lowered = header_name.lower()
+                if not lowered.startswith("x-usage-ratelimit-"):
+                    continue
+                window = lowered[len("x-usage-ratelimit-"):]
+                if not window:
+                    continue
+                raw: dict[str, str] = {}
+                for key, values in parse_qs(unquote(header_value), keep_blank_values=True).items():
+                    if values:
+                        raw[key] = values[0]
+                rem_percent = _to_float(raw.get("rem"))
+                ent_value = _to_float(raw.get("ent"))
+                overage = _to_float(raw.get("ov"))
+                ov_perm_raw = raw.get("ovPerm")
+                overage_permitted = (
+                    ov_perm_raw.lower() == "true" if isinstance(ov_perm_raw, str) and ov_perm_raw else None
+                )
+                reset_at = raw.get("rst")
+                percent_remaining = (
+                    round(max(0.0, min(rem_percent, 100.0)), 2) if rem_percent is not None else None
+                )
+                percent_used = (
+                    round(100.0 - percent_remaining, 2) if percent_remaining is not None else None
+                )
+                usage_ratelimits[window] = {
+                    "percent_remaining": percent_remaining,
+                    "percent_used": percent_used,
+                    "entitlement": int(ent_value) if (ent_value is not None and ent_value > 0) else ent_value,
+                    "overage": overage,
+                    "overage_permitted": overage_permitted,
+                    "reset_at": reset_at,
+                    "raw": raw,
+                }
+            if usage_ratelimits:
+                finished_event["usage_ratelimits"] = usage_ratelimits
 
             # Also keep generic x-ratelimit-* if any upstream variant ever emits them.
             rate_limit_fields = {}

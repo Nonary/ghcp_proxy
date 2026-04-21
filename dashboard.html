@@ -588,6 +588,118 @@
       border-radius: 999px;
       background: linear-gradient(90deg, #68d86f, #ffcb5b 58%, #ff7a64 100%);
     }
+    .ratelimit-list { display: flex; flex-direction: column; gap: 14px; }
+    .ratelimit-row {
+      display: grid;
+      grid-template-columns: 110px 1fr;
+      gap: 14px;
+      align-items: center;
+    }
+    .ratelimit-row-label {
+      font-size: 0.78rem;
+      letter-spacing: 0.07em;
+      text-transform: uppercase;
+      color: var(--muted, rgba(255,255,255,.65));
+    }
+    .ratelimit-row-meta {
+      font-size: 0.75rem;
+      color: var(--muted, rgba(255,255,255,.55));
+      margin-top: 4px;
+    }
+    .ratelimit-bar {
+      position: relative;
+      height: 10px;
+      border-radius: 999px;
+      background: rgba(255,255,255,.07);
+      overflow: hidden;
+    }
+    .ratelimit-bar-fill {
+      height: 100%;
+      border-radius: 999px;
+      transition: width 240ms ease;
+    }
+    .ratelimit-bar-fill.tone-green { background: linear-gradient(90deg, #5fd17a, #8be38d); }
+    .ratelimit-bar-fill.tone-yellow { background: linear-gradient(90deg, #ffcb5b, #ffb144); }
+    .ratelimit-bar-fill.tone-red { background: linear-gradient(90deg, #ff7a64, #ff4d4d); }
+    .ratelimit-headline { display: flex; align-items: baseline; gap: 8px; }
+    .ratelimit-headline-value { font-variant-numeric: tabular-nums; font-weight: 600; }
+    .ratelimit-section {
+      margin-top: 18px;
+      padding-top: 16px;
+      border-top: 1px solid rgba(255,255,255,.06);
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+    .ratelimit-section-head {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    .ratelimit-section-title {
+      font-size: 0.78rem;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--muted, rgba(255,255,255,.7));
+    }
+    .ratelimit-section-meta {
+      font-size: 0.72rem;
+      color: var(--muted, rgba(255,255,255,.5));
+    }
+    .burn-block { display: flex; flex-direction: column; gap: 8px; }
+    .burn-block-head {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 8px;
+    }
+    .burn-block-title {
+      font-size: 0.72rem;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: var(--muted, rgba(255,255,255,.6));
+    }
+    .burn-block-meta {
+      font-size: 0.7rem;
+      color: var(--muted, rgba(255,255,255,.45));
+    }
+    .burn-table {
+      display: grid;
+      grid-template-columns: minmax(120px, 1.4fr) repeat(5, minmax(64px, 1fr));
+      column-gap: 10px;
+      row-gap: 4px;
+      font-size: 0.78rem;
+      font-variant-numeric: tabular-nums;
+    }
+    .burn-table-head {
+      font-size: 0.66rem;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: var(--muted, rgba(255,255,255,.5));
+      padding-bottom: 4px;
+      border-bottom: 1px solid rgba(255,255,255,.06);
+    }
+    .burn-table-cell {
+      padding: 4px 0;
+    }
+    .burn-table-cell.num { text-align: right; }
+    .burn-table-row { display: contents; }
+    .burn-table-row.is-fastest .burn-table-cell {
+      color: #ffcb5b;
+    }
+    .burn-empty {
+      font-size: 0.74rem;
+      color: var(--muted, rgba(255,255,255,.5));
+      font-style: italic;
+    }
+    @media (max-width: 720px) {
+      .burn-table {
+        grid-template-columns: minmax(100px, 1.2fr) repeat(5, minmax(48px, 1fr));
+        font-size: 0.72rem;
+      }
+    }
     .premium-week-foot {
       display: grid;
       gap: 8px;
@@ -1494,6 +1606,68 @@
                 </div>
               </div>
             </details>
+
+            <section class="ratelimit-section" v-if="usageRatelimits.configured || usageRatelimitRows.length">
+              <div class="ratelimit-section-head">
+                <span class="ratelimit-section-title">Upstream Rate Limits</span>
+                <span class="ratelimit-section-meta">{{ usageRatelimitsStatusLabel }}</span>
+              </div>
+              <div class="ratelimit-list">
+                <div v-for="row in usageRatelimitRows" :key="row.key" class="ratelimit-row">
+                  <div>
+                    <div class="ratelimit-row-label">{{ row.label }}</div>
+                    <div class="ratelimit-row-meta">{{ row.subLabel }}</div>
+                  </div>
+                  <div>
+                    <div class="ratelimit-headline">
+                      <span class="ratelimit-headline-value">{{ row.percentLabel }} remaining</span>
+                      <span class="subtle">· used {{ row.usedLabel }}</span>
+                    </div>
+                    <div class="ratelimit-bar">
+                      <span class="ratelimit-bar-fill" :class="row.toneClass" :style="{ width: row.fillPercent + '%' }"></span>
+                    </div>
+                    <div class="ratelimit-row-meta">{{ row.resetLabel }}</div>
+                  </div>
+                </div>
+                <div v-if="!usageRatelimitRows.length" class="burn-empty">Awaiting first proxied response…</div>
+              </div>
+
+              <div class="ratelimit-section-head" style="margin-top: 4px;">
+                <span class="ratelimit-section-title">Burn Rate by Model</span>
+                <span class="ratelimit-section-meta">% per 100k tokens · attributed from header deltas</span>
+              </div>
+              <div v-if="usageRatelimitBurnWindows.length" style="display:flex; flex-direction:column; gap:14px;">
+                <div v-for="win in usageRatelimitBurnWindows" :key="win.key" class="burn-block">
+                  <div class="burn-block-head">
+                    <span class="burn-block-title">{{ win.label }}</span>
+                    <span class="burn-block-meta">{{ win.metaLabel }}</span>
+                  </div>
+                  <div v-if="win.models.length" class="burn-table">
+                    <div class="burn-table-cell burn-table-head">Model</div>
+                    <div class="burn-table-cell burn-table-head num">Δ%</div>
+                    <div class="burn-table-cell burn-table-head num">Billable</div>
+                    <div class="burn-table-cell burn-table-head num">Fresh in</div>
+                    <div class="burn-table-cell burn-table-head num">Cached</div>
+                    <div class="burn-table-cell burn-table-head num">Output</div>
+                    <template v-for="row in win.models" :key="row.model">
+                      <div class="burn-table-row" :class="{ 'is-fastest': row.fastest }">
+                        <div class="burn-table-cell">
+                          <span>{{ row.model }}</span>
+                          <span class="subtle"> · {{ row.samples }}× </span>
+                        </div>
+                        <div class="burn-table-cell num">{{ row.deltaLabel }}</div>
+                        <div class="burn-table-cell num">{{ row.billableLabel }}</div>
+                        <div class="burn-table-cell num">{{ row.freshLabel }}</div>
+                        <div class="burn-table-cell num">{{ row.cachedLabel }}</div>
+                        <div class="burn-table-cell num">{{ row.outputLabel }}</div>
+                      </div>
+                    </template>
+                  </div>
+                  <div v-else class="burn-empty">No attributable deltas yet for this window.</div>
+                </div>
+              </div>
+              <div v-else class="burn-empty">Burn rate appears once two consecutive responses share the same reset window.</div>
+            </section>
           </div>
         </div>
       </article>
@@ -3264,6 +3438,7 @@
           debugModalRow: null,
           data: {
             premium: {},
+            usage_ratelimits: { configured: false, source: 'awaiting-first-request', windows: {} },
             safeguard: {},
             current_month: { usage: { sources: {} }, daily_history: [] },
             all_time: { usage: { sources: {} } },
@@ -3313,6 +3488,53 @@
           return 'Start GitHub Sign-In';
         },
         premium() { return this.data.premium || {}; },
+        usageRatelimits() { return this.data.usage_ratelimits || { configured: false, windows: {} }; },
+        usageRatelimitsStatusLabel() {
+          if (!this.usageRatelimits.configured) return 'Awaiting first proxied request';
+          const captured = this.usageRatelimits.captured_at;
+          if (!captured) return 'Live from upstream headers';
+          try {
+            return `Captured ${new Date(captured).toLocaleString()}`;
+          } catch (err) { return 'Live from upstream headers'; }
+        },
+        usageRatelimitRows() {
+          const windows = this.usageRatelimits.windows || {};
+          const order = ['session', 'weekly'];
+          const seen = new Set();
+          const ordered = [];
+          for (const key of order) {
+            if (windows[key]) { ordered.push([key, windows[key]]); seen.add(key); }
+          }
+          for (const [key, value] of Object.entries(windows)) {
+            if (!seen.has(key)) ordered.push([key, value]);
+          }
+          return ordered.map(([key, value]) => this._buildRatelimitRow(key, value));
+        },
+        usageRatelimitBurnWindows() {
+          const burn = (this.usageRatelimits && this.usageRatelimits.burn_rate) || {};
+          const labels = { session: 'Session window', weekly: 'Weekly window' };
+          const order = ['session', 'weekly'];
+          const seen = new Set();
+          const ordered = [];
+          for (const key of order) {
+            if (burn[key]) { ordered.push([key, burn[key]]); seen.add(key); }
+          }
+          for (const [key, value] of Object.entries(burn)) {
+            if (!seen.has(key)) ordered.push([key, value]);
+          }
+          return ordered.map(([key, value]) => {
+            const samples = Number(value && value.samples) || 0;
+            const models = Array.isArray(value && value.models) ? value.models : [];
+            const formatted = models.map((row) => this._buildBurnRow(row));
+            return {
+              key,
+              label: labels[key] || (key.charAt(0).toUpperCase() + key.slice(1)),
+              samples,
+              metaLabel: `${samples} sample${samples === 1 ? '' : 's'}`,
+              models: formatted,
+            };
+          });
+        },
         safeguardStats() { return this.data.safeguard || {}; },
         gptFallbackOptions() {
           return (this.modelRouting.available_models || []).filter((option) => option.provider === 'codex');
@@ -3689,6 +3911,93 @@
           const date = new Date(value);
           if (Number.isNaN(date.getTime())) return '';
           return date.toLocaleDateString();
+        },
+        _asRatelimitNumber(value) {
+          const n = Number(value);
+          return Number.isFinite(n) ? n : null;
+        },
+        _ratelimitToneClass(percentRemaining) {
+          if (percentRemaining == null) return 'tone-green';
+          if (percentRemaining <= 10) return 'tone-red';
+          if (percentRemaining <= 30) return 'tone-yellow';
+          return 'tone-green';
+        },
+        _formatRatelimitReset(resetAt, secondsUntilReset) {
+          if (!resetAt && (secondsUntilReset == null)) return 'Reset time unknown';
+          let absolute = '';
+          if (resetAt) {
+            try { absolute = new Date(resetAt).toLocaleString(); } catch (err) { absolute = resetAt; }
+          }
+          const seconds = this._asRatelimitNumber(secondsUntilReset);
+          if (seconds == null) return absolute ? `Resets ${absolute}` : 'Reset time unknown';
+          if (seconds <= 0) return absolute ? `Reset due (${absolute})` : 'Reset due';
+          const days = Math.floor(seconds / 86400);
+          const hours = Math.floor((seconds % 86400) / 3600);
+          const mins = Math.floor((seconds % 3600) / 60);
+          let rel;
+          if (days > 0) rel = `${days}d ${hours}h`;
+          else if (hours > 0) rel = `${hours}h ${mins}m`;
+          else rel = `${Math.max(1, mins)}m`;
+          return absolute ? `Resets in ${rel} · ${absolute}` : `Resets in ${rel}`;
+        },
+        _buildRatelimitRow(key, value) {
+          const percentRemaining = this._asRatelimitNumber(value && value.percent_remaining);
+          const percentUsed = this._asRatelimitNumber(value && value.percent_used);
+          const fillPercent = percentRemaining == null ? 0 : Math.max(0, Math.min(100, percentRemaining));
+          const labels = { session: 'Session', weekly: 'Weekly' };
+          const subLabels = { session: 'Per-session throttle', weekly: 'Rolling weekly throttle' };
+          const overage = this._asRatelimitNumber(value && value.overage);
+          const overagePermitted = value && value.overage_permitted;
+          let percentLabel = 'unknown';
+          if (percentRemaining != null) {
+            percentLabel = `${percentRemaining.toFixed(percentRemaining >= 10 ? 0 : 1)}%`;
+          }
+          let usedLabel = '—';
+          if (percentUsed != null) usedLabel = `${percentUsed.toFixed(percentUsed >= 10 ? 0 : 1)}%`;
+          let resetLabel = this._formatRatelimitReset(value && value.reset_at, value && value.seconds_until_reset);
+          if (overage != null && overage > 0) {
+            resetLabel += ` · overage ${overage}${overagePermitted ? '' : ' (not permitted)'}`;
+          } else if (overagePermitted === false && percentRemaining != null && percentRemaining < 1) {
+            resetLabel += ' · no overage permitted';
+          }
+          return {
+            key,
+            label: labels[key] || (key.charAt(0).toUpperCase() + key.slice(1)),
+            subLabel: subLabels[key] || '',
+            percentLabel,
+            usedLabel,
+            fillPercent,
+            toneClass: this._ratelimitToneClass(percentRemaining),
+            resetLabel,
+          };
+        },
+        _formatBurnRate(value) {
+          if (value == null) return '—';
+          const n = Number(value);
+          if (!Number.isFinite(n)) return '—';
+          if (n === 0) return '0';
+          const abs = Math.abs(n);
+          let digits;
+          if (abs >= 100) digits = 0;
+          else if (abs >= 10) digits = 1;
+          else if (abs >= 1) digits = 2;
+          else digits = 3;
+          return n.toFixed(digits);
+        },
+        _buildBurnRow(row) {
+          const rates = (row && row.percent_per_100k) || {};
+          const delta = Number(row && row.delta_percent);
+          const samples = Number(row && row.samples) || 0;
+          return {
+            model: (row && row.model) || 'unknown',
+            samples,
+            fastest: !!(row && row.fastest_burner),
+            deltaLabel: Number.isFinite(delta) ? `${delta.toFixed(delta >= 10 ? 1 : 2)}%` : '—',
+            billableLabel: this._formatBurnRate(rates.billable),
+            freshLabel: this._formatBurnRate(rates.fresh_input),
+            cachedLabel: this._formatBurnRate(rates.cached_input),
+            outputLabel: this._formatBurnRate(rates.output),
+          };
         },
         stamp(value) {
           if (!value) return '-';

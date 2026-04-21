@@ -738,6 +738,39 @@ class UsageTrackingTests(unittest.TestCase):
         self.assertEqual(finished["premium_requests"], 1.0)
         self.assertTrue(finished["success"])
 
+    def test_finish_usage_event_parses_x_usage_ratelimit_headers(self):
+        tracker = self._make_usage_tracker()
+        log_path = self._make_usage_log_path()
+        event = {
+            "request_id": "req-rl-1",
+            "initiator": "user",
+            "resolved_model": "gpt-5-mini",
+        }
+        upstream = SimpleNamespace(
+            headers={
+                "content-type": "application/json",
+                # URL-encoded values exactly as Copilot CLI's `/responses` upstream emits them.
+                "x-usage-ratelimit-session": "ent=0&ov=0.0&ovPerm=false&rem=93.2&rst=2026-04-21T06%3A22%3A37Z",
+                "x-usage-ratelimit-weekly": "ent=0&ov=0.0&ovPerm=true&rem=99.0&rst=2026-04-27T00%3A00%3A00Z",
+            }
+        )
+
+        tracker.usage_log_file = str(log_path)
+        tracker.finish_event(event, 200, upstream=upstream, response_payload={"id": "resp_rl"})
+
+        finished = tracker.snapshot_usage_events()[0]
+        windows = finished["usage_ratelimits"]
+        self.assertIn("session", windows)
+        self.assertIn("weekly", windows)
+        self.assertEqual(windows["session"]["percent_remaining"], 93.2)
+        self.assertEqual(windows["session"]["percent_used"], 6.8)
+        self.assertEqual(windows["session"]["overage"], 0.0)
+        self.assertFalse(windows["session"]["overage_permitted"])
+        self.assertEqual(windows["session"]["reset_at"], "2026-04-21T06:22:37Z")
+        self.assertEqual(windows["weekly"]["percent_remaining"], 99.0)
+        self.assertTrue(windows["weekly"]["overage_permitted"])
+        self.assertEqual(windows["weekly"]["reset_at"], "2026-04-27T00:00:00Z")
+
     def test_finish_usage_event_does_not_count_agent_request_toward_premium_quota(self):
         tracker = self._make_usage_tracker()
         log_path = self._make_usage_log_path()
