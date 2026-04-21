@@ -695,14 +695,13 @@ class DashboardTests(unittest.TestCase):
         self.assertIn("claude-opus-4.7", models)
         self.assertNotIn("gpt-5-mini", models)
         opus = models["claude-opus-4.7"]
-        self.assertAlmostEqual(opus["delta_percent"], 4.0, places=4)
-        # OpenAI/Codex convention: fresh = input - cached. cached=0 so fresh=2000.
-        self.assertEqual(opus["tokens"]["fresh_input_tokens"], 2000.0)
-        # billable = fresh + output + reasoning = 2000 + 2000 + 0 = 4000
-        self.assertEqual(opus["tokens"]["billable_tokens"], 4000.0)
-        # 4.0% / 4000 tokens * 100k = 100.0 %/100k
-        self.assertAlmostEqual(opus["percent_per_100k"]["billable"], 100.0, places=2)
-        self.assertTrue(opus["fastest_burner"])
+        self.assertEqual(opus["sample_target_tokens"], 1_000_000)
+        self.assertAlmostEqual(opus["window_delta_percent"], 4.0, places=4)
+        self.assertAlmostEqual(opus["limit_percent_per_target_tokens"], 1000.0, places=4)
+        self.assertEqual(opus["tokens"]["input_tokens"], 2000.0)
+        self.assertEqual(opus["tokens"]["output_tokens"], 2000.0)
+        self.assertEqual(opus["tokens"]["total_tokens"], 4000.0)
+        self.assertEqual(opus["responsibility_percent"], {"input": 50.0, "cached": 0.0, "output": 50.0})
 
     def test_burn_rate_handles_anthropic_token_convention(self):
         reset = "2026-04-21T18:00:00Z"
@@ -722,10 +721,58 @@ class DashboardTests(unittest.TestCase):
         burn = dashboard._build_burn_rate_summary(events)
         opus = burn["session"]["models"][0]
         # Fresh input == input_tokens (not subtracted) under Anthropic shape.
-        self.assertEqual(opus["tokens"]["fresh_input_tokens"], 1000.0)
+        self.assertEqual(opus["tokens"]["input_tokens"], 1000.0)
         self.assertEqual(opus["tokens"]["cached_input_tokens"], 20000.0)
-        # billable = 1000 + 500 = 1500
-        self.assertEqual(opus["tokens"]["billable_tokens"], 1500.0)
+        self.assertEqual(opus["tokens"]["output_tokens"], 500.0)
+        self.assertEqual(opus["responsibility_percent"], {"input": 4.65, "cached": 93.02, "output": 2.33})
+
+    def test_burn_rate_uses_last_1m_tokens_and_splits_boundary_request(self):
+        reset = "2026-04-21T18:00:00Z"
+        events = [
+            self._burn_event("2026-04-21T10:00:00+00:00", "gpt-5-mini", 0.0, reset),
+            self._burn_event("2026-04-21T10:01:00+00:00", "gpt-5-mini", 1.0, reset, input_tokens=600_000),
+            self._burn_event("2026-04-21T10:02:00+00:00", "gpt-5-mini", 2.0, reset, output_tokens=500_000),
+        ]
+        burn = dashboard._build_burn_rate_summary(events)
+        mini = burn["session"]["models"][0]
+        self.assertEqual(mini["samples"], 2)
+        self.assertEqual(mini["sampled_tokens"], 1_000_000.0)
+        self.assertEqual(mini["sampled_requests"], 2)
+        self.assertAlmostEqual(mini["window_delta_percent"], 1.8333, places=4)
+        self.assertAlmostEqual(mini["limit_percent_per_target_tokens"], 1.8333, places=4)
+        self.assertEqual(mini["responsibility_percent"], {"input": 50.0, "cached": 0.0, "output": 50.0})
+
+    def test_burn_rate_uses_active_reset_epoch_only(self):
+        reset = "2026-04-21T18:00:00Z"
+        events = [
+            self._burn_event("2026-04-21T09:00:00+00:00", "gpt-5-mini", 0.0, "2026-04-21T10:00:00Z"),
+            self._burn_event("2026-04-21T09:01:00+00:00", "gpt-5-mini", 10.0, "2026-04-21T10:00:00Z", input_tokens=1_000_000),
+            self._burn_event("2026-04-21T10:00:00+00:00", "gpt-5-mini", 0.0, reset),
+            self._burn_event("2026-04-21T10:01:00+00:00", "gpt-5-mini", 1.0, reset, input_tokens=1_000_000),
+        ]
+        burn = dashboard._build_burn_rate_summary(events)
+        mini = burn["session"]["models"][0]
+        self.assertEqual(burn["session"]["reset_at"], reset)
+        self.assertAlmostEqual(mini["window_delta_percent"], 1.0, places=4)
+        self.assertAlmostEqual(mini["limit_percent_per_target_tokens"], 1.0, places=4)
+
+    def test_burn_rate_treats_reasoning_as_output_share(self):
+        reset = "2026-04-21T18:00:00Z"
+        events = [
+            self._burn_event("2026-04-21T10:00:00+00:00", "gpt-5.4", 0.0, reset),
+            self._burn_event(
+                "2026-04-21T10:01:00+00:00",
+                "gpt-5.4",
+                1.0,
+                reset,
+                input_tokens=500_000,
+                output_tokens=250_000,
+                reasoning=250_000,
+            ),
+        ]
+        burn = dashboard._build_burn_rate_summary(events)
+        gpt = burn["session"]["models"][0]
+        self.assertEqual(gpt["responsibility_percent"], {"input": 50.0, "cached": 0.0, "output": 50.0})
 
     def test_burn_rate_skips_delta_across_reset_boundary(self):
         events = [
@@ -737,20 +784,15 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(burn["session"]["samples"], 0)
         self.assertEqual(burn["session"]["models"], [])
 
-    def test_burn_rate_marks_fastest_billable_burner(self):
+    def test_burn_rate_sorts_models_by_limit_impact(self):
         reset = "2026-04-21T18:00:00Z"
         events = [
             self._burn_event("2026-04-21T10:00:00+00:00", "gpt-5-mini", 0.0, reset),
-            # gpt-5-mini: 1% / 10k billable -> 10 %/100k
-            self._burn_event("2026-04-21T10:01:00+00:00", "gpt-5-mini", 1.0, reset, input_tokens=5000, output_tokens=5000),
-            # claude-opus-4.7: 1% / 1k billable -> 100 %/100k (fastest)
-            self._burn_event("2026-04-21T10:02:00+00:00", "claude-opus-4.7", 2.0, reset, input_tokens=500, output_tokens=500),
+            self._burn_event("2026-04-21T10:01:00+00:00", "gpt-5-mini", 1.0, reset, input_tokens=1_000_000),
+            self._burn_event("2026-04-21T10:02:00+00:00", "claude-opus-4.7", 2.0, reset, input_tokens=500_000),
         ]
         burn = dashboard._build_burn_rate_summary(events)
-        models = {row["model"]: row for row in burn["session"]["models"]}
-        self.assertTrue(models["claude-opus-4.7"]["fastest_burner"])
-        self.assertFalse(models["gpt-5-mini"]["fastest_burner"])
-        # Sorted descending by billable rate: opus first.
+        # claude-opus-4.7: 1.0% over 500k => 2.0% / 1M, so it sorts ahead of gpt-5-mini.
         self.assertEqual(burn["session"]["models"][0]["model"], "claude-opus-4.7")
 
 

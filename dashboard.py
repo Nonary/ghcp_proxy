@@ -1124,6 +1124,7 @@ def _latest_usage_ratelimits(events: list[dict]) -> dict | None:
 
 
 _BURN_TOKEN_FIELDS = ("input_tokens", "cached_input_tokens", "output_tokens", "reasoning_output_tokens")
+_BURN_SAMPLE_TARGET_TOKENS = 1_000_000.0
 
 
 def _burn_event_model_label(event: dict) -> str | None:
@@ -1156,95 +1157,135 @@ def _burn_event_tokens(event: dict) -> dict:
     return tokens
 
 
+def _burn_event_sample_tokens(event: dict) -> dict:
+    tokens = _burn_event_tokens(event)
+    output_tokens = tokens["output_tokens"] + tokens["reasoning_output_tokens"]
+    total_tokens = tokens["fresh_input_tokens"] + tokens["cached_input_tokens"] + output_tokens
+    return {
+        "input_tokens": tokens["fresh_input_tokens"],
+        "cached_input_tokens": tokens["cached_input_tokens"],
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens,
+    }
+
+
 def _build_window_burn_breakdown(events_for_window: list[dict]) -> dict:
-    """Compute per-model burn rate for one window.
+    """Compute per-model limit impact for one window.
 
     `events_for_window` is the time-ordered list of events that carry usage gauges
     for this window. We walk consecutive pairs that share the same `reset_at`
     epoch and attribute the delta in `percent_used` to the *later* event's model.
+
+    The dashboard wants a simple "what does the last 1M tokens from this model
+    do to the meter?" view. So within the active reset epoch we gather the most
+    recent attributed 1M tokens per model (splitting a boundary request
+    proportionally if needed), compute the observed limit decrease for that slice,
+    normalize it to "% decrease per 1M tokens", and then show how much of that
+    1M-token slice was Input/Cached/Output.
     """
-    per_model: dict[str, dict] = {}
+    latest_reset: str | None = None
+    for event in reversed(events_for_window):
+        window_payload = event["__window_payload"]
+        reset_at = window_payload.get("reset_at") if isinstance(window_payload.get("reset_at"), str) else None
+        if reset_at:
+            latest_reset = reset_at
+            break
+
+    per_model: dict[str, list[dict]] = {}
     sample_count = 0
-    prev: dict | None = None
-    prev_reset: str | None = None
+    prev_percent_used: float | None = None
     for event in events_for_window:
         window_payload = event["__window_payload"]
         reset_at = window_payload.get("reset_at") if isinstance(window_payload.get("reset_at"), str) else None
+        if latest_reset is not None and reset_at != latest_reset:
+            continue
         percent_used = _coerce_float(window_payload.get("percent_used"))
         if not isinstance(percent_used, (int, float)):
-            prev = None
-            prev_reset = reset_at
+            prev_percent_used = None
             continue
-        if prev is None or prev_reset != reset_at:
-            prev = {"percent_used": percent_used}
-            prev_reset = reset_at
+        if prev_percent_used is None:
+            prev_percent_used = float(percent_used)
             continue
-        delta = percent_used - prev["percent_used"]
-        prev = {"percent_used": percent_used}
-        prev_reset = reset_at
+        delta = float(percent_used) - prev_percent_used
+        prev_percent_used = float(percent_used)
         if delta <= 0:
-            # Could happen if requests interleave; skip ambiguous attribution.
+            # Could happen if requests interleave or the upstream meter jitters.
             continue
         model = _burn_event_model_label(event) or "unknown"
-        tokens = _burn_event_tokens(event)
-        bucket = per_model.setdefault(
-            model,
-            {
-                "model": model,
-                "samples": 0,
-                "delta_percent": 0.0,
-                "tokens": {field: 0.0 for field in _BURN_TOKEN_FIELDS + ("fresh_input_tokens", "billable_tokens")},
-            },
-        )
-        bucket["samples"] += 1
-        bucket["delta_percent"] += float(delta)
-        for field, value in tokens.items():
-            bucket["tokens"][field] += float(value)
+        tokens = _burn_event_sample_tokens(event)
+        if tokens["total_tokens"] <= 0:
+            continue
+        per_model.setdefault(model, []).append({
+            "delta_percent": float(delta),
+            "tokens": tokens,
+        })
         sample_count += 1
+
     rows: list[dict] = []
-    for bucket in per_model.values():
-        delta_percent = round(bucket["delta_percent"], 4)
-        token_totals = {field: round(bucket["tokens"][field], 2) for field in bucket["tokens"]}
+    for model, model_events in per_model.items():
+        remaining = _BURN_SAMPLE_TARGET_TOKENS
+        sampled_input = 0.0
+        sampled_cached = 0.0
+        sampled_output = 0.0
+        sampled_total = 0.0
+        sampled_delta = 0.0
+        sampled_requests = 0
+        for item in reversed(model_events):
+            token_total = float(item["tokens"]["total_tokens"] or 0.0)
+            if token_total <= 0:
+                continue
+            take = min(remaining, token_total)
+            take_ratio = take / token_total
+            sampled_input += float(item["tokens"]["input_tokens"] or 0.0) * take_ratio
+            sampled_cached += float(item["tokens"]["cached_input_tokens"] or 0.0) * take_ratio
+            sampled_output += float(item["tokens"]["output_tokens"] or 0.0) * take_ratio
+            sampled_total += take
+            sampled_delta += float(item["delta_percent"] or 0.0) * take_ratio
+            sampled_requests += 1
+            remaining -= take
+            if remaining <= 0:
+                break
 
-        def _per_100k(total_tokens: float) -> float | None:
-            if total_tokens <= 0:
-                return None
-            return round((delta_percent / total_tokens) * 100_000, 4)
+        if sampled_total <= 0:
+            continue
 
+        responsibility_percent = {
+            "input": round((sampled_input / sampled_total) * 100.0, 2),
+            "cached": round((sampled_cached / sampled_total) * 100.0, 2),
+            "output": round((sampled_output / sampled_total) * 100.0, 2),
+        }
+        limit_percent_per_target_tokens = round((sampled_delta / sampled_total) * _BURN_SAMPLE_TARGET_TOKENS, 4)
         rows.append({
-            "model": bucket["model"],
-            "samples": bucket["samples"],
-            "delta_percent": delta_percent,
-            "tokens": token_totals,
-            "percent_per_100k": {
-                "billable": _per_100k(token_totals["billable_tokens"]),
-                "fresh_input": _per_100k(token_totals["fresh_input_tokens"]),
-                "cached_input": _per_100k(token_totals["cached_input_tokens"]),
-                "output": _per_100k(token_totals["output_tokens"]),
-                "reasoning_output": _per_100k(token_totals["reasoning_output_tokens"]),
+            "model": model,
+            "samples": len(model_events),
+            "sampled_requests": sampled_requests,
+            "sampled_tokens": round(sampled_total, 2),
+            "sample_target_tokens": int(_BURN_SAMPLE_TARGET_TOKENS),
+            "window_delta_percent": round(sampled_delta, 4),
+            "limit_percent_per_target_tokens": limit_percent_per_target_tokens,
+            "responsibility_percent": responsibility_percent,
+            "tokens": {
+                "input_tokens": round(sampled_input, 2),
+                "cached_input_tokens": round(sampled_cached, 2),
+                "output_tokens": round(sampled_output, 2),
+                "total_tokens": round(sampled_total, 2),
             },
         })
 
-    # Mark the fastest burner by billable rate (excluding rows with no billable signal).
-    burnable = [r for r in rows if r["percent_per_100k"]["billable"] is not None]
-    if burnable:
-        fastest = max(burnable, key=lambda r: r["percent_per_100k"]["billable"])
-        for r in rows:
-            r["fastest_burner"] = (r is fastest)
-    else:
-        for r in rows:
-            r["fastest_burner"] = False
-
     rows.sort(
         key=lambda r: (
-            r["percent_per_100k"]["billable"] is None,
-            -(r["percent_per_100k"]["billable"] or 0.0),
-            -r["delta_percent"],
+            -(r["limit_percent_per_target_tokens"] or 0.0),
+            -r["window_delta_percent"],
             r["model"],
         )
     )
 
-    return {"samples": sample_count, "models": rows}
+    return {
+        "samples": sample_count,
+        "models": rows,
+        "reset_at": latest_reset,
+        "sample_target_tokens": int(_BURN_SAMPLE_TARGET_TOKENS),
+    }
 
 
 def _build_burn_rate_summary(usage_events: list[dict]) -> dict:
@@ -1294,9 +1335,10 @@ def _build_usage_ratelimits_summary(
     when no completion has been seen yet.
 
     Also produces a `burn_rate` analysis: for every window, attributes successive
-    deltas in `percent_used` (within the same `reset_at` epoch) to the model that
-    served the request, then divides by tokens to surface "% per 100k tokens" by
-    token category — making it obvious which model burns the meter fastest.
+    deltas in `percent_used` (within the active `reset_at` epoch) to the model
+    that served the request, then looks at the most recent 1M attributed tokens
+    for that model to estimate "% limit decrease per 1M tokens" plus the
+    Input/Cached/Output share of that slice.
     """
     latest = _latest_usage_ratelimits(usage_events)
     burn_rate = _build_burn_rate_summary(usage_events)
