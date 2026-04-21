@@ -79,7 +79,7 @@ CLAUDE_PROXY_SETTINGS = {
     },
     "effortLevel": "medium",
 }
-DETAILED_REQUEST_HISTORY_LIMIT = 1000
+DETAILED_REQUEST_HISTORY_LIMIT = 5000
 # Rolling retention for the request-trace log. Appends past this count are
 # compacted down to the most recent N rows via a temp-file rewrite (same
 # pattern as the usage log). See proxy._enforce_trace_retention.
