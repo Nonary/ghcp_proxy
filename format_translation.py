@@ -1870,7 +1870,22 @@ def _format_compaction_tool_output(item: dict) -> str | None:
     return f"{label}\n{output_text}" if output_text else label
 
 
-def _compaction_transcript_input_items(input_items) -> list[dict]:
+def _compaction_transcript_message_item(item: dict, *, force_user_role: bool) -> dict | None:
+    role = str(item.get("role", "user")).lower()
+    if role not in {"system", "developer", "user", "assistant"}:
+        return None
+
+    text = util.extract_item_text(item)
+    if _is_fake_compaction_summary_message(item):
+        return _compaction_message_item("user", text)
+    if not force_user_role:
+        return item
+    if role != "user":
+        text = f"[{role} message]\n{text}"
+    return _compaction_message_item("user", text)
+
+
+def _compaction_transcript_input_items(input_items, *, force_user_role: bool = False) -> list[dict]:
     transcript = []
     if not isinstance(input_items, list):
         return transcript
@@ -1881,19 +1896,14 @@ def _compaction_transcript_input_items(input_items) -> list[dict]:
 
         item_type = str(item.get("type", "")).lower()
         if item_type == "message":
-            role = str(item.get("role", "user")).lower()
-            if role not in {"system", "developer", "user", "assistant"}:
-                continue
-            if _is_fake_compaction_summary_message(item):
-                transcript_item = _compaction_message_item("user", util.extract_item_text(item))
-            else:
-                transcript_item = item
+            transcript_item = _compaction_transcript_message_item(item, force_user_role=force_user_role)
             if transcript_item is not None:
                 transcript.append(transcript_item)
             continue
 
         if item_type == "function_call":
-            transcript_item = _compaction_message_item("assistant", _format_compaction_tool_call(item))
+            transcript_role = "user" if force_user_role else "assistant"
+            transcript_item = _compaction_message_item(transcript_role, _format_compaction_tool_call(item))
             if transcript_item is not None:
                 transcript.append(transcript_item)
             continue
@@ -1970,17 +1980,30 @@ def _strip_chat_transcript_compaction_fields(target: dict) -> None:
         for key in ("tools", "tool_choice"):
             target.pop(key, None)
     target.pop("parallel_tool_calls", None)
-def build_fake_compaction_request(body: dict) -> dict:
+
+
+def build_fake_compaction_request(body: dict, *, force_responses_safe_transcript: bool = False) -> dict:
     request_input = body.get("input")
     if isinstance(request_input, list):
         request_input = sanitize_input(request_input)
 
     # Match opencode's native compaction shape for Responses/GPT models so the
     # upstream prefix stays byte-stable and can reuse prompt cache / item state.
-    # Only flatten the transcript for Claude-targeted chat bridging, where the
-    # synthetic summary request must avoid tool-role message validation issues.
-    if _compaction_requires_chat_transcript(body.get("model")):
-        input_items = _compaction_transcript_input_items(request_input)
+    # Flatten the transcript for chat-backed targets, or when a translated-model
+    # compact will run through a GPT fallback that cannot safely replay the raw
+    # assistant/tool-shaped Responses history.
+    requires_transcript = force_responses_safe_transcript or _compaction_requires_chat_transcript(body.get("model"))
+    if requires_transcript:
+        if isinstance(request_input, list):
+            input_items = _compaction_transcript_input_items(
+                request_input,
+                force_user_role=force_responses_safe_transcript,
+            )
+        elif isinstance(request_input, str):
+            input_items = [_compaction_message_item("user", request_input)]
+            input_items = [item for item in input_items if item is not None]
+        else:
+            input_items = []
     elif isinstance(request_input, list):
         input_items = list(request_input)
     elif isinstance(request_input, str):
@@ -1998,7 +2021,7 @@ def build_fake_compaction_request(body: dict) -> dict:
     compact_request = {"input": input_items}
     _copy_compaction_passthrough_fields(body, compact_request)
     _apply_compaction_request_config(body, compact_request)
-    if _compaction_requires_chat_transcript(body.get("model")):
+    if requires_transcript:
         _strip_chat_transcript_compaction_fields(compact_request)
     return compact_request
 

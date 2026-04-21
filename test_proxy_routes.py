@@ -897,6 +897,73 @@ class ProxyRoutesTests(unittest.TestCase):
         self.assertEqual(response_payload["id"], "resp_123")
         self.assertEqual(response_payload["output"][0]["content"][0]["text"], "summary")
 
+    def test_responses_compact_flattens_history_for_translated_model_fallback(self):
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/responses/compact"),
+            method="POST",
+            headers={},
+        )
+        body = {
+            "model": "gpt-5.2",
+            "stream": False,
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "please inspect this"}],
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "I found the issue."}],
+                },
+            ],
+        }
+        upstream = httpx.Response(
+            200,
+            json={
+                "id": "resp_123",
+                "model": "gpt-5.2",
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "summary"}],
+                    }
+                ],
+                "usage": {
+                    "input_tokens": 24,
+                    "output_tokens": 5,
+                    "total_tokens": 29,
+                },
+            },
+            headers={"content-type": "application/json"},
+        )
+
+        with (
+            mock.patch.object(proxy, "parse_json_request", mock.AsyncMock(return_value=body)),
+            mock.patch.object(auth, "get_api_key", return_value="test-key"),
+            mock.patch.object(auth, "get_api_base", return_value="https://example.invalid"),
+            mock.patch.object(proxy.model_routing_config_service, "resolve_target_model", return_value="claude-opus-4.6"),
+            mock.patch.object(proxy.model_routing_config_service, "resolve_compact_fallback_model", return_value="gpt-5.2"),
+            mock.patch.object(proxy.usage_tracker, "start_event", return_value=None),
+            mock.patch.object(proxy.usage_tracker, "finish_event"),
+            mock.patch.object(proxy, "throttled_client_post", mock.AsyncMock(return_value=upstream)) as post,
+        ):
+            response = proxy.asyncio.run(proxy.responses_compact(request))
+
+        forwarded_body = post.await_args.kwargs["json"]
+        self.assertEqual(forwarded_body["model"], "gpt-5.2")
+        self.assertEqual(
+            [item["role"] for item in forwarded_body["input"]],
+            ["user", "user", "user"],
+        )
+        self.assertEqual(
+            forwarded_body["input"][1]["content"][0]["text"],
+            "[assistant message]\nI found the issue.",
+        )
+        self.assertEqual(response.status_code, 200)
+
     def test_proxy_streaming_response_connect_error_returns_openai_error(self):
         request = httpx.Request("POST", "https://example.invalid/responses")
 

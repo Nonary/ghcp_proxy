@@ -1124,7 +1124,7 @@ def _latest_usage_ratelimits(events: list[dict]) -> dict | None:
 
 
 _BURN_TOKEN_FIELDS = ("input_tokens", "cached_input_tokens", "output_tokens", "reasoning_output_tokens")
-_BURN_SAMPLE_TARGET_TOKENS = 1_000_000.0
+_BURN_SAMPLE_TARGET_TOKENS = 100_000.0
 
 
 def _burn_event_model_label(event: dict) -> str | None:
@@ -1150,9 +1150,8 @@ def _burn_event_tokens(event: dict) -> dict:
         fresh_input = max(0.0, tokens["input_tokens"] - tokens["cached_input_tokens"])
     tokens["fresh_input_tokens"] = fresh_input
     # "Billable" approximation: fresh input + output + reasoning output.
-    # Cached inputs are deeply discounted in $ but still consume request budget;
-    # we surface a separate cached-input ratio so the dashboard can show whether
-    # cached prefill is what's burning the meter.
+    # Cached inputs are tracked elsewhere, but they are excluded from burn-rate
+    # normalization so cached prefill does not dominate the estimate.
     tokens["billable_tokens"] = fresh_input + tokens["output_tokens"] + tokens["reasoning_output_tokens"]
     return tokens
 
@@ -1160,12 +1159,49 @@ def _burn_event_tokens(event: dict) -> dict:
 def _burn_event_sample_tokens(event: dict) -> dict:
     tokens = _burn_event_tokens(event)
     output_tokens = tokens["output_tokens"] + tokens["reasoning_output_tokens"]
-    total_tokens = tokens["fresh_input_tokens"] + tokens["cached_input_tokens"] + output_tokens
+    total_tokens = tokens["fresh_input_tokens"] + output_tokens
     return {
         "input_tokens": tokens["fresh_input_tokens"],
         "cached_input_tokens": tokens["cached_input_tokens"],
         "output_tokens": output_tokens,
         "total_tokens": total_tokens,
+    }
+
+
+def _sample_burn_dimension(model_events: list[dict], token_field: str) -> dict | None:
+    remaining = _BURN_SAMPLE_TARGET_TOKENS
+    sampled_tokens = 0.0
+    sampled_delta = 0.0
+    sampled_requests = 0
+    for item in reversed(model_events):
+        token_count = float(item["tokens"].get(token_field) or 0.0)
+        if token_count <= 0:
+            continue
+        non_cached_total = float(item["tokens"].get("total_tokens") or 0.0)
+        if non_cached_total <= 0:
+            continue
+        take = min(remaining, token_count)
+        # Attribute the observed request-level meter delta across fresh input and
+        # output by their non-cached token share. Otherwise the same delta gets
+        # charged once to input and again to output, wildly inflating whichever
+        # side has fewer tokens.
+        sampled_tokens += take
+        sampled_delta += float(item["delta_percent"] or 0.0) * (take / non_cached_total)
+        sampled_requests += 1
+        remaining -= take
+        if remaining <= 0:
+            break
+
+    if sampled_tokens <= 0:
+        return None
+
+    limit_percent_per_target_tokens = round((sampled_delta / sampled_tokens) * _BURN_SAMPLE_TARGET_TOKENS, 4)
+    return {
+        "sampled_tokens": round(sampled_tokens, 2),
+        "sampled_requests": sampled_requests,
+        "window_delta_percent": round(sampled_delta, 4),
+        "limit_percent_per_target_tokens": limit_percent_per_target_tokens,
+        "sample_target_tokens": int(_BURN_SAMPLE_TARGET_TOKENS),
     }
 
 
@@ -1176,12 +1212,13 @@ def _build_window_burn_breakdown(events_for_window: list[dict]) -> dict:
     for this window. We walk consecutive pairs that share the same `reset_at`
     epoch and attribute the delta in `percent_used` to the *later* event's model.
 
-    The dashboard wants a simple "what does the last 1M tokens from this model
-    do to the meter?" view. So within the active reset epoch we gather the most
-    recent attributed 1M tokens per model (splitting a boundary request
-    proportionally if needed), compute the observed limit decrease for that slice,
-    normalize it to "% decrease per 1M tokens", and then show how much of that
-    1M-token slice was Input/Cached/Output.
+    The dashboard wants a simple "what do the last 100K fresh input tokens or
+    output tokens from this model do to the meter?" view. So within the active
+    reset epoch we gather the most recent attributed 100K fresh input and output
+    tokens per model (splitting a boundary request proportionally if needed),
+    compute the observed limit decrease for each slice, and normalize them to
+    "% decrease per 100K tokens". Cached input tokens are tracked but excluded
+    from the burn-rate basis.
     """
     latest_reset: str | None = None
     for event in reversed(events_for_window):
@@ -1223,50 +1260,44 @@ def _build_window_burn_breakdown(events_for_window: list[dict]) -> dict:
 
     rows: list[dict] = []
     for model, model_events in per_model.items():
-        remaining = _BURN_SAMPLE_TARGET_TOKENS
-        sampled_input = 0.0
-        sampled_cached = 0.0
-        sampled_output = 0.0
-        sampled_total = 0.0
-        sampled_delta = 0.0
-        sampled_requests = 0
-        for item in reversed(model_events):
-            token_total = float(item["tokens"]["total_tokens"] or 0.0)
-            if token_total <= 0:
-                continue
-            take = min(remaining, token_total)
-            take_ratio = take / token_total
-            sampled_input += float(item["tokens"]["input_tokens"] or 0.0) * take_ratio
-            sampled_cached += float(item["tokens"]["cached_input_tokens"] or 0.0) * take_ratio
-            sampled_output += float(item["tokens"]["output_tokens"] or 0.0) * take_ratio
-            sampled_total += take
-            sampled_delta += float(item["delta_percent"] or 0.0) * take_ratio
-            sampled_requests += 1
-            remaining -= take
-            if remaining <= 0:
-                break
-
-        if sampled_total <= 0:
+        input_sample = _sample_burn_dimension(model_events, "input_tokens")
+        output_sample = _sample_burn_dimension(model_events, "output_tokens")
+        available_samples = [sample for sample in (input_sample, output_sample) if sample is not None]
+        if not available_samples:
             continue
 
+        primary_sample = max(
+            available_samples,
+            key=lambda sample: (
+                sample["limit_percent_per_target_tokens"] or 0.0,
+                sample["window_delta_percent"] or 0.0,
+            ),
+        )
+        sampled_input = float(input_sample["sampled_tokens"] if input_sample is not None else 0.0)
+        sampled_output = float(output_sample["sampled_tokens"] if output_sample is not None else 0.0)
+        sampled_total = sampled_input + sampled_output
         responsibility_percent = {
-            "input": round((sampled_input / sampled_total) * 100.0, 2),
-            "cached": round((sampled_cached / sampled_total) * 100.0, 2),
-            "output": round((sampled_output / sampled_total) * 100.0, 2),
+            "input": round((sampled_input / sampled_total) * 100.0, 2) if sampled_total > 0 else 0.0,
+            "cached": 0.0,
+            "output": round((sampled_output / sampled_total) * 100.0, 2) if sampled_total > 0 else 0.0,
         }
-        limit_percent_per_target_tokens = round((sampled_delta / sampled_total) * _BURN_SAMPLE_TARGET_TOKENS, 4)
+        limit_percent_per_target_tokens = primary_sample["limit_percent_per_target_tokens"]
         rows.append({
             "model": model,
             "samples": len(model_events),
-            "sampled_requests": sampled_requests,
+            "sampled_requests": primary_sample["sampled_requests"],
             "sampled_tokens": round(sampled_total, 2),
             "sample_target_tokens": int(_BURN_SAMPLE_TARGET_TOKENS),
-            "window_delta_percent": round(sampled_delta, 4),
+            "window_delta_percent": primary_sample["window_delta_percent"],
             "limit_percent_per_target_tokens": limit_percent_per_target_tokens,
+            "burn_rates": {
+                "input": input_sample,
+                "output": output_sample,
+            },
             "responsibility_percent": responsibility_percent,
             "tokens": {
                 "input_tokens": round(sampled_input, 2),
-                "cached_input_tokens": round(sampled_cached, 2),
+                "cached_input_tokens": 0.0,
                 "output_tokens": round(sampled_output, 2),
                 "total_tokens": round(sampled_total, 2),
             },
@@ -1336,9 +1367,9 @@ def _build_usage_ratelimits_summary(
 
     Also produces a `burn_rate` analysis: for every window, attributes successive
     deltas in `percent_used` (within the active `reset_at` epoch) to the model
-    that served the request, then looks at the most recent 1M attributed tokens
-    for that model to estimate "% limit decrease per 1M tokens" plus the
-    Input/Cached/Output share of that slice.
+    that served the request, then looks at the most recent 100K fresh input and
+    output tokens for that model to estimate "% limit decrease per 100K tokens".
+    Cached input tokens are excluded from the burn-rate basis.
     """
     latest = _latest_usage_ratelimits(usage_events)
     burn_rate = _build_burn_rate_summary(usage_events)

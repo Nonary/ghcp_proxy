@@ -648,6 +648,12 @@
       font-size: 0.72rem;
       color: var(--muted, rgba(255,255,255,.5));
     }
+    .ratelimit-section-note {
+      margin-top: -4px;
+      font-size: 0.72rem;
+      line-height: 1.4;
+      color: var(--muted, rgba(255,255,255,.52));
+    }
     .burn-block { display: flex; flex-direction: column; gap: 10px; }
     .burn-block-head {
       display: flex;
@@ -725,6 +731,14 @@
     .burn-impact {
       display: grid;
       gap: 4px;
+    }
+    .burn-impact-pair {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+    }
+    .burn-impact-side {
+      min-width: 0;
     }
     .burn-impact-value {
       font-size: clamp(1.6rem, 3vw, 2.25rem);
@@ -1812,7 +1826,10 @@
 
               <div class="ratelimit-section-head" style="margin-top: 4px;">
                 <span class="ratelimit-section-title">Limit Impact by Model</span>
-                <span class="ratelimit-section-meta">limit drop per 1M tokens · split into input, cached, and output responsibility</span>
+                <span class="ratelimit-section-meta">limit drop per 100K fresh input or output tokens · cached excluded</span>
+              </div>
+              <div class="ratelimit-section-note">
+                Some models can report artificially higher impact here, especially <code>claude-haiku-4.5</code> and <code>gpt-5.4-mini</code>, because they are almost always used in a subagent fashion.
               </div>
               <div v-if="usageRatelimitBurnWindows.length" style="display:flex; flex-direction:column; gap:14px;">
                 <div v-for="win in usageRatelimitBurnWindows" :key="win.key" class="burn-block">
@@ -1831,8 +1848,16 @@
                       </div>
 
                       <div class="burn-impact">
-                        <div class="burn-impact-value">{{ row.deltaLabel }}</div>
-                        <div class="burn-impact-caption">Limit drop per 1M tokens</div>
+                        <div class="burn-impact-pair">
+                          <div class="burn-impact-side">
+                            <div class="burn-impact-value">{{ row.inputDeltaLabel }}</div>
+                            <div class="burn-impact-caption">per 100K input</div>
+                          </div>
+                          <div class="burn-impact-side">
+                            <div class="burn-impact-value">{{ row.outputDeltaLabel }}</div>
+                            <div class="burn-impact-caption">per 100K output</div>
+                          </div>
+                        </div>
                       </div>
 
                       <div class="burn-sample">
@@ -1847,7 +1872,7 @@
 
                       <div class="burn-share-block">
                         <div class="burn-share-head">
-                          <span class="burn-share-title">Responsibility share</span>
+                          <span class="burn-share-title">Sample mix</span>
                           <span class="burn-share-summary">{{ row.primaryShareLabel }}</span>
                         </div>
                         <div class="burn-share-track">
@@ -3737,7 +3762,7 @@
             if (!seen.has(key)) ordered.push([key, value]);
           }
           return ordered.map(([key, value]) => {
-            const sampleTargetTokens = Number(value && value.sample_target_tokens) || 1000000;
+            const sampleTargetTokens = Number(value && value.sample_target_tokens) || 100000;
             const models = Array.isArray(value && value.models) ? value.models : [];
             const formatted = models.map((row, index) => this._buildBurnRow(row, {
               isLeader: index === 0 && models.length > 1,
@@ -4213,19 +4238,24 @@
           return `${n.toFixed(digits)}%`;
         },
         _buildBurnRow(row, options = {}) {
-          const delta = Number(row && row.limit_percent_per_target_tokens);
-          const sampledTokens = Number(row && row.sampled_tokens) || 0;
-          const sampleTargetTokens = Number((row && row.sample_target_tokens) || options.sampleTargetTokens) || 1000000;
-          const sampledRequests = Number(row && row.sampled_requests) || 0;
-          const tokenMix = (row && row.tokens) || {};
-          const inputTokens = Number(tokenMix.input_tokens) || 0;
-          const cachedTokens = Number(tokenMix.cached_input_tokens) || 0;
-          const outputTokens = Number(tokenMix.output_tokens) || 0;
-          const totalTokens = Number(tokenMix.total_tokens) || sampledTokens || 0;
+          const rates = (row && row.burn_rates) || {};
+          const inputRate = rates.input || {};
+          const outputRate = rates.output || {};
+          const hasSplitRates = Boolean(rates.input || rates.output);
+          const inputDelta = Number(inputRate.limit_percent_per_target_tokens);
+          const outputDelta = Number(outputRate.limit_percent_per_target_tokens);
+          const fallbackDelta = Number(row && row.limit_percent_per_target_tokens);
+          const sampleTargetTokens = Number((row && row.sample_target_tokens) || inputRate.sample_target_tokens || outputRate.sample_target_tokens || options.sampleTargetTokens) || 100000;
+          const inputTokens = Number(inputRate.sampled_tokens) || 0;
+          const outputTokens = Number(outputRate.sampled_tokens) || 0;
+          const totalTokens = inputTokens + outputTokens;
+          const inputRequests = Number(inputRate.sampled_requests) || 0;
+          const outputRequests = Number(outputRate.sampled_requests) || 0;
+          const sampledRequests = Math.max(inputRequests, outputRequests, Number(row && row.sampled_requests) || 0);
+          const sampledTokens = Math.max(inputTokens, outputTokens, hasSplitRates ? 0 : (Number(row && row.sampled_tokens) || 0));
           const coverage = sampleTargetTokens > 0 ? Math.max(0, Math.min(100, (sampledTokens / sampleTargetTokens) * 100)) : 0;
           const shareSegments = [
             { key: 'input', label: 'Input', tokens: inputTokens, toneClass: 'tone-input' },
-            { key: 'cached', label: 'Cached', tokens: cachedTokens, toneClass: 'tone-cached' },
             { key: 'output', label: 'Output', tokens: outputTokens, toneClass: 'tone-output' },
           ].map((segment) => {
             const value = totalTokens > 0 ? (segment.tokens / totalTokens) * 100 : 0;
@@ -4240,18 +4270,21 @@
           const primaryShare = shareSegments.reduce((best, segment) => (
             segment.value > (best?.value || 0) ? segment : best
           ), shareSegments[0]);
+          const bestDelta = [inputDelta, outputDelta, fallbackDelta].filter(Number.isFinite).sort((a, b) => b - a)[0];
           return {
             model: (row && row.model) || 'unknown',
             kickerLabel: 'Model',
             badgeLabel: options.isLeader ? 'highest impact' : '',
             isLeader: Boolean(options.isLeader),
-            deltaLabel: this._formatBurnImpactPercent(delta),
-            sampleLabel: `${this.compact(sampledTokens)} of ${this.compact(sampleTargetTokens)} sampled`,
+            deltaLabel: this._formatBurnImpactPercent(bestDelta),
+            inputDeltaLabel: this._formatBurnImpactPercent(inputDelta),
+            outputDeltaLabel: this._formatBurnImpactPercent(outputDelta),
+            sampleLabel: `Input ${this.compact(inputTokens)} · Output ${this.compact(outputTokens)} of ${this.compact(sampleTargetTokens)}`,
             requestLabel: `${this.integer(sampledRequests)} request${sampledRequests === 1 ? '' : 's'}`,
             sampleProgress: coverage,
             primaryShareLabel: primaryShare && primaryShare.value > 0
-              ? `${primaryShare.label} leads at ${primaryShare.valueLabel}`
-              : 'No attributed token mix yet',
+              ? `${primaryShare.label} leads sampled tokens at ${primaryShare.valueLabel}`
+              : 'No non-cached sample yet',
             shareSegments,
           };
         },

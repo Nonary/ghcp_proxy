@@ -523,6 +523,8 @@ class FormatTranslationTests(unittest.TestCase):
 
         compact_request = format_translation.build_fake_compaction_request(body)
 
+        self.assertEqual(compact_request["input"][0]["content"][0]["text"], "hello")
+        self.assertEqual(compact_request["input"][-1]["content"][0]["text"], format_translation.COMPACTION_SUMMARY_PROMPT)
         self.assertEqual(compact_request["tools"], body["tools"])
         self.assertEqual(compact_request["tool_choice"], "none")
         self.assertNotIn("parallel_tool_calls", compact_request)
@@ -647,6 +649,51 @@ class FormatTranslationTests(unittest.TestCase):
         self.assertNotIn("tool_calls", translated["messages"][0])
         self.assertEqual(len(translated["tools"]), 1)
         self.assertEqual(translated["tool_choice"], "none")
+
+    def test_build_fake_compaction_request_can_force_responses_safe_transcript(self):
+        body = {
+            "model": "gpt-5.2",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "please inspect this"}],
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "I found the issue."}],
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "Read",
+                    "arguments": '{"file":"main.py"}',
+                },
+            ],
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "Read",
+                    "description": "Read a file",
+                    "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+                }
+            ],
+            "parallel_tool_calls": True,
+            "tool_choice": "auto",
+        }
+
+        compact_request = format_translation.build_fake_compaction_request(
+            body,
+            force_responses_safe_transcript=True,
+        )
+
+        self.assertEqual([item["role"] for item in compact_request["input"]], ["user", "user", "user", "user"])
+        self.assertEqual(compact_request["input"][1]["content"][0]["text"], "[assistant message]\nI found the issue.")
+        self.assertEqual(compact_request["input"][2]["content"][0]["text"], '[Tool call (call_1)] Read\n{"file":"main.py"}')
+        self.assertEqual(compact_request["input"][-1]["content"][0]["text"], format_translation.COMPACTION_SUMMARY_PROMPT)
+        self.assertEqual(compact_request["tool_choice"], "none")
+        self.assertNotIn("parallel_tool_calls", compact_request)
 
     def test_responses_request_to_chat_transcriptizes_custom_tool_history(self):
         body = {

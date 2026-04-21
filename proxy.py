@@ -13,14 +13,49 @@ Configure Codex:
   export OPENAI_API_KEY=anything
 """
 
+import os
+import sys
+
+
+def _prepare_standalone_process_file_descriptors():
+    """Avoid inheriting a descriptor table that is already near the soft limit."""
+    try:
+        import resource
+    except ImportError:
+        return
+
+    try:
+        soft_limit, hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
+    except (OSError, ValueError):
+        return
+
+    target_limit = 4096
+    if hard_limit != resource.RLIM_INFINITY:
+        target_limit = min(target_limit, hard_limit)
+    if soft_limit < target_limit:
+        try:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (target_limit, hard_limit))
+            soft_limit = target_limit
+        except (OSError, ValueError):
+            pass
+
+    try:
+        close_until = int(soft_limit)
+    except (OverflowError, ValueError):
+        close_until = 4096
+    os.closerange(3, max(3, close_until))
+
+
+if __name__ == "__main__":
+    _prepare_standalone_process_file_descriptors()
+
+
 import asyncio
 import auth
 import dashboard as dashboard_module
 import format_translation
 import json
-import os
 import sqlite3
-import sys
 import tempfile
 import time
 import safeguard_config as safeguard_config_module
@@ -39,7 +74,7 @@ from anthropic_stream import AnthropicStreamTranslator
 from bridge_streams import ChatToResponsesStreamTranslator, ResponsesToAnthropicStreamTranslator
 from initiator_policy import InitiatorPolicy
 from event_bus import EventBus
-from model_routing_config import ModelRoutingConfig, ModelRoutingConfigService
+from model_routing_config import ModelRoutingConfig, ModelRoutingConfigService, model_provider_family
 from protocol_bridge import BridgeExecutionPlan, ProtocolBridgePlanner
 from proxy_client_config import (
     ProxyClientConfig,
@@ -1827,7 +1862,15 @@ async def responses_compact(request: Request):
             format_translation.http_exception_detail_to_message(exc.detail),
         )
 
-    summary_request = format_translation.build_fake_compaction_request(body)
+    resolved_target = model_routing_config_service.resolve_target_model(body.get("model"))
+    force_responses_safe_transcript = (
+        isinstance(resolved_target, str)
+        and model_provider_family(resolved_target) not in (None, "codex")
+    )
+    summary_request = format_translation.build_fake_compaction_request(
+        body,
+        force_responses_safe_transcript=force_responses_safe_transcript,
+    )
     try:
         api_key = auth.get_api_key()
     except Exception:
