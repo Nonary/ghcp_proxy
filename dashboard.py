@@ -1143,9 +1143,14 @@ def _burn_event_tokens(event: dict) -> dict:
     #   * OpenAI/Codex: strips cached_input_tokens out of the gross input_tokens count.
     #   * Anthropic/Claude (bridged): strips cached tokens sourced from
     #     input_tokens_details.cached_tokens out of input_tokens.
-    # In both cases `input_tokens` is the FRESH-only count by the time it lands
-    # here, so no further subtraction is needed or correct.
-    fresh_input = tokens["input_tokens"]
+    # In both cases `input_tokens` is normally the FRESH-only count by the time
+    # it lands here. The cached-only guard below handles older/test payloads
+    # where gross input and cached input are equal.
+    output_tokens = tokens["output_tokens"] + tokens["reasoning_output_tokens"]
+    if tokens["cached_input_tokens"] > 0 and tokens["cached_input_tokens"] >= tokens["input_tokens"] and output_tokens <= 0:
+        fresh_input = 0.0
+    else:
+        fresh_input = tokens["input_tokens"]
     tokens["fresh_input_tokens"] = fresh_input
     # "Billable" approximation: fresh input + output + reasoning output.
     # Cached inputs are tracked elsewhere, but they are excluded from burn-rate
@@ -1200,6 +1205,226 @@ def _sample_burn_dimension(model_events: list[dict], token_field: str) -> dict |
         "window_delta_percent": round(sampled_delta, 4),
         "limit_percent_per_target_tokens": limit_percent_per_target_tokens,
         "sample_target_tokens": int(_BURN_SAMPLE_TARGET_TOKENS),
+    }
+
+
+
+_RECENT_BURN_BUCKET_MINUTES = (15, 30, 45, 60, 120, 360, 720, 1440)
+
+
+def _bucket_event_summary(event: dict) -> dict:
+    tokens = _burn_event_sample_tokens(event)
+    duration_ms = _coerce_float(event.get("duration_ms"))
+    return {
+        "input_tokens": float(tokens.get("input_tokens") or 0.0),
+        "cached_input_tokens": float(tokens.get("cached_input_tokens") or 0.0),
+        "output_tokens": float(tokens.get("output_tokens") or 0.0),
+        "billable_tokens": float(tokens.get("input_tokens") or 0.0) + float(tokens.get("output_tokens") or 0.0),
+        "duration_ms": float(duration_ms or 0.0),
+    }
+
+
+def _build_recent_burn_buckets(
+    events_for_window: list[dict],
+    *,
+    now: datetime | None = None,
+    bucket_minutes: tuple[int, ...] = _RECENT_BURN_BUCKET_MINUTES,
+) -> dict:
+    """Build a multi-time-bucket observed burn summary for one rate-limit window.
+
+    For each requested time bucket (e.g. last 15m, 30m, 45m, 1h, 2h):
+      * Look at events within that lookback that share the active reset epoch.
+      * Sum observed `percent_used` deltas between consecutive snapshots.
+      * Per model, count requests and sum input / cached_input / output tokens.
+
+    No extrapolation, no per-token rate — these are raw observed counts. The
+    upstream meters round to 0.01%, and they drain on premium-request weight
+    rather than tokens, so reporting raw counts is the only honest view.
+    """
+    if now is None:
+        now = utc_now()
+
+    # Locate the active reset epoch (latest seen `reset_at`) and the most
+    # recently reported `percent_remaining` for projection math.
+    latest_reset: str | None = None
+    latest_percent_remaining: float | None = None
+    for event in reversed(events_for_window):
+        window_payload = event.get("__window_payload") or {}
+        if latest_percent_remaining is None:
+            rem = _coerce_float(window_payload.get("percent_remaining"))
+            used = _coerce_float(window_payload.get("percent_used"))
+            if isinstance(rem, (int, float)):
+                latest_percent_remaining = float(rem)
+            elif isinstance(used, (int, float)):
+                latest_percent_remaining = max(0.0, 100.0 - float(used))
+        if latest_reset is None:
+            reset_at = window_payload.get("reset_at") if isinstance(window_payload.get("reset_at"), str) else None
+            if reset_at:
+                latest_reset = reset_at
+        if latest_reset is not None and latest_percent_remaining is not None:
+            break
+
+    # Pre-build segment list once: each segment = (later_event, delta_percent, finished_dt).
+    segments: list[dict] = []
+    prev_event: dict | None = None
+    prev_percent_used: float | None = None
+    prev_reset: str | None = None
+
+    for event in events_for_window:
+        window_payload = event.get("__window_payload") or {}
+        reset_at = window_payload.get("reset_at") if isinstance(window_payload.get("reset_at"), str) else None
+        percent_used = _coerce_float(window_payload.get("percent_used"))
+        if not isinstance(percent_used, (int, float)):
+            prev_event = None
+            prev_percent_used = None
+            prev_reset = reset_at
+            continue
+        if (
+            prev_event is None
+            or prev_percent_used is None
+            or prev_reset != reset_at
+            or (latest_reset is not None and reset_at != latest_reset)
+        ):
+            prev_event = event
+            prev_percent_used = float(percent_used)
+            prev_reset = reset_at
+            continue
+
+        delta = float(percent_used) - prev_percent_used
+        finished_raw = event.get("finished_at") or event.get("started_at")
+        finished_dt = _parse_iso_datetime(finished_raw) if isinstance(finished_raw, str) else None
+
+        tokens = _bucket_event_summary(event)
+        if finished_dt is not None and delta >= 0 and tokens["billable_tokens"] > 0:
+            segments.append({
+                "model": _burn_event_model_label(event) or "unknown",
+                "delta_percent": delta,
+                "finished_at": finished_raw,
+                "finished_dt": finished_dt,
+                "tokens": tokens,
+            })
+
+        prev_event = event
+        prev_percent_used = float(percent_used)
+        prev_reset = reset_at
+
+    buckets_out: list[dict] = []
+    for minutes in bucket_minutes:
+        cutoff = now - timedelta(minutes=minutes)
+        in_window = [seg for seg in segments if seg["finished_dt"] >= cutoff]
+
+        per_model: dict[str, dict] = {}
+        total_delta = 0.0
+        total_input = 0.0
+        total_cached = 0.0
+        total_output = 0.0
+        total_duration_ms = 0.0
+
+        for seg in in_window:
+            bucket = per_model.setdefault(seg["model"], {
+                "model": seg["model"],
+                "requests": 0,
+                "delta_percent": 0.0,
+                "input_tokens": 0.0,
+                "cached_input_tokens": 0.0,
+                "output_tokens": 0.0,
+                "billable_tokens": 0.0,
+                "duration_ms": 0.0,
+                "last_finished_at": None,
+            })
+            bucket["requests"] += 1
+            bucket["delta_percent"] += seg["delta_percent"]
+            bucket["input_tokens"] += seg["tokens"]["input_tokens"]
+            bucket["cached_input_tokens"] += seg["tokens"]["cached_input_tokens"]
+            bucket["output_tokens"] += seg["tokens"]["output_tokens"]
+            bucket["billable_tokens"] += seg["tokens"]["billable_tokens"]
+            bucket["duration_ms"] += seg["tokens"].get("duration_ms", 0.0)
+            finished_raw = seg.get("finished_at")
+            if isinstance(finished_raw, str) and (
+                bucket["last_finished_at"] is None or finished_raw > bucket["last_finished_at"]
+            ):
+                bucket["last_finished_at"] = finished_raw
+
+            total_delta += seg["delta_percent"]
+            total_input += seg["tokens"]["input_tokens"]
+            total_cached += seg["tokens"]["cached_input_tokens"]
+            total_output += seg["tokens"]["output_tokens"]
+            total_duration_ms += seg["tokens"].get("duration_ms", 0.0)
+
+        models_out = []
+        for bucket in per_model.values():
+            models_out.append({
+                "model": bucket["model"],
+                "requests": bucket["requests"],
+                "delta_percent": round(bucket["delta_percent"], 4),
+                "input_tokens": round(bucket["input_tokens"], 2),
+                "cached_input_tokens": round(bucket["cached_input_tokens"], 2),
+                "output_tokens": round(bucket["output_tokens"], 2),
+                "billable_tokens": round(bucket["billable_tokens"], 2),
+                "duration_ms": round(bucket["duration_ms"], 2),
+                "last_finished_at": bucket["last_finished_at"],
+            })
+        models_out.sort(
+            key=lambda r: (
+                -(r["delta_percent"] or 0.0),
+                -(r["billable_tokens"] or 0.0),
+                r["model"],
+            )
+        )
+
+        minutes_int = int(minutes)
+        avg_per_minute = (total_delta / minutes_int) if minutes_int > 0 else 0.0
+        request_count = sum(int(b["requests"]) for b in models_out)
+        avg_per_request = (total_delta / request_count) if request_count > 0 else 0.0
+        total_billable = total_input + total_output
+        tokens_per_minute = (total_billable / minutes_int) if minutes_int > 0 else 0.0
+        duration_per_minute_ms = (total_duration_ms / minutes_int) if minutes_int > 0 else 0.0
+        projected_minutes_to_full: float | None = None
+        if avg_per_minute > 0 and latest_percent_remaining is not None and latest_percent_remaining > 0:
+            projected_minutes_to_full = round(latest_percent_remaining / avg_per_minute, 2)
+
+        buckets_out.append({
+            "minutes": minutes_int,
+            "since": cutoff.isoformat().replace("+00:00", "Z"),
+            "segments_observed": len(in_window),
+            "request_count": request_count,
+            "totals": {
+                "delta_percent": round(total_delta, 4),
+                "input_tokens": round(total_input, 2),
+                "cached_input_tokens": round(total_cached, 2),
+                "output_tokens": round(total_output, 2),
+                "billable_tokens": round(total_billable, 2),
+                "duration_ms": round(total_duration_ms, 2),
+            },
+            "avg_delta_percent_per_minute": round(avg_per_minute, 6),
+            "avg_delta_percent_per_request": round(avg_per_request, 6),
+            "avg_tokens_per_minute": round(tokens_per_minute, 2),
+            "avg_duration_ms_per_minute": round(duration_per_minute_ms, 2),
+            "projected_minutes_to_full": projected_minutes_to_full,
+            "current_percent_remaining": latest_percent_remaining,
+            "models": models_out,
+        })
+
+    timeline = [
+        {
+            "finished_at": seg.get("finished_at"),
+            "model": seg["model"],
+            "delta_percent": round(seg["delta_percent"], 4),
+            "input_tokens": round(seg["tokens"].get("input_tokens", 0.0), 2),
+            "cached_input_tokens": round(seg["tokens"].get("cached_input_tokens", 0.0), 2),
+            "output_tokens": round(seg["tokens"].get("output_tokens", 0.0), 2),
+            "billable_tokens": round(seg["tokens"].get("billable_tokens", 0.0), 2),
+            "duration_ms": round(seg["tokens"].get("duration_ms", 0.0), 2),
+        }
+        for seg in segments
+    ]
+    return {
+        "captured_at": now.isoformat().replace("+00:00", "Z"),
+        "reset_at": latest_reset,
+        "current_percent_remaining": latest_percent_remaining,
+        "bucket_minutes": list(bucket_minutes),
+        "buckets": buckets_out,
+        "timeline": timeline,
     }
 
 
@@ -1309,11 +1534,13 @@ def _build_window_burn_breakdown(events_for_window: list[dict]) -> dict:
         )
     )
 
+    time_buckets = _build_recent_burn_buckets(events_for_window)
     return {
         "samples": sample_count,
         "models": rows,
         "reset_at": latest_reset,
         "sample_target_tokens": int(_BURN_SAMPLE_TARGET_TOKENS),
+        "time_buckets": time_buckets,
     }
 
 

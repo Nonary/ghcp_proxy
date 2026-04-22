@@ -75,6 +75,7 @@ class ResponsesToResponsesStrategy(ProtocolBridgeStrategy):
             if mapped_effort is not None:
                 upstream_body["reasoning"] = {**incoming_reasoning, "effort": mapped_effort}
         upstream_body = format_translation.sanitize_responses_tools_for_copilot(upstream_body)
+        upstream_body = format_translation.sanitize_responses_body_for_copilot(upstream_body)
         return BridgeExecutionPlan(
             strategy_name=self.strategy_name,
             inbound_protocol=self.inbound_protocol,

@@ -63,6 +63,10 @@ def _responses_model_disallows_temperature(model_name: str | None) -> bool:
 
 _COPILOT_UNSUPPORTED_RESPONSES_TOOL_TYPES = {"image_generation"}
 
+# Top-level Responses-API fields that Codex may send but Copilot's upstream
+# Responses endpoint rejects (e.g. priority/flex routing hints).
+_COPILOT_UNSUPPORTED_RESPONSES_BODY_KEYS = {"service_tier"}
+
 
 # ─── Anthropic content helpers ────────────────────────────────────────────────
 
@@ -600,6 +604,27 @@ def _responses_tool_choice_targets_removed_tool(tool_choice, removed_types: set[
         return True
 
     return False
+
+
+def sanitize_responses_body_for_copilot(body: dict) -> dict:
+    """Strip top-level Responses-API fields that Copilot's upstream rejects.
+
+    Codex sends fields such as ``service_tier`` (``priority``/``flex``) that
+    Copilot's GitHub-fronted Responses endpoint does not accept. Drop them so
+    the request is forwarded successfully; we still record the requested
+    service tier separately for usage tracking via the Codex logs scraper.
+    """
+    if not isinstance(body, dict):
+        return body
+    removed = [k for k in _COPILOT_UNSUPPORTED_RESPONSES_BODY_KEYS if k in body]
+    if not removed:
+        return body
+    sanitized = {k: v for k, v in body.items() if k not in _COPILOT_UNSUPPORTED_RESPONSES_BODY_KEYS}
+    print(
+        f"Responses proxy dropped Copilot-unsupported fields: {', '.join(sorted(removed))}",
+        flush=True,
+    )
+    return sanitized
 
 
 def sanitize_responses_tools_for_copilot(body: dict) -> dict:
@@ -1717,6 +1742,10 @@ def _sanitize_function_call_output_item(item: dict) -> dict:
     if not isinstance(item, dict) or item.get("type") != "function_call_output":
         return item
 
+    # GHCP rejects a stray ``content`` array on function_call_output items.
+    if "content" in item:
+        item = {k: v for k, v in item.items() if k != "content"}
+
     output = item.get("output")
     if not isinstance(output, list):
         return item
@@ -1793,7 +1822,20 @@ def sanitize_input(input_items):
             continue
 
         if item_type != "reasoning":
-            result.append(item)
+            # GHCP's Responses API rejects a non-empty ``content`` array on
+            # non-message items (e.g. function_call, function_call_output).
+            # Codex sometimes echoes a stray empty/legacy ``content`` field on
+            # these items; strip it defensively so upstream does not 400 with
+            # "Invalid 'input[N].content': array too long".
+            if (
+                isinstance(item, dict)
+                and "content" in item
+                and item_type not in (None, "message")
+            ):
+                cleaned = {k: v for k, v in item.items() if k != "content"}
+                result.append(cleaned)
+            else:
+                result.append(item)
             continue
 
         filtered = {}
@@ -1804,6 +1846,12 @@ def sanitize_input(input_items):
                 continue
             if k == "status" and v is None:
                 continue              # strip status=None
+            if k == "content":
+                # GHCP's Responses API rejects ``content`` on reasoning items
+                # ("array too long. Expected ... maximum length 0"). Reasoning
+                # text belongs in ``summary`` / ``encrypted_content``; drop any
+                # stray ``content`` payload here.
+                continue
             if v is not None:
                 filtered[k] = v
         result.append(filtered)

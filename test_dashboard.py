@@ -810,6 +810,7 @@ class DashboardTests(unittest.TestCase):
         burn = dashboard._build_burn_rate_summary(events)
         self.assertEqual(burn["session"]["samples"], 0)
         self.assertEqual(burn["session"]["models"], [])
+        self.assertEqual(burn["session"]["time_buckets"]["timeline"], [])
 
     def test_burn_rate_skips_delta_across_reset_boundary(self):
         events = [

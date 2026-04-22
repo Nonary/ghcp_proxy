@@ -914,6 +914,36 @@ class FormatTranslationTests(unittest.TestCase):
             ],
         )
 
+    def test_sanitize_input_strips_content_from_non_message_items(self):
+        # GHCP's Responses API rejects a non-empty ``content`` array on
+        # non-message items: it emits "Invalid 'input[N].content': array too
+        # long. Expected an array with maximum length 0".
+        sanitized = format_translation.sanitize_input(
+            [
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "shell",
+                    "arguments": "{}",
+                    "content": [{"type": "input_text", "text": "leaked"}],
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "ok",
+                    "content": [{"type": "input_text", "text": "leaked"}],
+                },
+                {
+                    "type": "reasoning",
+                    "summary": [],
+                    "content": [{"type": "input_text", "text": "leaked"}],
+                },
+            ]
+        )
+
+        for item in sanitized:
+            self.assertNotIn("content", item, item)
+
     def test_anthropic_request_to_chat_stream_requests_usage_chunks(self):
         body = {
             "model": "claude-sonnet-4.6",
