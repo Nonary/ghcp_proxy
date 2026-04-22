@@ -748,7 +748,7 @@ class DashboardTests(unittest.TestCase):
         self.assertAlmostEqual(mini["burn_rates"]["output"]["limit_percent_per_target_tokens"], 0.2, places=4)
         self.assertEqual(mini["responsibility_percent"], {"input": 50.0, "cached": 0.0, "output": 50.0})
 
-    def test_burn_rate_uses_active_reset_epoch_only(self):
+    def test_burn_rate_reports_latest_reset_while_sampling_recent_historical_tokens(self):
         reset = "2026-04-21T18:00:00Z"
         events = [
             self._burn_event("2026-04-21T09:00:00+00:00", "gpt-5-mini", 0.0, "2026-04-21T10:00:00Z"),
@@ -761,6 +761,58 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(burn["session"]["reset_at"], reset)
         self.assertAlmostEqual(mini["window_delta_percent"], 0.1, places=4)
         self.assertAlmostEqual(mini["limit_percent_per_target_tokens"], 0.1, places=4)
+
+    def test_burn_rate_time_buckets_are_historical_averages_across_resets(self):
+        old_reset = "2026-04-21T10:00:00Z"
+        new_reset = "2026-04-21T18:00:00Z"
+        events = [
+            self._burn_event("2026-04-21T09:00:00+00:00", "gpt-5-mini", 0.0, old_reset),
+            self._burn_event("2026-04-21T09:05:00+00:00", "gpt-5-mini", 2.0, old_reset, input_tokens=1_000),
+            self._burn_event("2026-04-21T10:00:00+00:00", "claude-opus-4.7", 0.0, new_reset),
+            self._burn_event("2026-04-21T10:35:00+00:00", "claude-opus-4.7", 3.0, new_reset, input_tokens=3_000),
+        ]
+
+        burn = dashboard._build_burn_rate_summary(events)
+        bucket = next(b for b in burn["session"]["time_buckets"]["buckets"] if b["minutes"] == 30)
+        models = {row["model"]: row for row in bucket["models"]}
+
+        self.assertEqual(bucket["periods_observed"], 2)
+        self.assertEqual(bucket["segments_observed"], 2)
+        self.assertAlmostEqual(bucket["totals"]["delta_percent"], 2.5, places=4)
+        self.assertAlmostEqual(bucket["avg_delta_percent_per_minute"], 0.083333, places=6)
+        self.assertAlmostEqual(bucket["request_count"], 1.0, places=2)
+        self.assertAlmostEqual(bucket["totals"]["billable_tokens"], 2_000.0, places=2)
+        self.assertAlmostEqual(models["gpt-5-mini"]["delta_percent"], 1.0, places=4)
+        self.assertAlmostEqual(models["gpt-5-mini"]["requests"], 0.5, places=2)
+        self.assertEqual(models["gpt-5-mini"]["active_periods"], 1)
+        self.assertAlmostEqual(models["claude-opus-4.7"]["delta_percent"], 1.5, places=4)
+        self.assertAlmostEqual(models["claude-opus-4.7"]["requests"], 0.5, places=2)
+
+    def test_burn_rate_larger_buckets_normalize_to_same_30m_equivalent(self):
+        reset = "2026-04-21T18:00:00Z"
+        events = [self._burn_event("2026-04-21T05:30:00+00:00", "gpt-5-mini", 0.0, reset)]
+        percent_used = 0.0
+        for idx in range(12):
+            percent_used += 2.0
+            hour = 6 + (idx // 2)
+            minute = 0 if idx % 2 == 0 else 30
+            ts = f"2026-04-21T{hour:02d}:{minute:02d}:00+00:00"
+            events.append(self._burn_event(ts, "gpt-5-mini", percent_used, reset, input_tokens=1_000))
+
+        burn = dashboard._build_burn_rate_summary(events)
+        bucket_30m = next(b for b in burn["session"]["time_buckets"]["buckets"] if b["minutes"] == 30)
+        bucket_6h = next(b for b in burn["session"]["time_buckets"]["buckets"] if b["minutes"] == 360)
+
+        self.assertEqual(bucket_30m["reporting_minutes"], 30)
+        self.assertEqual(bucket_6h["reporting_minutes"], 30)
+        self.assertAlmostEqual(bucket_30m["totals"]["delta_percent"], 2.0, places=4)
+        self.assertAlmostEqual(bucket_6h["totals"]["delta_percent"], 2.0, places=4)
+        self.assertAlmostEqual(bucket_30m["avg_delta_percent_per_minute"], 0.066667, places=6)
+        self.assertAlmostEqual(bucket_6h["avg_delta_percent_per_minute"], 0.066667, places=6)
+        self.assertAlmostEqual(bucket_30m["request_count"], 1.0, places=2)
+        self.assertAlmostEqual(bucket_6h["request_count"], 1.0, places=2)
+        self.assertAlmostEqual(bucket_30m["totals"]["billable_tokens"], 1_000.0, places=2)
+        self.assertAlmostEqual(bucket_6h["totals"]["billable_tokens"], 1_000.0, places=2)
 
     def test_burn_rate_treats_reasoning_as_output_share(self):
         reset = "2026-04-21T18:00:00Z"
