@@ -1138,16 +1138,14 @@ def _burn_event_model_label(event: dict) -> str | None:
 def _burn_event_tokens(event: dict) -> dict:
     usage = event.get("usage") if isinstance(event.get("usage"), dict) else {}
     tokens = {field: _coerce_float(usage.get(field)) for field in _BURN_TOKEN_FIELDS}
-    # Two upstream conventions:
-    #   * OpenAI/Codex: `input_tokens` is the GROSS prompt count, `cached_input_tokens`
-    #     is a subset of it (so fresh = input - cached).
-    #   * Anthropic/Claude: `input_tokens` is already the FRESH count and
-    #     `cached_input_tokens` is a separate counter (so fresh = input).
-    # Detect by checking whether cached <= input.
-    if tokens["cached_input_tokens"] > tokens["input_tokens"]:
-        fresh_input = tokens["input_tokens"]
-    else:
-        fresh_input = max(0.0, tokens["input_tokens"] - tokens["cached_input_tokens"])
+    # normalize_usage_payload() in util.py already normalizes both upstream
+    # conventions before events are recorded:
+    #   * OpenAI/Codex: strips cached_input_tokens out of the gross input_tokens count.
+    #   * Anthropic/Claude (bridged): strips cached tokens sourced from
+    #     input_tokens_details.cached_tokens out of input_tokens.
+    # In both cases `input_tokens` is the FRESH-only count by the time it lands
+    # here, so no further subtraction is needed or correct.
+    fresh_input = tokens["input_tokens"]
     tokens["fresh_input_tokens"] = fresh_input
     # "Billable" approximation: fresh input + output + reasoning output.
     # Cached inputs are tracked elsewhere, but they are excluded from burn-rate
