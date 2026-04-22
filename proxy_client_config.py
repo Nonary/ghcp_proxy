@@ -49,6 +49,7 @@ class ProxyClientConfig:
     claude_proxy_settings: dict
     claude_max_context_tokens: str
     claude_max_output_tokens: str
+    client_proxy_settings_file: str
 
     @property
     def codex_config_dir(self) -> str:
@@ -216,6 +217,48 @@ class ProxyClientConfigService:
                 missing.append("output cap")
             status["status_message"] = f"proxy configured, missing {' and '.join(missing)}"
         return status
+
+    def default_client_proxy_settings(self) -> dict[str, object]:
+        return {
+            "revert_on_shutdown": True,
+            "pending_restore_targets": [],
+        }
+
+    def load_client_proxy_settings(self) -> dict[str, object]:
+        payload = self._raw_client_proxy_settings()
+        return {
+            "revert_on_shutdown": bool(
+                payload.get(
+                    "revert_on_shutdown",
+                    self.default_client_proxy_settings()["revert_on_shutdown"],
+                )
+            ),
+            "pending_restore_targets": self._normalize_restore_targets(
+                payload.get("pending_restore_targets"),
+            ),
+        }
+
+    def client_proxy_settings_payload(self) -> dict[str, object]:
+        return {
+            **self.load_client_proxy_settings(),
+            "path": self._config.client_proxy_settings_file,
+        }
+
+    def save_client_proxy_settings(self, payload: dict) -> dict[str, object]:
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="Request body must be an object")
+        if "revert_on_shutdown" not in payload:
+            raise HTTPException(status_code=400, detail="revert_on_shutdown is required.")
+        if not isinstance(payload.get("revert_on_shutdown"), bool):
+            raise HTTPException(status_code=400, detail="revert_on_shutdown must be true or false.")
+
+        existing = self.load_client_proxy_settings()
+        settings = {
+            "revert_on_shutdown": payload.get("revert_on_shutdown"),
+            "pending_restore_targets": existing.get("pending_restore_targets", []),
+        }
+        self._write_client_proxy_settings(settings)
+        return self.client_proxy_settings_payload()
 
     def write_codex_proxy_config(self) -> dict[str, bool | str | None]:
         status = self.codex_proxy_status()
@@ -407,7 +450,128 @@ class ProxyClientConfigService:
         claude_status["backup_path"] = self._latest_backup_path(self._config.claude_settings_file)
         codex_status["restored_from_backup"] = False
         claude_status["restored_from_backup"] = False
-        return {"clients": {"codex": codex_status, "claude": claude_status}}
+        return {
+            "clients": {"codex": codex_status, "claude": claude_status},
+            "settings": self.client_proxy_settings_payload(),
+        }
+
+    def revert_proxy_configs_on_shutdown(self) -> dict[str, object]:
+        settings = self.load_client_proxy_settings()
+        if not bool(settings.get("revert_on_shutdown")):
+            self._write_client_proxy_settings(
+                {
+                    **settings,
+                    "pending_restore_targets": [],
+                }
+            )
+            return {
+                "attempted": False,
+                "reverted": False,
+                "reason": "disabled",
+                "clients": {},
+            }
+
+        pending_targets = self._configured_proxy_targets()
+        self._write_client_proxy_settings(
+            {
+                **settings,
+                "pending_restore_targets": pending_targets,
+            }
+        )
+        clients = {
+            "codex": self.disable_codex_proxy_config(),
+            "claude": self.disable_claude_proxy_settings(),
+        }
+        reverted = any(
+            bool(client.get("restored_from_backup"))
+            or client.get("status_message") in {"removed proxy config", "removed proxy-managed Codex files"}
+            for client in clients.values()
+            if isinstance(client, dict)
+        )
+        return {
+            "attempted": True,
+            "reverted": reverted,
+            "reason": "shutdown",
+            "clients": clients,
+        }
+
+    def restore_proxy_configs_on_startup(self) -> dict[str, object]:
+        settings = self.load_client_proxy_settings()
+        pending_targets = self._normalize_restore_targets(settings.get("pending_restore_targets"))
+        if not pending_targets:
+            return {
+                "attempted": False,
+                "restored": False,
+                "reason": "no-pending-targets",
+                "clients": {},
+            }
+
+        clients = {}
+        failed_targets: list[str] = []
+        for target in pending_targets:
+            result = self.enable_target(target)
+            clients[target] = result
+            if not bool(result.get("configured")):
+                failed_targets.append(target)
+
+        self._write_client_proxy_settings(
+            {
+                **settings,
+                "pending_restore_targets": failed_targets,
+            }
+        )
+        restored = any(bool(result.get("configured")) for result in clients.values() if isinstance(result, dict))
+        return {
+            "attempted": True,
+            "restored": restored,
+            "reason": "startup",
+            "clients": clients,
+        }
+
+    def _configured_proxy_targets(self) -> list[str]:
+        targets = []
+        if bool(self.codex_proxy_status().get("configured")):
+            targets.append("codex")
+        if bool(self.claude_proxy_status().get("configured")):
+            targets.append("claude")
+        return targets
+
+    def _raw_client_proxy_settings(self) -> dict[str, object]:
+        try:
+            with open(self._config.client_proxy_settings_file, encoding="utf-8") as f:
+                payload = json.load(f)
+        except OSError:
+            payload = {}
+        except json.JSONDecodeError as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to parse {self._config.client_proxy_settings_file}: {exc}",
+            ) from exc
+
+        return payload if isinstance(payload, dict) else {}
+
+    def _write_client_proxy_settings(self, payload: dict[str, object]) -> None:
+        os.makedirs(os.path.dirname(self._config.client_proxy_settings_file) or ".", exist_ok=True)
+        normalized = {
+            "revert_on_shutdown": bool(payload.get("revert_on_shutdown", True)),
+            "pending_restore_targets": self._normalize_restore_targets(payload.get("pending_restore_targets")),
+        }
+        self._write_json_atomic(self._config.client_proxy_settings_file, normalized)
+
+    def _normalize_restore_targets(self, raw_targets: object) -> list[str]:
+        if not isinstance(raw_targets, list):
+            return []
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for entry in raw_targets:
+            if not isinstance(entry, str):
+                continue
+            target = entry.strip().lower()
+            if target not in {"codex", "claude"} or target in seen:
+                continue
+            seen.add(target)
+            normalized.append(target)
+        return normalized
 
     def _disable_client_proxy_config(self, config_path: str, status_fn) -> dict[str, bool | str | None]:
         status = status_fn()

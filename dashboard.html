@@ -2401,6 +2401,22 @@
             <button class="primary" @click="enableAllClientProxy" :disabled="savingProxyConfig || allClientProxyConfigured || anyClientProxyError">Enable All</button>
             <button @click="disableAllClientProxy" :disabled="savingProxyConfig || noClientProxyConfigured || anyClientProxyError">Disable All</button>
           </div>
+          <article class="mini-card" style="margin-top: 12px;">
+            <div class="eyebrow">Shutdown Behavior</div>
+            <label style="display:flex; align-items:center; gap:10px; margin-top:6px;">
+              <input type="checkbox" v-model="clientProxySettings.revert_on_shutdown" :disabled="savingClientProxySettings">
+              <span>Revert Codex and Claude proxy config when GHCP Proxy shuts down</span>
+            </label>
+            <div class="subtle" style="margin-top: 8px;">On by default so local clients stop pointing at localhost after the proxy exits.</div>
+            <div class="subtle" style="margin-top: 4px;">{{ clientProxySettings.path }}</div>
+            <div class="toolbar" style="margin-top: 10px;">
+              <button class="primary" @click="saveClientProxySettings" :disabled="savingClientProxySettings">
+                {{ savingClientProxySettings ? 'Saving…' : 'Save shutdown setting' }}
+              </button>
+            </div>
+            <div v-if="clientProxySettings.error" class="status error" style="margin-top: 10px;">{{ clientProxySettings.error }}</div>
+            <div v-else-if="clientProxySettings.statusMessage" class="status good" style="margin-top: 10px;">{{ clientProxySettings.statusMessage }}</div>
+          </article>
           <div v-if="proxyConfigError" class="status error" style="margin-top: 10px;">{{ proxyConfigError }}</div>
           <div v-else-if="proxyConfigStatusMessage" class="status good" style="margin-top: 10px;">{{ proxyConfigStatusMessage }}</div>
         </article>
@@ -3509,6 +3525,7 @@
           startingAuthFlow: false,
           loadingClientProxyStatus: false,
           savingProxyConfig: false,
+          savingClientProxySettings: false,
           loadingModelRoutingConfig: false,
           savingModelRoutingConfig: false,
           proxyConfigError: '',
@@ -3545,6 +3562,12 @@
               error: '',
               status_message: 'loading status...',
             },
+          },
+          clientProxySettings: {
+            revert_on_shutdown: true,
+            path: '',
+            error: '',
+            statusMessage: '',
           },
           activeTab: 'sessions',
           tabs: ['sessions', 'requests'],
@@ -5645,10 +5668,52 @@
             if (payload?.clients?.claude) {
               this.clientProxyStatus.claude = { ...this.clientProxyStatus.claude, ...payload.clients.claude };
             }
+            if (payload?.settings) {
+              this.clientProxySettings = {
+                ...this.clientProxySettings,
+                ...payload.settings,
+                error: '',
+              };
+            }
           } catch (error) {
             this.proxyConfigError = error.message;
           } finally {
             this.loadingClientProxyStatus = false;
+          }
+        },
+        async saveClientProxySettings() {
+          if (this.savingClientProxySettings) return;
+          this.savingClientProxySettings = true;
+          this.clientProxySettings.statusMessage = '';
+          this.clientProxySettings.error = '';
+          try {
+            const response = await fetch('/api/config/client-proxy/settings', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                revert_on_shutdown: Boolean(this.clientProxySettings.revert_on_shutdown),
+              }),
+            });
+            if (!response.ok) {
+              let message = `client proxy settings request failed: ${response.status}`;
+              try {
+                const data = await response.json();
+                if (data?.detail) message = data.detail;
+              } catch (_error) {}
+              throw new Error(message);
+            }
+
+            const payload = await response.json();
+            this.clientProxySettings = {
+              ...this.clientProxySettings,
+              ...payload,
+              error: '',
+            };
+            this.clientProxySettings.statusMessage = 'Client proxy settings saved.';
+          } catch (error) {
+            this.clientProxySettings.error = error.message;
+          } finally {
+            this.savingClientProxySettings = false;
           }
         },
         async configureClientProxy(target, action) {

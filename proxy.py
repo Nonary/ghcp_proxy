@@ -85,6 +85,7 @@ from proxy_client_config import (
 # ─── Import from new modules ─────────────────────────────────────────────────
 
 from constants import (
+    CLIENT_PROXY_SETTINGS_FILE,
     DASHBOARD_FILE,
     DETAILED_REQUEST_HISTORY_LIMIT,
     CODEX_PRIMARY_CONFIG_FILE,
@@ -119,6 +120,10 @@ from rate_limiting import (
 
 app = FastAPI()
 _REQUEST_TRACE_LOCK = Lock()
+_CLIENT_PROXY_STARTUP_RESTORE_LOCK = Lock()
+_CLIENT_PROXY_STARTUP_RESTORE_COMPLETE = False
+_CLIENT_PROXY_SHUTDOWN_REVERT_LOCK = Lock()
+_CLIENT_PROXY_SHUTDOWN_REVERT_COMPLETE = False
 _TRACE_HEADER_ALLOWLIST = {
     "content-type",
     "user-agent",
@@ -203,6 +208,7 @@ client_proxy_config_service = ProxyClientConfigService(
         claude_proxy_settings=CLAUDE_PROXY_SETTINGS,
         claude_max_context_tokens=CLAUDE_MAX_CONTEXT_TOKENS,
         claude_max_output_tokens=CLAUDE_MAX_OUTPUT_TOKENS,
+        client_proxy_settings_file=CLIENT_PROXY_SETTINGS_FILE,
     ),
     model_capabilities_provider=lambda: fetch_copilot_model_capabilities(),
     model_routing_settings_provider=lambda: model_routing_config_service.load_settings(),
@@ -277,6 +283,16 @@ except Exception as _codex_ingest_exc:  # pragma: no cover - best effort
     print(f"codex_native_ingest: disabled ({_codex_ingest_exc})", flush=True)
 
 
+@app.on_event("startup")
+async def _app_startup_restore_client_proxy_configs():
+    restore_client_proxy_configs_on_startup()
+
+
+@app.on_event("shutdown")
+async def _app_shutdown_revert_client_proxy_configs():
+    revert_client_proxy_configs_on_shutdown()
+
+
 # ─── Upstream response helpers ────────────────────────────────────────────────
 
 def _extract_upstream_json_payload(upstream: httpx.Response) -> dict | None:
@@ -347,6 +363,64 @@ def request_tracing_enabled() -> bool:
 def request_trace_log_path() -> str:
     configured = str(os.environ.get("GHCP_TRACE_LOG_FILE", "")).strip()
     return os.path.expanduser(configured or REQUEST_TRACE_LOG_FILE)
+
+
+def restore_client_proxy_configs_on_startup() -> dict[str, object]:
+    global _CLIENT_PROXY_STARTUP_RESTORE_COMPLETE
+    with _CLIENT_PROXY_STARTUP_RESTORE_LOCK:
+        if _CLIENT_PROXY_STARTUP_RESTORE_COMPLETE:
+            return {
+                "attempted": False,
+                "restored": False,
+                "reason": "already-ran",
+                "clients": {},
+            }
+        _CLIENT_PROXY_STARTUP_RESTORE_COMPLETE = True
+
+    try:
+        result = client_proxy_config_service.restore_proxy_configs_on_startup()
+    except Exception as exc:  # pragma: no cover - best effort
+        print(f"client proxy startup restore failed: {exc}", flush=True)
+        return {
+            "attempted": True,
+            "restored": False,
+            "reason": "error",
+            "error": str(exc),
+            "clients": {},
+        }
+
+    if result.get("attempted"):
+        print(f"Client proxy startup restore: {json.dumps(result, default=str)}", flush=True)
+    return result
+
+
+def revert_client_proxy_configs_on_shutdown() -> dict[str, object]:
+    global _CLIENT_PROXY_SHUTDOWN_REVERT_COMPLETE
+    with _CLIENT_PROXY_SHUTDOWN_REVERT_LOCK:
+        if _CLIENT_PROXY_SHUTDOWN_REVERT_COMPLETE:
+            return {
+                "attempted": False,
+                "reverted": False,
+                "reason": "already-ran",
+                "clients": {},
+            }
+        _CLIENT_PROXY_SHUTDOWN_REVERT_COMPLETE = True
+
+    try:
+        result = client_proxy_config_service.revert_proxy_configs_on_shutdown()
+    except Exception as exc:  # pragma: no cover - best effort
+        print(f"client proxy shutdown revert failed: {exc}", flush=True)
+        return {
+            "attempted": True,
+            "reverted": False,
+            "reason": "error",
+            "error": str(exc),
+            "clients": {},
+        }
+
+    if result.get("attempted"):
+        print(f"Client proxy shutdown revert: {json.dumps(result, default=str)}", flush=True)
+    return result
 
 
 def _header_trace_subset(headers: dict | None) -> dict:
@@ -1735,6 +1809,13 @@ async def client_proxy_status_api():
     return JSONResponse(content=client_proxy_config_service.proxy_client_status_payload())
 
 
+@app.post("/api/config/client-proxy/settings")
+async def client_proxy_settings_api(request: Request):
+    payload = await parse_json_request(request)
+    result = client_proxy_config_service.save_client_proxy_settings(payload)
+    return JSONResponse(content=result)
+
+
 @app.get("/api/config/model-remapping")
 @app.get("/api/config/model-routing")
 async def model_routing_status_api():
@@ -2045,4 +2126,7 @@ if __name__ == "__main__":
     print("    export OPENAI_API_KEY=anything", flush=True)
     print("", flush=True)
 
-    uvicorn.run(app, host="127.0.0.1", port=8000, access_log=False, timeout_graceful_shutdown=2)
+    try:
+        uvicorn.run(app, host="127.0.0.1", port=8000, access_log=False, timeout_graceful_shutdown=2)
+    finally:
+        revert_client_proxy_configs_on_shutdown()

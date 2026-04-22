@@ -6,6 +6,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from constants import (
+    CLIENT_PROXY_SETTINGS_FILE,
     CLAUDE_MAX_CONTEXT_TOKENS,
     CLAUDE_MAX_OUTPUT_TOKENS,
     CLAUDE_PROXY_SETTINGS,
@@ -40,12 +41,27 @@ class ClientConfigTests(unittest.TestCase):
         codex_managed_config_file: str | None = None,
         codex_model_catalog_file: str | None = None,
         claude_settings_file: str | None = None,
+        client_proxy_settings_file: str | None = None,
         model_capabilities_provider=None,
         model_routing_settings_provider=None,
     ) -> ProxyClientConfigService:
         resolved_primary_config_file = codex_primary_config_file
         if resolved_primary_config_file is None and codex_managed_config_file:
             resolved_primary_config_file = str(Path(codex_managed_config_file).with_name("config.toml"))
+        resolved_settings_file = client_proxy_settings_file
+        if resolved_settings_file is None:
+            base_dir = None
+            for candidate in (
+                codex_managed_config_file,
+                resolved_primary_config_file,
+                claude_settings_file,
+            ):
+                if candidate:
+                    base_dir = Path(candidate).parent
+                    break
+            if base_dir is None:
+                base_dir = self._make_temp_dir("client-proxy-settings-")
+            resolved_settings_file = str(base_dir / Path(CLIENT_PROXY_SETTINGS_FILE).name)
         return ProxyClientConfigService(
             ProxyClientConfig(
                 codex_primary_config_file=resolved_primary_config_file or CODEX_PRIMARY_CONFIG_FILE,
@@ -58,10 +74,110 @@ class ClientConfigTests(unittest.TestCase):
                 claude_proxy_settings=CLAUDE_PROXY_SETTINGS,
                 claude_max_context_tokens=CLAUDE_MAX_CONTEXT_TOKENS,
                 claude_max_output_tokens=CLAUDE_MAX_OUTPUT_TOKENS,
+                client_proxy_settings_file=resolved_settings_file,
             ),
             model_capabilities_provider=model_capabilities_provider,
             model_routing_settings_provider=model_routing_settings_provider,
         )
+
+    def test_client_proxy_settings_default_reverts_on_shutdown(self):
+        temp_dir = self._make_temp_dir("client-proxy-settings-default-")
+        settings_path = temp_dir / "client-proxy.json"
+        service = self._make_client_proxy_service(
+            codex_managed_config_file=str(temp_dir / "managed_config.toml"),
+            client_proxy_settings_file=str(settings_path),
+        )
+
+        settings = service.client_proxy_settings_payload()
+
+        self.assertTrue(settings["revert_on_shutdown"])
+        self.assertEqual(settings["path"], str(settings_path))
+        self.assertEqual(settings["pending_restore_targets"], [])
+
+    def test_client_proxy_settings_persist_revert_on_shutdown_toggle(self):
+        temp_dir = self._make_temp_dir("client-proxy-settings-save-")
+        settings_path = temp_dir / "client-proxy.json"
+        service = self._make_client_proxy_service(
+            codex_managed_config_file=str(temp_dir / "managed_config.toml"),
+            client_proxy_settings_file=str(settings_path),
+        )
+
+        saved = service.save_client_proxy_settings({"revert_on_shutdown": False})
+
+        self.assertFalse(saved["revert_on_shutdown"])
+        self.assertEqual(
+            json.loads(settings_path.read_text(encoding="utf-8")),
+            {"revert_on_shutdown": False, "pending_restore_targets": []},
+        )
+
+    def test_revert_proxy_configs_on_shutdown_skips_when_disabled(self):
+        temp_dir = self._make_temp_dir("client-proxy-shutdown-disabled-")
+        service = self._make_client_proxy_service(
+            codex_managed_config_file=str(temp_dir / "managed_config.toml"),
+            client_proxy_settings_file=str(temp_dir / "client-proxy.json"),
+        )
+        service.save_client_proxy_settings({"revert_on_shutdown": False})
+
+        with (
+            unittest.mock.patch.object(service, "disable_codex_proxy_config") as disable_codex,
+            unittest.mock.patch.object(service, "disable_claude_proxy_settings") as disable_claude,
+        ):
+            result = service.revert_proxy_configs_on_shutdown()
+
+        self.assertFalse(result["attempted"])
+        disable_codex.assert_not_called()
+        disable_claude.assert_not_called()
+
+    def test_revert_proxy_configs_on_shutdown_marks_targets_for_next_start(self):
+        temp_dir = self._make_temp_dir("client-proxy-shutdown-pending-")
+        settings_path = temp_dir / "client-proxy.json"
+        service = self._make_client_proxy_service(
+            codex_managed_config_file=str(temp_dir / "managed_config.toml"),
+            claude_settings_file=str(temp_dir / "settings.json"),
+            client_proxy_settings_file=str(settings_path),
+        )
+
+        with (
+            unittest.mock.patch.object(service, "codex_proxy_status", return_value={"configured": True}),
+            unittest.mock.patch.object(service, "claude_proxy_status", return_value={"configured": False}),
+            unittest.mock.patch.object(service, "disable_codex_proxy_config", return_value={"restored_from_backup": True, "status_message": "restored"}),
+            unittest.mock.patch.object(service, "disable_claude_proxy_settings", return_value={"restored_from_backup": False, "status_message": "proxy already disabled"}),
+        ):
+            result = service.revert_proxy_configs_on_shutdown()
+
+        self.assertTrue(result["attempted"])
+        persisted = json.loads(settings_path.read_text(encoding="utf-8"))
+        self.assertEqual(persisted["pending_restore_targets"], ["codex"])
+
+    def test_restore_proxy_configs_on_startup_reenables_pending_targets_and_clears_them(self):
+        temp_dir = self._make_temp_dir("client-proxy-startup-restore-")
+        settings_path = temp_dir / "client-proxy.json"
+        service = self._make_client_proxy_service(
+            codex_managed_config_file=str(temp_dir / "managed_config.toml"),
+            claude_settings_file=str(temp_dir / "settings.json"),
+            client_proxy_settings_file=str(settings_path),
+        )
+        service._write_json_atomic(
+            str(settings_path),
+            {"revert_on_shutdown": True, "pending_restore_targets": ["codex", "claude"]},
+        )
+
+        with unittest.mock.patch.object(
+            service,
+            "enable_target",
+            side_effect=[
+                {"configured": True, "status_message": "installed proxy config"},
+                {"configured": True, "status_message": "installed proxy settings"},
+            ],
+        ) as enable_target:
+            result = service.restore_proxy_configs_on_startup()
+
+        self.assertTrue(result["attempted"])
+        self.assertTrue(result["restored"])
+        self.assertEqual(enable_target.call_args_list[0].args[0], "codex")
+        self.assertEqual(enable_target.call_args_list[1].args[0], "claude")
+        persisted = json.loads(settings_path.read_text(encoding="utf-8"))
+        self.assertEqual(persisted["pending_restore_targets"], [])
 
     def test_enabling_codex_proxy_is_idempotent_when_already_enabled(self):
         temp_dir = self._make_temp_dir("codex-config-")

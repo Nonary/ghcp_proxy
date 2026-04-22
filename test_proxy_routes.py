@@ -19,6 +19,8 @@ class ProxyRoutesTests(unittest.TestCase):
         proxy.set_initiator_policy(initiator_policy.InitiatorPolicy())
         proxy.usage_tracker.clear_state()
         proxy._COPILOT_MODEL_CAPS_CACHE.update({"key": None, "ts": 0.0, "data": {}})
+        proxy._CLIENT_PROXY_STARTUP_RESTORE_COMPLETE = False
+        proxy._CLIENT_PROXY_SHUTDOWN_REVERT_COMPLETE = False
 
     def test_proxy_registers_copilot_native_root_aliases(self):
         paths = {route.path for route in proxy.app.routes}
@@ -194,6 +196,85 @@ class ProxyRoutesTests(unittest.TestCase):
         refresh_catalog.assert_called_once_with()
         self.assertEqual(response.status_code, 200)
         self.assertEqual(json.loads(response.body), saved)
+
+    def test_client_proxy_status_route_includes_settings_payload(self):
+        payload = {
+            "clients": {
+                "codex": {"client": "codex"},
+                "claude": {"client": "claude"},
+            },
+            "settings": {"revert_on_shutdown": True, "path": "/tmp/client-proxy.json"},
+        }
+
+        with mock.patch.object(
+            proxy.client_proxy_config_service,
+            "proxy_client_status_payload",
+            return_value=payload,
+        ) as status_payload:
+            response = proxy.asyncio.run(proxy.client_proxy_status_api())
+
+        status_payload.assert_called_once_with()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(json.loads(response.body), payload)
+
+    def test_client_proxy_settings_route_saves_settings(self):
+        request = SimpleNamespace()
+        payload = {"revert_on_shutdown": False}
+        saved = {"revert_on_shutdown": False, "path": "/tmp/client-proxy.json"}
+
+        with (
+            mock.patch.object(proxy, "parse_json_request", mock.AsyncMock(return_value=payload)),
+            mock.patch.object(
+                proxy.client_proxy_config_service,
+                "save_client_proxy_settings",
+                return_value=saved,
+            ) as save_settings,
+        ):
+            response = proxy.asyncio.run(proxy.client_proxy_settings_api(request))
+
+        save_settings.assert_called_once_with(payload)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(json.loads(response.body), saved)
+
+    def test_revert_client_proxy_configs_on_shutdown_is_idempotent(self):
+        result = {
+            "attempted": True,
+            "reverted": True,
+            "reason": "shutdown",
+            "clients": {},
+        }
+
+        with mock.patch.object(
+            proxy.client_proxy_config_service,
+            "revert_proxy_configs_on_shutdown",
+            return_value=result,
+        ) as revert_configs:
+            first = proxy.revert_client_proxy_configs_on_shutdown()
+            second = proxy.revert_client_proxy_configs_on_shutdown()
+
+        revert_configs.assert_called_once_with()
+        self.assertEqual(first, result)
+        self.assertEqual(second["reason"], "already-ran")
+
+    def test_restore_client_proxy_configs_on_startup_is_idempotent(self):
+        result = {
+            "attempted": True,
+            "restored": True,
+            "reason": "startup",
+            "clients": {},
+        }
+
+        with mock.patch.object(
+            proxy.client_proxy_config_service,
+            "restore_proxy_configs_on_startup",
+            return_value=result,
+        ) as restore_configs:
+            first = proxy.restore_client_proxy_configs_on_startup()
+            second = proxy.restore_client_proxy_configs_on_startup()
+
+        restore_configs.assert_called_once_with()
+        self.assertEqual(first, result)
+        self.assertEqual(second["reason"], "already-ran")
 
     def test_anthropic_messages_route_uses_anthropic_headers_and_error_shape(self):
         request = SimpleNamespace(
