@@ -69,7 +69,7 @@ The managed Codex config written by the dashboard is:
 model_provider = "custom"
 approvals_reviewer = "user"
 model_catalog_json = "~/.codex/ghcp-proxy-models.json"
-model_context_window = 184000
+model_context_window = 272000
 model_auto_compact_token_limit = 120000
 
 [model_providers.custom]

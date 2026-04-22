@@ -44,7 +44,9 @@ CODEX_CONFIG_DIR    = os.path.expanduser("~/.codex")
 CODEX_PRIMARY_CONFIG_FILE = os.path.join(CODEX_CONFIG_DIR, "config.toml")
 CODEX_MANAGED_CONFIG_FILE = os.path.join(CODEX_CONFIG_DIR, "managed_config.toml")
 CODEX_PROXY_MODEL_CATALOG_FILE = os.path.join(CODEX_CONFIG_DIR, "ghcp-proxy-models.json")
-CODEX_PROXY_MODEL_CONTEXT_WINDOW = 184000
+# Codex presents the usable window at 95% of this raw prompt limit; 272k
+# therefore reports as the expected ~258k before auto compaction.
+CODEX_PROXY_MODEL_CONTEXT_WINDOW = 272000
 CODEX_PROXY_MODEL_AUTO_COMPACT_TOKEN_LIMIT = 120000
 CLAUDE_CONFIG_DIR   = os.path.expanduser("~/.claude")
 CLAUDE_SETTINGS_FILE = os.path.join(CLAUDE_CONFIG_DIR, "settings.json")
