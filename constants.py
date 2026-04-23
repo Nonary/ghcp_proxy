@@ -8,6 +8,8 @@ no functions or classes.
 
 import os
 
+from app_paths import user_cache_dir, user_config_dir, user_state_dir
+
 # ─── Constants ────────────────────────────────────────────────────────────────
 GITHUB_CLIENT_ID        = "Iv1.b507a08c87ecfe98"
 GITHUB_DEVICE_CODE_URL  = "https://github.com/login/device/code"
@@ -22,14 +24,16 @@ UPSTREAM_REQUESTS_PER_WINDOW = 5
 UPSTREAM_REQUEST_WINDOW_SECONDS = 1.0
 DEFAULT_UPSTREAM_TIMEOUT_SECONDS = 300
 
-TOKEN_DIR         = os.path.expanduser("~/.config/ghcp_proxy")
+CONFIG_DIR        = user_config_dir()
+TOKEN_DIR         = user_state_dir()
+CACHE_DIR         = user_cache_dir()
 ACCESS_TOKEN_FILE = os.path.join(TOKEN_DIR, "access-token")
 API_KEY_FILE      = os.path.join(TOKEN_DIR, "api-key.json")
-MODEL_ROUTING_CONFIG_FILE = os.path.join(TOKEN_DIR, "model-routing.json")
-CLIENT_PROXY_SETTINGS_FILE = os.path.join(TOKEN_DIR, "client-proxy.json")
-LEGACY_PREMIUM_PLAN_CONFIG_FILE = os.path.join(TOKEN_DIR, "premium-plan.json")
-LEGACY_BILLING_TOKEN_FILE = os.path.join(TOKEN_DIR, "billing-token")
-SAFEGUARD_CONFIG_FILE = os.path.join(TOKEN_DIR, "safeguard.json")
+MODEL_ROUTING_CONFIG_FILE = os.path.join(CONFIG_DIR, "model-routing.json")
+CLIENT_PROXY_SETTINGS_FILE = os.path.join(CONFIG_DIR, "client-proxy.json")
+LEGACY_PREMIUM_PLAN_CONFIG_FILE = os.path.join(CONFIG_DIR, "premium-plan.json")
+LEGACY_BILLING_TOKEN_FILE = os.path.join(CONFIG_DIR, "billing-token")
+SAFEGUARD_CONFIG_FILE = os.path.join(CONFIG_DIR, "safeguard.json")
 USAGE_LOG_FILE    = os.path.join(TOKEN_DIR, "usage-log.jsonl")
 REQUEST_ERROR_LOG_FILE = os.path.join(TOKEN_DIR, "request-errors.log")
 REQUEST_TRACE_LOG_FILE = os.path.join(TOKEN_DIR, "request-trace.jsonl")
@@ -38,7 +42,7 @@ CODEX_PROXY_BASE_URL = f"{PROXY_BASE_URL}/v1"
 DASHBOARD_BASE_URL = "http://localhost:8000"
 DASHBOARD_FILE    = os.path.join(os.path.dirname(__file__), "dashboard.html")
 SQLITE_CACHE_FILE = os.path.join(
-    os.path.expanduser(os.environ.get("GHCP_CACHE_DB_PATH", os.path.join(TOKEN_DIR, ".ghcp_proxy-cache-v2.sqlite3")))
+    os.path.expanduser(os.environ.get("GHCP_CACHE_DB_PATH", os.path.join(CACHE_DIR, ".ghcp_proxy-cache-v2.sqlite3")))
 )
 CODEX_CONFIG_DIR    = os.path.expanduser("~/.codex")
 CODEX_PRIMARY_CONFIG_FILE = os.path.join(CODEX_CONFIG_DIR, "config.toml")

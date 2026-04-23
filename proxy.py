@@ -55,6 +55,7 @@ import auth
 import dashboard as dashboard_module
 import format_translation
 import messages_preprocess
+import migrate_runtime_paths
 import json
 import sqlite3
 import tempfile
@@ -130,6 +131,9 @@ _CLIENT_PROXY_STARTUP_RESTORE_LOCK = Lock()
 _CLIENT_PROXY_STARTUP_RESTORE_COMPLETE = False
 _CLIENT_PROXY_SHUTDOWN_REVERT_LOCK = Lock()
 _CLIENT_PROXY_SHUTDOWN_REVERT_COMPLETE = False
+migrated_runtime_files = migrate_runtime_paths.migrate_legacy_runtime_files()
+if migrated_runtime_files:
+    print(f"runtime migration: copied {len(migrated_runtime_files)} legacy file(s)", flush=True)
 _TRACE_HEADER_ALLOWLIST = {
     "content-type",
     "user-agent",
