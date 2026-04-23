@@ -1264,6 +1264,39 @@ class FormatTranslationTests(unittest.TestCase):
 
         self.assertEqual(translated["model"], "claude-sonnet-4.6")
 
+    def test_chat_completion_to_compaction_response_encodes_summary_item(self):
+        payload = {
+            "id": "chatcmpl_123",
+            "model": "claude-opus-4.7",
+            "created": 123,
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "summary text",
+                    },
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 20,
+                "completion_tokens": 4,
+                "prompt_tokens_details": {"cached_tokens": 6},
+            },
+        }
+
+        translated = format_translation.chat_completion_to_compaction_response(payload)
+
+        self.assertEqual(translated["id"], "chatcmpl_123")
+        self.assertEqual(translated["model"], "claude-opus-4.7")
+        self.assertEqual(translated["output_text"], "summary text")
+        self.assertEqual(translated["usage"]["input_tokens"], 20)
+        self.assertEqual(translated["output"][0]["type"], "compaction")
+        self.assertEqual(
+            format_translation.decode_fake_compaction(translated["output"][0]["encrypted_content"]),
+            "summary text",
+        )
+
     def test_response_payload_to_anthropic_prefers_fallback_model_when_present(self):
         payload = {
             "id": "resp_123",

@@ -278,7 +278,7 @@ class ProtocolBridgePlannerTests(unittest.TestCase):
         )
 
         self.assertEqual(plan.resolved_model, "claude-opus-4.7")
-    def test_planner_swaps_to_gpt_fallback_on_compact_against_claude(self):
+    def test_planner_keeps_chat_target_on_compact_against_claude(self):
         planner = ProtocolBridgePlanner(
             _RoutingConfigStub(target_model="claude-opus-4.6", compact_fallback_model="gpt-5.4")
         )
@@ -294,11 +294,31 @@ class ProtocolBridgePlannerTests(unittest.TestCase):
             )
         )
 
-        self.assertEqual(plan.strategy_name, "responses_to_responses")
-        self.assertEqual(plan.resolved_model, "gpt-5.4")
-        self.assertEqual(plan.upstream_path, "/responses")
+        self.assertEqual(plan.strategy_name, "responses_to_chat")
+        self.assertEqual(plan.resolved_model, "claude-opus-4.6")
+        self.assertEqual(plan.upstream_path, "/chat/completions")
+        self.assertTrue(plan.is_compact)
 
-    def test_planner_swaps_to_gpt_fallback_on_compact_against_gemini(self):
+    def test_planner_keeps_direct_claude_compact_on_chat(self):
+        planner = ProtocolBridgePlanner(_RoutingConfigStub())
+        body = {"model": "claude-opus-4.7", "input": "hello", "stream": False}
+
+        plan = proxy.asyncio.run(
+            planner.plan(
+                "responses",
+                body,
+                api_base="https://example.invalid",
+                api_key="test-key",
+                is_compact=True,
+            )
+        )
+
+        self.assertEqual(plan.strategy_name, "responses_to_chat")
+        self.assertEqual(plan.resolved_model, "claude-opus-4.7")
+        self.assertEqual(plan.upstream_path, "/chat/completions")
+        self.assertTrue(plan.is_compact)
+
+    def test_planner_keeps_chat_target_on_compact_against_gemini(self):
         planner = ProtocolBridgePlanner(
             _RoutingConfigStub(target_model="gemini-3.1-pro-preview", compact_fallback_model="gpt-5.4")
         )
@@ -314,11 +334,12 @@ class ProtocolBridgePlannerTests(unittest.TestCase):
             )
         )
 
-        self.assertEqual(plan.strategy_name, "responses_to_responses")
-        self.assertEqual(plan.resolved_model, "gpt-5.4")
-        self.assertEqual(plan.upstream_path, "/responses")
+        self.assertEqual(plan.strategy_name, "responses_to_chat")
+        self.assertEqual(plan.resolved_model, "gemini-3.1-pro-preview")
+        self.assertEqual(plan.upstream_path, "/chat/completions")
+        self.assertTrue(plan.is_compact)
 
-    def test_planner_swaps_to_gpt_fallback_on_compact_against_grok(self):
+    def test_planner_keeps_chat_target_on_compact_against_grok(self):
         planner = ProtocolBridgePlanner(
             _RoutingConfigStub(target_model="grok-code-fast-1", compact_fallback_model="gpt-5.4")
         )
@@ -334,9 +355,10 @@ class ProtocolBridgePlannerTests(unittest.TestCase):
             )
         )
 
-        self.assertEqual(plan.strategy_name, "responses_to_responses")
-        self.assertEqual(plan.resolved_model, "gpt-5.4")
-        self.assertEqual(plan.upstream_path, "/responses")
+        self.assertEqual(plan.strategy_name, "responses_to_chat")
+        self.assertEqual(plan.resolved_model, "grok-code-fast-1")
+        self.assertEqual(plan.upstream_path, "/chat/completions")
+        self.assertTrue(plan.is_compact)
 
     def test_planner_does_not_swap_on_compact_when_target_is_codex(self):
         planner = ProtocolBridgePlanner(

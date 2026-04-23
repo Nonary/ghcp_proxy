@@ -978,7 +978,7 @@ class ProxyRoutesTests(unittest.TestCase):
         self.assertEqual(response_payload["id"], "resp_123")
         self.assertEqual(response_payload["output"][0]["content"][0]["text"], "summary")
 
-    def test_responses_compact_flattens_history_for_translated_model_fallback(self):
+    def test_responses_compact_wraps_chat_summary_for_translated_model(self):
         request = SimpleNamespace(
             url=SimpleNamespace(path="/v1/responses/compact"),
             method="POST",
@@ -1003,19 +1003,20 @@ class ProxyRoutesTests(unittest.TestCase):
         upstream = httpx.Response(
             200,
             json={
-                "id": "resp_123",
-                "model": "gpt-5.2",
-                "output": [
+                "id": "chatcmpl_123",
+                "model": "claude-opus-4.6",
+                "choices": [
                     {
-                        "type": "message",
-                        "role": "assistant",
-                        "content": [{"type": "output_text", "text": "summary"}],
+                        "message": {
+                            "role": "assistant",
+                            "content": "summary",
+                        },
+                        "finish_reason": "stop",
                     }
                 ],
                 "usage": {
-                    "input_tokens": 24,
-                    "output_tokens": 5,
-                    "total_tokens": 29,
+                    "prompt_tokens": 24,
+                    "completion_tokens": 5,
                 },
             },
             headers={"content-type": "application/json"},
@@ -1034,16 +1035,18 @@ class ProxyRoutesTests(unittest.TestCase):
             response = proxy.asyncio.run(proxy.responses_compact(request))
 
         forwarded_body = post.await_args.kwargs["json"]
-        self.assertEqual(forwarded_body["model"], "gpt-5.2")
-        self.assertEqual(
-            [item["role"] for item in forwarded_body["input"]],
-            ["user", "user", "user"],
-        )
-        self.assertEqual(
-            forwarded_body["input"][1]["content"][0]["text"],
-            "[assistant message]\nI found the issue.",
-        )
+        self.assertEqual(forwarded_body["model"], "claude-opus-4.6")
+        self.assertEqual([message["role"] for message in forwarded_body["messages"]], ["user", "user", "user"])
+        self.assertIn("please inspect this", forwarded_body["messages"][0]["content"])
+        self.assertIn("[assistant message]\nI found the issue.", forwarded_body["messages"][1]["content"])
+        self.assertIn("Please create a detailed summary", forwarded_body["messages"][2]["content"])
         self.assertEqual(response.status_code, 200)
+        payload = json.loads(response.body)
+        self.assertEqual(payload["output"][0]["type"], "compaction")
+        self.assertEqual(
+            format_translation.decode_fake_compaction(payload["output"][0]["encrypted_content"]),
+            "summary",
+        )
 
     def test_proxy_streaming_response_connect_error_returns_openai_error(self):
         request = httpx.Request("POST", "https://example.invalid/responses")

@@ -1352,6 +1352,39 @@ def chat_completion_to_response(payload: dict, fallback_model=None) -> dict:
     }
 
 
+def chat_completion_to_compaction_response(payload: dict, fallback_model=None) -> dict:
+    """Wrap a chat-completions summary as a Responses compact payload.
+
+    Codex's remote compaction client expects ``/responses/compact`` to return
+    ``{"output": [ResponseItem...]}``, and later sends any compaction item back
+    in normal Responses history.  Chat-backed models can produce the summary
+    text, but they cannot produce a native compaction item, so encode the text
+    in the proxy's local compaction format for the next request to expand.
+    """
+    choices = payload.get("choices") if isinstance(payload, dict) else None
+    first_choice = choices[0] if isinstance(choices, list) and choices else {}
+    message = first_choice.get("message") if isinstance(first_choice, dict) else {}
+    summary_text = _extract_chat_message_text(message if isinstance(message, dict) else {}).strip()
+    if not summary_text:
+        summary_text = "(no summary available)"
+
+    return {
+        "id": (payload.get("id") if isinstance(payload, dict) else None) or f"resp_{uuid4().hex}",
+        "object": "response",
+        "created_at": payload.get("created") if isinstance(payload, dict) else int(time.time()),
+        "status": "completed",
+        "model": fallback_model or (payload.get("model") if isinstance(payload, dict) else None),
+        "output": [
+            {
+                "type": "compaction",
+                "encrypted_content": encode_fake_compaction(summary_text),
+            }
+        ],
+        "output_text": summary_text,
+        "usage": chat_usage_to_response(payload.get("usage") if isinstance(payload, dict) else {}),
+    }
+
+
 # ─── Error translation ───────────────────────────────────────────────────────
 
 def _anthropic_error_type_for_status(status_code: int) -> str:

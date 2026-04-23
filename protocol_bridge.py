@@ -22,6 +22,7 @@ class BridgeExecutionPlan:
     resolved_model: str | None
     upstream_body: dict
     stream: bool
+    is_compact: bool = False
 
     @property
     def upstream_path(self) -> str:
@@ -51,6 +52,7 @@ class ProtocolBridgeStrategy(ABC):
         resolved_model: str | None,
         api_base: str,
         api_key: str,
+        is_compact: bool = False,
     ) -> BridgeExecutionPlan:
         raise NotImplementedError
 
@@ -63,7 +65,7 @@ class ResponsesToResponsesStrategy(ProtocolBridgeStrategy):
     header_kind = "responses"
     caller_protocol = "responses"
 
-    async def build_plan(self, body: dict, *, requested_model, resolved_model, api_base, api_key) -> BridgeExecutionPlan:
+    async def build_plan(self, body: dict, *, requested_model, resolved_model, api_base, api_key, is_compact=False) -> BridgeExecutionPlan:
         del api_base, api_key
         upstream_body = dict(body)
         upstream_body["model"] = resolved_model
@@ -86,6 +88,7 @@ class ResponsesToResponsesStrategy(ProtocolBridgeStrategy):
             resolved_model=resolved_model,
             upstream_body=upstream_body,
             stream=bool(upstream_body.get("stream", False)),
+            is_compact=is_compact,
         )
 
 
@@ -97,7 +100,7 @@ class ResponsesToChatStrategy(ProtocolBridgeStrategy):
     header_kind = "chat"
     caller_protocol = "responses"
 
-    async def build_plan(self, body: dict, *, requested_model, resolved_model, api_base, api_key) -> BridgeExecutionPlan:
+    async def build_plan(self, body: dict, *, requested_model, resolved_model, api_base, api_key, is_compact=False) -> BridgeExecutionPlan:
         del api_base, api_key
         upstream_body = dict(body)
         upstream_body["model"] = resolved_model
@@ -112,6 +115,7 @@ class ResponsesToChatStrategy(ProtocolBridgeStrategy):
             resolved_model=resolved_model,
             upstream_body=translated,
             stream=bool(translated.get("stream", False)),
+            is_compact=is_compact,
         )
 
 
@@ -123,7 +127,7 @@ class MessagesToChatStrategy(ProtocolBridgeStrategy):
     header_kind = "anthropic"
     caller_protocol = "anthropic"
 
-    async def build_plan(self, body: dict, *, requested_model, resolved_model, api_base, api_key) -> BridgeExecutionPlan:
+    async def build_plan(self, body: dict, *, requested_model, resolved_model, api_base, api_key, is_compact=False) -> BridgeExecutionPlan:
         upstream_body = dict(body)
         upstream_body["model"] = resolved_model
         translated = await format_translation.anthropic_request_to_chat(upstream_body, api_base, api_key)
@@ -137,6 +141,7 @@ class MessagesToChatStrategy(ProtocolBridgeStrategy):
             resolved_model=resolved_model,
             upstream_body=translated,
             stream=bool(translated.get("stream", False)),
+            is_compact=is_compact,
         )
 
 
@@ -148,7 +153,7 @@ class MessagesToResponsesStrategy(ProtocolBridgeStrategy):
     header_kind = "responses"
     caller_protocol = "anthropic"
 
-    async def build_plan(self, body: dict, *, requested_model, resolved_model, api_base, api_key) -> BridgeExecutionPlan:
+    async def build_plan(self, body: dict, *, requested_model, resolved_model, api_base, api_key, is_compact=False) -> BridgeExecutionPlan:
         del api_base, api_key
         upstream_body = dict(body)
         upstream_body["model"] = resolved_model
@@ -163,6 +168,7 @@ class MessagesToResponsesStrategy(ProtocolBridgeStrategy):
             resolved_model=resolved_model,
             upstream_body=translated,
             stream=bool(translated.get("stream", False)),
+            is_compact=is_compact,
         )
 
 
@@ -201,18 +207,6 @@ class ProtocolBridgePlanner:
         if target_family is None:
             raise ValueError(f"Unsupported mapped model family: {resolved_model}")
 
-        # Codex compact requests do not fit cleanly through chat-backed target
-        # families; swap to a configured GPT fallback so the compaction call
-        # itself can complete. The subsequent normal turns remain routed to the
-        # configured target model.
-        if is_compact and target_family != "codex":
-            fallback = self._routing_config_service.resolve_compact_fallback_model(requested_model)
-            if fallback:
-                resolved_model = normalize_routing_model_name(fallback)
-                target_family = model_provider_family(resolved_model)
-                if target_family is None:
-                    raise ValueError(f"Unsupported compact fallback model: {resolved_model}")
-
         strategy = self._strategy_for(inbound_protocol, target_family)
         return await strategy.build_plan(
             body,
@@ -220,6 +214,7 @@ class ProtocolBridgePlanner:
             resolved_model=resolved_model,
             api_base=api_base,
             api_key=api_key,
+            is_compact=is_compact,
         )
 
     def _strategy_for(self, inbound_protocol: str, target_family: str) -> ProtocolBridgeStrategy:

@@ -1103,6 +1103,11 @@ def _prepare_bridge_request(
 
 def _translate_bridge_success_payload(bridge_plan: BridgeExecutionPlan, payload: dict) -> dict:
     if bridge_plan.caller_protocol == "responses" and bridge_plan.upstream_protocol == "chat":
+        if bridge_plan.is_compact:
+            return format_translation.chat_completion_to_compaction_response(
+                payload,
+                fallback_model=bridge_plan.resolved_model,
+            )
         return format_translation.chat_completion_to_response(payload, fallback_model=bridge_plan.resolved_model)
     if bridge_plan.caller_protocol == "anthropic" and bridge_plan.upstream_protocol == "responses":
         return format_translation.response_payload_to_anthropic(payload, fallback_model=bridge_plan.resolved_model)
