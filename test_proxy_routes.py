@@ -316,6 +316,7 @@ class ProxyRoutesTests(unittest.TestCase):
             mock.patch.object(usage_tracking, "log_proxy_request"),
             mock.patch.object(proxy.usage_tracker, "start_event", return_value=None),
             mock.patch.object(proxy.usage_tracker, "finish_event"),
+            mock.patch.object(proxy, "model_supports_native_messages", return_value=False),
             mock.patch.object(format_translation, "build_anthropic_headers_for_request", return_value={"X-Initiator": "user"}) as build_headers,
             mock.patch.object(format_translation, "build_chat_headers_for_request", side_effect=AssertionError("unexpected chat headers")),
             mock.patch.object(proxy, "throttled_client_post", mock.AsyncMock(return_value=upstream)) as post,
@@ -518,6 +519,7 @@ class ProxyRoutesTests(unittest.TestCase):
             mock.patch.object(auth, "get_api_key", return_value="test-key"),
             mock.patch.object(auth, "get_api_base", return_value="https://example.invalid"),
             mock.patch.object(proxy.model_routing_config_service, "resolve_target_model", return_value="claude-opus-4.6"),
+            mock.patch.object(proxy, "model_supports_native_messages", return_value=False),
             mock.patch.object(format_translation, "build_chat_headers_for_request", return_value={"X-Initiator": "user"}) as build_headers,
             mock.patch.object(format_translation, "build_responses_headers_for_request", side_effect=AssertionError("unexpected responses headers")),
             mock.patch.object(proxy.usage_tracker, "start_event", return_value=None) as start_event,
@@ -592,6 +594,7 @@ class ProxyRoutesTests(unittest.TestCase):
             mock.patch.object(auth, "get_api_key", return_value="test-key"),
             mock.patch.object(auth, "get_api_base", return_value="https://example.invalid"),
             mock.patch.object(proxy.model_routing_config_service, "resolve_target_model", return_value="claude-opus-4.6"),
+            mock.patch.object(proxy, "model_supports_native_messages", return_value=False),
             mock.patch.object(format_translation, "build_chat_headers_for_request", return_value={"X-Initiator": "user"}),
             mock.patch.object(proxy.usage_tracker, "start_event", return_value=None),
             mock.patch.object(proxy.usage_tracker, "finish_event"),
@@ -1027,6 +1030,7 @@ class ProxyRoutesTests(unittest.TestCase):
             mock.patch.object(auth, "get_api_key", return_value="test-key"),
             mock.patch.object(auth, "get_api_base", return_value="https://example.invalid"),
             mock.patch.object(proxy.model_routing_config_service, "resolve_target_model", return_value="claude-opus-4.6"),
+            mock.patch.object(proxy, "model_supports_native_messages", return_value=False),
             mock.patch.object(proxy.model_routing_config_service, "resolve_compact_fallback_model", return_value="gpt-5.2"),
             mock.patch.object(proxy.usage_tracker, "start_event", return_value=None),
             mock.patch.object(proxy.usage_tracker, "finish_event"),
@@ -1118,3 +1122,274 @@ class ProxyRoutesTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+# ─── Native Anthropic Messages passthrough route tests ───────────────────────
+
+
+from protocol_bridge import BridgeExecutionPlan as _BridgeExecutionPlan_for_msgs
+
+
+class AnthropicMessagesPassthroughRouteTests(unittest.TestCase):
+    def setUp(self):
+        proxy.set_initiator_policy(initiator_policy.InitiatorPolicy())
+        proxy.usage_tracker.clear_state()
+
+    def _messages_request(self):
+        return SimpleNamespace(
+            url=SimpleNamespace(path="/v1/messages"),
+            method="POST",
+            headers={"x-client-request-id": "req-msg-1", "anthropic-beta": "context-management-2025-06-27"},
+        )
+
+    def test_messages_route_uses_messages_passthrough_upstream(self):
+        request = self._messages_request()
+        body = {
+            "model": "claude-sonnet-4.6",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": False,
+        }
+        # Build a synthetic plan that drives MessagesToMessages.
+        plan = _BridgeExecutionPlan_for_msgs(
+            strategy_name="messages_to_messages",
+            inbound_protocol="messages",
+            caller_protocol="anthropic",
+            upstream_protocol="messages",
+            header_kind="messages",
+            requested_model="claude-sonnet-4.6",
+            resolved_model="claude-sonnet-4.6",
+            upstream_body=dict(body),
+            stream=False,
+            is_compact=False,
+        )
+        upstream = httpx.Response(
+            200,
+            json={
+                "id": "msg_x",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-sonnet-4.6",
+                "content": [{"type": "text", "text": "ok"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 5, "output_tokens": 1},
+            },
+            headers={"content-type": "application/json"},
+        )
+
+        async def fake_plan(*args, **kwargs):
+            return plan
+
+        with (
+            mock.patch.object(proxy, "parse_json_request", mock.AsyncMock(return_value=body)),
+            mock.patch.object(auth, "get_api_key", return_value="test-key"),
+            mock.patch.object(auth, "get_api_base", return_value="https://example.invalid"),
+            mock.patch.object(proxy.bridge_planner, "plan", side_effect=fake_plan),
+            mock.patch.object(usage_tracking, "log_proxy_request"),
+            mock.patch.object(proxy.usage_tracker, "start_event", return_value=None),
+            mock.patch.object(proxy.usage_tracker, "finish_event"),
+            mock.patch.object(proxy, "throttled_client_post", mock.AsyncMock(return_value=upstream)) as post,
+        ):
+            response = proxy.asyncio.run(proxy.anthropic_messages(request))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(post.await_args.args[1], "https://example.invalid/v1/messages")
+        sent_headers = post.await_args.kwargs["headers"]
+        # Required: anthropic-beta and messages-proxy interaction type, NO copilot-integration-id
+        self.assertIn("anthropic-beta", sent_headers)
+        self.assertIn("context-management-2025-06-27", sent_headers["anthropic-beta"])
+        self.assertEqual(sent_headers.get("x-interaction-type"), "messages-proxy")
+        lower_keys = {k.lower() for k in sent_headers}
+        self.assertNotIn("copilot-integration-id", lower_keys)
+        # Body should be the upstream Anthropic body, unchanged shape
+        self.assertEqual(post.await_args.kwargs["json"]["model"], "claude-sonnet-4.6")
+        # Response is passthrough - same Anthropic shape
+        payload = json.loads(response.body)
+        self.assertEqual(payload["id"], "msg_x")
+        self.assertEqual(payload["content"][0]["text"], "ok")
+
+    def test_responses_route_to_messages_translates_back_to_responses(self):
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/responses"),
+            method="POST",
+            headers={"x-client-request-id": "req-msg-2"},
+        )
+        body = {
+            "model": "claude-sonnet-4.6",
+            "input": "hi",
+            "stream": False,
+        }
+        translated_anthropic = {
+            "model": "claude-sonnet-4.6",
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+        }
+        plan = _BridgeExecutionPlan_for_msgs(
+            strategy_name="responses_to_messages",
+            inbound_protocol="responses",
+            caller_protocol="responses",
+            upstream_protocol="messages",
+            header_kind="messages",
+            requested_model="claude-sonnet-4.6",
+            resolved_model="claude-sonnet-4.6",
+            upstream_body=translated_anthropic,
+            stream=False,
+            is_compact=False,
+        )
+        upstream = httpx.Response(
+            200,
+            json={
+                "id": "msg_y",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-sonnet-4.6",
+                "content": [{"type": "text", "text": "translated"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 3, "output_tokens": 2},
+            },
+            headers={"content-type": "application/json"},
+        )
+
+        async def fake_plan(*args, **kwargs):
+            return plan
+
+        translator_called = {"count": 0}
+
+        def fake_translator(payload, *, fallback_model=None):
+            translator_called["count"] += 1
+            return {
+                "id": "resp_translated",
+                "object": "response",
+                "model": fallback_model or payload.get("model"),
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "translated"}],
+                    }
+                ],
+                "usage": {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5},
+            }
+
+        with (
+            mock.patch.object(proxy, "parse_json_request", mock.AsyncMock(return_value=body)),
+            mock.patch.object(auth, "get_api_key", return_value="test-key"),
+            mock.patch.object(auth, "get_api_base", return_value="https://example.invalid"),
+            mock.patch.object(proxy.bridge_planner, "plan", side_effect=fake_plan),
+            mock.patch.object(format_translation, "anthropic_response_to_responses", create=True, side_effect=fake_translator),
+            mock.patch.object(usage_tracking, "log_proxy_request"),
+            mock.patch.object(proxy.usage_tracker, "start_event", return_value=None),
+            mock.patch.object(proxy.usage_tracker, "finish_event"),
+            mock.patch.object(proxy, "throttled_client_post", mock.AsyncMock(return_value=upstream)) as post,
+        ):
+            response = proxy.asyncio.run(proxy.responses(request))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(post.await_args.args[1], "https://example.invalid/v1/messages")
+        self.assertEqual(translator_called["count"], 1)
+        payload = json.loads(response.body)
+        self.assertEqual(payload["id"], "resp_translated")
+        self.assertEqual(payload["output"][0]["content"][0]["text"], "translated")
+
+
+    def test_responses_to_messages_upstream_error_returns_openai_error_shape(self):
+        bridge_plan = SimpleNamespace(caller_protocol="responses", upstream_protocol="messages")
+        upstream = httpx.Response(
+            400,
+            json={
+                "type": "error",
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": "bad anthropic request",
+                },
+            },
+            headers={"content-type": "application/json"},
+        )
+
+        response = proxy._bridge_error_response_from_upstream(bridge_plan, upstream)
+        self.assertEqual(response.status_code, 400)
+        payload = json.loads(response.body)
+        self.assertEqual(payload["error"]["message"], "bad anthropic request")
+        self.assertEqual(payload["error"]["type"], "invalid_request_error")
+        self.assertNotEqual(payload.get("type"), "error")
+
+    def test_prepare_upstream_request_reads_lowercase_initiator_header(self):
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/messages"),
+            method="POST",
+            headers={},
+        )
+
+        with mock.patch.object(proxy.usage_tracker, "start_event", return_value=None) as start_event:
+            plan, error = proxy._prepare_upstream_request(
+                request,
+                body={"model": "claude-sonnet-4.6", "messages": []},
+                requested_model="claude-sonnet-4.6",
+                resolved_model="claude-sonnet-4.6",
+                upstream_path="/v1/messages",
+                upstream_url="https://example.invalid/v1/messages",
+                header_builder=lambda _api_key, _request_id: {"x-initiator": "agent"},
+                error_response=format_translation.openai_error_response,
+                api_key="test-key",
+            )
+
+        self.assertIsNone(error)
+        self.assertIsNotNone(plan)
+        self.assertEqual(start_event.call_args.args[3], "agent")
+
+
+    def test_bridge_planner_end_to_end_dispatches_to_messages_url(self):
+        """Regression: feed the *real* bridge_planner through to dispatch.
+
+        Earlier tests synthesized BridgeExecutionPlan objects with
+        ``header_kind="messages"`` directly, which masked a bug where the
+        strategy classes returned ``"anthropic_messages"`` (mismatched with
+        the dispatcher). This test exercises the full pipeline so a future
+        regression in either side will fail loudly.
+        """
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/messages"),
+            method="POST",
+            headers={"x-client-request-id": "req-e2e-1"},
+        )
+        body = {
+            "model": "claude-sonnet-4.6",
+            "messages": [{"role": "user", "content": "ping"}],
+            "stream": False,
+        }
+        upstream = httpx.Response(
+            200,
+            json={
+                "id": "msg_e2e",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-sonnet-4.6",
+                "content": [{"type": "text", "text": "pong"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            },
+            headers={"content-type": "application/json"},
+        )
+
+        with (
+            mock.patch.object(proxy, "parse_json_request", mock.AsyncMock(return_value=body)),
+            mock.patch.object(auth, "get_api_key", return_value="test-key"),
+            mock.patch.object(auth, "get_api_base", return_value="https://example.invalid"),
+            mock.patch.object(proxy.model_routing_config_service, "resolve_target_model", return_value="claude-sonnet-4.6"),
+            # Force native /v1/messages capability on (do NOT bypass the planner).
+            mock.patch.object(proxy, "model_supports_native_messages", return_value=True),
+            mock.patch.object(usage_tracking, "log_proxy_request"),
+            mock.patch.object(proxy.usage_tracker, "start_event", return_value=None),
+            mock.patch.object(proxy.usage_tracker, "finish_event"),
+            mock.patch.object(proxy, "throttled_client_post", mock.AsyncMock(return_value=upstream)) as post,
+        ):
+            response = proxy.asyncio.run(proxy.anthropic_messages(request))
+
+        # The dispatcher must have selected the /v1/messages upstream URL,
+        # which only happens when both the strategy header_kind and the
+        # dispatcher branch agree on "messages".
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(post.await_args.args[1], "https://example.invalid/v1/messages")
+        sent_headers = post.await_args.kwargs["headers"]
+        self.assertEqual(sent_headers.get("x-interaction-type"), "messages-proxy")
+        # Capability gating must drop the chat-style copilot-integration-id.
+        lower_keys = {k.lower() for k in sent_headers}
+        self.assertNotIn("copilot-integration-id", lower_keys)

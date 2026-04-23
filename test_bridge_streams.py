@@ -307,3 +307,177 @@ class ReasoningTextExtractionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+import json as _json2
+from bridge_streams import AnthropicToResponsesStreamTranslator
+
+
+class AnthropicToResponsesStreamTranslatorTests(unittest.TestCase):
+    def _build_anthropic_sse(self, events):
+        out = b""
+        for name, payload in events:
+            out += f"event: {name}\ndata: {_json2.dumps(payload)}\n\n".encode("utf-8")
+        return out
+
+    def test_translates_text_tool_and_thinking_blocks(self):
+        events = [
+            ("message_start", {
+                "type": "message_start",
+                "message": {
+                    "id": "msg_abc",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": "claude-sonnet-4.6",
+                    "content": [],
+                    "usage": {"input_tokens": 11, "output_tokens": 0},
+                },
+            }),
+            # block 0: thinking
+            ("content_block_start", {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "thinking", "thinking": ""},
+            }),
+            ("content_block_delta", {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "thinking_delta", "thinking": "hmm "},
+            }),
+            ("content_block_delta", {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "signature_delta", "signature": "SIG-PART-1"},
+            }),
+            ("content_block_stop", {"type": "content_block_stop", "index": 0}),
+            # block 1: text
+            ("content_block_start", {
+                "type": "content_block_start",
+                "index": 1,
+                "content_block": {"type": "text", "text": ""},
+            }),
+            ("content_block_delta", {
+                "type": "content_block_delta",
+                "index": 1,
+                "delta": {"type": "text_delta", "text": "hello"},
+            }),
+            ("content_block_delta", {
+                "type": "content_block_delta",
+                "index": 1,
+                "delta": {"type": "text_delta", "text": " world"},
+            }),
+            ("content_block_stop", {"type": "content_block_stop", "index": 1}),
+            # block 2: tool_use
+            ("content_block_start", {
+                "type": "content_block_start",
+                "index": 2,
+                "content_block": {"type": "tool_use", "id": "toolu_x", "name": "Read", "input": {}},
+            }),
+            ("content_block_delta", {
+                "type": "content_block_delta",
+                "index": 2,
+                "delta": {"type": "input_json_delta", "partial_json": "{\"file\":"},
+            }),
+            ("content_block_delta", {
+                "type": "content_block_delta",
+                "index": 2,
+                "delta": {"type": "input_json_delta", "partial_json": "\"a.py\"}"},
+            }),
+            ("content_block_stop", {"type": "content_block_stop", "index": 2}),
+            ("message_delta", {
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                "usage": {"output_tokens": 7},
+            }),
+            ("message_stop", {"type": "message_stop"}),
+        ]
+        chunks = [self._build_anthropic_sse(events)]
+
+        async def byte_iter():
+            for chunk in chunks:
+                yield chunk
+
+        async def collect():
+            translator = AnthropicToResponsesStreamTranslator(model="claude-sonnet-4.6")
+            body = b""
+            async for ev in translator.translate(byte_iter()):
+                body += ev
+            return body.decode("utf-8"), translator.build_response_payload()
+
+        body, payload = proxy.asyncio.run(collect())
+
+        self.assertIn("event: response.created", body)
+        self.assertIn("event: response.in_progress", body)
+        self.assertIn("event: response.reasoning_summary_text.delta", body)
+        self.assertIn("event: response.output_text.delta", body)
+        self.assertIn("event: response.function_call_arguments.delta", body)
+        self.assertIn("event: response.completed", body)
+
+        self.assertEqual(payload["status"], "completed")
+        self.assertEqual(payload["model"], "claude-sonnet-4.6")
+        self.assertEqual(len(payload["output"]), 3)
+        self.assertEqual(payload["output"][0]["type"], "reasoning")
+        self.assertEqual(payload["output"][0]["encrypted_content"], "SIG-PART-1")
+        self.assertEqual(payload["output"][1]["type"], "message")
+        self.assertEqual(
+            payload["output"][1]["content"][0]["text"], "hello world"
+        )
+        self.assertEqual(payload["output"][2]["type"], "function_call")
+        self.assertEqual(payload["output"][2]["call_id"], "toolu_x")
+        self.assertEqual(payload["output"][2]["name"], "Read")
+        self.assertEqual(payload["output"][2]["arguments"], '{"file":"a.py"}')
+        self.assertEqual(payload["usage"]["input_tokens"], 11)
+        self.assertEqual(payload["usage"]["output_tokens"], 7)
+        self.assertEqual(payload["usage"]["total_tokens"], 18)
+
+    def test_reasoning_output_item_done_splits_signature_id(self):
+        events = [
+            ("message_start", {
+                "type": "message_start",
+                "message": {
+                    "id": "msg_abc",
+                    "model": "claude-sonnet-4.6",
+                    "usage": {"input_tokens": 1, "output_tokens": 0},
+                },
+            }),
+            ("content_block_start", {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "thinking", "thinking": ""},
+            }),
+            ("content_block_delta", {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "thinking_delta", "thinking": "hmm"},
+            }),
+            ("content_block_delta", {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "signature_delta", "signature": "ENC@reason_1"},
+            }),
+            ("content_block_stop", {"type": "content_block_stop", "index": 0}),
+            ("message_stop", {"type": "message_stop"}),
+        ]
+        chunks = [self._build_anthropic_sse(events)]
+
+        async def byte_iter():
+            for chunk in chunks:
+                yield chunk
+
+        async def collect():
+            translator = AnthropicToResponsesStreamTranslator(model="claude-sonnet-4.6")
+            body = b""
+            async for ev in translator.translate(byte_iter()):
+                body += ev
+            return body.decode("utf-8"), translator.build_response_payload()
+
+        body, payload = proxy.asyncio.run(collect())
+        done_lines = [
+            line for line in body.splitlines()
+            if line.startswith("data: {") and "response.output_item.done" in line
+        ]
+        self.assertTrue(done_lines, "expected response.output_item.done event")
+        done_payload = _json2.loads(done_lines[0][len("data: "):])
+        self.assertEqual(done_payload["item"]["id"], "reason_1")
+        self.assertEqual(done_payload["item"]["encrypted_content"], "ENC")
+        self.assertEqual(payload["output"][0]["id"], "reason_1")
+        self.assertEqual(payload["output"][0]["encrypted_content"], "ENC")

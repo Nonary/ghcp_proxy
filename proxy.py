@@ -54,10 +54,12 @@ import asyncio
 import auth
 import dashboard as dashboard_module
 import format_translation
+import messages_preprocess
 import json
 import sqlite3
 import tempfile
 import time
+import threading
 import safeguard_config as safeguard_config_module
 import usage_tracking
 import util
@@ -71,7 +73,11 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 from anthropic_stream import AnthropicStreamTranslator
-from bridge_streams import ChatToResponsesStreamTranslator, ResponsesToAnthropicStreamTranslator
+from bridge_streams import (
+    AnthropicToResponsesStreamTranslator,
+    ChatToResponsesStreamTranslator,
+    ResponsesToAnthropicStreamTranslator,
+)
 from initiator_policy import InitiatorPolicy
 from event_bus import EventBus
 from model_routing_config import ModelRoutingConfig, ModelRoutingConfigService, model_provider_family
@@ -213,7 +219,10 @@ client_proxy_config_service = ProxyClientConfigService(
     model_capabilities_provider=lambda: fetch_copilot_model_capabilities(),
     model_routing_settings_provider=lambda: model_routing_config_service.load_settings(),
 )
-bridge_planner = ProtocolBridgePlanner(model_routing_config_service)
+bridge_planner = ProtocolBridgePlanner(
+    model_routing_config_service,
+    capability_resolver=lambda model: model_supports_native_messages(model) if model else False,
+)
 
 dashboard_service = dashboard_module.create_dashboard_service(
     dependencies=dashboard_module.DashboardDependencies(
@@ -950,8 +959,21 @@ def _prepare_upstream_request(
         except Exception:
             return None, error_response(401, AUTH_FAILURE_MESSAGE)
 
+    def header_value(name: str):
+        if not isinstance(headers, dict):
+            return None
+        value = headers.get(name)
+        if value is not None:
+            return value
+        target = name.lower()
+        for key, candidate in headers.items():
+            if isinstance(key, str) and key.lower() == target:
+                return candidate
+        return None
+
     headers = header_builder(effective_api_key, request_id)
-    initiator = str(headers.get("X-Initiator", "")).strip().lower()
+    initiator_header = header_value("X-Initiator")
+    initiator = str(initiator_header or "").strip().lower()
     initiator_verdict = None
     if isinstance(trace_metadata, dict):
         initiator_verdict = trace_metadata.get("initiator_verdict")
@@ -963,7 +985,7 @@ def _prepare_upstream_request(
         request,
         requested_model,
         resolved_model,
-        headers.get("X-Initiator"),
+        initiator_header,
         request_id=request_id,
         request_body=body,
         upstream_path=upstream_path,
@@ -1009,10 +1031,103 @@ def _prepare_upstream_request(
     )
 
 
+
 def _bridge_error_response(plan: BridgeExecutionPlan):
     if plan.caller_protocol == "anthropic":
         return format_translation.anthropic_error_response
     return format_translation.openai_error_response
+
+
+import request_headers as _request_headers_module
+
+
+def _build_anthropic_messages_passthrough_headers(
+    request: Request,
+    *,
+    original_body: dict,
+    bridge_plan: BridgeExecutionPlan,
+    api_key: str,
+    request_id: str | None = None,
+    verdict_sink: dict | None = None,
+) -> dict:
+    """Headers for native Anthropic Messages passthrough."""
+    base_headers = format_translation.build_copilot_headers(api_key)
+
+    # Resolve initiator from the original Anthropic-shaped request (when the
+    # caller is Claude Code) or from translated messages (when called via
+    # Codex /v1/responses bridge).
+    if bridge_plan.caller_protocol == "anthropic":
+        body_for_initiator = original_body if isinstance(original_body, dict) else bridge_plan.upstream_body
+        messages = body_for_initiator.get("messages") if isinstance(body_for_initiator, dict) else None
+        system = body_for_initiator.get("system") if isinstance(body_for_initiator, dict) else None
+        model_for_initiator = (
+            body_for_initiator.get("model")
+            if isinstance(body_for_initiator, dict)
+            else bridge_plan.resolved_model
+        )
+        initiator = _initiator_policy.resolve_anthropic_messages(
+            messages,
+            model_for_initiator,
+            system=system,
+            subagent=request.headers.get("x-openai-subagent"),
+            request_id=request_id,
+            verdict_sink=verdict_sink,
+        )
+    else:
+        body_for_initiator = bridge_plan.upstream_body if isinstance(bridge_plan.upstream_body, dict) else {}
+        messages = body_for_initiator.get("messages")
+        system = body_for_initiator.get("system")
+        initiator = _initiator_policy.resolve_anthropic_messages(
+            messages,
+            bridge_plan.resolved_model,
+            system=system,
+            subagent=request.headers.get("x-openai-subagent"),
+            request_id=request_id,
+            verdict_sink=verdict_sink,
+        )
+
+    # Forward standard request id / session headers via the existing helper
+    # so we behave like other bridge paths.
+    _request_headers_module._apply_forwarded_request_headers(
+        base_headers,
+        request,
+        original_body if isinstance(original_body, dict) else None,
+        session_id_resolver=usage_tracking.request_session_id,
+    )
+
+    # Parse incoming anthropic-beta header (comma separated) for derive_anthropic_betas.
+    incoming_beta = None
+    for header_name in ("anthropic-beta", "Anthropic-Beta"):
+        value = request.headers.get(header_name) if hasattr(request, "headers") else None
+        if value:
+            incoming_beta = value
+            break
+    incoming_betas = (
+        [piece.strip() for piece in incoming_beta.split(",") if piece.strip()]
+        if isinstance(incoming_beta, str)
+        else []
+    )
+
+    body_for_betas = bridge_plan.upstream_body if isinstance(bridge_plan.upstream_body, dict) else {}
+    anthropic_betas = _request_headers_module.derive_anthropic_betas(
+        client_betas=incoming_betas,
+        body=body_for_betas,
+        model=bridge_plan.resolved_model or "",
+    )
+
+    interaction_id = usage_tracking.request_session_id(
+        request,
+        original_body if isinstance(original_body, dict) else None,
+    )
+    headers = _request_headers_module.build_anthropic_messages_passthrough_headers(
+        request_id=request_id or "",
+        initiator=initiator,
+        interaction_id=interaction_id if isinstance(interaction_id, str) and interaction_id else None,
+        interaction_type=None,
+        anthropic_betas=anthropic_betas,
+        base_headers=base_headers,
+    )
+    return headers
 
 
 def _build_bridge_headers(
@@ -1055,6 +1170,15 @@ def _build_bridge_headers(
             request_id=request_id,
             initiator_policy=_initiator_policy,
             session_id_resolver=usage_tracking.request_session_id,
+            verdict_sink=verdict_sink,
+        )
+    if bridge_plan.header_kind == "messages":
+        return _build_anthropic_messages_passthrough_headers(
+            request,
+            original_body=original_body,
+            bridge_plan=bridge_plan,
+            api_key=api_key,
+            request_id=request_id,
             verdict_sink=verdict_sink,
         )
     raise ValueError(f"Unsupported bridge header kind: {bridge_plan.header_kind}")
@@ -1113,12 +1237,28 @@ def _translate_bridge_success_payload(bridge_plan: BridgeExecutionPlan, payload:
         return format_translation.response_payload_to_anthropic(payload, fallback_model=bridge_plan.resolved_model)
     if bridge_plan.caller_protocol == "anthropic" and bridge_plan.upstream_protocol == "chat":
         return format_translation.chat_completion_to_anthropic(payload, fallback_model=bridge_plan.resolved_model)
+    if bridge_plan.caller_protocol == "anthropic" and bridge_plan.upstream_protocol == "messages":
+        # Native Anthropic passthrough: strip any internal-only fields
+        # (none defined yet) and return upstream payload as-is.
+        return payload
+    if bridge_plan.caller_protocol == "responses" and bridge_plan.upstream_protocol == "messages":
+        return format_translation.anthropic_response_to_responses(
+            payload, fallback_model=bridge_plan.resolved_model,
+        )
     return payload
 
 
 def _bridge_error_response_from_upstream(bridge_plan: BridgeExecutionPlan, upstream: httpx.Response) -> Response:
     if bridge_plan.caller_protocol == "anthropic":
         return format_translation.anthropic_error_response_from_upstream(upstream)
+    if bridge_plan.caller_protocol == "responses" and bridge_plan.upstream_protocol == "messages":
+        payload = _extract_upstream_json_payload(upstream)
+        message = _extract_upstream_text(upstream) or f"Upstream request failed with status {upstream.status_code}"
+        if isinstance(payload, dict):
+            error = payload.get("error")
+            if isinstance(error, dict) and isinstance(error.get("message"), str):
+                message = error["message"]
+        return format_translation.openai_error_response(upstream.status_code, message)
     return proxy_non_streaming_response(upstream)
 
 
@@ -1549,6 +1689,224 @@ async def proxy_anthropic_from_responses_streaming_response(
     )
 
 
+
+# ─── Anthropic Messages passthrough streaming ────────────────────────────────
+
+
+async def proxy_anthropic_passthrough_streaming_response(
+    upstream_url: str,
+    headers: dict,
+    body: dict,
+    fallback_model: str,
+    timeout: int = 300,
+    usage_event: dict | None = None,
+    trace_plan: UpstreamRequestPlan | None = None,
+) -> Response:
+    """Re-emit upstream Anthropic /v1/messages SSE bytes verbatim to the
+    client, while parsing message_start / message_delta usage so we can still
+    report token counts to the dashboard."""
+    del fallback_model  # unused; kept for signature symmetry with siblings.
+
+    client = httpx.AsyncClient(timeout=timeout)
+    request = client.build_request("POST", upstream_url, headers=headers, json=body)
+    try:
+        upstream = await throttled_client_send(client, request, stream=True)
+    except httpx.RequestError as exc:
+        status_code, message = format_translation.upstream_request_error_status_and_message(exc)
+        _finish_usage_and_trace(trace_plan, status_code, response_text=message)
+        await client.aclose()
+        return format_translation.anthropic_error_response(status_code, message)
+    except Exception:
+        _finish_usage_and_trace(trace_plan, 599)
+        await client.aclose()
+        raise
+
+    if upstream.status_code >= 400:
+        try:
+            await upstream.aread()
+            fallback_message = _extract_upstream_text(upstream) or f"Upstream request failed with status {upstream.status_code}"
+            error_payload = format_translation.anthropic_error_payload_from_openai(
+                _extract_upstream_json_payload(upstream),
+                upstream.status_code,
+                fallback_message,
+            )
+            _finish_usage_and_trace(
+                trace_plan,
+                upstream.status_code,
+                upstream=upstream,
+                response_payload=error_payload,
+                response_text=error_payload.get("error", {}).get("message"),
+            )
+            return format_translation.anthropic_error_response_from_upstream(upstream)
+        finally:
+            await upstream.aclose()
+            await client.aclose()
+
+    response_headers = {
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no",
+        "content-type": "text/event-stream; charset=utf-8",
+    }
+    # Propagate quota snapshot headers if present.
+    for key, value in upstream.headers.items():
+        if key.lower().startswith("x-quota-snapshot"):
+            response_headers[key] = value
+
+    async def stream_passthrough():
+        usage_state: dict = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+        first_output_marked = False
+        buffer = ""
+        try:
+            async for chunk in upstream.aiter_bytes():
+                if chunk:
+                    yield chunk
+                    try:
+                        text = chunk.decode("utf-8", errors="replace")
+                    except Exception:
+                        text = ""
+                    buffer += text
+                    normalized = buffer.replace("\r\n", "\n")
+                    while "\n\n" in normalized:
+                        raw_block, normalized = normalized.split("\n\n", 1)
+                        event_name, data = format_translation.parse_sse_block(raw_block)
+                        if not data:
+                            continue
+                        try:
+                            payload = json.loads(data)
+                        except json.JSONDecodeError:
+                            continue
+                        evt = (event_name or payload.get("type") if isinstance(payload, dict) else event_name) or ""
+                        evt = str(evt).lower()
+                        if evt == "message_start" and isinstance(payload, dict):
+                            message = payload.get("message")
+                            if isinstance(message, dict) and isinstance(message.get("usage"), dict):
+                                u = message["usage"]
+                                in_t = int(u.get("input_tokens", 0) or 0)
+                                out_t = int(u.get("output_tokens", 0) or 0)
+                                usage_state.update({
+                                    "input_tokens": in_t,
+                                    "output_tokens": out_t,
+                                    "total_tokens": in_t + out_t,
+                                })
+                        elif evt == "message_delta" and isinstance(payload, dict):
+                            u = payload.get("usage")
+                            if isinstance(u, dict):
+                                in_t = int(u.get("input_tokens", usage_state["input_tokens"]) or 0)
+                                out_t = int(u.get("output_tokens", usage_state["output_tokens"]) or 0)
+                                usage_state.update({
+                                    "input_tokens": in_t,
+                                    "output_tokens": out_t,
+                                    "total_tokens": in_t + out_t,
+                                })
+                        elif evt in ("content_block_delta", "content_block_start"):
+                            if not first_output_marked:
+                                first_output_marked = True
+                                usage_tracker.mark_first_output(usage_event)
+                    buffer = normalized
+        finally:
+            _finish_usage_and_trace(
+                trace_plan,
+                upstream.status_code,
+                upstream=upstream,
+                usage=usage_state,
+            )
+            await upstream.aclose()
+            await client.aclose()
+
+    return GracefulStreamingResponse(
+        stream_passthrough(),
+        status_code=upstream.status_code,
+        headers=response_headers,
+    )
+
+
+async def proxy_responses_from_anthropic_streaming_response(
+    upstream_url: str,
+    headers: dict,
+    body: dict,
+    fallback_model: str,
+    timeout: int = 300,
+    usage_event: dict | None = None,
+    trace_plan: UpstreamRequestPlan | None = None,
+) -> Response:
+    """Translate upstream Anthropic Messages SSE into Responses SSE."""
+    client = httpx.AsyncClient(timeout=timeout)
+    request = client.build_request("POST", upstream_url, headers=headers, json=body)
+    try:
+        upstream = await throttled_client_send(client, request, stream=True)
+    except httpx.RequestError as exc:
+        status_code, message = format_translation.upstream_request_error_status_and_message(exc)
+        _finish_usage_and_trace(trace_plan, status_code, response_text=message)
+        await client.aclose()
+        return format_translation.openai_error_response(status_code, message)
+    except Exception:
+        _finish_usage_and_trace(trace_plan, 599)
+        await client.aclose()
+        raise
+
+    if upstream.status_code >= 400:
+        try:
+            await upstream.aread()
+            upstream_payload = _extract_upstream_json_payload(upstream)
+            upstream_text = _extract_upstream_text(upstream) or f"Upstream request failed with status {upstream.status_code}"
+            # Upstream is Anthropic-shaped; reshape to a Responses-shaped error
+            # so Codex callers receive the format they expect.
+            err_message = upstream_text
+            if isinstance(upstream_payload, dict):
+                err_obj = upstream_payload.get("error")
+                if isinstance(err_obj, dict) and isinstance(err_obj.get("message"), str):
+                    err_message = err_obj["message"]
+            _finish_usage_and_trace(
+                trace_plan,
+                upstream.status_code,
+                upstream=upstream,
+                response_payload=upstream_payload,
+                response_text=err_message,
+            )
+            return format_translation.openai_error_response(upstream.status_code, err_message)
+        finally:
+            await upstream.aclose()
+            await client.aclose()
+
+    response_headers = {
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no",
+        "content-type": "text/event-stream; charset=utf-8",
+    }
+    for key, value in upstream.headers.items():
+        if key.lower().startswith("x-quota-snapshot"):
+            response_headers[key] = value
+
+    async def stream_translated():
+        translator = AnthropicToResponsesStreamTranslator(
+            model=fallback_model,
+            mark_first_output=lambda: usage_tracker.mark_first_output(usage_event),
+        )
+        try:
+            async for evbytes in translator.translate(upstream.aiter_bytes()):
+                yield evbytes
+            yield b"data: [DONE]\n\n"
+        finally:
+            response_payload = translator.build_response_payload()
+            _finish_usage_and_trace(
+                trace_plan,
+                upstream.status_code,
+                upstream=upstream,
+                response_payload=response_payload,
+                response_text=translator.response_text,
+                reasoning_text=translator.reasoning_text,
+                usage=response_payload.get("usage"),
+            )
+            await upstream.aclose()
+            await client.aclose()
+
+    return GracefulStreamingResponse(
+        stream_translated(),
+        status_code=upstream.status_code,
+        headers=response_headers,
+    )
+
+
 async def _proxy_bridge_streaming_response(plan: UpstreamRequestPlan, bridge_plan: BridgeExecutionPlan) -> Response:
     if bridge_plan.caller_protocol == "responses" and bridge_plan.upstream_protocol == "responses":
         return await proxy_streaming_response(
@@ -1580,6 +1938,26 @@ async def _proxy_bridge_streaming_response(plan: UpstreamRequestPlan, bridge_pla
             usage_event=plan.usage_event,
             trace_plan=plan,
         )
+    if bridge_plan.caller_protocol == "anthropic" and bridge_plan.upstream_protocol == "messages":
+        return await proxy_anthropic_passthrough_streaming_response(
+            plan.upstream_url,
+            plan.headers,
+            plan.body,
+            bridge_plan.resolved_model,
+            timeout=300,
+            usage_event=plan.usage_event,
+            trace_plan=plan,
+        )
+    if bridge_plan.caller_protocol == "responses" and bridge_plan.upstream_protocol == "messages":
+        return await proxy_responses_from_anthropic_streaming_response(
+            plan.upstream_url,
+            plan.headers,
+            plan.body,
+            bridge_plan.resolved_model,
+            timeout=300,
+            usage_event=plan.usage_event,
+            trace_plan=plan,
+        )
     return await proxy_anthropic_from_responses_streaming_response(
         plan.upstream_url,
         plan.headers,
@@ -1592,6 +1970,7 @@ async def _proxy_bridge_streaming_response(plan: UpstreamRequestPlan, bridge_pla
 
 
 _COPILOT_MODEL_CAPS_CACHE: dict[str, object] = {"key": None, "ts": 0.0, "data": {}}
+_COPILOT_MODEL_CAPS_LOCK = threading.Lock()
 _COPILOT_MODEL_CAPS_TTL_SECONDS = 300.0
 # Capability fetch is best-effort and used during client-config writes (codex
 # `enable_target`). Use a tight timeout so a slow/unreachable upstream does not
@@ -1613,14 +1992,15 @@ def fetch_copilot_model_capabilities() -> dict[str, dict]:
         return {}
 
     now = time.monotonic()
-    cache = _COPILOT_MODEL_CAPS_CACHE
-    if (
-        cache.get("key") == api_base
-        and isinstance(cache.get("data"), dict)
-        and cache["data"]
-        and (now - float(cache.get("ts", 0.0))) < _COPILOT_MODEL_CAPS_TTL_SECONDS
-    ):
-        return dict(cache["data"])  # type: ignore[arg-type]
+    with _COPILOT_MODEL_CAPS_LOCK:
+        cache = _COPILOT_MODEL_CAPS_CACHE
+        if (
+            cache.get("key") == api_base
+            and isinstance(cache.get("data"), dict)
+            and cache["data"]
+            and (now - float(cache.get("ts", 0.0))) < _COPILOT_MODEL_CAPS_TTL_SECONDS
+        ):
+            return dict(cache["data"])  # type: ignore[arg-type]
 
     try:
         api_key = auth.get_api_key()
@@ -1675,12 +2055,50 @@ def fetch_copilot_model_capabilities() -> dict[str, dict]:
             enriched["reasoning_efforts"] = reasoning_efforts
         if isinstance(parallel, bool):
             enriched["parallel_tool_calls"] = parallel
+        supported_endpoints = entry.get("supported_endpoints") or []
+        if not isinstance(supported_endpoints, list):
+            supported_endpoints = []
+        enriched["supported_endpoints"] = list(supported_endpoints)
+        enriched["messages_endpoint_supported"] = "/v1/messages" in supported_endpoints
         result[model_id] = enriched
 
-    cache["key"] = api_base
-    cache["ts"] = now
-    cache["data"] = result
+    with _COPILOT_MODEL_CAPS_LOCK:
+        _COPILOT_MODEL_CAPS_CACHE["key"] = api_base
+        _COPILOT_MODEL_CAPS_CACHE["ts"] = now
+        _COPILOT_MODEL_CAPS_CACHE["data"] = result
     return dict(result)
+
+
+# Models known to natively support Anthropic /v1/messages upstream when the
+# Copilot capability cache is empty/stale (e.g. during tests, or before the
+# first /models fetch lands). Case-insensitive prefix match.
+_NATIVE_MESSAGES_FALLBACK_ALLOWLIST = frozenset({
+    "claude-sonnet-4.5", "claude-sonnet-4.6",
+    "claude-opus-4.5", "claude-opus-4.6",
+    "claude-haiku-4.5",
+})
+
+
+def model_supports_native_messages(model: str) -> bool:
+    """Returns True when `model` advertises `/v1/messages` in the Copilot
+    `/models` capability cache, or — when the cache is empty/stale — matches
+    the offline-dev fallback allowlist by case-insensitive prefix.
+    """
+    if not isinstance(model, str) or not model:
+        return False
+
+    with _COPILOT_MODEL_CAPS_LOCK:
+        cache = _COPILOT_MODEL_CAPS_CACHE
+        data = cache.get("data") if isinstance(cache, dict) else None
+        record = data.get(model) if isinstance(data, dict) and data else None
+        if isinstance(record, dict):
+            return bool(record.get("messages_endpoint_supported"))
+
+    candidate = model.lower()
+    for entry in _NATIVE_MESSAGES_FALLBACK_ALLOWLIST:
+        if candidate.startswith(entry.lower()):
+            return True
+    return False
 
 
 async def _proxy_models_request() -> Response:

@@ -3,6 +3,7 @@
 import base64
 import codecs
 import json
+import time
 
 import httpx
 from fastapi import HTTPException, Request
@@ -278,7 +279,7 @@ def _anthropic_tool_use_to_chat_tool_call(item: dict) -> dict:
         "type": "function",
         "function": {
             "name": tool_name,
-            "arguments": json.dumps(tool_input, separators=(",", ":")),
+            "arguments": json.dumps(tool_input, separators=(",", ":"), ensure_ascii=False),
         },
     }
 
@@ -478,6 +479,30 @@ def _response_content_item_to_chat(item: dict) -> dict | None:
             return content_item
         return None
 
+    if item_type in {"input_file", "file"}:
+        # Responses-API input_file carries either a data: URL in file_data or
+        # a file_url/file_id. Anthropic /v1/messages requires a `document`
+        # block with a base64 source for PDFs; URL/file_id variants cannot
+        # round-trip without an upstream fetch, so we drop them (matches TS
+        # which only emits a document block for the data: URL case).
+        file_data = item.get("file_data")
+        filename = item.get("filename") or "document.pdf"
+        if isinstance(file_data, str) and file_data.startswith("data:"):
+            try:
+                header, data = file_data.split(",", 1)
+                media_type = header[5:].split(";", 1)[0] or "application/pdf"
+            except ValueError:
+                return None
+            return {
+                "type": "document",
+                "source": {
+                    "type": "base64",
+                    "media_type": media_type,
+                    "data": data,
+                },
+                "title": filename,
+            }
+        return None
     if item_type == "input_image":
         image_url = item.get("image_url")
         if isinstance(image_url, str) and image_url:
@@ -704,7 +729,7 @@ def _format_custom_tool_call_for_chat(item: dict) -> str | None:
     elif tool_input is None:
         input_text = "[no input]"
     else:
-        input_text = json.dumps(tool_input, separators=(",", ":"))
+        input_text = json.dumps(tool_input, separators=(",", ":"), ensure_ascii=False)
 
     call_id = item.get("call_id") or item.get("id")
     call_suffix = f" ({call_id})" if isinstance(call_id, str) and call_id else ""
@@ -723,7 +748,7 @@ def _format_custom_tool_output_for_chat(item: dict) -> str:
     elif output is None:
         output_text = ""
     else:
-        output_text = json.dumps(output, separators=(",", ":"))
+        output_text = json.dumps(output, separators=(",", ":"), ensure_ascii=False)
 
     output_text = output_text.strip()
     return f"{label}\n{output_text}" if output_text else label
@@ -793,7 +818,7 @@ def responses_request_to_chat(body: dict) -> dict:
                                     "name": function_name,
                                     "arguments": item.get("arguments")
                                     if isinstance(item.get("arguments"), str)
-                                    else json.dumps(item.get("arguments", {}), separators=(",", ":")),
+                                    else json.dumps(item.get("arguments", {}), separators=(",", ":"), ensure_ascii=False),
                                 },
                             }
                         ],
@@ -809,7 +834,7 @@ def responses_request_to_chat(body: dict) -> dict:
                 if isinstance(output_text, list):
                     output_text = "".join(util.extract_item_text(part) for part in output_text if isinstance(part, dict))
                 elif not isinstance(output_text, str):
-                    output_text = json.dumps(output_text, separators=(",", ":")) if output_text is not None else ""
+                    output_text = json.dumps(output_text, separators=(",", ":"), ensure_ascii=False) if output_text is not None else ""
                 chat_messages.append(
                     {
                         "role": "tool",
@@ -1010,7 +1035,7 @@ def anthropic_request_to_responses(body: dict) -> dict:
                             "type": "function_call",
                             "call_id": tool_id,
                             "name": tool_name,
-                            "arguments": json.dumps(item.get("input") or {}, separators=(",", ":")),
+                            "arguments": json.dumps(item.get("input") or {}, separators=(",", ":"), ensure_ascii=False),
                         }
                     )
                     continue
@@ -1328,7 +1353,7 @@ def chat_completion_to_response(payload: dict, fallback_model=None) -> dict:
                     "type": "function_call",
                     "call_id": tool_call.get("id") or f"call_{uuid4().hex}",
                     "name": function.get("name", ""),
-                    "arguments": function.get("arguments", "") if isinstance(function.get("arguments"), str) else json.dumps(function.get("arguments", {}), separators=(",", ":")),
+                    "arguments": function.get("arguments", "") if isinstance(function.get("arguments"), str) else json.dumps(function.get("arguments", {}), separators=(",", ":"), ensure_ascii=False),
                 }
             )
 
@@ -1520,7 +1545,7 @@ def http_exception_detail_to_message(detail) -> str:
 # ─── SSE helpers ──────────────────────────────────────────────────────────────
 
 def sse_encode(event_name: str, payload: dict) -> bytes:
-    return f"event: {event_name}\ndata: {json.dumps(payload, separators=(',', ':'))}\n\n".encode("utf-8")
+    return f"event: {event_name}\ndata: {json.dumps(payload, separators=(',', ':'), ensure_ascii=False)}\n\n".encode("utf-8")
 
 
 def parse_sse_block(raw_block: str) -> tuple[str | None, str | None]:
@@ -1926,7 +1951,7 @@ def _format_compaction_tool_call(item: dict) -> str | None:
     elif arguments is None:
         arguments_text = "{}"
     else:
-        arguments_text = json.dumps(arguments, separators=(",", ":"))
+        arguments_text = json.dumps(arguments, separators=(",", ":"), ensure_ascii=False)
 
     call_id = item.get("call_id") or item.get("id")
     call_suffix = f" ({call_id})" if isinstance(call_id, str) and call_id else ""
@@ -1945,7 +1970,7 @@ def _format_compaction_tool_output(item: dict) -> str | None:
     elif output is None:
         output_text = ""
     else:
-        output_text = json.dumps(output, separators=(",", ":"))
+        output_text = json.dumps(output, separators=(",", ":"), ensure_ascii=False)
 
     output_text = output_text.strip()
     return f"{label}\n{output_text}" if output_text else label
@@ -2134,3 +2159,567 @@ def extract_response_output_text(payload: dict) -> str | None:
     if not parts:
         return None
     return "\n\n".join(parts)
+
+# ─── Responses → Anthropic Messages translation ──────────────────────────────
+
+def _responses_input_text_to_anthropic_block(item: dict) -> dict | None:
+    """Translate a Responses content part into an Anthropic content block.
+
+    Returns ``None`` if the part is not representable (e.g. unknown type).
+    """
+    if not isinstance(item, dict):
+        return None
+    item_type = str(item.get("type", "")).lower()
+    if item_type in {"input_text", "output_text", "text"}:
+        text = item.get("text")
+        if isinstance(text, str):
+            return {"type": "text", "text": text}
+        return None
+    if item_type in {"input_file", "file"}:
+        # Responses-API input_file carries either a data: URL in file_data or
+        # a file_url/file_id. Anthropic /v1/messages requires a `document`
+        # block with a base64 source for PDFs; URL/file_id variants cannot
+        # round-trip without an upstream fetch, so we drop them (matches TS
+        # which only emits a document block for the data: URL case).
+        file_data = item.get("file_data")
+        filename = item.get("filename") or "document.pdf"
+        if isinstance(file_data, str) and file_data.startswith("data:"):
+            try:
+                header, data = file_data.split(",", 1)
+                media_type = header[5:].split(";", 1)[0] or "application/pdf"
+            except ValueError:
+                return None
+            return {
+                "type": "document",
+                "source": {
+                    "type": "base64",
+                    "media_type": media_type,
+                    "data": data,
+                },
+                "title": filename,
+            }
+        return None
+    if item_type == "input_image":
+        # Responses encodes images either as a bare image_url string or as a
+        # nested {image_url:{url:...}} object. Anthropic wants either a base64
+        # source (for data: URLs) or a url source.
+        image_url = item.get("image_url")
+        if isinstance(image_url, dict):
+            image_url = image_url.get("url")
+        if not isinstance(image_url, str):
+            return None
+        if image_url.startswith("data:"):
+            try:
+                header, data = image_url.split(",", 1)
+                # header looks like "data:image/png;base64"
+                media_type = header[5:].split(";", 1)[0]
+            except ValueError:
+                return None
+            return {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": media_type or "image/png",
+                    "data": data,
+                },
+            }
+        return {
+            "type": "image",
+            "source": {"type": "url", "url": image_url},
+        }
+    return None
+
+
+def _split_reasoning_signature(signature: str) -> tuple[str, str]:
+    """Split a reasoning signature of the form ``"<encrypted>@<id>"``.
+
+    Mirrors copilot-api's ``parseReasoningSignature``: we split on the LAST
+    ``@`` so encrypted payloads that happen to contain ``@`` still round-trip
+    correctly. If the split is at the start/end or absent, fall back to
+    treating the entire string as the encrypted payload with an empty id.
+    """
+    if not isinstance(signature, str) or not signature:
+        return "", ""
+    idx = signature.rfind("@")
+    if idx <= 0 or idx == len(signature) - 1:
+        return signature, ""
+    return signature[:idx], signature[idx + 1:]
+
+
+def _responses_reasoning_item_to_anthropic_block(item: dict) -> dict | None:
+    if not isinstance(item, dict):
+        return None
+    summary = item.get("summary")
+    text_parts: list[str] = []
+    if isinstance(summary, list):
+        for part in summary:
+            if isinstance(part, dict):
+                text = part.get("text")
+                if isinstance(text, str):
+                    text_parts.append(text)
+            elif isinstance(part, str):
+                text_parts.append(part)
+    elif isinstance(summary, str):
+        text_parts.append(summary)
+    thinking_text = "\n".join(text_parts)
+    block: dict = {"type": "thinking", "thinking": thinking_text}
+    encrypted = item.get("encrypted_content")
+    if isinstance(encrypted, str) and encrypted:
+        block["signature"] = encrypted
+    return block
+
+
+def _responses_function_call_to_anthropic_block(item: dict) -> dict:
+    name = item.get("name")
+    if not isinstance(name, str):
+        raise ValueError("Responses function_call items must include a name")
+    call_id = item.get("call_id") or item.get("id")
+    if not isinstance(call_id, str):
+        raise ValueError("Responses function_call items must include call_id")
+    raw_args = item.get("arguments")
+    if isinstance(raw_args, str) and raw_args.strip():
+        try:
+            parsed = json.loads(raw_args)
+        except json.JSONDecodeError:
+            parsed = {"_raw": raw_args}
+        if not isinstance(parsed, dict):
+            parsed = {"value": parsed}
+    elif isinstance(raw_args, dict):
+        parsed = raw_args
+    else:
+        parsed = {}
+    return {
+        "type": "tool_use",
+        "id": call_id,
+        "name": name,
+        "input": parsed,
+    }
+
+
+def _responses_function_call_output_to_anthropic_block(item: dict) -> dict:
+    call_id = item.get("call_id")
+    if not isinstance(call_id, str):
+        raise ValueError("Responses function_call_output items must include call_id")
+    output = item.get("output")
+    if isinstance(output, list):
+        text = "".join(util.extract_item_text(part) for part in output if isinstance(part, dict))
+    elif isinstance(output, str):
+        text = output
+    elif output is None:
+        text = ""
+    else:
+        text = json.dumps(output, separators=(",", ":"), ensure_ascii=False)
+    return {
+        "type": "tool_result",
+        "tool_use_id": call_id,
+        "content": [{"type": "text", "text": text}],
+    }
+
+
+def _responses_tool_to_anthropic(tool: dict) -> dict | None:
+    if not isinstance(tool, dict):
+        return None
+    tool_type = str(tool.get("type", "")).lower()
+    if tool_type and tool_type != "function":
+        return None
+    name = tool.get("name") or (
+        tool.get("function", {}).get("name") if isinstance(tool.get("function"), dict) else None
+    )
+    if not isinstance(name, str):
+        raise ValueError("Responses tools must include a name")
+    description = tool.get("description")
+    if not isinstance(description, str):
+        function = tool.get("function") if isinstance(tool.get("function"), dict) else {}
+        description = function.get("description") if isinstance(function.get("description"), str) else ""
+    parameters = tool.get("parameters")
+    if not isinstance(parameters, dict):
+        function = tool.get("function") if isinstance(tool.get("function"), dict) else {}
+        parameters = function.get("parameters") if isinstance(function.get("parameters"), dict) else {"type": "object", "properties": {}}
+    return {
+        "name": name,
+        "description": description or "",
+        "input_schema": parameters,
+    }
+
+
+def _responses_tool_choice_to_anthropic(tool_choice):
+    if tool_choice is None:
+        return None
+    if isinstance(tool_choice, str):
+        normalized = tool_choice.lower()
+        if normalized == "auto":
+            return {"type": "auto"}
+        if normalized == "required":
+            return {"type": "any"}
+        if normalized == "none":
+            return {"type": "none"}
+    if isinstance(tool_choice, dict):
+        choice_type = str(tool_choice.get("type", "")).lower()
+        if choice_type in {"auto", "none"}:
+            return {"type": choice_type}
+        if choice_type == "required":
+            return {"type": "any"}
+        if choice_type == "function":
+            name = tool_choice.get("name")
+            if not isinstance(name, str):
+                function = tool_choice.get("function") if isinstance(tool_choice.get("function"), dict) else {}
+                name = function.get("name") if isinstance(function.get("name"), str) else None
+            if not isinstance(name, str):
+                raise ValueError("Responses tool_choice type=function must include name")
+            return {"type": "tool", "name": name}
+    raise ValueError("Unsupported Responses tool_choice value")
+
+
+def responses_request_to_anthropic_messages(body: dict) -> dict:
+    """Translate an OpenAI Responses request body into Anthropic Messages shape.
+
+    This is the inverse of :func:`anthropic_request_to_responses`. The result
+    is a fresh dict ready to send to an Anthropic ``/v1/messages`` endpoint
+    (apart from any host-specific adornments the caller may add).
+    """
+    if not isinstance(body, dict):
+        raise ValueError("Responses body must be a dict")
+
+    raw_input = body.get("input")
+    messages: list[dict] = []
+    system_extra: list[str] = []
+
+    # Coalesce consecutive same-role messages.
+    def push_blocks(role: str, blocks: list[dict]) -> None:
+        if not blocks:
+            return
+        if messages and messages[-1].get("role") == role:
+            messages[-1]["content"].extend(blocks)
+        else:
+            messages.append({"role": role, "content": list(blocks)})
+
+    if isinstance(raw_input, str):
+        if raw_input:
+            push_blocks("user", [{"type": "text", "text": raw_input}])
+    elif isinstance(raw_input, list):
+        for item in raw_input:
+            if not isinstance(item, dict):
+                continue
+            item_type = str(item.get("type", "")).lower()
+
+            if item_type == "message":
+                role = str(item.get("role", "user")).lower()
+                content = item.get("content")
+                if role in {"system", "developer"}:
+                    # Route system/developer messages to top-level ``system``.
+                    text_parts: list[str] = []
+                    if isinstance(content, str):
+                        text_parts.append(content)
+                    elif isinstance(content, list):
+                        for part in content:
+                            if isinstance(part, dict) and isinstance(part.get("text"), str):
+                                text_parts.append(part["text"])
+                    text = "\n\n".join(p for p in text_parts if p)
+                    if text:
+                        system_extra.append(text)
+                    continue
+                if role not in {"user", "assistant"}:
+                    raise ValueError(f"Unsupported Responses message role: {role}")
+                blocks: list[dict] = []
+                if isinstance(content, str):
+                    blocks.append({"type": "text", "text": content})
+                elif isinstance(content, list):
+                    for part in content:
+                        block = _responses_input_text_to_anthropic_block(part)
+                        if block is not None:
+                            blocks.append(block)
+                push_blocks(role, blocks)
+                continue
+
+            if item_type == "function_call":
+                push_blocks("assistant", [_responses_function_call_to_anthropic_block(item)])
+                continue
+
+            if item_type == "function_call_output":
+                push_blocks("user", [_responses_function_call_output_to_anthropic_block(item)])
+                continue
+
+            if item_type == "custom_tool_call":
+                custom_tool_text = _format_custom_tool_call_for_chat(item)
+                if custom_tool_text is None:
+                    raise ValueError("Responses custom_tool_call items must include a name")
+                push_blocks("assistant", [{"type": "text", "text": custom_tool_text}])
+                continue
+
+            if item_type == "custom_tool_call_output":
+                push_blocks("user", [{"type": "text", "text": _format_custom_tool_output_for_chat(item)}])
+                continue
+
+            if item_type == "reasoning":
+                block = _responses_reasoning_item_to_anthropic_block(item)
+                if block is not None:
+                    push_blocks("assistant", [block])
+                continue
+
+            if item_type in {"compaction", "item_reference", "web_search_call"}:
+                # No native Anthropic equivalent; skip silently to mirror the
+                # behaviour of responses_request_to_chat.
+                continue
+
+            raise ValueError(f"Unsupported Responses input item type: {item_type}")
+
+    payload: dict = {
+        "model": body.get("model"),
+        "messages": messages,
+    }
+
+    # System / instructions
+    system_parts: list[str] = []
+    instructions = body.get("instructions")
+    if isinstance(instructions, str) and instructions:
+        system_parts.append(instructions)
+    system_parts.extend(system_extra)
+    if system_parts:
+        payload["system"] = "\n\n".join(system_parts)
+
+    # max_tokens is required by Anthropic.
+    max_tokens = body.get("max_output_tokens")
+    if not isinstance(max_tokens, int) or max_tokens <= 0:
+        max_tokens = 4096
+    payload["max_tokens"] = max_tokens
+
+    for source_key, target_key in (
+        ("temperature", "temperature"),
+        ("top_p", "top_p"),
+        ("metadata", "metadata"),
+    ):
+        value = body.get(source_key)
+        if value is not None:
+            payload[target_key] = value
+
+    # Anthropic requires temperature in [0, 1]; Codex commonly sends 1.5/2.0.
+    temp = payload.get("temperature")
+    if isinstance(temp, (int, float)):
+        if temp < 0:
+            payload["temperature"] = 0
+        elif temp > 1:
+            payload["temperature"] = 1
+
+    # Stop sequences: Responses uses "stop_sequences" or "stop".
+    stop = body.get("stop_sequences")
+    if stop is None:
+        stop = body.get("stop")
+    if stop is not None:
+        payload["stop_sequences"] = stop
+
+    if body.get("stream") is not None:
+        payload["stream"] = bool(body.get("stream"))
+
+    # Tools
+    tools = body.get("tools")
+    if isinstance(tools, list):
+        translated: list[dict] = []
+        for tool in tools:
+            converted = _responses_tool_to_anthropic(tool)
+            if converted is not None:
+                translated.append(converted)
+        if translated:
+            payload["tools"] = translated
+
+    # tool_choice
+    tool_choice = _responses_tool_choice_to_anthropic(body.get("tool_choice"))
+    if tool_choice is not None:
+        payload["tool_choice"] = tool_choice
+
+    # parallel_tool_calls (Responses) -> disable_parallel_tool_use (Anthropic)
+    # Only emit when explicitly disabling parallel calls; some Claude models
+    # reject the field, and the default is already to allow parallel.
+    parallel = body.get("parallel_tool_calls")
+    if parallel is False:
+        payload["disable_parallel_tool_use"] = True
+
+    # Reasoning effort -> thinking adaptive + output_config carry-through.
+    # Anthropic models reject extended thinking when tool_choice forces a
+    # specific tool (type=any/tool), so skip the thinking injection then.
+    reasoning = body.get("reasoning")
+    incoming_effort = reasoning.get("effort") if isinstance(reasoning, dict) else None
+    mapped_effort = effort_mapping.map_effort_for_model(payload.get("model"), incoming_effort)
+    forces_tool = isinstance(tool_choice, dict) and tool_choice.get("type") in ("any", "tool")
+    if mapped_effort is not None and not forces_tool:
+        payload["thinking"] = {"type": "adaptive", "display": "summarized"}
+        payload["output_config"] = {"effort": mapped_effort}
+
+    return payload
+
+
+# ─── Anthropic Messages response → Responses response translation ────────────
+
+def _anthropic_usage_to_responses_usage(usage) -> dict:
+    if not isinstance(usage, dict):
+        return {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+    input_tokens = usage.get("input_tokens", 0) or 0
+    output_tokens = usage.get("output_tokens", 0) or 0
+    cache_read = usage.get("cache_read_input_tokens")
+    cache_create = usage.get("cache_creation_input_tokens")
+    out: dict = {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": input_tokens + output_tokens,
+    }
+    details: dict = {}
+    if isinstance(cache_read, int) and cache_read:
+        details["cached_tokens"] = cache_read
+    if isinstance(cache_create, int) and cache_create:
+        details["cache_creation_input_tokens"] = cache_create
+    if details:
+        out["input_tokens_details"] = details
+    return out
+
+
+_ANTHROPIC_STOP_REASON_TO_RESPONSES_STATUS = {
+    "end_turn": ("completed", None),
+    "tool_use": ("completed", None),
+    "stop_sequence": ("completed", None),
+    "pause_turn": ("completed", None),
+    "max_tokens": ("incomplete", {"reason": "max_output_tokens"}),
+    "refusal": ("incomplete", {"reason": "content_filter"}),
+}
+
+
+def _anthropic_content_blocks_to_responses_output(content) -> list[dict]:
+    if not isinstance(content, list):
+        return []
+
+    output: list[dict] = []
+    pending_message_parts: list[dict] = []
+
+    def flush_message():
+        nonlocal pending_message_parts
+        if pending_message_parts:
+            output.append(
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": list(pending_message_parts),
+                }
+            )
+            pending_message_parts = []
+
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        block_type = str(block.get("type", "")).lower()
+
+        if block_type == "text":
+            text = block.get("text")
+            if isinstance(text, str):
+                pending_message_parts.append(
+                    {"type": "output_text", "text": text, "annotations": []}
+                )
+            continue
+
+        # Anything other than ``text`` becomes its own top-level item.
+        flush_message()
+
+        if block_type == "thinking":
+            thinking_text = block.get("thinking")
+            if not isinstance(thinking_text, str):
+                thinking_text = ""
+            raw_signature = block.get("signature")
+            encrypted_content = None
+            reasoning_id = None
+            if isinstance(raw_signature, str) and raw_signature:
+                encrypted_content, reasoning_id = _split_reasoning_signature(raw_signature)
+            reasoning_item: dict = {
+                "type": "reasoning",
+                "summary": [{"type": "summary_text", "text": thinking_text}],
+            }
+            if reasoning_id:
+                reasoning_item["id"] = reasoning_id
+            if encrypted_content:
+                reasoning_item["encrypted_content"] = encrypted_content
+            output.append(reasoning_item)
+            continue
+
+        if block_type == "redacted_thinking":
+            # Preserve the opaque payload via encrypted_content if present.
+            redacted = block.get("data") or block.get("signature")
+            reasoning_item = {
+                "type": "reasoning",
+                "summary": [],
+            }
+            if isinstance(redacted, str) and redacted:
+                reasoning_item["encrypted_content"] = redacted
+            output.append(reasoning_item)
+            continue
+
+        if block_type == "tool_use":
+            name = block.get("name")
+            tool_id = block.get("id")
+            if not isinstance(name, str) or not isinstance(tool_id, str):
+                continue
+            tool_input = block.get("input") if isinstance(block.get("input"), (dict, list)) else {}
+            output.append(
+                {
+                    "type": "function_call",
+                    "call_id": tool_id,
+                    "name": name,
+                    "arguments": json.dumps(tool_input, separators=(",", ":"), ensure_ascii=False),
+                }
+            )
+            continue
+
+        # Unknown block type — skip.
+
+    flush_message()
+    return output
+
+
+def anthropic_response_to_responses(payload: dict, *, fallback_model: str | None = None) -> dict:
+    """Translate a non-streaming Anthropic Messages response into a Responses payload.
+
+    Inverse of :func:`response_payload_to_anthropic`.
+    """
+    if not isinstance(payload, dict):
+        payload = {}
+
+    content = payload.get("content")
+    output_items = _anthropic_content_blocks_to_responses_output(content)
+
+    stop_reason = payload.get("stop_reason")
+    status_pair = _ANTHROPIC_STOP_REASON_TO_RESPONSES_STATUS.get(
+        stop_reason if isinstance(stop_reason, str) else "",
+        ("completed", None),
+    )
+    status, incomplete_details = status_pair
+
+    response_id = payload.get("id")
+    if not isinstance(response_id, str) or not response_id:
+        response_id = "resp_anthropic"
+
+    model = payload.get("model") or fallback_model
+
+    # Aggregate output_text from any assistant message blocks for parity with
+    # chat_completion_to_response.
+    output_text_parts: list[str] = []
+    for item in output_items:
+        if not isinstance(item, dict) or item.get("type") != "message":
+            continue
+        for part in item.get("content", []) or []:
+            if isinstance(part, dict) and isinstance(part.get("text"), str):
+                stripped = part["text"].strip()
+                if stripped:
+                    output_text_parts.append(stripped)
+
+    created_at = payload.get("created") if isinstance(payload, dict) else None
+    if not isinstance(created_at, int):
+        created_at = int(time.time())
+
+    result: dict = {
+        "id": response_id,
+        "object": "response",
+        "created_at": created_at,
+        "model": model,
+        "status": status,
+        "output": output_items,
+        "output_text": "\n\n".join(output_text_parts),
+        "usage": _anthropic_usage_to_responses_usage(payload.get("usage")),
+    }
+    if incomplete_details is not None:
+        result["incomplete_details"] = incomplete_details
+    return result

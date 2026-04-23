@@ -1637,5 +1637,438 @@ class FormatTranslationTests(unittest.TestCase):
         )
 
 
+
+
+class ResponsesToAnthropicMessagesTests(unittest.TestCase):
+    def test_instructions_become_system_and_input_message_text(self):
+        body = {
+            "model": "claude-sonnet-4.6",
+            "instructions": "You are helpful.",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Hi"}],
+                }
+            ],
+            "max_output_tokens": 1024,
+        }
+        out = format_translation.responses_request_to_anthropic_messages(body)
+        self.assertEqual(out["system"], "You are helpful.")
+        self.assertEqual(out["max_tokens"], 1024)
+        self.assertEqual(
+            out["messages"],
+            [{"role": "user", "content": [{"type": "text", "text": "Hi"}]}],
+        )
+
+    def test_default_max_tokens_when_unset(self):
+        body = {"model": "claude-sonnet-4.6", "input": []}
+        out = format_translation.responses_request_to_anthropic_messages(body)
+        self.assertEqual(out["max_tokens"], 4096)
+        self.assertEqual(out["messages"], [])
+        self.assertNotIn("system", out)
+
+    def test_function_call_and_output_become_tool_use_and_tool_result(self):
+        body = {
+            "model": "claude-sonnet-4.6",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "do it"}],
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "do_thing",
+                    "arguments": '{"x": 1}',
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "result text",
+                },
+            ],
+        }
+        out = format_translation.responses_request_to_anthropic_messages(body)
+        self.assertEqual(len(out["messages"]), 3)
+        self.assertEqual(out["messages"][0]["role"], "user")
+        self.assertEqual(out["messages"][1]["role"], "assistant")
+        self.assertEqual(
+            out["messages"][1]["content"],
+            [{"type": "tool_use", "id": "call_1", "name": "do_thing", "input": {"x": 1}}],
+        )
+        self.assertEqual(out["messages"][2]["role"], "user")
+        self.assertEqual(
+            out["messages"][2]["content"],
+            [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "call_1",
+                    "content": [{"type": "text", "text": "result text"}],
+                }
+            ],
+        )
+
+    def test_custom_tool_history_becomes_text_transcript(self):
+        body = {
+            "model": "claude-sonnet-4.6",
+            "input": [
+                {
+                    "type": "custom_tool_call",
+                    "call_id": "call_1",
+                    "name": "apply_patch",
+                    "input": "*** Begin Patch\n*** End Patch",
+                },
+                {
+                    "type": "custom_tool_call_output",
+                    "call_id": "call_1",
+                    "output": "Exit code: 0\nSuccess.",
+                },
+            ],
+        }
+        out = format_translation.responses_request_to_anthropic_messages(body)
+        self.assertEqual(len(out["messages"]), 2)
+        self.assertEqual(out["messages"][0]["role"], "assistant")
+        self.assertIn(
+            "[Custom tool call (call_1)] apply_patch",
+            out["messages"][0]["content"][0]["text"],
+        )
+        self.assertEqual(out["messages"][1]["role"], "user")
+        self.assertIn(
+            "[Custom tool result (call_1)]",
+            out["messages"][1]["content"][0]["text"],
+        )
+
+    def test_consecutive_function_calls_coalesce_into_single_assistant_turn(self):
+        body = {
+            "model": "claude-sonnet-4.6",
+            "input": [
+                {"type": "function_call", "call_id": "c1", "name": "a", "arguments": "{}"},
+                {"type": "function_call", "call_id": "c2", "name": "b", "arguments": "{}"},
+            ],
+        }
+        out = format_translation.responses_request_to_anthropic_messages(body)
+        self.assertEqual(len(out["messages"]), 1)
+        self.assertEqual(out["messages"][0]["role"], "assistant")
+        self.assertEqual(len(out["messages"][0]["content"]), 2)
+
+    def test_consecutive_function_call_outputs_coalesce(self):
+        body = {
+            "model": "claude-sonnet-4.6",
+            "input": [
+                {"type": "function_call_output", "call_id": "c1", "output": "a"},
+                {"type": "function_call_output", "call_id": "c2", "output": "b"},
+            ],
+        }
+        out = format_translation.responses_request_to_anthropic_messages(body)
+        self.assertEqual(len(out["messages"]), 1)
+        self.assertEqual(out["messages"][0]["role"], "user")
+        self.assertEqual(len(out["messages"][0]["content"]), 2)
+
+    def test_reasoning_item_becomes_thinking_block_with_signature(self):
+        body = {
+            "model": "claude-sonnet-4.6",
+            "input": [
+                {
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": "thought"}],
+                    "encrypted_content": "OPAQUE-SIG",
+                }
+            ],
+        }
+        out = format_translation.responses_request_to_anthropic_messages(body)
+        self.assertEqual(out["messages"][0]["role"], "assistant")
+        self.assertEqual(
+            out["messages"][0]["content"],
+            [{"type": "thinking", "thinking": "thought", "signature": "OPAQUE-SIG"}],
+        )
+
+    def test_tool_choice_mapping_table(self):
+        cases = [
+            ("auto", {"type": "auto"}),
+            ("required", {"type": "any"}),
+            ("none", {"type": "none"}),
+            ({"type": "function", "name": "foo"}, {"type": "tool", "name": "foo"}),
+            ({"type": "auto"}, {"type": "auto"}),
+        ]
+        for src, expected in cases:
+            body = {"model": "claude-sonnet-4.6", "input": [], "tool_choice": src}
+            out = format_translation.responses_request_to_anthropic_messages(body)
+            self.assertEqual(out["tool_choice"], expected, f"for {src!r}")
+
+    def test_tools_translated_with_input_schema(self):
+        body = {
+            "model": "claude-sonnet-4.6",
+            "input": [],
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "do",
+                    "description": "desc",
+                    "parameters": {"type": "object", "properties": {"x": {"type": "string"}}},
+                }
+            ],
+        }
+        out = format_translation.responses_request_to_anthropic_messages(body)
+        self.assertEqual(
+            out["tools"],
+            [
+                {
+                    "name": "do",
+                    "description": "desc",
+                    "input_schema": {"type": "object", "properties": {"x": {"type": "string"}}},
+                }
+            ],
+        )
+
+    def test_reasoning_effort_becomes_adaptive_thinking(self):
+        body = {
+            "model": "claude-sonnet-4.6",
+            "input": [],
+            "reasoning": {"effort": "high"},
+        }
+        out = format_translation.responses_request_to_anthropic_messages(body)
+        self.assertEqual(out["thinking"], {"type": "adaptive", "display": "summarized"})
+        self.assertEqual(out["output_config"], {"effort": "high"})
+
+    def test_parallel_tool_calls_inverts_to_disable_parallel(self):
+        body = {
+            "model": "claude-sonnet-4.6",
+            "input": [],
+            "parallel_tool_calls": False,
+        }
+        out = format_translation.responses_request_to_anthropic_messages(body)
+        self.assertTrue(out["disable_parallel_tool_use"])
+
+    def test_developer_message_skipped_from_messages(self):
+        body = {
+            "model": "claude-sonnet-4.6",
+            "instructions": "sys",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "developer",
+                    "content": [{"type": "input_text", "text": "ignored"}],
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "hi"}],
+                },
+            ],
+        }
+        out = format_translation.responses_request_to_anthropic_messages(body)
+        self.assertEqual(len(out["messages"]), 1)
+        self.assertEqual(out["messages"][0]["role"], "user")
+
+    def test_round_trip_anthropic_to_responses_back_to_anthropic(self):
+        original = {
+            "model": "claude-sonnet-4.6",
+            "system": "sys prompt",
+            "max_tokens": 2048,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "hi"}],
+                },
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": "ok"},
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_1",
+                            "name": "search",
+                            "input": {"q": "x"},
+                        },
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_1",
+                            "content": [{"type": "text", "text": "results"}],
+                        }
+                    ],
+                },
+            ],
+            "tools": [
+                {
+                    "name": "search",
+                    "description": "Search the web",
+                    "input_schema": {"type": "object", "properties": {"q": {"type": "string"}}},
+                }
+            ],
+            "tool_choice": {"type": "auto"},
+        }
+        as_responses = format_translation.anthropic_request_to_responses(original)
+        back = format_translation.responses_request_to_anthropic_messages(as_responses)
+
+        self.assertEqual(back["system"], "sys prompt")
+        self.assertEqual(back["max_tokens"], 2048)
+        # Tool round-trip
+        self.assertEqual(back["tools"][0]["name"], "search")
+        self.assertEqual(back["tools"][0]["input_schema"], original["tools"][0]["input_schema"])
+        self.assertEqual(back["tool_choice"], {"type": "auto"})
+
+        # Message structure preserved (3 turns: user, assistant w/ text+tool_use, user w/ tool_result)
+        self.assertEqual([m["role"] for m in back["messages"]], ["user", "assistant", "user"])
+        # Assistant turn has both text and tool_use blocks
+        assistant_block_types = [b["type"] for b in back["messages"][1]["content"]]
+        self.assertIn("text", assistant_block_types)
+        self.assertIn("tool_use", assistant_block_types)
+        # Tool use id preserved
+        tool_use = next(b for b in back["messages"][1]["content"] if b["type"] == "tool_use")
+        self.assertEqual(tool_use["id"], "toolu_1")
+        self.assertEqual(tool_use["input"], {"q": "x"})
+        # Tool result preserved
+        self.assertEqual(back["messages"][2]["content"][0]["type"], "tool_result")
+        self.assertEqual(back["messages"][2]["content"][0]["tool_use_id"], "toolu_1")
+
+
+class AnthropicResponseToResponsesTests(unittest.TestCase):
+    def test_text_only_response(self):
+        anth = {
+            "id": "msg_abc",
+            "model": "claude-sonnet-4.6",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "hello"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 5, "output_tokens": 2},
+        }
+        out = format_translation.anthropic_response_to_responses(anth)
+        self.assertEqual(out["id"], "msg_abc")
+        self.assertEqual(out["status"], "completed")
+        self.assertEqual(out["model"], "claude-sonnet-4.6")
+        self.assertEqual(len(out["output"]), 1)
+        msg = out["output"][0]
+        self.assertEqual(msg["type"], "message")
+        self.assertEqual(msg["role"], "assistant")
+        self.assertEqual(msg["content"], [{"type": "output_text", "text": "hello", "annotations": []}])
+        self.assertEqual(out["usage"], {"input_tokens": 5, "output_tokens": 2, "total_tokens": 7})
+
+    def test_tool_use_response(self):
+        anth = {
+            "id": "msg_t",
+            "model": "claude-sonnet-4.6",
+            "content": [
+                {"type": "text", "text": "calling"},
+                {"type": "tool_use", "id": "toolu_9", "name": "search", "input": {"q": "y"}},
+            ],
+            "stop_reason": "tool_use",
+            "usage": {"input_tokens": 10, "output_tokens": 4},
+        }
+        out = format_translation.anthropic_response_to_responses(anth)
+        self.assertEqual(out["status"], "completed")
+        types = [item["type"] for item in out["output"]]
+        self.assertEqual(types, ["message", "function_call"])
+        fc = out["output"][1]
+        self.assertEqual(fc["call_id"], "toolu_9")
+        self.assertEqual(fc["name"], "search")
+        self.assertEqual(json.loads(fc["arguments"]), {"q": "y"})
+
+    def test_thinking_plus_text_with_signature(self):
+        anth = {
+            "id": "msg_th",
+            "model": "claude-sonnet-4.6",
+            "content": [
+                {"type": "thinking", "thinking": "hmm", "signature": "SIG"},
+                {"type": "text", "text": "answer"},
+            ],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+        }
+        out = format_translation.anthropic_response_to_responses(anth)
+        types = [item["type"] for item in out["output"]]
+        self.assertEqual(types, ["reasoning", "message"])
+        self.assertEqual(out["output"][0]["encrypted_content"], "SIG")
+        self.assertEqual(
+            out["output"][0]["summary"], [{"type": "summary_text", "text": "hmm"}]
+        )
+
+    def test_thinking_signature_with_id_is_split_for_responses(self):
+        anth = {
+            "id": "msg_th",
+            "model": "claude-sonnet-4.6",
+            "content": [
+                {"type": "thinking", "thinking": "hmm", "signature": "ENC@reason_1"},
+            ],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+        }
+        out = format_translation.anthropic_response_to_responses(anth)
+        self.assertEqual(out["output"][0]["id"], "reason_1")
+        self.assertEqual(out["output"][0]["encrypted_content"], "ENC")
+
+    def test_max_tokens_stop_marks_incomplete(self):
+        anth = {
+            "id": "x",
+            "model": "claude-sonnet-4.6",
+            "content": [{"type": "text", "text": "partial"}],
+            "stop_reason": "max_tokens",
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+        }
+        out = format_translation.anthropic_response_to_responses(anth)
+        self.assertEqual(out["status"], "incomplete")
+        self.assertEqual(out["incomplete_details"], {"reason": "max_output_tokens"})
+
+    def test_usage_carries_cache_details(self):
+        anth = {
+            "id": "x",
+            "model": "claude-sonnet-4.6",
+            "content": [{"type": "text", "text": "hi"}],
+            "stop_reason": "end_turn",
+            "usage": {
+                "input_tokens": 7,
+                "output_tokens": 3,
+                "cache_read_input_tokens": 4,
+                "cache_creation_input_tokens": 2,
+            },
+        }
+        out = format_translation.anthropic_response_to_responses(anth)
+        self.assertEqual(out["usage"]["input_tokens"], 7)
+        self.assertEqual(out["usage"]["output_tokens"], 3)
+        self.assertEqual(out["usage"]["total_tokens"], 10)
+        self.assertEqual(
+            out["usage"]["input_tokens_details"],
+            {"cached_tokens": 4, "cache_creation_input_tokens": 2},
+        )
+
+
+class ReasoningSignatureRoundTripTests(unittest.TestCase):
+    def test_encrypted_content_signature_round_trips(self):
+        responses_body = {
+            "model": "claude-sonnet-4.6",
+            "input": [
+                {
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": "think"}],
+                    "encrypted_content": "ABC",
+                }
+            ],
+        }
+        anth = format_translation.responses_request_to_anthropic_messages(responses_body)
+        thinking_block = anth["messages"][0]["content"][0]
+        self.assertEqual(thinking_block["signature"], "ABC")
+
+        # And back via the response translator (since the response shape mirrors
+        # an assistant turn carrying the same thinking block).
+        fake_response = {
+            "id": "x",
+            "model": "claude-sonnet-4.6",
+            "content": [thinking_block],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 0, "output_tokens": 0},
+        }
+        round_tripped = format_translation.anthropic_response_to_responses(fake_response)
+        self.assertEqual(round_tripped["output"][0]["encrypted_content"], "ABC")
+
+
+import json  # noqa: E402  (re-imported here to keep the new tests self-contained)
+
+
 if __name__ == "__main__":
     unittest.main()

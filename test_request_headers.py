@@ -702,3 +702,125 @@ class RequestHeadersTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# Anthropic /v1/messages passthrough header helpers
+# ---------------------------------------------------------------------------
+
+import request_headers as _rh
+
+
+class DeriveAnthropicBetasTests(unittest.TestCase):
+    def test_filters_to_allowlist(self):
+        out = _rh.derive_anthropic_betas(
+            client_betas=[
+                "interleaved-thinking-2025-05-14",
+                "prompt-caching-2024-07-31",  # not in allowlist
+                "context-management-2025-06-27",
+            ],
+            body={},
+            model="claude-haiku-4.5",
+        )
+        self.assertIn("interleaved-thinking-2025-05-14", out)
+        self.assertIn("context-management-2025-06-27", out)
+        self.assertNotIn("prompt-caching-2024-07-31", out)
+
+    def test_auto_injects_interleaved_thinking_when_budget_set(self):
+        out = _rh.derive_anthropic_betas(
+            client_betas=None,
+            body={"thinking": {"type": "enabled", "budget_tokens": 4096}},
+            model="claude-haiku-4.5",
+        )
+        self.assertIn("interleaved-thinking-2025-05-14", out)
+
+    def test_does_not_inject_thinking_for_adaptive(self):
+        out = _rh.derive_anthropic_betas(
+            client_betas=None,
+            body={"thinking": {"type": "adaptive"}},
+            model="claude-haiku-4.5",
+        )
+        self.assertNotIn("interleaved-thinking-2025-05-14", out)
+
+    def test_auto_injects_advanced_tool_use_for_sonnet_46(self):
+        out = _rh.derive_anthropic_betas(
+            client_betas=None,
+            body={},
+            model="claude-sonnet-4.6",
+        )
+        self.assertIn("advanced-tool-use-2025-11-20", out)
+
+    def test_no_advanced_tool_use_for_sonnet_4(self):
+        out = _rh.derive_anthropic_betas(
+            client_betas=None,
+            body={},
+            model="claude-sonnet-4.0",
+        )
+        self.assertNotIn("advanced-tool-use-2025-11-20", out)
+
+    def test_dedupes_and_handles_comma_separated(self):
+        out = _rh.derive_anthropic_betas(
+            client_betas=[
+                "interleaved-thinking-2025-05-14, context-management-2025-06-27",
+                "interleaved-thinking-2025-05-14",
+            ],
+            body={},
+            model="claude-haiku-4.5",
+        )
+        self.assertEqual(
+            sorted(out),
+            sorted({"interleaved-thinking-2025-05-14", "context-management-2025-06-27"}),
+        )
+
+
+class BuildAnthropicMessagesPassthroughHeadersTests(unittest.TestCase):
+    def test_sets_required_headers(self):
+        base = {
+            "Authorization": "Bearer x",
+            "Copilot-Integration-Id": "vscode-chat",
+            "content-type": "application/json",
+        }
+        headers = _rh.build_anthropic_messages_passthrough_headers(
+            request_id="req-123",
+            initiator="agent",
+            interaction_id="int-9",
+            interaction_type=None,
+            anthropic_betas=[
+                "interleaved-thinking-2025-05-14",
+                "advanced-tool-use-2025-11-20",
+            ],
+            base_headers=base,
+        )
+        self.assertEqual(headers["x-agent-task-id"], "req-123")
+        self.assertEqual(headers["x-request-id"], "req-123")
+        self.assertEqual(headers["x-interaction-type"], "messages-proxy")
+        self.assertEqual(headers["openai-intent"], "messages-proxy")
+        self.assertEqual(headers["x-initiator"], "agent")
+        self.assertEqual(headers["x-interaction-id"], "int-9")
+        self.assertEqual(headers["anthropic-version"], "2023-06-01")
+        self.assertEqual(
+            headers["anthropic-beta"],
+            "interleaved-thinking-2025-05-14,advanced-tool-use-2025-11-20",
+        )
+        self.assertIn("vscode_claude_code/2.1.98", headers["user-agent"])
+        # Copilot-Integration-Id removed (case insensitive)
+        self.assertNotIn("Copilot-Integration-Id", headers)
+        self.assertNotIn("copilot-integration-id", headers)
+        # Authorization passed through
+        self.assertEqual(headers["Authorization"], "Bearer x")
+        # Input dict not mutated
+        self.assertIn("Copilot-Integration-Id", base)
+
+    def test_omits_anthropic_beta_when_empty_and_interaction_id_optional(self):
+        headers = _rh.build_anthropic_messages_passthrough_headers(
+            request_id="r",
+            initiator="user",
+            interaction_id=None,
+            interaction_type=None,
+            anthropic_betas=[],
+            base_headers={"copilot-integration-id": "vscode-chat"},
+        )
+        self.assertNotIn("anthropic-beta", headers)
+        self.assertNotIn("x-interaction-id", headers)
+        self.assertNotIn("copilot-integration-id", headers)
+        self.assertEqual(headers["x-initiator"], "user")

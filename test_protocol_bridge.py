@@ -24,6 +24,14 @@ class _RoutingConfigStub:
 
 
 class ProtocolBridgePlannerTests(unittest.TestCase):
+    def setUp(self):
+        # Reset the Copilot /models capability cache so cross-test
+        # pollution cannot accidentally enable the native /v1/messages
+        # bridge for plans that expect the legacy chat/responses path.
+        cache = getattr(proxy, "_COPILOT_MODEL_CAPS_CACHE", None)
+        if isinstance(cache, dict):
+            cache.clear()
+
     def test_planner_selects_native_responses_strategy_for_codex_models(self):
         planner = ProtocolBridgePlanner(_RoutingConfigStub())
         body = {"model": "gpt-5.4", "input": "hello", "stream": False}
@@ -403,6 +411,88 @@ class ProtocolBridgePlannerTests(unittest.TestCase):
 
         self.assertEqual(plan.resolved_model, "claude-opus-4.6")
         self.assertEqual(plan.strategy_name, "responses_to_chat")
+
+
+class NativeMessagesBridgeTests(unittest.TestCase):
+    def _planner(self, target_model, *, supports=True):
+        resolver = lambda model: bool(supports) and (model or "").startswith("claude")
+        return ProtocolBridgePlanner(
+            _RoutingConfigStub(target_model=target_model),
+            capability_resolver=resolver,
+        )
+
+    def test_messages_to_messages_matches_when_capability_supported(self):
+        planner = self._planner("claude-sonnet-4.6", supports=True)
+        body = {
+            "model": "claude-sonnet-4.6",
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+            "stream": False,
+        }
+        plan = proxy.asyncio.run(
+            planner.plan("messages", body, api_base="https://example.invalid", api_key="k")
+        )
+        self.assertEqual(plan.strategy_name, "messages_to_messages")
+        self.assertEqual(plan.upstream_protocol, "messages")
+        self.assertEqual(plan.upstream_path, "/v1/messages")
+        self.assertEqual(plan.header_kind, "messages")
+        self.assertEqual(plan.caller_protocol, "anthropic")
+        self.assertEqual(plan.upstream_body["model"], "claude-sonnet-4.6")
+
+    def test_messages_to_messages_falls_back_when_capability_unsupported(self):
+        planner = self._planner("claude-sonnet-4.6", supports=False)
+        body = {
+            "model": "claude-sonnet-4.6",
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+            "stream": False,
+        }
+        plan = proxy.asyncio.run(
+            planner.plan("messages", body, api_base="https://example.invalid", api_key="k")
+        )
+        # Falls through to the existing chat bridge for Claude targets.
+        self.assertEqual(plan.strategy_name, "messages_to_chat")
+        self.assertEqual(plan.upstream_path, "/chat/completions")
+
+    def test_responses_to_messages_matches_for_codex_inbound_claude_target(self):
+        planner = self._planner("claude-opus-4.6", supports=True)
+        body = {
+            "model": "gpt-5.3-codex",
+            "input": [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}
+            ],
+            "stream": False,
+        }
+        plan = proxy.asyncio.run(
+            planner.plan("responses", body, api_base="https://example.invalid", api_key="k")
+        )
+        self.assertEqual(plan.strategy_name, "responses_to_messages")
+        self.assertEqual(plan.upstream_protocol, "messages")
+        self.assertEqual(plan.upstream_path, "/v1/messages")
+        self.assertEqual(plan.header_kind, "messages")
+        self.assertEqual(plan.caller_protocol, "responses")
+
+    def test_responses_to_messages_does_not_match_for_gpt5_target(self):
+        planner = self._planner("gpt-5", supports=True)
+        body = {"model": "gpt-5", "input": "hi", "stream": False}
+        plan = proxy.asyncio.run(
+            planner.plan("responses", body, api_base="https://example.invalid", api_key="k")
+        )
+        self.assertEqual(plan.strategy_name, "responses_to_responses")
+        self.assertEqual(plan.upstream_path, "/responses")
+
+    def test_upstream_path_returns_v1_messages_for_messages_protocol(self):
+        from protocol_bridge import BridgeExecutionPlan
+        plan = BridgeExecutionPlan(
+            strategy_name="x",
+            inbound_protocol="messages",
+            caller_protocol="anthropic",
+            upstream_protocol="messages",
+            header_kind="messages",
+            requested_model="claude-sonnet-4.6",
+            resolved_model="claude-sonnet-4.6",
+            upstream_body={},
+            stream=False,
+        )
+        self.assertEqual(plan.upstream_path, "/v1/messages")
 
 if __name__ == "__main__":
     unittest.main()

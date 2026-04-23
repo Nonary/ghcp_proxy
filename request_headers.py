@@ -232,3 +232,126 @@ def build_anthropic_headers_for_request(
         headers["Copilot-Vision-Request"] = "true"
 
     return headers
+
+
+# ---------------------------------------------------------------------------
+# Anthropic /v1/messages native passthrough helpers
+# ---------------------------------------------------------------------------
+
+ALLOWED_ANTHROPIC_BETAS = frozenset({
+    "interleaved-thinking-2025-05-14",
+    "context-management-2025-06-27",
+    "advanced-tool-use-2025-11-20",
+})
+
+ADVANCED_TOOL_USE_MODELS_PREFIXES = (
+    "claude-sonnet-4.5",
+    "claude-sonnet-4.6",
+    "claude-opus-4.5",
+    "claude-opus-4.6",
+)
+
+CLAUDE_AGENT_USER_AGENT = (
+    "vscode_claude_code/2.1.98 (external, sdk-ts, agent-sdk/0.2.98)"
+)
+
+
+def _normalize_model_for_betas(model: str | None) -> str:
+    norm = (model or "").strip().lower()
+    if norm.startswith("anthropic/"):
+        norm = norm.split("/", 1)[1]
+    return norm
+
+
+def derive_anthropic_betas(
+    *,
+    client_betas: list[str] | None,
+    body: dict,
+    model: str,
+) -> list[str]:
+    """Filter inbound ``anthropic-beta`` values against the allowlist and
+    auto-inject the betas this proxy knows how to use."""
+
+    seen: set[str] = set()
+    out: list[str] = []
+
+    def _add(name: str) -> None:
+        if name in ALLOWED_ANTHROPIC_BETAS and name not in seen:
+            seen.add(name)
+            out.append(name)
+
+    if isinstance(client_betas, list):
+        for entry in client_betas:
+            if not isinstance(entry, str):
+                continue
+            for piece in entry.split(","):
+                token = piece.strip()
+                if token:
+                    _add(token)
+
+    # Auto-inject interleaved-thinking when explicit budget_tokens are used
+    # (and the request is not already adaptive).
+    thinking = body.get("thinking") if isinstance(body, dict) else None
+    if isinstance(thinking, dict):
+        t_type = thinking.get("type")
+        budget = thinking.get("budget_tokens")
+        if t_type == "enabled" and isinstance(budget, int) and budget > 0:
+            _add("interleaved-thinking-2025-05-14")
+
+    norm_model = _normalize_model_for_betas(model)
+    if any(norm_model.startswith(p) for p in ADVANCED_TOOL_USE_MODELS_PREFIXES):
+        _add("advanced-tool-use-2025-11-20")
+
+    return out
+
+
+def build_anthropic_messages_passthrough_headers(
+    *,
+    request_id: str,
+    initiator: str,
+    interaction_id: str | None,
+    interaction_type: str | None,  # noqa: ARG001 - accepted for API symmetry
+    anthropic_betas: list[str],
+    base_headers: dict,
+) -> dict:
+    """Produce the upstream header set for a native Copilot Messages proxy
+    request. Mirrors copilot-api's ``prepareMessageProxyHeaders``."""
+
+    headers: dict = dict(base_headers) if isinstance(base_headers, dict) else {}
+
+    # Drop any header (regardless of casing) that this function is about to
+    # set itself. httpx merges duplicate-cased keys into a comma-joined value
+    # which corrupts user-agent / openai-intent / interaction headers and
+    # triggers Copilot validation errors.
+    _drop_keys = (
+        "copilot-integration-id",
+        "user-agent",
+        "openai-intent",
+        "x-interaction-type",
+        "x-interaction-id",
+        "x-agent-task-id",
+        "x-request-id",
+        "x-initiator",
+        "anthropic-version",
+        "anthropic-beta",
+    )
+    for key in [k for k in list(headers.keys()) if k.lower() in _drop_keys]:
+        headers.pop(key, None)
+
+    headers["x-agent-task-id"] = request_id
+    headers["x-request-id"] = request_id
+    headers["x-interaction-type"] = "messages-proxy"
+    headers["openai-intent"] = "messages-proxy"
+    headers["user-agent"] = CLAUDE_AGENT_USER_AGENT
+    headers["anthropic-version"] = "2023-06-01"
+
+    if isinstance(anthropic_betas, list) and anthropic_betas:
+        headers["anthropic-beta"] = ",".join(anthropic_betas)
+
+    if isinstance(initiator, str) and initiator:
+        headers["x-initiator"] = initiator
+
+    if isinstance(interaction_id, str) and interaction_id:
+        headers["x-interaction-id"] = interaction_id
+
+    return headers
