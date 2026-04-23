@@ -28,6 +28,13 @@ From `~/sources/codex-proxy`:
 python3 proxy.py
 ```
 
+Once the dashboard is open, Settings -> Background Proxy can install a user
+login starter so GHCP Proxy starts in the background automatically. The same
+panel can install shell helpers:
+
+- PowerShell on Windows: `Start-GHProxy` and `Stop-GHProxy`
+- zsh on macOS: `start-ghproxy` and `stop-ghproxy`
+
 If upstream non-streaming requests are timing out, you can raise the proxy timeout before starting it:
 
 ```bash
@@ -185,7 +192,7 @@ The dashboard activation controls are meant to behave like a light switch.
 
 The dashboard combines two local data sources:
 
-- proxy request logs in `~/.config/ghcp_proxy/usage-log.jsonl` for tracked GitHub Copilot traffic
+- proxy request logs in the OS user state directory for tracked GitHub Copilot traffic
 - built-in token tracking and model pricing for Claude and GPT requests that pass through the proxy
 
 The local cost estimates use the common model rates configured in `proxy.py`, including cached-input pricing where the provider publishes it.
@@ -206,5 +213,5 @@ Until you make at least one request through the proxy in the current session, th
 The dashboard cache is also persisted in SQLite for fast startup/refreshes:
 
 ```bash
-export GHCP_CACHE_DB_PATH="~/.config/ghcp_proxy/ghcp-dashboard-cache.sqlite3"
+export GHCP_CACHE_DB_PATH="~/Library/Caches/ghcp_proxy/ghcp-dashboard-cache.sqlite3"
 ```

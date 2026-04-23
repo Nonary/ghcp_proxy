@@ -31,6 +31,16 @@ class ProxyRoutesTests(unittest.TestCase):
         self.assertIn("/v1/responses", paths)
         self.assertIn("/v1/chat/completions", paths)
         self.assertIn("/v1/models", paths)
+        self.assertIn("/api/config/background-proxy", paths)
+
+    def test_background_proxy_status_route_uses_manager(self):
+        manager = SimpleNamespace(status_payload=mock.Mock(return_value={"startup_enabled": True}))
+        with mock.patch.object(proxy, "background_proxy_manager", manager):
+            response = proxy.asyncio.run(proxy.background_proxy_status_api())
+
+        manager.status_payload.assert_called_once_with()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(json.loads(response.body), {"startup_enabled": True})
 
     def test_models_route_proxies_upstream_copilot_models(self):
         upstream = httpx.Response(

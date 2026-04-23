@@ -52,6 +52,8 @@ if __name__ == "__main__":
 
 import asyncio
 import auth
+import atexit
+import background_proxy
 import dashboard as dashboard_module
 import format_translation
 import messages_preprocess
@@ -108,6 +110,7 @@ from constants import (
     DEFAULT_UPSTREAM_TIMEOUT_SECONDS,
     LEGACY_BILLING_TOKEN_FILE,
     LEGACY_PREMIUM_PLAN_CONFIG_FILE,
+    PROXY_PID_FILE,
     REQUEST_TRACE_LOG_FILE,
     REQUEST_TRACE_HISTORY_LIMIT,
     REQUEST_TRACE_RETENTION_SLACK,
@@ -223,6 +226,7 @@ client_proxy_config_service = ProxyClientConfigService(
     model_capabilities_provider=lambda: fetch_copilot_model_capabilities(),
     model_routing_settings_provider=lambda: model_routing_config_service.load_settings(),
 )
+background_proxy_manager = background_proxy.BackgroundProxyManager()
 bridge_planner = ProtocolBridgePlanner(
     model_routing_config_service,
     capability_resolver=lambda model: model_supports_native_messages(model) if model else False,
@@ -273,6 +277,30 @@ def configured_upstream_timeout_seconds() -> int:
         )
         return DEFAULT_UPSTREAM_TIMEOUT_SECONDS
     return value
+
+
+def _write_proxy_pid_file() -> None:
+    try:
+        os.makedirs(os.path.dirname(PROXY_PID_FILE), exist_ok=True)
+        with open(PROXY_PID_FILE, "w", encoding="utf-8") as f:
+            f.write(str(os.getpid()))
+            f.write("\n")
+    except OSError as exc:
+        print(f"Warning: failed to write proxy pid file: {exc}", file=sys.stderr, flush=True)
+
+
+def _remove_proxy_pid_file() -> None:
+    try:
+        with open(PROXY_PID_FILE, encoding="utf-8") as f:
+            recorded_pid = f.read().strip()
+    except OSError:
+        return
+    if recorded_pid != str(os.getpid()):
+        return
+    try:
+        os.remove(PROXY_PID_FILE)
+    except OSError:
+        pass
 
 
 # ─── Initialization ──────────────────────────────────────────────────────────
@@ -2339,6 +2367,37 @@ async def client_proxy_install_api(request: Request):
 
 # ─── Route: /v1/responses  (Codex / Responses API) ───────────────────────────
 
+@app.get("/api/config/background-proxy")
+async def background_proxy_status_api():
+    return JSONResponse(content=background_proxy_manager.status_payload())
+
+
+@app.post("/api/config/background-proxy")
+async def background_proxy_config_api(request: Request):
+    payload = await parse_json_request(request)
+    action = payload.get("action")
+    try:
+        if action == "enable_startup":
+            result = background_proxy_manager.enable_startup()
+            message = "Background startup enabled."
+        elif action == "disable_startup":
+            result = background_proxy_manager.disable_startup()
+            message = "Background startup disabled."
+        elif action == "install_shell_commands":
+            result = background_proxy_manager.install_shell_commands()
+            message = "Shell commands installed."
+        elif action == "uninstall_shell_commands":
+            result = background_proxy_manager.uninstall_shell_commands()
+            message = "Shell commands removed."
+        else:
+            raise HTTPException(status_code=400, detail="Unsupported background proxy action.")
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to update background proxy setup: {exc}") from exc
+    return JSONResponse(content={**result, "message": message})
+
+
 @app.post("/responses")
 @app.post("/v1/responses")
 async def responses(request: Request):
@@ -2583,7 +2642,10 @@ if __name__ == "__main__":
     print("    export OPENAI_API_KEY=anything", flush=True)
     print("", flush=True)
 
+    _write_proxy_pid_file()
+    atexit.register(_remove_proxy_pid_file)
     try:
         uvicorn.run(app, host="127.0.0.1", port=8000, access_log=False, timeout_graceful_shutdown=2)
     finally:
         revert_client_proxy_configs_on_shutdown()
+        _remove_proxy_pid_file()

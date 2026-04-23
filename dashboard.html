@@ -743,6 +743,9 @@
     .arrow-cell { text-align: center; color: var(--muted); width: 24px; }
     .proxy-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; }
     .mini-card { background: var(--panel-soft); border: 1px solid var(--line); border-radius: 10px; padding: 12px; display: grid; gap: 8px; }
+    .command-list { display: grid; gap: 6px; margin-top: 4px; }
+    .command-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 0.82rem; }
+    .command-row code { color: var(--text); background: rgba(255,255,255,0.06); border: 1px solid var(--line); border-radius: 6px; padding: 2px 6px; }
     .control-secondary-grid { display: grid; gap: 12px; grid-column: 1 / -1; }
     .spacer { flex: 1; }
     .status-stack { display: grid; gap: 6px; }
@@ -2430,6 +2433,37 @@
             <div v-if="clientProxySettings.error" class="status error" style="margin-top: 10px;">{{ clientProxySettings.error }}</div>
             <div v-else-if="clientProxySettings.statusMessage" class="status good" style="margin-top: 10px;">{{ clientProxySettings.statusMessage }}</div>
           </article>
+          <article class="mini-card" style="margin-top: 12px;">
+            <div class="eyebrow">Background Proxy</div>
+            <div :class="['status', backgroundProxyStatus.startup_enabled ? 'good' : 'warn']">
+              {{ backgroundProxyStartupLabel }}
+            </div>
+            <label style="display:flex; align-items:center; gap:10px; margin-top:6px;">
+              <input type="checkbox"
+                     :checked="backgroundProxyStatus.startup_enabled"
+                     :disabled="savingBackgroundProxy || !backgroundProxyStatus.startup_supported"
+                     @change="toggleBackgroundStartup($event.target.checked)">
+              <span>Start GHCP Proxy in the background when this user logs in</span>
+            </label>
+            <div class="subtle" style="margin-top: 8px;">{{ backgroundProxyStatus.startup_path || 'Startup integration is not supported on this OS.' }}</div>
+            <div class="toolbar" style="margin-top: 10px;">
+              <button :class="backgroundProxyStatus.shell_commands_installed ? '' : 'primary'"
+                      @click="toggleShellCommands"
+                      :disabled="savingBackgroundProxy || !backgroundProxyStatus.shell_commands_supported">
+                {{ backgroundProxyStatus.shell_commands_installed ? 'Remove shell commands' : 'Install shell commands' }}
+              </button>
+              <button @click="loadBackgroundProxyStatus" :disabled="savingBackgroundProxy">Refresh</button>
+            </div>
+            <div class="command-list" v-if="backgroundProxyCommandNames.length">
+              <div class="command-row" v-for="name in backgroundProxyCommandNames" :key="name">
+                <span>{{ name.includes('Stop') || name.startsWith('stop-') ? 'Stop' : 'Start' }}</span>
+                <code>{{ name }}</code>
+              </div>
+            </div>
+            <div class="subtle" style="margin-top: 4px;">{{ backgroundProxyStatus.shell_profile_path }}</div>
+            <div v-if="backgroundProxyStatus.error" class="status error" style="margin-top: 10px;">{{ backgroundProxyStatus.error }}</div>
+            <div v-else-if="backgroundProxyStatus.statusMessage" class="status good" style="margin-top: 10px;">{{ backgroundProxyStatus.statusMessage }}</div>
+          </article>
           <div v-if="proxyConfigError" class="status error" style="margin-top: 10px;">{{ proxyConfigError }}</div>
           <div v-else-if="proxyConfigStatusMessage" class="status good" style="margin-top: 10px;">{{ proxyConfigStatusMessage }}</div>
         </article>
@@ -3539,6 +3573,7 @@
           loadingClientProxyStatus: false,
           savingProxyConfig: false,
           savingClientProxySettings: false,
+          savingBackgroundProxy: false,
           loadingModelRoutingConfig: false,
           savingModelRoutingConfig: false,
           proxyConfigError: '',
@@ -3579,6 +3614,18 @@
           clientProxySettings: {
             revert_on_shutdown: true,
             path: '',
+            error: '',
+            statusMessage: '',
+          },
+          backgroundProxyStatus: {
+            platform: '',
+            startup_supported: false,
+            startup_enabled: false,
+            startup_path: '',
+            shell_commands_supported: false,
+            shell_commands_installed: false,
+            shell_profile_path: '',
+            commands: {},
             error: '',
             statusMessage: '',
           },
@@ -4843,6 +4890,14 @@
         noClientProxyConfigured() {
           return !this.clientProxyStatus.codex?.configured && !this.clientProxyStatus.claude?.configured;
         },
+        backgroundProxyCommandNames() {
+          const commands = this.backgroundProxyStatus.commands || {};
+          return [commands.start, commands.stop].filter(Boolean);
+        },
+        backgroundProxyStartupLabel() {
+          if (!this.backgroundProxyStatus.startup_supported) return 'Login startup is not supported on this OS';
+          return this.backgroundProxyStatus.startup_enabled ? 'Starts at login' : 'Manual start only';
+        },
 
         navItems() {
           const ico = (svg) => svg;
@@ -5757,6 +5812,67 @@
             this.savingClientProxySettings = false;
           }
         },
+        async loadBackgroundProxyStatus() {
+          try {
+            const response = await fetch('/api/config/background-proxy', { cache: 'no-store' });
+            if (!response.ok) {
+              throw new Error(`background proxy status request failed: ${response.status}`);
+            }
+            const payload = await response.json();
+            this.backgroundProxyStatus = {
+              ...this.backgroundProxyStatus,
+              ...payload,
+              error: '',
+            };
+          } catch (error) {
+            this.backgroundProxyStatus.error = error.message;
+          }
+        },
+        async configureBackgroundProxy(action, successMessage) {
+          if (this.savingBackgroundProxy) return;
+          this.savingBackgroundProxy = true;
+          this.backgroundProxyStatus.statusMessage = '';
+          this.backgroundProxyStatus.error = '';
+          try {
+            const response = await fetch('/api/config/background-proxy', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ action }),
+            });
+            if (!response.ok) {
+              let message = `background proxy request failed: ${response.status}`;
+              try {
+                const data = await response.json();
+                if (data?.detail) message = data.detail;
+              } catch (_error) {}
+              throw new Error(message);
+            }
+            const payload = await response.json();
+            this.backgroundProxyStatus = {
+              ...this.backgroundProxyStatus,
+              ...payload,
+              error: '',
+              statusMessage: payload?.message || successMessage,
+            };
+          } catch (error) {
+            this.backgroundProxyStatus.error = error.message;
+          } finally {
+            this.savingBackgroundProxy = false;
+          }
+        },
+        async toggleBackgroundStartup(enabled) {
+          return this.configureBackgroundProxy(
+            enabled ? 'enable_startup' : 'disable_startup',
+            enabled ? 'Background startup enabled.' : 'Background startup disabled.'
+          );
+        },
+        async toggleShellCommands() {
+          const installed = Boolean(this.backgroundProxyStatus.shell_commands_installed);
+          return this.configureBackgroundProxy(
+            installed ? 'uninstall_shell_commands' : 'install_shell_commands',
+            installed ? 'Shell commands removed.' : 'Shell commands installed.'
+          );
+        },
         async configureClientProxy(target, action) {
           if (this.savingProxyConfig) return;
 
@@ -6313,6 +6429,7 @@
         this.load(true);
         this.loadSafeguardConfig();
         this.loadClientProxyStatus();
+        this.loadBackgroundProxyStatus();
         this.loadModelRoutingConfig();
         this.startDashboardStream();
         this.autoRefreshTimer = window.setInterval(() => {

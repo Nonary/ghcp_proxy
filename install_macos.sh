@@ -34,7 +34,8 @@ echo "Installing Python dependencies"
 "${VENV_DIR}/bin/python" -m pip install --upgrade pip
 "${VENV_DIR}/bin/python" -m pip install -r "${REQ_FILE}"
 
-mkdir -p "${HOME}/.config/ghcp_proxy"
+mkdir -p "${HOME}/Library/Application Support/ghcp_proxy"
+mkdir -p "${HOME}/Library/Caches/ghcp_proxy"
 mkdir -p "${HOME}/.codex"
 mkdir -p "${HOME}/.claude"
 
@@ -53,5 +54,6 @@ Next steps:
 Notes:
   - Node.js and npx were detected successfully.
   - Client activation for Codex and Claude is handled from the dashboard so backups stay intact.
+  - The dashboard can install a macOS login item and zsh commands: start-ghproxy / stop-ghproxy.
   - Dashboard usage helpers are fetched lazily through npx when needed.
 EOF
