@@ -317,6 +317,12 @@ MODEL_PRICING = {
         "cached_input_per_million": 0.25,
         "output_per_million": 15.00,
     },
+    "gpt-5.5": {
+        "provider": "OpenAI",
+        "input_per_million": 5.00,
+        "cached_input_per_million": 0.50,
+        "output_per_million": 30.00,
+    },
     "gpt-5.4-mini": {
         "provider": "OpenAI",
         "input_per_million": 0.75,
@@ -374,6 +380,7 @@ PREMIUM_REQUEST_MULTIPLIERS = {
     "gpt-5.2-codex": 1.0,
     "gpt-5.3-codex": 1.0,
     "gpt-5.4": 1.0,
+    "gpt-5.5": 1.0,
     "gpt-5.4-mini": 0.33,
     "gpt-5-mini": 0.0,
     "gemini-2.5-pro": 1.0,

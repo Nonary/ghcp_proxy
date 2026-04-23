@@ -521,15 +521,21 @@ def _usage_event_cost(model_name: str | None, usage: dict | None) -> float:
     return sum(_usage_event_cost_breakdown(model_name, usage).values())
 
 
+def _fast_service_tier_cost_multiplier(event: dict | None) -> float:
+    if _usage_event_model_name(event) == "gpt-5.5":
+        return 2.5
+    return 2.0
+
+
 def _usage_event_cost_multiplier(event: dict | None) -> float:
     if not isinstance(event, dict):
         return 1.0
     requested_service_tier = event.get("native_requested_service_tier")
     if isinstance(requested_service_tier, str) and requested_service_tier.strip().lower() in FAST_SERVICE_TIERS:
-        return 2.0
+        return _fast_service_tier_cost_multiplier(event)
     service_tier = event.get("native_service_tier")
     if isinstance(service_tier, str) and service_tier.strip().lower() in FAST_SERVICE_TIERS:
-        return 2.0
+        return _fast_service_tier_cost_multiplier(event)
     return 1.0
 
 

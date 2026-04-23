@@ -139,7 +139,7 @@ class UsageTrackingTests(unittest.TestCase):
         self.assertEqual(normalized["session_id_origin"], "codex_native_request_id")
         self.assertEqual(normalized["server_request_id"], "session-native")
 
-    def test_normalize_recorded_usage_event_backfills_requested_fast_tier_and_doubles_cost(self):
+    def test_normalize_recorded_usage_event_backfills_requested_fast_tier_and_doubles_gpt54_cost(self):
         with mock.patch(
             "usage_tracking._codex_logs_service_tiers",
             return_value={
@@ -181,6 +181,49 @@ class UsageTrackingTests(unittest.TestCase):
         self.assertEqual(normalized["native_service_tier"], "default")
         self.assertEqual(normalized["native_service_tier_source"], "codex_logs_response_completed")
         self.assertAlmostEqual(normalized["cost_usd"], baseline * 2, places=8)
+
+    def test_normalize_recorded_usage_event_backfills_requested_fast_tier_and_multiplies_gpt55_cost(self):
+        with mock.patch(
+            "usage_tracking._codex_logs_service_tiers",
+            return_value={
+                "requested": "priority",
+                "requested_source": "codex_logs_request",
+                "effective": "default",
+                "effective_source": "codex_logs_response_completed",
+            },
+        ):
+            normalized = usage_tracking._normalize_recorded_usage_event(
+                {
+                    "request_id": "codex-native:session-fast-55:1",
+                    "path": "/native/codex/responses",
+                    "requested_model": "gpt-5.5",
+                    "native_source": "codex_native",
+                    "native_turn_id": "turn-fast-55-1",
+                    "native_reasoning_effort": "high",
+                    "usage": {
+                        "input_tokens": 100,
+                        "output_tokens": 10,
+                        "cached_input_tokens": 20,
+                        "total_tokens": 130,
+                    },
+                    "cost_usd": 0.0,
+                }
+            )
+
+        baseline = usage_tracking._usage_event_cost(
+            "gpt-5.5",
+            {
+                "input_tokens": 100,
+                "output_tokens": 10,
+                "cached_input_tokens": 20,
+                "total_tokens": 130,
+            },
+        )
+        self.assertEqual(normalized["native_requested_service_tier"], "priority")
+        self.assertEqual(normalized["native_requested_service_tier_source"], "codex_logs_request")
+        self.assertEqual(normalized["native_service_tier"], "default")
+        self.assertEqual(normalized["native_service_tier_source"], "codex_logs_response_completed")
+        self.assertAlmostEqual(normalized["cost_usd"], baseline * 2.5, places=8)
 
     def test_normalize_recorded_usage_event_drops_proxied_codex_native_rows(self):
         normalized = usage_tracking._normalize_recorded_usage_event(
