@@ -154,7 +154,11 @@ def _apply_missing_claude_session_context(event: dict | None) -> dict | None:
     return event
 
 
-def _normalize_recorded_usage_event(payload: dict | None) -> dict | None:
+def _normalize_recorded_usage_event(
+    payload: dict | None,
+    *,
+    refresh_native_tiers: bool = True,
+) -> dict | None:
     if not isinstance(payload, dict):
         return None
 
@@ -193,16 +197,30 @@ def _normalize_recorded_usage_event(payload: dict | None) -> dict | None:
         ):
             normalized_event["server_request_id"] = effective_native_session_id
     if normalized_event.get("native_source") == "codex_native":
-        native_service_tiers = _codex_logs_service_tiers(
-            normalized_event.get("session_id") or native_session_id,
-            normalized_event.get("native_turn_id"),
-            normalized_event.get("started_at"),
+        requested_source = normalized_event.get("native_requested_service_tier_source")
+        effective_source = normalized_event.get("native_service_tier_source")
+        should_refresh_native_tiers = refresh_native_tiers or str(
+            os.environ.get("GHCP_REFRESH_CODEX_LOG_TIERS_ON_LOAD", "")
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        native_service_tiers = (
+            _codex_logs_service_tiers(
+                normalized_event.get("session_id") or native_session_id,
+                normalized_event.get("native_turn_id"),
+                normalized_event.get("started_at"),
+            )
+            if should_refresh_native_tiers
+            else {
+                "requested": normalized_event.get("native_requested_service_tier"),
+                "requested_source": requested_source,
+                "effective": normalized_event.get("native_service_tier"),
+                "effective_source": effective_source,
+            }
         )
         requested_native_service_tier = native_service_tiers.get("requested")
         if isinstance(requested_native_service_tier, str) and requested_native_service_tier:
             normalized_event["native_requested_service_tier"] = requested_native_service_tier
             normalized_event["native_requested_service_tier_source"] = native_service_tiers.get("requested_source")
-        elif normalized_event.get("native_requested_service_tier_source") != "codex_logs_request":
+        elif should_refresh_native_tiers and normalized_event.get("native_requested_service_tier_source") != "codex_logs_request":
             normalized_event.pop("native_requested_service_tier", None)
             normalized_event.pop("native_requested_service_tier_source", None)
 
@@ -210,7 +228,7 @@ def _normalize_recorded_usage_event(payload: dict | None) -> dict | None:
         if isinstance(exact_native_service_tier, str) and exact_native_service_tier:
             normalized_event["native_service_tier"] = exact_native_service_tier
             normalized_event["native_service_tier_source"] = native_service_tiers.get("effective_source")
-        elif not str(normalized_event.get("native_service_tier_source") or "").startswith("codex_logs_response"):
+        elif should_refresh_native_tiers and not str(normalized_event.get("native_service_tier_source") or "").startswith("codex_logs_response"):
             normalized_event.pop("native_service_tier", None)
             normalized_event.pop("native_service_tier_source", None)
 
@@ -757,7 +775,7 @@ class UsageTracker:
                 payload = json.loads(row["payload_json"])
             except json.JSONDecodeError:
                 continue
-            normalized_event = _normalize_recorded_usage_event(payload)
+            normalized_event = _normalize_recorded_usage_event(payload, refresh_native_tiers=False)
             if normalized_event is not None:
                 self.state.archived_usage_events.append(normalized_event)
 
@@ -828,7 +846,7 @@ class UsageTracker:
                             payload = json.loads(line)
                         except json.JSONDecodeError:
                             continue
-                        normalized_event = _normalize_recorded_usage_event(payload)
+                        normalized_event = _normalize_recorded_usage_event(payload, refresh_native_tiers=False)
                         if normalized_event is None:
                             continue
                         self.state.recent_usage_events.append(normalized_event)

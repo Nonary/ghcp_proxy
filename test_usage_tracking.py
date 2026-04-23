@@ -1033,6 +1033,44 @@ class UsageTrackingTests(unittest.TestCase):
         self.assertEqual(archived_count, 2)
         keeper.close()
 
+    def test_load_history_reuses_stored_codex_native_service_tiers(self):
+        event = {
+            "request_id": "codex-native:session-1:0",
+            "started_at": "2026-01-01T00:00:00+00:00",
+            "finished_at": "2026-01-01T00:00:00+00:00",
+            "path": "/native/codex/responses",
+            "requested_model": "gpt-5",
+            "resolved_model": "gpt-5",
+            "native_source": "codex_native",
+            "session_id": "session-1",
+            "native_turn_id": "turn-1",
+            "native_requested_service_tier": "priority",
+            "native_requested_service_tier_source": "codex_logs_request",
+            "native_service_tier": "priority",
+            "native_service_tier_source": "codex_logs_response_completed",
+            "usage": {
+                "input_tokens": 1,
+                "output_tokens": 1,
+                "total_tokens": 2,
+            },
+        }
+
+        log_path = self._make_usage_log_path(prefix="usage-history-native-")
+        log_path.write_text(json.dumps(event) + "\n", encoding="utf-8")
+        tracker = self._make_usage_tracker()
+        tracker.usage_log_file = str(log_path)
+
+        with mock.patch.object(
+            usage_tracking,
+            "_codex_logs_service_tiers",
+            side_effect=AssertionError("stored tiers should be reused"),
+        ):
+            tracker.load_history()
+
+        [loaded] = tracker.snapshot_usage_events()
+        self.assertEqual(loaded["native_requested_service_tier"], "priority")
+        self.assertEqual(loaded["native_service_tier"], "priority")
+
 
 if __name__ == "__main__":
     unittest.main()
