@@ -1752,8 +1752,51 @@ async def proxy_anthropic_passthrough_streaming_response(
         if key.lower().startswith("x-quota-snapshot"):
             response_headers[key] = value
 
+    def merge_anthropic_usage(usage_state: dict, usage: dict) -> None:
+        if not isinstance(usage, dict):
+            return
+
+        def read_int(key: str):
+            value = usage.get(key)
+            if isinstance(value, (int, float)):
+                return int(value)
+            return None
+
+        input_tokens = read_int("input_tokens")
+        if input_tokens is not None:
+            usage_state["input_tokens"] = input_tokens
+
+        output_tokens = read_int("output_tokens")
+        if output_tokens is not None:
+            usage_state["output_tokens"] = output_tokens
+
+        cache_read = read_int("cache_read_input_tokens")
+        if cache_read is None:
+            cache_read = read_int("cached_input_tokens")
+        if cache_read is not None:
+            usage_state["cached_input_tokens"] = cache_read
+
+        cache_creation = read_int("cache_creation_input_tokens")
+        if cache_creation is not None:
+            usage_state["cache_creation_input_tokens"] = cache_creation
+
+        total_tokens = read_int("total_tokens")
+        if total_tokens is not None:
+            usage_state["total_tokens"] = total_tokens
+        else:
+            usage_state["total_tokens"] = (
+                int(usage_state.get("input_tokens", 0) or 0)
+                + int(usage_state.get("output_tokens", 0) or 0)
+            )
+
     async def stream_passthrough():
-        usage_state: dict = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+        usage_state: dict = {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+            "cached_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+        }
         first_output_marked = False
         buffer = ""
         try:
@@ -1780,24 +1823,11 @@ async def proxy_anthropic_passthrough_streaming_response(
                         if evt == "message_start" and isinstance(payload, dict):
                             message = payload.get("message")
                             if isinstance(message, dict) and isinstance(message.get("usage"), dict):
-                                u = message["usage"]
-                                in_t = int(u.get("input_tokens", 0) or 0)
-                                out_t = int(u.get("output_tokens", 0) or 0)
-                                usage_state.update({
-                                    "input_tokens": in_t,
-                                    "output_tokens": out_t,
-                                    "total_tokens": in_t + out_t,
-                                })
+                                merge_anthropic_usage(usage_state, message["usage"])
                         elif evt == "message_delta" and isinstance(payload, dict):
                             u = payload.get("usage")
                             if isinstance(u, dict):
-                                in_t = int(u.get("input_tokens", usage_state["input_tokens"]) or 0)
-                                out_t = int(u.get("output_tokens", usage_state["output_tokens"]) or 0)
-                                usage_state.update({
-                                    "input_tokens": in_t,
-                                    "output_tokens": out_t,
-                                    "total_tokens": in_t + out_t,
-                                })
+                                merge_anthropic_usage(usage_state, u)
                         elif evt in ("content_block_delta", "content_block_start"):
                             if not first_output_marked:
                                 first_output_marked = True

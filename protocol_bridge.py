@@ -344,6 +344,8 @@ class ResponsesToMessagesStrategy(ProtocolBridgeStrategy):
             translated,
             model_supports_adaptive=_default_adaptive_thinking_resolver(resolved_model),
         )
+        if format_translation._responses_body_requests_prompt_cache(upstream_body):
+            format_translation._apply_responses_prompt_cache_to_anthropic_messages(translated)
         return BridgeExecutionPlan(
             strategy_name=self.strategy_name,
             inbound_protocol=self.inbound_protocol,

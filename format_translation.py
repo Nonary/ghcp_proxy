@@ -2265,7 +2265,11 @@ def _responses_reasoning_item_to_anthropic_block(item: dict) -> dict | None:
     block: dict = {"type": "thinking", "thinking": thinking_text}
     encrypted = item.get("encrypted_content")
     if isinstance(encrypted, str) and encrypted:
-        block["signature"] = encrypted
+        reasoning_id = item.get("id")
+        if isinstance(reasoning_id, str) and reasoning_id:
+            block["signature"] = f"{encrypted}@{reasoning_id}"
+        else:
+            block["signature"] = encrypted
     return block
 
 
@@ -2368,6 +2372,75 @@ def _responses_tool_choice_to_anthropic(tool_choice):
                 raise ValueError("Responses tool_choice type=function must include name")
             return {"type": "tool", "name": name}
     raise ValueError("Unsupported Responses tool_choice value")
+
+
+_ANTHROPIC_CACHEABLE_BLOCK_TYPES = {"text", "image", "document", "tool_use", "tool_result"}
+
+
+def _responses_body_requests_prompt_cache(body: dict) -> bool:
+    for key in ("prompt_cache_key", "promptCacheKey"):
+        value = body.get(key)
+        if isinstance(value, str) and value.strip():
+            return True
+    return False
+
+
+def _add_anthropic_cache_control(block: dict) -> None:
+    if not isinstance(block.get("cache_control"), dict):
+        block["cache_control"] = {"type": "ephemeral"}
+
+
+def _last_cacheable_anthropic_content_block(content) -> dict | None:
+    if not isinstance(content, list):
+        return None
+    for block in reversed(content):
+        if not isinstance(block, dict):
+            continue
+        if str(block.get("type", "")).lower() in _ANTHROPIC_CACHEABLE_BLOCK_TYPES:
+            return block
+    return None
+
+
+def _apply_responses_prompt_cache_to_anthropic_messages(payload: dict) -> None:
+    """Preserve Responses prompt-cache intent after translating to Messages.
+
+    Copilot's Responses API accepts ``prompt_cache_key``. Anthropic Messages
+    does not, so the equivalent cache request is explicit ``cache_control``
+    breakpoints. Keep this to four markers, matching Anthropic's limit.
+    """
+    if not isinstance(payload, dict):
+        return
+
+    remaining = 4
+
+    def mark(block: dict | None) -> None:
+        nonlocal remaining
+        if remaining <= 0 or not isinstance(block, dict):
+            return
+        _add_anthropic_cache_control(block)
+        remaining -= 1
+
+    tools = payload.get("tools")
+    if isinstance(tools, list):
+        for tool in reversed(tools):
+            if isinstance(tool, dict):
+                mark(tool)
+                break
+
+    system = payload.get("system")
+    if isinstance(system, str) and system:
+        block = {"type": "text", "text": system}
+        mark(block)
+        payload["system"] = [block]
+    elif isinstance(system, list):
+        mark(_last_cacheable_anthropic_content_block(system))
+
+    messages = payload.get("messages")
+    if isinstance(messages, list):
+        for message in messages[-2:]:
+            if not isinstance(message, dict):
+                continue
+            mark(_last_cacheable_anthropic_content_block(message.get("content")))
 
 
 def responses_request_to_anthropic_messages(body: dict) -> dict:
@@ -2543,6 +2616,9 @@ def responses_request_to_anthropic_messages(body: dict) -> dict:
     if mapped_effort is not None and not forces_tool:
         payload["thinking"] = {"type": "adaptive", "display": "summarized"}
         payload["output_config"] = {"effort": mapped_effort}
+
+    if _responses_body_requests_prompt_cache(body):
+        _apply_responses_prompt_cache_to_anthropic_messages(payload)
 
     return payload
 

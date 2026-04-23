@@ -1206,6 +1206,80 @@ class AnthropicMessagesPassthroughRouteTests(unittest.TestCase):
         self.assertEqual(payload["id"], "msg_x")
         self.assertEqual(payload["content"][0]["text"], "ok")
 
+    def test_messages_passthrough_stream_preserves_cache_usage(self):
+        chunks = [
+            (
+                'event: message_start\n'
+                'data: {"type":"message_start","message":{"id":"msg_x","type":"message",'
+                '"role":"assistant","usage":{"input_tokens":1200,"output_tokens":0,'
+                '"cache_read_input_tokens":125000,"cache_creation_input_tokens":42}}}\n\n'
+            ).encode("utf-8"),
+            (
+                'event: message_delta\n'
+                'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},'
+                '"usage":{"output_tokens":321}}\n\n'
+            ).encode("utf-8"),
+            b'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+        ]
+
+        class FakeUpstream:
+            status_code = 200
+            headers = {"content-type": "text/event-stream"}
+
+            async def aiter_bytes(self):
+                for chunk in chunks:
+                    yield chunk
+
+            async def aclose(self):
+                return None
+
+        class FakeClient:
+            def build_request(self, *args, **kwargs):
+                return httpx.Request("POST", "https://example.invalid/v1/messages")
+
+            async def aclose(self):
+                return None
+
+        usage_event = {"request_id": "req-stream-cache"}
+        trace_plan = proxy.UpstreamRequestPlan(
+            request_id="req-stream-cache",
+            upstream_url="https://example.invalid/v1/messages",
+            headers={},
+            body={"stream": True},
+            usage_event=usage_event,
+            requested_model="claude-sonnet-4.6",
+            resolved_model="claude-sonnet-4.6",
+        )
+
+        async def run_stream():
+            with (
+                mock.patch.object(proxy.httpx, "AsyncClient", return_value=FakeClient()),
+                mock.patch.object(proxy, "throttled_client_send", mock.AsyncMock(return_value=FakeUpstream())),
+                mock.patch.object(proxy.usage_tracker, "finish_event") as finish_usage,
+            ):
+                response = await proxy.proxy_anthropic_passthrough_streaming_response(
+                    "https://example.invalid/v1/messages",
+                    {"Authorization": "Bearer test"},
+                    {"model": "claude-sonnet-4.6", "stream": True},
+                    "claude-sonnet-4.6",
+                    usage_event=usage_event,
+                    trace_plan=trace_plan,
+                )
+                body = b""
+                async for chunk in response.body_iterator:
+                    body += chunk
+                return body, finish_usage
+
+        body, finish_usage = proxy.asyncio.run(run_stream())
+
+        self.assertIn(b"cache_read_input_tokens", body)
+        finish_usage.assert_called_once()
+        usage = finish_usage.call_args.kwargs["usage"]
+        self.assertEqual(usage["input_tokens"], 1200)
+        self.assertEqual(usage["output_tokens"], 321)
+        self.assertEqual(usage["cached_input_tokens"], 125000)
+        self.assertEqual(usage["cache_creation_input_tokens"], 42)
+
     def test_responses_route_to_messages_translates_back_to_responses(self):
         request = SimpleNamespace(
             url=SimpleNamespace(path="/v1/responses"),

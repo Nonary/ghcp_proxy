@@ -1822,6 +1822,58 @@ class ResponsesToAnthropicMessagesTests(unittest.TestCase):
             ],
         )
 
+    def test_responses_prompt_cache_key_adds_messages_cache_breakpoints(self):
+        body = {
+            "model": "claude-sonnet-4.6",
+            "prompt_cache_key": "session-123",
+            "instructions": "system prompt",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "first"}],
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "second"}],
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "third"}],
+                },
+            ],
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "read",
+                    "description": "Read a file",
+                    "parameters": {"type": "object", "properties": {}},
+                }
+            ],
+        }
+
+        out = format_translation.responses_request_to_anthropic_messages(body)
+
+        self.assertIsInstance(out["system"], list)
+        self.assertEqual(out["system"][0]["cache_control"], {"type": "ephemeral"})
+        self.assertEqual(out["tools"][0]["cache_control"], {"type": "ephemeral"})
+        self.assertNotIn("cache_control", out["messages"][0]["content"][0])
+        self.assertEqual(out["messages"][1]["content"][0]["cache_control"], {"type": "ephemeral"})
+        self.assertEqual(out["messages"][2]["content"][0]["cache_control"], {"type": "ephemeral"})
+
+        def count_cache_controls(value):
+            if isinstance(value, dict):
+                return int(isinstance(value.get("cache_control"), dict)) + sum(
+                    count_cache_controls(v) for v in value.values()
+                )
+            if isinstance(value, list):
+                return sum(count_cache_controls(v) for v in value)
+            return 0
+
+        self.assertEqual(count_cache_controls(out), 4)
+
     def test_reasoning_effort_becomes_adaptive_thinking(self):
         body = {
             "model": "claude-sonnet-4.6",
@@ -2064,6 +2116,34 @@ class ReasoningSignatureRoundTripTests(unittest.TestCase):
             "usage": {"input_tokens": 0, "output_tokens": 0},
         }
         round_tripped = format_translation.anthropic_response_to_responses(fake_response)
+        self.assertEqual(round_tripped["output"][0]["encrypted_content"], "ABC")
+
+    def test_responses_reasoning_id_is_carried_in_anthropic_signature(self):
+        responses_body = {
+            "model": "claude-sonnet-4.6",
+            "input": [
+                {
+                    "id": "reason_123",
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": "think"}],
+                    "encrypted_content": "ABC",
+                }
+            ],
+        }
+
+        anth = format_translation.responses_request_to_anthropic_messages(responses_body)
+        thinking_block = anth["messages"][0]["content"][0]
+        self.assertEqual(thinking_block["signature"], "ABC@reason_123")
+
+        fake_response = {
+            "id": "x",
+            "model": "claude-sonnet-4.6",
+            "content": [thinking_block],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 0, "output_tokens": 0},
+        }
+        round_tripped = format_translation.anthropic_response_to_responses(fake_response)
+        self.assertEqual(round_tripped["output"][0]["id"], "reason_123")
         self.assertEqual(round_tripped["output"][0]["encrypted_content"], "ABC")
 
 

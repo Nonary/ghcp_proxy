@@ -470,6 +470,62 @@ class NativeMessagesBridgeTests(unittest.TestCase):
         self.assertEqual(plan.header_kind, "messages")
         self.assertEqual(plan.caller_protocol, "responses")
 
+    def test_responses_to_messages_preserves_prompt_cache_with_cache_control(self):
+        planner = self._planner("claude-opus-4.6", supports=True)
+        body = {
+            "model": "gpt-5.3-codex",
+            "prompt_cache_key": "session-123",
+            "instructions": "system prompt",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "hello"}],
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "hi"}],
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "again"}],
+                },
+            ],
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "read",
+                    "description": "Read a file",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+                {
+                    "type": "function",
+                    "name": "mcp__ide__executeCode",
+                    "description": "Execute code",
+                    "parameters": {"type": "object", "properties": {}},
+                }
+            ],
+        }
+
+        plan = proxy.asyncio.run(
+            planner.plan("responses", body, api_base="https://example.invalid", api_key="k")
+        )
+
+        self.assertEqual(plan.strategy_name, "responses_to_messages")
+        self.assertEqual([tool["name"] for tool in plan.upstream_body["tools"]], ["read"])
+        self.assertEqual(plan.upstream_body["system"][0]["cache_control"], {"type": "ephemeral"})
+        self.assertEqual(plan.upstream_body["tools"][0]["cache_control"], {"type": "ephemeral"})
+        self.assertEqual(
+            plan.upstream_body["messages"][-2]["content"][-1]["cache_control"],
+            {"type": "ephemeral"},
+        )
+        self.assertEqual(
+            plan.upstream_body["messages"][-1]["content"][-1]["cache_control"],
+            {"type": "ephemeral"},
+        )
+
     def test_responses_to_messages_does_not_match_for_gpt5_target(self):
         planner = self._planner("gpt-5", supports=True)
         body = {"model": "gpt-5", "input": "hi", "stream": False}
