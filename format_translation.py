@@ -631,7 +631,12 @@ def _responses_tool_choice_targets_removed_tool(tool_choice, removed_types: set[
     return False
 
 
-def sanitize_responses_body_for_copilot(body: dict) -> dict:
+def _append_sanitizer_diagnostic(diagnostics: list[dict] | None, diagnostic: dict) -> None:
+    if isinstance(diagnostics, list):
+        diagnostics.append(diagnostic)
+
+
+def sanitize_responses_body_for_copilot(body: dict, *, diagnostics: list[dict] | None = None) -> dict:
     """Strip top-level Responses-API fields that Copilot's upstream rejects.
 
     Codex sends fields such as ``service_tier`` (``priority``/``flex``) that
@@ -645,6 +650,14 @@ def sanitize_responses_body_for_copilot(body: dict) -> dict:
     if not removed:
         return body
     sanitized = {k: v for k, v in body.items() if k not in _COPILOT_UNSUPPORTED_RESPONSES_BODY_KEYS}
+    _append_sanitizer_diagnostic(
+        diagnostics,
+        {
+            "kind": "responses_body",
+            "action": "drop_unsupported_fields",
+            "fields": sorted(removed),
+        },
+    )
     print(
         f"Responses proxy dropped Copilot-unsupported fields: {', '.join(sorted(removed))}",
         flush=True,
@@ -652,10 +665,155 @@ def sanitize_responses_body_for_copilot(body: dict) -> dict:
     return sanitized
 
 
-def sanitize_responses_tools_for_copilot(body: dict) -> dict:
+_TOOL_SEARCH_TOOL_NAMES = {"tool_search", "tools.tool_search"}
+
+
+def _responses_tool_name(tool: dict) -> str | None:
+    name = tool.get("name")
+    if isinstance(name, str) and name.strip():
+        return name.strip()
+    function = tool.get("function") if isinstance(tool.get("function"), dict) else None
+    if isinstance(function, dict):
+        name = function.get("name")
+        if isinstance(name, str) and name.strip():
+            return name.strip()
+    return None
+
+
+def _responses_tool_is_tool_search(tool: dict) -> bool:
+    tool_type = str(tool.get("type", "")).strip().lower()
+    if tool_type == "tool_search":
+        return True
+    if "tool_search" in tool:
+        return True
+    name = _responses_tool_name(tool)
+    if not isinstance(name, str):
+        return False
+    normalized = name.strip().lower()
+    return normalized in _TOOL_SEARCH_TOOL_NAMES or normalized.endswith("__tool_search")
+
+
+def responses_tools_have_tool_search(tools) -> bool:
+    """Return whether a Responses ``tools`` tree exposes a tool-search tool.
+
+    Recent Codex clients can mark tools as ``defer_loading``. GitHub Copilot's
+    Responses endpoint rejects deferred tools unless the request also includes
+    the companion ``tool_search`` loader. Tool definitions can be nested under
+    namespace tools, so this check intentionally walks the whole tool tree.
+    """
+    if isinstance(tools, list):
+        return any(responses_tools_have_tool_search(tool) for tool in tools)
+    if not isinstance(tools, dict):
+        return False
+    if _responses_tool_is_tool_search(tools):
+        return True
+    nested = tools.get("tools")
+    if isinstance(nested, (list, dict)):
+        return responses_tools_have_tool_search(nested)
+    return False
+
+
+def _strip_responses_defer_loading_fields(node, *, path: str, removed: list[dict]):
+    if isinstance(node, list):
+        changed = False
+        new_items = []
+        for index, item in enumerate(node):
+            new_item, item_changed = _strip_responses_defer_loading_fields(
+                item,
+                path=f"{path}[{index}]",
+                removed=removed,
+            )
+            changed = changed or item_changed
+            new_items.append(new_item)
+        return (new_items if changed else node), changed
+
+    if not isinstance(node, dict):
+        return node, False
+
+    changed = False
+    new_node = None
+    if "defer_loading" in node:
+        new_node = dict(node)
+        removed_value = new_node.pop("defer_loading", None)
+        removed.append(
+            {
+                "path": path,
+                "name": _responses_tool_name(node),
+                "type": node.get("type"),
+                "value": removed_value,
+            }
+        )
+        changed = True
+
+    current = new_node if new_node is not None else node
+    nested = current.get("tools")
+    if isinstance(nested, (list, dict)):
+        new_nested, nested_changed = _strip_responses_defer_loading_fields(
+            nested,
+            path=f"{path}.tools",
+            removed=removed,
+        )
+        if nested_changed:
+            if new_node is None:
+                new_node = dict(node)
+            new_node["tools"] = new_nested
+            changed = True
+
+    return (new_node if changed and new_node is not None else node), changed
+
+
+def _strip_invalid_responses_defer_loading(body: dict, *, diagnostics: list[dict] | None = None) -> dict:
+    tools = body.get("tools")
+    if not isinstance(tools, (list, dict)):
+        return body
+    if responses_tools_have_tool_search(tools):
+        return body
+
+    removed: list[dict] = []
+    sanitized_tools, changed = _strip_responses_defer_loading_fields(
+        tools,
+        path="tools",
+        removed=removed,
+    )
+    if not changed:
+        return body
+
+    sanitized = dict(body)
+    sanitized["tools"] = sanitized_tools
+    tool_names = [
+        str(item.get("name"))
+        for item in removed
+        if isinstance(item.get("name"), str) and item.get("name")
+    ]
+    _append_sanitizer_diagnostic(
+        diagnostics,
+        {
+            "kind": "responses_tools",
+            "action": "strip_defer_loading",
+            "reason": "deferred_tools_require_tool_search",
+            "count": len(removed),
+            "tool_names": tool_names[:20],
+            "tools": removed[:20],
+            "truncated": len(removed) > 20,
+        },
+    )
+    print(
+        "Responses proxy stripped defer_loading from "
+        f"{len(removed)} tool definition(s) because tool_search was absent",
+        flush=True,
+    )
+    return sanitized
+
+
+def sanitize_responses_tools_for_copilot(body: dict, *, diagnostics: list[dict] | None = None) -> dict:
     if not isinstance(body, dict):
         return body
 
+    tools = body.get("tools")
+    if not isinstance(tools, (list, dict)):
+        return body
+
+    body = _strip_invalid_responses_defer_loading(body, diagnostics=diagnostics)
     tools = body.get("tools")
     if not isinstance(tools, list):
         return body
@@ -697,6 +855,15 @@ def sanitize_responses_tools_for_copilot(body: dict) -> dict:
     ):
         sanitized.pop("tool_choice", None)
 
+    _append_sanitizer_diagnostic(
+        diagnostics,
+        {
+            "kind": "responses_tools",
+            "action": "drop_unsupported_tool_types",
+            "tool_types": sorted(removed_types),
+            "tool_names": sorted(removed_names),
+        },
+    )
     return sanitized
 
 

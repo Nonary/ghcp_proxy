@@ -502,6 +502,83 @@ class FormatTranslationTests(unittest.TestCase):
         self.assertTrue(compact_request["stream"])
         self.assertFalse(compact_request["store"])
 
+    def test_sanitize_responses_tools_strips_defer_loading_without_tool_search(self):
+        diagnostics = []
+        body = {
+            "model": "gpt-5.5",
+            "input": "hello",
+            "tools": [
+                {
+                    "type": "namespace",
+                    "name": "codex_app",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "automation_update",
+                            "defer_loading": True,
+                            "parameters": {"type": "object", "properties": {}},
+                        }
+                    ],
+                }
+            ],
+        }
+
+        sanitized = format_translation.sanitize_responses_tools_for_copilot(
+            body,
+            diagnostics=diagnostics,
+        )
+
+        self.assertIsNot(sanitized, body)
+        nested_tool = sanitized["tools"][0]["tools"][0]
+        self.assertNotIn("defer_loading", nested_tool)
+        self.assertEqual(nested_tool["name"], "automation_update")
+        self.assertEqual(
+            diagnostics,
+            [
+                {
+                    "kind": "responses_tools",
+                    "action": "strip_defer_loading",
+                    "reason": "deferred_tools_require_tool_search",
+                    "count": 1,
+                    "tool_names": ["automation_update"],
+                    "tools": [
+                        {
+                            "path": "tools[0].tools[0]",
+                            "name": "automation_update",
+                            "type": "function",
+                            "value": True,
+                        }
+                    ],
+                    "truncated": False,
+                }
+            ],
+        )
+
+    def test_sanitize_responses_tools_keeps_defer_loading_with_tool_search(self):
+        body = {
+            "model": "gpt-5.5",
+            "input": "hello",
+            "tools": [
+                {"type": "function", "name": "tool_search", "parameters": {"type": "object", "properties": {}}},
+                {
+                    "type": "namespace",
+                    "name": "codex_app",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "automation_update",
+                            "defer_loading": True,
+                        }
+                    ],
+                },
+            ],
+        }
+
+        sanitized = format_translation.sanitize_responses_tools_for_copilot(body)
+
+        self.assertIs(sanitized, body)
+        self.assertTrue(sanitized["tools"][1]["tools"][0]["defer_loading"])
+
     def test_build_fake_compaction_request_keeps_tools_with_none_choice_for_claude_models(self):
         body = {
             "model": "claude-opus-4.6",

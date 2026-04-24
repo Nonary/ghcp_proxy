@@ -991,6 +991,81 @@ class ProxyRoutesTests(unittest.TestCase):
         self.assertEqual(response_payload["id"], "resp_123")
         self.assertEqual(response_payload["output"][0]["content"][0]["text"], "summary")
 
+    def test_responses_compact_strips_invalid_deferred_tools_and_traces_diagnostic(self):
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/responses/compact"),
+            method="POST",
+            headers={},
+        )
+        body = {
+            "model": "gpt-5.4",
+            "stream": False,
+            "tools": [
+                {
+                    "type": "namespace",
+                    "name": "codex_app",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "automation_update",
+                            "defer_loading": True,
+                        }
+                    ],
+                }
+            ],
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "hello"}],
+                }
+            ],
+        }
+        upstream = httpx.Response(
+            200,
+            json={
+                "id": "resp_123",
+                "model": "gpt-5.4",
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "summary"}],
+                    }
+                ],
+                "usage": {"input_tokens": 24, "output_tokens": 5, "total_tokens": 29},
+            },
+            headers={"content-type": "application/json"},
+        )
+
+        with (
+            mock.patch.object(proxy, "parse_json_request", mock.AsyncMock(return_value=body)),
+            mock.patch.object(auth, "get_api_key", return_value="test-key"),
+            mock.patch.object(auth, "get_api_base", return_value="https://example.invalid"),
+            mock.patch.object(proxy.model_routing_config_service, "resolve_target_model", return_value="gpt-5.4"),
+            mock.patch.object(proxy.usage_tracker, "start_event", return_value=None),
+            mock.patch.object(proxy.usage_tracker, "finish_event"),
+            mock.patch.object(proxy, "_append_request_trace") as append_trace,
+            mock.patch.object(proxy, "throttled_client_post", mock.AsyncMock(return_value=upstream)) as post,
+        ):
+            response = proxy.asyncio.run(proxy.responses_compact(request))
+
+        forwarded_body = post.await_args.kwargs["json"]
+        self.assertNotIn("defer_loading", forwarded_body["tools"][0]["tools"][0])
+        self.assertEqual(response.status_code, 200)
+
+        request_started = next(
+            call.args[0]
+            for call in append_trace.call_args_list
+            if call.args and call.args[0].get("event") == "request_started"
+        )
+        self.assertEqual(request_started["request_body"]["deferred_tool_count"], 1)
+        self.assertNotIn("deferred_tool_count", request_started["upstream_body"])
+        diagnostics = request_started["trace"]["sanitizer_diagnostics"]
+        self.assertEqual(diagnostics[0]["action"], "strip_defer_loading")
+        self.assertEqual(diagnostics[0]["count"], 1)
+        self.assertEqual(diagnostics[0]["tools"][0]["path"], "tools[0].tools[0]")
+
     def test_responses_compact_wraps_chat_summary_for_translated_model(self):
         request = SimpleNamespace(
             url=SimpleNamespace(path="/v1/responses/compact"),

@@ -81,6 +81,36 @@ class ProtocolBridgePlannerTests(unittest.TestCase):
         self.assertEqual(plan.strategy_name, "responses_to_responses")
         self.assertNotIn("service_tier", plan.upstream_body)
 
+    def test_planner_strips_invalid_deferred_tools_for_native_responses(self):
+        planner = ProtocolBridgePlanner(_RoutingConfigStub())
+        body = {
+            "model": "gpt-5.5",
+            "input": "hello",
+            "stream": False,
+            "tools": [
+                {
+                    "type": "namespace",
+                    "name": "codex_app",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "automation_update",
+                            "defer_loading": True,
+                        }
+                    ],
+                }
+            ],
+        }
+
+        plan = proxy.asyncio.run(
+            planner.plan("responses", body, api_base="https://example.invalid", api_key="test-key", is_compact=True)
+        )
+
+        self.assertEqual(plan.strategy_name, "responses_to_responses")
+        self.assertNotIn("defer_loading", plan.upstream_body["tools"][0]["tools"][0])
+        self.assertEqual(plan.diagnostics[0]["action"], "strip_defer_loading")
+        self.assertEqual(plan.diagnostics[0]["reason"], "deferred_tools_require_tool_search")
+
     def test_planner_selects_responses_to_chat_strategy_when_mapping_targets_claude(self):
         planner = ProtocolBridgePlanner(_RoutingConfigStub("claude-opus-4.6"))
         body = {

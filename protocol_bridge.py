@@ -100,6 +100,7 @@ class BridgeExecutionPlan:
     upstream_body: dict
     stream: bool
     is_compact: bool = False
+    diagnostics: tuple[dict, ...] = ()
 
     @property
     def upstream_path(self) -> str:
@@ -156,6 +157,7 @@ class ResponsesToResponsesStrategy(ProtocolBridgeStrategy):
 
     async def build_plan(self, body: dict, *, requested_model, resolved_model, api_base, api_key, is_compact=False) -> BridgeExecutionPlan:
         del api_base, api_key
+        diagnostics: list[dict] = []
         upstream_body = dict(body)
         upstream_body["model"] = resolved_model
         incoming_reasoning = upstream_body.get("reasoning")
@@ -165,8 +167,14 @@ class ResponsesToResponsesStrategy(ProtocolBridgeStrategy):
             )
             if mapped_effort is not None:
                 upstream_body["reasoning"] = {**incoming_reasoning, "effort": mapped_effort}
-        upstream_body = format_translation.sanitize_responses_tools_for_copilot(upstream_body)
-        upstream_body = format_translation.sanitize_responses_body_for_copilot(upstream_body)
+        upstream_body = format_translation.sanitize_responses_tools_for_copilot(
+            upstream_body,
+            diagnostics=diagnostics,
+        )
+        upstream_body = format_translation.sanitize_responses_body_for_copilot(
+            upstream_body,
+            diagnostics=diagnostics,
+        )
         return BridgeExecutionPlan(
             strategy_name=self.strategy_name,
             inbound_protocol=self.inbound_protocol,
@@ -178,6 +186,7 @@ class ResponsesToResponsesStrategy(ProtocolBridgeStrategy):
             upstream_body=upstream_body,
             stream=bool(upstream_body.get("stream", False)),
             is_compact=is_compact,
+            diagnostics=tuple(diagnostics),
         )
 
 

@@ -557,6 +557,18 @@ def _trace_input_summary(input_value) -> dict:
     }
 
 
+def _trace_tools_deferred_count(tools) -> int:
+    if isinstance(tools, list):
+        return sum(_trace_tools_deferred_count(tool) for tool in tools)
+    if not isinstance(tools, dict):
+        return 0
+    count = 1 if "defer_loading" in tools else 0
+    nested = tools.get("tools")
+    if isinstance(nested, (list, dict)):
+        count += _trace_tools_deferred_count(nested)
+    return count
+
+
 def _trace_body_summary(body: dict | None) -> dict | None:
     if not isinstance(body, dict):
         return None
@@ -601,6 +613,17 @@ def _trace_body_summary(body: dict | None) -> dict | None:
     tools = body.get("tools")
     if isinstance(tools, list):
         summary["tool_count"] = len(tools)
+        deferred_tool_count = _trace_tools_deferred_count(tools)
+        if deferred_tool_count:
+            summary["deferred_tool_count"] = deferred_tool_count
+        if format_translation.responses_tools_have_tool_search(tools):
+            summary["tool_search_present"] = True
+    elif isinstance(tools, dict):
+        deferred_tool_count = _trace_tools_deferred_count(tools)
+        if deferred_tool_count:
+            summary["deferred_tool_count"] = deferred_tool_count
+        if format_translation.responses_tools_have_tool_search(tools):
+            summary["tool_search_present"] = True
 
     if "input" in body:
         summary["input"] = _trace_input_summary(body.get("input"))
@@ -1227,6 +1250,16 @@ def _prepare_bridge_request(
 ) -> tuple[UpstreamRequestPlan | None, Response | None]:
     upstream_url = f"{api_base.rstrip('/')}{bridge_plan.upstream_path}"
     verdict_sink: dict = {}
+    trace_metadata = {
+        "bridge": True,
+        "strategy_name": bridge_plan.strategy_name,
+        "caller_protocol": bridge_plan.caller_protocol,
+        "upstream_protocol": bridge_plan.upstream_protocol,
+        "header_kind": bridge_plan.header_kind,
+        "initiator_verdict": verdict_sink,
+    }
+    if bridge_plan.diagnostics:
+        trace_metadata["sanitizer_diagnostics"] = list(bridge_plan.diagnostics)
     return _prepare_upstream_request(
         request,
         body=bridge_plan.upstream_body,
@@ -1246,14 +1279,7 @@ def _prepare_bridge_request(
         error_response=_bridge_error_response(bridge_plan),
         api_key=api_key,
         source_body=original_body,
-        trace_metadata={
-            "bridge": True,
-            "strategy_name": bridge_plan.strategy_name,
-            "caller_protocol": bridge_plan.caller_protocol,
-            "upstream_protocol": bridge_plan.upstream_protocol,
-            "header_kind": bridge_plan.header_kind,
-            "initiator_verdict": verdict_sink,
-        },
+        trace_metadata=trace_metadata,
     )
 
 
