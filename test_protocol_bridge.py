@@ -550,5 +550,59 @@ class NativeMessagesBridgeTests(unittest.TestCase):
         )
         self.assertEqual(plan.upstream_path, "/v1/messages")
 
+
+class ProxyNativeMessagesCapabilityTests(unittest.TestCase):
+    def setUp(self):
+        self._clear_capability_cache()
+
+    def tearDown(self):
+        self._clear_capability_cache()
+
+    def _clear_capability_cache(self):
+        cache = getattr(proxy, "_COPILOT_MODEL_CAPS_CACHE", None)
+        if isinstance(cache, dict):
+            cache.clear()
+
+    def test_proxy_native_messages_supports_opus_47_without_models_cache(self):
+        self.assertTrue(proxy.model_supports_native_messages("claude-opus-4.7"))
+
+    def test_proxy_native_messages_allowlist_overrides_stale_negative_cache(self):
+        cache = getattr(proxy, "_COPILOT_MODEL_CAPS_CACHE", None)
+        self.assertIsInstance(cache, dict)
+        cache.update(
+            {
+                "key": "https://example.invalid",
+                "data": {
+                    "claude-opus-4.7": {
+                        "messages_endpoint_supported": False,
+                        "supported_endpoints": ["/chat/completions"],
+                    }
+                },
+            }
+        )
+
+        self.assertTrue(proxy.model_supports_native_messages("claude-opus-4.7"))
+
+    def test_runtime_planner_prefers_messages_bridge_for_opus_47_responses(self):
+        planner = ProtocolBridgePlanner(
+            _RoutingConfigStub("claude-opus-4.7"),
+            capability_resolver=lambda model: proxy.model_supports_native_messages(model) if model else False,
+        )
+        body = {
+            "model": "gpt-5.3-codex",
+            "input": [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hello"}]}
+            ],
+            "stream": False,
+        }
+
+        plan = proxy.asyncio.run(
+            planner.plan("responses", body, api_base="https://example.invalid", api_key="test-key")
+        )
+
+        self.assertEqual(plan.strategy_name, "responses_to_messages")
+        self.assertEqual(plan.upstream_path, "/v1/messages")
+        self.assertEqual(plan.header_kind, "messages")
+
 if __name__ == "__main__":
     unittest.main()

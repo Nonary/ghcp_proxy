@@ -2131,32 +2131,41 @@ def fetch_copilot_model_capabilities() -> dict[str, dict]:
     return dict(result)
 
 
-# Models known to natively support Anthropic /v1/messages upstream when the
-# Copilot capability cache is empty/stale (e.g. during tests, or before the
-# first /models fetch lands). Case-insensitive prefix match.
+# Models known to natively support Anthropic /v1/messages upstream. This is a
+# safety net for empty/stale capability caches and for cache records that lag
+# newly exposed Claude endpoints. Case-insensitive prefix match.
 _NATIVE_MESSAGES_FALLBACK_ALLOWLIST = frozenset({
     "claude-sonnet-4.5", "claude-sonnet-4.6",
-    "claude-opus-4.5", "claude-opus-4.6",
+    "claude-opus-4.5", "claude-opus-4.6", "claude-opus-4.7",
     "claude-haiku-4.5",
 })
 
 
 def model_supports_native_messages(model: str) -> bool:
     """Returns True when `model` advertises `/v1/messages` in the Copilot
-    `/models` capability cache, or — when the cache is empty/stale — matches
-    the offline-dev fallback allowlist by case-insensitive prefix.
+    `/models` capability cache, or matches the known-native fallback allowlist
+    by case-insensitive prefix.
+
+    The allowlist is intentionally consulted even when the capability cache has
+    a stale/negative record. Routing known Claude models through the chat bridge
+    loses native Messages thinking/tool semantics and can leave Codex with a
+    reasoning-only turn followed by an invisible/stalled tool call.
     """
     if not isinstance(model, str) or not model:
         return False
+
+    candidate = model.lower()
+    if candidate.startswith("anthropic/"):
+        candidate = candidate.split("/", 1)[1]
 
     with _COPILOT_MODEL_CAPS_LOCK:
         cache = _COPILOT_MODEL_CAPS_CACHE
         data = cache.get("data") if isinstance(cache, dict) else None
         record = data.get(model) if isinstance(data, dict) and data else None
         if isinstance(record, dict):
-            return bool(record.get("messages_endpoint_supported"))
+            if bool(record.get("messages_endpoint_supported")):
+                return True
 
-    candidate = model.lower()
     for entry in _NATIVE_MESSAGES_FALLBACK_ALLOWLIST:
         if candidate.startswith(entry.lower()):
             return True
