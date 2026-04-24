@@ -1294,8 +1294,10 @@ def _build_recent_burn_buckets(
         smooth the estimate without mechanically increasing the reported burn.
 
     The only live value mixed into this block is latest remaining percent, which
-    powers the session-limit prediction. The reported burn, tokens, and model
-    rows are all historical averages.
+    powers the session-limit prediction. The reported overall burn/tokens are
+    historical averages across non-empty periods. Per-model rows are averaged
+    across periods where that model was active, so a newly-used or rarely-used
+    model is not diluted by unrelated periods where other models were active.
     """
     if now is None:
         now = utc_now()
@@ -1415,15 +1417,16 @@ def _build_recent_burn_buckets(
 
         models_out = []
         for bucket in per_model_totals.values():
+            model_divisor = int(bucket.get("active_periods") or 0) or divisor
             models_out.append({
                 "model": bucket["model"],
-                "requests": round((bucket["requests"] / divisor) * normalize_to_reporting_window, 2),
-                "delta_percent": round((bucket["delta_percent"] / divisor) * normalize_to_reporting_window, 4),
-                "input_tokens": round((bucket["input_tokens"] / divisor) * normalize_to_reporting_window, 2),
-                "cached_input_tokens": round((bucket["cached_input_tokens"] / divisor) * normalize_to_reporting_window, 2),
-                "output_tokens": round((bucket["output_tokens"] / divisor) * normalize_to_reporting_window, 2),
-                "billable_tokens": round((bucket["billable_tokens"] / divisor) * normalize_to_reporting_window, 2),
-                "duration_ms": round((bucket["duration_ms"] / divisor) * normalize_to_reporting_window, 2),
+                "requests": round((bucket["requests"] / model_divisor) * normalize_to_reporting_window, 2),
+                "delta_percent": round((bucket["delta_percent"] / model_divisor) * normalize_to_reporting_window, 4),
+                "input_tokens": round((bucket["input_tokens"] / model_divisor) * normalize_to_reporting_window, 2),
+                "cached_input_tokens": round((bucket["cached_input_tokens"] / model_divisor) * normalize_to_reporting_window, 2),
+                "output_tokens": round((bucket["output_tokens"] / model_divisor) * normalize_to_reporting_window, 2),
+                "billable_tokens": round((bucket["billable_tokens"] / model_divisor) * normalize_to_reporting_window, 2),
+                "duration_ms": round((bucket["duration_ms"] / model_divisor) * normalize_to_reporting_window, 2),
                 "last_finished_at": bucket["last_finished_at"],
                 "periods_observed": period_count,
                 "active_periods": bucket["active_periods"],

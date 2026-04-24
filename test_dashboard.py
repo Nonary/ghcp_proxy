@@ -782,11 +782,37 @@ class DashboardTests(unittest.TestCase):
         self.assertAlmostEqual(bucket["avg_delta_percent_per_minute"], 0.083333, places=6)
         self.assertAlmostEqual(bucket["request_count"], 1.0, places=2)
         self.assertAlmostEqual(bucket["totals"]["billable_tokens"], 2_000.0, places=2)
-        self.assertAlmostEqual(models["gpt-5-mini"]["delta_percent"], 1.0, places=4)
-        self.assertAlmostEqual(models["gpt-5-mini"]["requests"], 0.5, places=2)
+        self.assertAlmostEqual(models["gpt-5-mini"]["delta_percent"], 2.0, places=4)
+        self.assertAlmostEqual(models["gpt-5-mini"]["requests"], 1.0, places=2)
         self.assertEqual(models["gpt-5-mini"]["active_periods"], 1)
-        self.assertAlmostEqual(models["claude-opus-4.7"]["delta_percent"], 1.5, places=4)
-        self.assertAlmostEqual(models["claude-opus-4.7"]["requests"], 0.5, places=2)
+        self.assertAlmostEqual(models["claude-opus-4.7"]["delta_percent"], 3.0, places=4)
+        self.assertAlmostEqual(models["claude-opus-4.7"]["requests"], 1.0, places=2)
+
+    def test_burn_rate_model_rows_average_only_when_model_is_active(self):
+        reset = "2026-04-21T18:00:00Z"
+        events = [
+            self._burn_event("2026-04-21T09:00:00+00:00", "gpt-5-mini", 0.0, reset),
+            self._burn_event("2026-04-21T09:05:00+00:00", "gpt-5-mini", 2.0, reset, input_tokens=1_000),
+            self._burn_event("2026-04-21T10:00:00+00:00", "gpt-5.5", 2.0, reset),
+            self._burn_event("2026-04-21T10:05:00+00:00", "gpt-5.5", 8.0, reset, input_tokens=3_000),
+        ]
+
+        burn = dashboard._build_burn_rate_summary(events)
+        bucket = next(b for b in burn["session"]["time_buckets"]["buckets"] if b["minutes"] == 30)
+        models = {row["model"]: row for row in bucket["models"]}
+
+        # Overall is still the historical average of non-empty 30m periods:
+        # (2% + 6%) / 2 = 4%.
+        self.assertEqual(bucket["periods_observed"], 2)
+        self.assertAlmostEqual(bucket["totals"]["delta_percent"], 4.0, places=4)
+
+        # Each model row represents "a 30m period when this model is in use",
+        # not "this model averaged over every period where anything was used".
+        self.assertEqual(models["gpt-5-mini"]["active_periods"], 1)
+        self.assertEqual(models["gpt-5.5"]["active_periods"], 1)
+        self.assertAlmostEqual(models["gpt-5-mini"]["delta_percent"], 2.0, places=4)
+        self.assertAlmostEqual(models["gpt-5.5"]["delta_percent"], 6.0, places=4)
+        self.assertAlmostEqual(models["gpt-5.5"]["requests"], 1.0, places=2)
 
     def test_burn_rate_larger_buckets_normalize_to_same_30m_equivalent(self):
         reset = "2026-04-21T18:00:00Z"

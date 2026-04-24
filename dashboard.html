@@ -318,6 +318,17 @@
       font-size: 0.76rem; color: var(--muted); margin-top: 6px;
     }
     .rl-stats .ok { color: var(--text); }
+    .rl-live {
+      display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px;
+      margin-top: 8px;
+    }
+    .rl-live-chip {
+      border: 1px solid var(--line); border-radius: 9px;
+      background: rgba(255,255,255,0.025); padding: 7px 8px;
+    }
+    .rl-live-k { color: var(--muted-2); font-size: 0.64rem; text-transform: uppercase; letter-spacing: 0.09em; }
+    .rl-live-v { color: var(--text); font-weight: 700; font-size: 0.9rem; margin-top: 2px; }
+    .rl-live-sub { color: var(--muted); font-size: 0.68rem; margin-top: 1px; }
 
     /* Limit impact card */
     .li-window {
@@ -1392,6 +1403,18 @@
                       <span class="ok">{{ row.percentLabel }} remaining</span>
                       <span>used {{ row.usedLabel }}</span>
                     </div>
+                    <div class="rl-live">
+                      <div class="rl-live-chip">
+                        <div class="rl-live-k">Current burn</div>
+                        <div class="rl-live-v">{{ row.currentBurnLabel }}</div>
+                        <div class="rl-live-sub">{{ row.currentBurnSubLabel }}</div>
+                      </div>
+                      <div class="rl-live-chip">
+                        <div class="rl-live-k">30m projection</div>
+                        <div class="rl-live-v">{{ row.projected30mBurnLabel }}</div>
+                        <div class="rl-live-sub">{{ row.projected30mBurnSubLabel }}</div>
+                      </div>
+                    </div>
                     <div class="rl-sub">{{ row.resetLabel }}</div>
                   </div>
                 </div>
@@ -2147,7 +2170,7 @@
                 <select v-model="rl2YAxis"><option value="pct">% / min</option><option value="tok">tokens / min</option></select>
               </div>
             </div>
-            <div class="rl2-section-title" style="margin-top:-6px;"><span class="sub">Average burn rate over time. Lower is better.</span></div>
+            <div class="rl2-section-title" style="margin-top:-6px;"><span class="sub">Actual burn rate over the last 30 minutes. Lower is better.</span></div>
             <svg class="rl2-line" :viewBox="`0 0 ${rl2BurnLine.viewW} ${rl2BurnLine.viewH}`" preserveAspectRatio="none">
               <g>
                 <line v-for="g in rl2BurnLine.gridLines" :key="g.y" class="grid" :x1="0" :x2="rl2BurnLine.viewW" :y1="g.y" :y2="g.y"/>
@@ -3737,7 +3760,10 @@
           for (const [key, value] of Object.entries(windows)) {
             if (!seen.has(key)) ordered.push([key, value]);
           }
-          return ordered.map(([key, value]) => this._buildRatelimitRow(key, value));
+          return ordered.map(([key, value]) => {
+            const row = this._buildRatelimitRow(key, value);
+            return { ...row, ...this._buildCurrentBurnSnapshot(key) };
+          });
         },
         usageRatelimitBurnWindows() {
           const burn = (this.usageRatelimits && this.usageRatelimits.burn_rate) || {};
@@ -4036,23 +4062,18 @@
           const burn = (this.usageRatelimits && this.usageRatelimits.burn_rate) || {};
           const viewW = 600, viewH = 180;
           const padL = 32, padR = 8, padT = 8, padB = 18;
-          // Build a historical per-minute series by binning all timeline segments
-          // into evenly sized slots across the observed history.
+          // Build an actual per-minute series for the last 30 minutes. The
+          // summary cards intentionally use historical bucket averages, but the
+          // line chart should show the current trailing-window burn and must not
+          // stretch older history across the chart.
           const N = 48;
+          const chartWindowMs = 30 * 60 * 1000;
 
           const metric = this.rl2YAxis === 'tok' ? 'tok' : 'pct';
-          const timelines = ['session', 'weekly'].flatMap((key) => {
-            const tb = burn[key] && burn[key].time_buckets;
-            return Array.isArray(tb && tb.timeline) ? tb.timeline : [];
-          });
-          const times = timelines.map((seg) => {
-            const t = seg && seg.finished_at ? new Date(seg.finished_at).getTime() : NaN;
-            return Number.isFinite(t) ? t : null;
-          }).filter((t) => t != null);
-          const maxMs = times.length ? Math.max(...times) : Date.now();
-          const minMs = times.length ? Math.min(...times) : maxMs - 30 * 60 * 1000;
-          const spanMs = Math.max(30 * 60 * 1000, maxMs - minMs);
-          const slotMs = spanMs / N;
+          const snapshotMs = Date.parse((this.data && this.data.generated_at) || '');
+          const maxMs = Number.isFinite(snapshotMs) ? snapshotMs : Date.now();
+          const minMs = maxMs - chartWindowMs;
+          const slotMs = chartWindowMs / N;
 
           const buildSeries = (winKey) => {
             const w = burn[winKey];
@@ -4061,7 +4082,6 @@
             const timeline = Array.isArray(tb.timeline) ? tb.timeline : [];
             if (!timeline.length) return null;
             const samples = new Array(N).fill(0);
-            const counts = new Array(N).fill(0);
             for (const seg of timeline) {
               const ts = seg && seg.finished_at;
               if (!ts) continue;
@@ -4073,7 +4093,6 @@
                 ? Math.max(0, Number(seg.billable_tokens) || 0)
                 : Math.max(0, Number(seg.delta_percent) || 0);
               samples[slot] += value;
-              counts[slot] += 1;
             }
             // Convert per-slot totals into the selected per-minute rate.
             const slotMinutes = slotMs / 60000;
@@ -4082,18 +4101,8 @@
 
           const session = buildSeries('session');
           const weekly = buildSeries('weekly');
-          // Light smoothing (3-point moving average) to avoid spiky artifacts.
-          const smooth = (arr) => {
-            if (!arr) return null;
-            return arr.map((_, i) => {
-              const a = arr[Math.max(0, i - 1)];
-              const b = arr[i];
-              const c = arr[Math.min(arr.length - 1, i + 1)];
-              return (a + b + c) / 3;
-            });
-          };
-          const sSession = smooth(session);
-          const sWeekly = smooth(weekly);
+          const sSession = session;
+          const sWeekly = weekly;
 
           const all = [].concat(sSession || [], sWeekly || []);
           let maxY = Math.max(0.3, ...(all.length ? all : [0.3]));
@@ -4122,7 +4131,7 @@
           for (let k = 0; k < labelCount; k++) {
             const frac = k / (labelCount - 1);
             const x = padL + frac * (viewW - padL - padR);
-            const d = new Date(minMs + spanMs * frac);
+            const d = new Date(minMs + chartWindowMs * frac);
             let label = '';
             try { label = d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }); } catch (_) {}
             xLabels.push({ x, label });
@@ -5213,6 +5222,64 @@
             percentUsed,
             secondsUntilReset: this._asRatelimitNumber(value && value.seconds_until_reset),
             resetAt: (value && value.reset_at) || null,
+          };
+        },
+        _trailingBurnStats(winKey, minutes) {
+          const burn = (this.usageRatelimits && this.usageRatelimits.burn_rate) || {};
+          const win = burn[winKey] || {};
+          const tb = win.time_buckets || {};
+          const timeline = Array.isArray(tb.timeline) ? tb.timeline : [];
+          const windowMinutes = Number(minutes) || 5;
+          const snapshotMs = Date.parse((this.data && this.data.generated_at) || '');
+          const maxMs = Number.isFinite(snapshotMs) ? snapshotMs : Date.now();
+          const minMs = maxMs - windowMinutes * 60 * 1000;
+          let deltaPercent = 0;
+          let billableTokens = 0;
+          let requests = 0;
+          let latestMs = null;
+          for (const seg of timeline) {
+            const ts = seg && seg.finished_at;
+            if (!ts) continue;
+            const t = new Date(ts).getTime();
+            if (!Number.isFinite(t) || t < minMs || t > maxMs) continue;
+            deltaPercent += Math.max(0, Number(seg.delta_percent) || 0);
+            billableTokens += Math.max(0, Number(seg.billable_tokens) || 0);
+            requests += 1;
+            latestMs = latestMs == null ? t : Math.max(latestMs, t);
+          }
+          return {
+            minutes: windowMinutes,
+            deltaPercent,
+            billableTokens,
+            requests,
+            percentPerMinute: deltaPercent / Math.max(0.0001, windowMinutes),
+            tokensPerMinute: billableTokens / Math.max(0.0001, windowMinutes),
+            latestMs,
+            hasTimeline: timeline.length > 0,
+          };
+        },
+        _buildCurrentBurnSnapshot(winKey) {
+          // Keep the overview card intentionally more reactive than the
+          // historical "when in use" averages: use the last 5 minutes as the
+          // current slope, then project that slope across a 30-minute window.
+          const current = this._trailingBurnStats(winKey, 5);
+          const projected30 = current.percentPerMinute * 30;
+          const projectedTokens = current.tokensPerMinute * 30;
+          const hasHistory = current.hasTimeline;
+          const reqLabel = current.requests === 1 ? '1 req' : `${current.requests} reqs`;
+          const currentSub = hasHistory
+            ? `last 5m · ${reqLabel}`
+            : 'awaiting burn samples';
+          const projectedSub = hasHistory
+            ? `${this.compact(projectedTokens)} tokens if pace holds`
+            : 'needs two shared reset samples';
+          return {
+            currentBurnLabel: hasHistory ? this._rl2FormatBurn(current.percentPerMinute) : '—',
+            currentBurnSubLabel: currentSub,
+            projected30mBurnLabel: hasHistory ? this._formatBurnMixPercent(projected30) : '—',
+            projected30mBurnSubLabel: projectedSub,
+            currentBurnPerMinute: current.percentPerMinute,
+            projected30mBurnPercent: projected30,
           };
         },
         _formatBurnMixPercent(value) {
