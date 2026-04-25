@@ -2005,10 +2005,10 @@
               <article class="detail-block" v-if="selectedRequest.usage">
                 <div class="detail-label">Request Usage</div>
                 <div class="detail-grid">
-                  <div><div class="detail-label">Input Tokens</div><div class="detail-value">{{ compact(selectedRequest.usage.input_tokens) }}</div></div>
+                  <div><div class="detail-label">Input Tokens</div><div class="detail-value">{{ compact(displayInputTokens(selectedRequest.usage)) }}</div></div>
                   <div><div class="detail-label">Output Tokens</div><div class="detail-value">{{ compact(displayOutputTokens(selectedRequest.usage)) }}</div></div>
                   <div><div class="detail-label">Cached Input Tokens</div><div class="detail-value">{{ compact(cachedInputTokens(selectedRequest)) }}</div></div>
-                  <div><div class="detail-label">Total Tokens</div><div class="detail-value">{{ compact(selectedRequest.usage.total_tokens || 0) }}</div></div>
+                  <div><div class="detail-label">Total Tokens</div><div class="detail-value">{{ compact(displayTotalTokens(selectedRequest.usage)) }}</div></div>
                 </div>
               </article>
               <article class="detail-block" v-if="selectedRequest.request_prompt && (selectedRequest.request_prompt.system || selectedRequest.request_prompt.user)">
@@ -3028,6 +3028,32 @@
         visible_output_tokens: output,
         stacked_total_tokens: freshInput + output,
       };
+    }
+
+    function displayInputTokensFromUsage(usage, fallback = 0) {
+      if (!usage || typeof usage !== 'object') return Math.max(0, Number(fallback || 0));
+      const explicitFresh = usage.fresh_input_tokens ?? usage.billable_input_tokens;
+      if (explicitFresh != null) return Math.max(0, Number(explicitFresh) || 0);
+      const input = Math.max(0, Number(usage.input_tokens ?? fallback ?? 0) || 0);
+      const details = usage.input_tokens_details || usage.prompt_tokens_details;
+      const cachedFromRawDetails = details && details.cached_tokens != null
+        ? Math.max(0, Number(details.cached_tokens) || 0)
+        : null;
+      if (cachedFromRawDetails != null) return Math.max(0, input - cachedFromRawDetails);
+      return input;
+    }
+
+    function displayTotalTokensFromUsage(usage) {
+      if (!usage || typeof usage !== 'object') return 0;
+      const input = displayInputTokensFromUsage(usage);
+      const output = Math.max(0, Number(usage.output_tokens || 0));
+      const hasNetInput = usage.fresh_input_tokens != null
+        || usage.billable_input_tokens != null
+        || Boolean((usage.input_tokens_details || usage.prompt_tokens_details)?.cached_tokens != null);
+      if (hasNetInput) return input + output;
+      const total = Number(usage.total_tokens);
+      if (Number.isFinite(total) && total > 0) return total;
+      return input + output;
     }
 
     function mergeUsageRows(rows) {
@@ -5703,9 +5729,9 @@
         modelLabel(models) { return Array.isArray(models) && models.length ? models.join(', ') : '-'; },
         tokenSummary(row) {
           const usage = row?.usage || {};
-          const input = Number(usage.input_tokens || 0);
+          const input = this.displayInputTokens(usage);
           const output = this.displayOutputTokens(usage);
-          const total = Number(usage.total_tokens || (input + output));
+          const total = this.displayTotalTokens(usage);
           if (!Number.isFinite(input) && !Number.isFinite(output) && !Number.isFinite(total)) {
             return '-';
           }
@@ -5723,9 +5749,15 @@
           if (direct != null) return Number(direct);
           const cacheRead = usage.cache_read_input_tokens;
           if (cacheRead != null) return Number(cacheRead);
-          const details = usage.prompt_tokens_details;
+          const details = usage.input_tokens_details || usage.prompt_tokens_details;
           if (details && details.cached_tokens != null) return Number(details.cached_tokens);
           return 0;
+        },
+        displayInputTokens(usage, fallback = 0) {
+          return displayInputTokensFromUsage(usage, fallback);
+        },
+        displayTotalTokens(usage) {
+          return displayTotalTokensFromUsage(usage);
         },
         displayOutputTokens(usage) {
           // Unified output for display: OpenAI separates reasoning from output, Anthropic
@@ -5746,10 +5778,10 @@
           if (!rows.length) return null;
           return rows.reduce((totals, item) => {
             const usage = item?.usage || {};
-            const input = Number(usage.input_tokens || 0);
+            const input = this.displayInputTokens(usage);
             const output = Number(usage.output_tokens || 0);
             const reasoning = Number(usage.reasoning_output_tokens || 0);
-            const total = Number(usage.total_tokens || (input + output));
+            const total = this.displayTotalTokens(usage);
             const cost = Number(item?.cost_usd || 0);
             totals.input_tokens += Number.isFinite(input) ? input : 0;
             totals.output_tokens += Number.isFinite(output) ? output : 0;
@@ -6464,7 +6496,11 @@
         },
         shortTokens(row) {
           const usage = row?.usage || {};
-          const i = Number(usage.input_tokens ?? row?.input_tokens ?? 0);
+          const i = Number(
+            typeof this.displayInputTokens === 'function'
+              ? this.displayInputTokens(usage, row?.input_tokens)
+              : displayInputTokensFromUsage(usage, row?.input_tokens)
+          );
           const o = Number((typeof this.displayOutputTokens === 'function' ? this.displayOutputTokens(usage) : (usage.output_tokens || 0))) ||
                     Number(row?.output_tokens || 0);
           if (!i && !o) return '—';

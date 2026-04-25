@@ -560,6 +560,29 @@ def _new_usage_aggregate_bucket() -> dict:
     }
 
 
+def _usage_display_input_tokens(usage: dict) -> int:
+    """Return the input-token count shown in dashboard rollups.
+
+    OpenAI/Codex response usage keeps ``input_tokens`` in upstream shape
+    (gross input including cached tokens) and carries the old/net presentation
+    value in ``fresh_input_tokens``.  Dashboard rollups should present that net
+    count while leaving the recorded event payload untouched.
+    """
+    fresh_input_tokens = usage.get("fresh_input_tokens")
+    if fresh_input_tokens is None:
+        fresh_input_tokens = usage.get("billable_input_tokens")
+    if fresh_input_tokens is not None:
+        return max(0, _coerce_int(fresh_input_tokens))
+    return max(0, _coerce_int(usage.get("input_tokens")))
+
+
+def _usage_display_total_tokens(usage: dict, *, input_tokens: int, output_tokens: int) -> int:
+    """Return the total-token count shown in dashboard rollups."""
+    if usage.get("fresh_input_tokens") is not None or usage.get("billable_input_tokens") is not None:
+        return max(0, input_tokens) + max(0, output_tokens)
+    return _coerce_int(usage.get("total_tokens"))
+
+
 def _ingest_usage_event(bucket: dict, event: dict):
     if not isinstance(bucket, dict) or not isinstance(event, dict):
         return
@@ -584,9 +607,9 @@ def _ingest_usage_event(bucket: dict, event: dict):
     if bucket.get("project_path") is None and isinstance(project_path, str) and project_path:
         bucket["project_path"] = project_path
 
-    input_tokens = _coerce_int(usage.get("input_tokens"))
+    input_tokens = _usage_display_input_tokens(usage)
     output_tokens = _coerce_int(usage.get("output_tokens"))
-    total_tokens = _coerce_int(usage.get("total_tokens"))
+    total_tokens = _usage_display_total_tokens(usage, input_tokens=input_tokens, output_tokens=output_tokens)
     cached_input_tokens = _coerce_int(usage.get("cached_input_tokens"))
     cache_creation_tokens = _coerce_int(usage.get("cache_creation_input_tokens"))
     reasoning_output_tokens = _coerce_int(usage.get("reasoning_output_tokens"))
@@ -1137,18 +1160,21 @@ def _burn_event_model_label(event: dict) -> str | None:
 
 
 def _burn_event_tokens(event: dict) -> dict:
-    usage = event.get("usage") if isinstance(event.get("usage"), dict) else {}
+    raw_usage = event.get("usage") if isinstance(event.get("usage"), dict) else {}
+    usage = normalize_usage_payload(raw_usage) or raw_usage
     tokens = {field: _coerce_float(usage.get(field)) for field in _BURN_TOKEN_FIELDS}
-    # normalize_usage_payload() in util.py already normalizes both upstream
-    # conventions before events are recorded:
-    #   * OpenAI/Codex: strips cached_input_tokens out of the gross input_tokens count.
-    #   * Anthropic/Claude (bridged): strips cached tokens sourced from
-    #     input_tokens_details.cached_tokens out of input_tokens.
-    # In both cases `input_tokens` is normally the FRESH-only count by the time
-    # it lands here. The cached-only guard below handles older/test payloads
-    # where gross input and cached input are equal.
+    # OpenAI/Codex response usage is stored in upstream shape: input_tokens is
+    # gross input and fresh_input_tokens carries the non-cached presentation /
+    # billing count.  Anthropic/Claude-style rows usually already store
+    # input_tokens as fresh input.  Use the explicit fresh value when present so
+    # cached prefill does not dominate burn-rate reporting.
     output_tokens = tokens["output_tokens"] + tokens["reasoning_output_tokens"]
-    if tokens["cached_input_tokens"] > 0 and tokens["cached_input_tokens"] >= tokens["input_tokens"] and output_tokens <= 0:
+    explicit_fresh_input = usage.get("fresh_input_tokens")
+    if explicit_fresh_input is None:
+        explicit_fresh_input = usage.get("billable_input_tokens")
+    if explicit_fresh_input is not None:
+        fresh_input = _coerce_float(explicit_fresh_input)
+    elif tokens["cached_input_tokens"] > 0 and tokens["cached_input_tokens"] >= tokens["input_tokens"] and output_tokens <= 0:
         fresh_input = 0.0
     else:
         fresh_input = tokens["input_tokens"]

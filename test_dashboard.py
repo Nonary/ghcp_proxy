@@ -127,6 +127,81 @@ class DashboardTests(unittest.TestCase):
         self.assertAlmostEqual(claude_usage["cost_breakdown"]["cached_input"], 0.0005)
         self.assertAlmostEqual(claude_usage["cost_breakdown"]["output"], 0.025)
 
+    def test_build_dashboard_payload_presents_codex_input_net_of_cached_tokens(self):
+        fixed_now = datetime(2026, 4, 4, 18, 0, tzinfo=timezone.utc)
+        usage_events = [
+            {
+                "request_id": "codex-req",
+                "session_id": "codex-session",
+                "server_request_id": "codex-chain",
+                "started_at": "2026-04-04T17:55:00+00:00",
+                "finished_at": "2026-04-04T17:56:00+00:00",
+                "resolved_model": "gpt-5.4",
+                "path": "/v1/responses",
+                "usage": {
+                    "input_tokens": 1_000,
+                    "output_tokens": 50,
+                    "total_tokens": 1_050,
+                    "input_tokens_details": {"cached_tokens": 800},
+                },
+            },
+        ]
+
+        service = dashboard.DashboardService(
+            dependencies=dashboard.DashboardDependencies(
+                snapshot_all_usage_events=lambda: usage_events,
+                snapshot_usage_events=lambda: usage_events,
+                load_safeguard_trigger_stats=lambda _now: {},
+            ),
+            utc_now=lambda: fixed_now,
+        )
+
+        payload = service.build_payload()
+        usage = payload["current_month"]["usage"]
+        codex_usage = usage["sources"]["codex"]
+
+        self.assertEqual(usage["input_tokens"], 200)
+        self.assertEqual(usage["cached_input_tokens"], 800)
+        self.assertEqual(usage["total_tokens"], 250)
+        self.assertEqual(codex_usage["input_tokens"], 200)
+        self.assertEqual(codex_usage["cached_input_tokens"], 800)
+        self.assertEqual(codex_usage["total_tokens"], 250)
+
+    def test_build_dashboard_payload_keeps_explicit_cached_input_shape_net(self):
+        fixed_now = datetime(2026, 4, 4, 18, 0, tzinfo=timezone.utc)
+        usage_events = [
+            {
+                "request_id": "claude-req",
+                "session_id": "claude-session",
+                "server_request_id": "claude-chain",
+                "started_at": "2026-04-04T17:55:00+00:00",
+                "finished_at": "2026-04-04T17:56:00+00:00",
+                "resolved_model": "claude-sonnet-4.6",
+                "path": "/v1/messages",
+                "usage": {
+                    "input_tokens": 1_000,
+                    "output_tokens": 50,
+                    "total_tokens": 1_050,
+                    "cached_input_tokens": 800,
+                },
+            },
+        ]
+
+        service = dashboard.DashboardService(
+            dependencies=dashboard.DashboardDependencies(
+                snapshot_all_usage_events=lambda: usage_events,
+                snapshot_usage_events=lambda: usage_events,
+                load_safeguard_trigger_stats=lambda _now: {},
+            ),
+            utc_now=lambda: fixed_now,
+        )
+
+        usage = service.build_payload()["current_month"]["usage"]
+
+        self.assertEqual(usage["input_tokens"], 1_000)
+        self.assertEqual(usage["cached_input_tokens"], 800)
+        self.assertEqual(usage["total_tokens"], 1_050)
+
     def test_build_dashboard_payload_keeps_archived_totals_and_recent_requests_separate(self):
         fixed_now = datetime(2026, 4, 4, 18, 0, tzinfo=timezone.utc)
         archived_event = {
@@ -729,6 +804,30 @@ class DashboardTests(unittest.TestCase):
         self.assertAlmostEqual(opus["burn_rates"]["input"]["limit_percent_per_target_tokens"], 133.3333, places=4)
         self.assertAlmostEqual(opus["burn_rates"]["output"]["limit_percent_per_target_tokens"], 133.3333, places=4)
         self.assertEqual(opus["responsibility_percent"], {"input": 66.67, "cached": 0.0, "output": 33.33})
+
+    def test_burn_rate_uses_explicit_fresh_input_for_codex_upstream_shape(self):
+        reset = "2026-04-21T18:00:00Z"
+        codex_event = self._burn_event(
+            "2026-04-21T10:01:00+00:00",
+            "gpt-5.4",
+            3.0,
+            reset,
+            input_tokens=1_000,
+            cached_input_tokens=800,
+            output_tokens=50,
+        )
+        codex_event["usage"]["fresh_input_tokens"] = 200
+        events = [
+            self._burn_event("2026-04-21T10:00:00+00:00", "gpt-5.4", 1.0, reset),
+            codex_event,
+        ]
+
+        burn = dashboard._build_burn_rate_summary(events)
+        row = burn["session"]["models"][0]
+
+        self.assertEqual(row["tokens"]["input_tokens"], 200.0)
+        self.assertEqual(row["tokens"]["output_tokens"], 50.0)
+        self.assertEqual(row["tokens"]["total_tokens"], 250.0)
 
     def test_burn_rate_uses_last_100k_input_or_output_tokens_and_splits_boundary_request(self):
         reset = "2026-04-21T18:00:00Z"
