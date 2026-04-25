@@ -102,6 +102,83 @@ class AutoUpdateTests(unittest.TestCase):
         self.assertIn(("merge", "--ff-only", "origin/main"), calls)
         self.assertEqual(state["last_result"]["reason"], "updated")
 
+    def test_diverged_checkout_rebases_local_commits_on_upstream(self):
+        calls = []
+        head = {"value": "localsha"}
+
+        def runner(command):
+            calls.append(tuple(command[3:]))
+            args = tuple(command[3:])
+            mapping = {
+                ("rev-parse", "--is-inside-work-tree"): auto_update.GitCommandResult(0, "true\n"),
+                ("rev-parse", "--show-toplevel"): auto_update.GitCommandResult(0, "/repo\n"),
+                ("rev-parse", "--abbrev-ref", "HEAD"): auto_update.GitCommandResult(0, "main\n"),
+                ("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"): auto_update.GitCommandResult(0, "origin/main\n"),
+                ("fetch", "--quiet", "--prune", "origin"): auto_update.GitCommandResult(0, ""),
+                ("status", "--porcelain", "--untracked-files=all"): auto_update.GitCommandResult(0, ""),
+                ("rev-list", "--left-right", "--count", "HEAD...@{u}"): auto_update.GitCommandResult(0, "2 3\n"),
+            }
+            if args == ("rev-parse", "HEAD"):
+                return auto_update.GitCommandResult(0, head["value"] + "\n")
+            if args == ("rebase", "origin/main"):
+                head["value"] = "rebasedsha"
+                return auto_update.GitCommandResult(0, "Successfully rebased and updated refs/heads/main.\n")
+            if args in mapping:
+                return mapping[args]
+            raise AssertionError(f"unexpected git args: {args}")
+
+        with self._tempdir() as temp_dir, mock.patch.dict(
+            os.environ,
+            {"GHCP_AUTO_UPDATE": "1", "GHCP_AUTO_UPDATE_INTERVAL_SECONDS": "0"},
+        ):
+            manager = self._manager(runner, temp_dir)
+            result = manager.startup_check_and_update()
+
+        self.assertTrue(result["updated"])
+        self.assertTrue(result["restart_required"])
+        self.assertEqual(result["reason"], "updated")
+        self.assertEqual(result["update_method"], "rebase")
+        self.assertEqual(result["rebased_local_commits"], 2)
+        self.assertEqual(result["old_head"], "localsha")
+        self.assertEqual(result["new_head"], "rebasedsha")
+        self.assertIn(("rebase", "origin/main"), calls)
+        self.assertNotIn(("merge", "--ff-only", "origin/main"), calls)
+
+    def test_diverged_checkout_aborts_failed_rebase(self):
+        calls = []
+
+        def runner(command):
+            calls.append(tuple(command[3:]))
+            args = tuple(command[3:])
+            mapping = {
+                ("rev-parse", "--is-inside-work-tree"): auto_update.GitCommandResult(0, "true\n"),
+                ("rev-parse", "--show-toplevel"): auto_update.GitCommandResult(0, "/repo\n"),
+                ("rev-parse", "--abbrev-ref", "HEAD"): auto_update.GitCommandResult(0, "main\n"),
+                ("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"): auto_update.GitCommandResult(0, "origin/main\n"),
+                ("fetch", "--quiet", "--prune", "origin"): auto_update.GitCommandResult(0, ""),
+                ("status", "--porcelain", "--untracked-files=all"): auto_update.GitCommandResult(0, ""),
+                ("rev-list", "--left-right", "--count", "HEAD...@{u}"): auto_update.GitCommandResult(0, "1 1\n"),
+                ("rev-parse", "HEAD"): auto_update.GitCommandResult(0, "localsha\n"),
+                ("rebase", "origin/main"): auto_update.GitCommandResult(1, "", "CONFLICT (content): Merge conflict\n"),
+                ("rebase", "--abort"): auto_update.GitCommandResult(0, ""),
+            }
+            if args in mapping:
+                return mapping[args]
+            raise AssertionError(f"unexpected git args: {args}")
+
+        with self._tempdir() as temp_dir, mock.patch.dict(
+            os.environ,
+            {"GHCP_AUTO_UPDATE": "1", "GHCP_AUTO_UPDATE_INTERVAL_SECONDS": "0"},
+        ):
+            manager = self._manager(runner, temp_dir)
+            result = manager.startup_check_and_update()
+
+        self.assertFalse(result["updated"])
+        self.assertEqual(result["reason"], "rebase-failed")
+        self.assertEqual(result["update_method"], "rebase")
+        self.assertIn("CONFLICT", result["error"])
+        self.assertIn(("rebase", "--abort"), calls)
+
     def test_local_tracked_changes_skip_before_merge(self):
         calls = []
 

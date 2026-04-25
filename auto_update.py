@@ -274,8 +274,6 @@ class AutoUpdateManager:
         if behind <= 0:
             reason = "local-ahead" if ahead > 0 else "up-to-date"
             return self._result(False, reason, **base_payload, dirty=dirty)
-        if ahead > 0:
-            return self._result(False, "diverged", **base_payload, dirty=dirty)
 
         stash_ref = ""
         stashed = False
@@ -313,17 +311,23 @@ class AutoUpdateManager:
         old_head_result = self._git("rev-parse", "HEAD")
         old_head = _single_line(old_head_result.stdout) if old_head_result.returncode == 0 else ""
 
-        merge_result = self._git("merge", "--ff-only", upstream)
-        if merge_result.returncode != 0:
+        update_method = "rebase" if ahead > 0 else "fast-forward"
+        update_result = self._git("rebase", upstream) if ahead > 0 else self._git("merge", "--ff-only", upstream)
+        if update_result.returncode != 0:
+            abort_result = GitCommandResult(0, "", "")
+            if update_method == "rebase":
+                abort_result = self._git("rebase", "--abort")
             if stashed:
                 self._restore_stash_after_failed_upgrade(stash_ref)
             return self._result(
                 False,
-                "fast-forward-failed",
+                "rebase-failed" if update_method == "rebase" else "fast-forward-failed",
                 **base_payload,
                 dirty=dirty,
                 stashed_local_changes=stashed,
-                error=merge_result.stderr or merge_result.stdout,
+                update_method=update_method,
+                error=update_result.stderr or update_result.stdout,
+                abort_error=abort_result.stderr or abort_result.stdout,
             )
 
         new_head_result = self._git("rev-parse", "HEAD")
@@ -356,6 +360,8 @@ class AutoUpdateManager:
             dirty=dirty,
             stashed_local_changes=stashed,
             discarded_local_changes=discarded_local_changes,
+            update_method=update_method,
+            rebased_local_commits=ahead if update_method == "rebase" else 0,
             restart_required=bool(old_head and new_head and old_head != new_head),
         )
 

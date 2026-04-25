@@ -38,21 +38,22 @@ panel can install shell helpers:
 ## Auto Update
 
 When GHCP Proxy is started from a git checkout, it checks the configured
-upstream branch and fast-forwards itself when a safe update is available. The
-proxy restarts itself after a successful update.
+upstream branch and updates itself when a safe upgrade is available. The proxy
+restarts itself after a successful update.
 
-After startup, the proxy keeps checking for safe fast-forward updates every 15
-minutes. If an update is applied while upstream requests are active, the proxy
+After startup, the proxy keeps checking for safe updates every 15 minutes. If an
+update is applied while upstream requests are active, the proxy
 lets those requests finish before restarting. The dashboard shows when a restart
 is pending or scheduled.
 
 The updater is conservative:
 
 - uses the checkout's existing upstream branch, such as `origin/main`
-- runs `git fetch` and only applies `git merge --ff-only`
-- skips updates when the checkout is ahead of or diverged from upstream
+- runs `git fetch` and applies fast-forward updates when possible
+- rebases committed local changes onto upstream when the checkout has diverged
+- skips updates when the checkout is only ahead of upstream
 - defaults to **user mode**, which stashes pending GHCP Proxy folder edits,
-  fast-forwards, then reapplies those edits
+  updates, then reapplies those edits
 - blocks the upgrade if pending changes cannot be safely reapplied, and the
   dashboard offers an explicit "Apply upgrade anyway" override that discards
   pending local changes before upgrading
