@@ -196,7 +196,12 @@ class AutoUpdateManager:
 
         state = self._load_state()
         now = self.clock()
-        if not force and not self._is_check_due(state, now) and self._recent_state_matches_checkout(state):
+        if (
+            not force
+            and not self._state_result_requires_restart(state)
+            and not self._is_check_due(state, now)
+            and self._recent_state_matches_checkout(state)
+        ):
             last_result = state.get("last_result") if isinstance(state.get("last_result"), dict) else {}
             return {
                 "attempted": False,
@@ -240,7 +245,12 @@ class AutoUpdateManager:
 
         state = self._load_state()
         now = self.clock()
-        if not force and not self._is_check_due(state, now) and self._recent_state_matches_checkout(state):
+        if (
+            not force
+            and not self._state_result_requires_restart(state)
+            and not self._is_check_due(state, now)
+            and self._recent_state_matches_checkout(state)
+        ):
             return {
                 "attempted": False,
                 "updated": False,
@@ -660,6 +670,14 @@ class AutoUpdateManager:
             if value:
                 return value
         return ""
+
+    def _state_result_requires_restart(self, state: dict[str, object]) -> bool:
+        result = state.get("last_result")
+        if not isinstance(result, dict):
+            return False
+        if bool(result.get("restart_required")):
+            return True
+        return str(result.get("reason") or "") == "updated"
 
     def _load_state(self) -> dict[str, object]:
         try:

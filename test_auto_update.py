@@ -392,9 +392,57 @@ class AutoUpdateTests(unittest.TestCase):
             )
             result = manager.startup_check_and_update()
 
-        self.assertEqual(calls[0], ("rev-parse", "HEAD"))
         self.assertTrue(result["updated"])
         self.assertEqual(result["reason"], "updated")
+        self.assertIn(("fetch", "--quiet", "--prune", "origin"), calls)
+
+    def test_recent_updated_state_is_rechecked_after_restart(self):
+        calls = []
+
+        def runner(command):
+            calls.append(tuple(command[3:]))
+            args = tuple(command[3:])
+            mapping = {
+                ("rev-parse", "--is-inside-work-tree"): auto_update.GitCommandResult(0, "true\n"),
+                ("rev-parse", "--show-toplevel"): auto_update.GitCommandResult(0, "/repo\n"),
+                ("rev-parse", "--abbrev-ref", "HEAD"): auto_update.GitCommandResult(0, "main\n"),
+                ("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"): auto_update.GitCommandResult(0, "origin/main\n"),
+                ("fetch", "--quiet", "--prune", "origin"): auto_update.GitCommandResult(0, ""),
+                ("rev-list", "--left-right", "--count", "HEAD...@{u}"): auto_update.GitCommandResult(0, "0 0\n"),
+                ("status", "--porcelain", "--untracked-files=all"): auto_update.GitCommandResult(0, ""),
+            }
+            if args in mapping:
+                return mapping[args]
+            raise AssertionError(f"unexpected git args: {args}")
+
+        with self._tempdir() as temp_dir, mock.patch.dict(
+            os.environ,
+            {"GHCP_AUTO_UPDATE": "1", "GHCP_AUTO_UPDATE_INTERVAL_SECONDS": "3600"},
+        ):
+            manager = self._manager(runner, temp_dir, now=2000.0)
+            Path(manager.state_file).parent.mkdir(parents=True)
+            Path(manager.state_file).write_text(
+                json.dumps(
+                    {
+                        "last_check_epoch": 1990.0,
+                        "last_result": {
+                            "reason": "updated",
+                            "updated": True,
+                            "restart_required": True,
+                            "old_head": "oldsha",
+                            "new_head": "newsha",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            result = manager.startup_check_for_update()
+            state = json.loads(Path(manager.state_file).read_text(encoding="utf-8"))
+
+        self.assertFalse(result["updated"])
+        self.assertFalse(result["update_available"])
+        self.assertEqual(result["reason"], "up-to-date")
+        self.assertEqual(state["last_result"]["reason"], "up-to-date")
         self.assertIn(("fetch", "--quiet", "--prune", "origin"), calls)
 
     def test_default_check_interval_is_ten_minutes(self):

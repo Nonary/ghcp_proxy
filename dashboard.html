@@ -272,6 +272,23 @@
       border-color: rgba(255,122,58,0.28);
       background: linear-gradient(180deg, rgba(255,122,58,0.08), rgba(255,255,255,0.015) 42%, var(--panel));
     }
+    .overview-update-callout {
+      position: relative;
+      overflow: hidden;
+      border-color: rgba(255,122,58,0.38);
+      background:
+        radial-gradient(circle at 18px 18px, rgba(255,122,58,0.20), transparent 30%),
+        linear-gradient(135deg, rgba(255,122,58,0.13), rgba(255,255,255,0.018) 44%, rgba(94,200,255,0.06));
+    }
+    .overview-update-callout::before {
+      content: "";
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+      background: linear-gradient(90deg, rgba(255,122,58,0.5), rgba(94,200,255,0.28), transparent 46%);
+      height: 2px;
+      opacity: 0.85;
+    }
     .update-panel-head {
       display: grid;
       grid-template-columns: minmax(0, 1fr) auto;
@@ -1403,6 +1420,60 @@
 
         <div class="stack">
 
+          <article v-if="autoUpdateOverviewVisible" :class="['update-panel', 'overview-update-callout', { prominent: autoUpdateNeedsAttention }]">
+            <div class="update-panel-head">
+              <div>
+                <div class="update-title-row">
+                  <div class="update-icon">
+                    <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M3 21v-5h5"/><path d="M3 12a9 9 0 0 1 15.74-6.26L21 8"/><path d="M21 3v5h-5"/></svg>
+                  </div>
+                  <div>
+                    <div class="eyebrow">Proxy Update</div>
+                    <div class="update-title">{{ autoUpdateOverviewTitle }}</div>
+                  </div>
+                </div>
+                <div class="update-subtitle">{{ autoUpdateOverviewSubtitle }}</div>
+              </div>
+              <div :class="['status', autoUpdateStatusClass]">{{ autoUpdateStatusLabel }}</div>
+            </div>
+            <div class="update-actions">
+              <button v-if="autoUpdateRestartRequired"
+                      class="primary"
+                      @click="restartProxy"
+                      :disabled="savingAutoUpdate">
+                <span v-if="autoUpdateAction === 'restart_proxy'" class="spinner"></span>
+                {{ autoUpdateAction === 'restart_proxy' ? 'Restarting…' : 'Restart proxy' }}
+              </button>
+              <button v-else-if="autoUpdateAvailable"
+                      class="primary"
+                      @click="pullAutoUpdate"
+                      :disabled="savingAutoUpdate">
+                <span v-if="autoUpdateAction === 'pull_update'" class="spinner"></span>
+                {{ autoUpdateAction === 'pull_update' ? 'Updating…' : 'Pull update' }}
+              </button>
+              <button v-else
+                      @click="runAutoUpdateCheck"
+                      :disabled="savingAutoUpdate">
+                <span v-if="autoUpdateAction === 'check_now'" class="spinner"></span>
+                {{ autoUpdateAction === 'check_now' ? 'Checking…' : 'Check for updates' }}
+              </button>
+              <button v-if="autoUpdateBlockedMessage"
+                      class="danger"
+                      @click="applyAutoUpdateAnyway"
+                      :disabled="savingAutoUpdate">
+                <span v-if="autoUpdateAction === 'upgrade_anyway'" class="spinner"></span>
+                {{ autoUpdateAction === 'upgrade_anyway' ? 'Applying…' : 'Apply anyway' }}
+              </button>
+              <button @click="activeView = 'settings'">Update settings</button>
+            </div>
+            <div class="update-meta-grid">
+              <div class="update-meta"><div class="k">Mode</div><div class="v">{{ autoUpdateModeLabel }}</div></div>
+              <div class="update-meta"><div class="k">Last Check</div><div class="v">{{ autoUpdateLastCheckLabel }}</div></div>
+              <div class="update-meta"><div class="k">Repository</div><div class="v">{{ autoUpdateRepoLabel }}</div></div>
+            </div>
+            <div v-if="autoUpdateStatus.statusMessage" class="status good">{{ autoUpdateStatus.statusMessage }}</div>
+          </article>
+
           <!-- KPI strip -->
           <div class="kpi-grid">
             <article class="kpi">
@@ -1465,60 +1536,6 @@
               </div>
             </article>
           </div>
-
-          <article :class="['update-panel', { prominent: autoUpdateNeedsAttention }]">
-            <div class="update-panel-head">
-              <div>
-                <div class="update-title-row">
-                  <div class="update-icon">
-                    <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M3 21v-5h5"/><path d="M3 12a9 9 0 0 1 15.74-6.26L21 8"/><path d="M21 3v5h-5"/></svg>
-                  </div>
-                  <div>
-                    <div class="eyebrow">Proxy Update</div>
-                    <div class="update-title">{{ autoUpdateOverviewTitle }}</div>
-                  </div>
-                </div>
-                <div class="update-subtitle">{{ autoUpdateOverviewSubtitle }}</div>
-              </div>
-              <div :class="['status', autoUpdateStatusClass]">{{ autoUpdateStatusLabel }}</div>
-            </div>
-            <div class="update-actions">
-              <button v-if="autoUpdateStatus.runtime?.restart_pending || autoUpdateLastResult?.reason === 'updated'"
-                      class="primary"
-                      @click="restartProxy"
-                      :disabled="savingAutoUpdate">
-                <span v-if="autoUpdateAction === 'restart_proxy'" class="spinner"></span>
-                {{ autoUpdateAction === 'restart_proxy' ? 'Restarting…' : 'Restart proxy' }}
-              </button>
-              <button v-else-if="autoUpdateAvailable"
-                      class="primary"
-                      @click="pullAutoUpdate"
-                      :disabled="savingAutoUpdate">
-                <span v-if="autoUpdateAction === 'pull_update'" class="spinner"></span>
-                {{ autoUpdateAction === 'pull_update' ? 'Updating…' : 'Pull update' }}
-              </button>
-              <button v-else
-                      @click="runAutoUpdateCheck"
-                      :disabled="savingAutoUpdate">
-                <span v-if="autoUpdateAction === 'check_now'" class="spinner"></span>
-                {{ autoUpdateAction === 'check_now' ? 'Checking…' : 'Check for updates' }}
-              </button>
-              <button v-if="autoUpdateBlockedMessage"
-                      class="danger"
-                      @click="applyAutoUpdateAnyway"
-                      :disabled="savingAutoUpdate">
-                <span v-if="autoUpdateAction === 'upgrade_anyway'" class="spinner"></span>
-                {{ autoUpdateAction === 'upgrade_anyway' ? 'Applying…' : 'Apply anyway' }}
-              </button>
-              <button @click="activeView = 'settings'">Update settings</button>
-            </div>
-            <div class="update-meta-grid">
-              <div class="update-meta"><div class="k">Mode</div><div class="v">{{ autoUpdateModeLabel }}</div></div>
-              <div class="update-meta"><div class="k">Last Check</div><div class="v">{{ autoUpdateLastCheckLabel }}</div></div>
-              <div class="update-meta"><div class="k">Repository</div><div class="v">{{ autoUpdateRepoLabel }}</div></div>
-            </div>
-            <div v-if="autoUpdateStatus.statusMessage" class="status good">{{ autoUpdateStatus.statusMessage }}</div>
-          </article>
 
           <!-- Sparkline strip -->
           <div class="spark-grid">
@@ -2708,7 +2725,7 @@
                 <span v-if="autoUpdateAction === 'upgrade_anyway'" class="spinner"></span>
                 {{ autoUpdateAction === 'upgrade_anyway' ? 'Applying…' : 'Apply upgrade anyway' }}
               </button>
-              <button v-if="autoUpdateStatus.runtime?.restart_pending || autoUpdateLastResult?.reason === 'updated'"
+              <button v-if="autoUpdateRestartRequired"
                       class="primary"
                       @click="restartProxy"
                       :disabled="savingAutoUpdate">
@@ -3931,6 +3948,7 @@
           },
           savingAutoUpdate: false,
           autoUpdateAction: '',
+          autoUpdatePostRestartRefreshInFlight: false,
           activeTab: 'sessions',
           tabs: ['sessions', 'requests'],
           spendTrendRange: 'day',
@@ -5198,8 +5216,22 @@
           const result = this.autoUpdateLastResult;
           return Boolean(this.autoUpdateStatus.runtime?.update_available || result?.update_available || result?.reason === 'update-available');
         },
+        autoUpdateRestartRequired() {
+          const runtime = this.autoUpdateStatus.runtime || {};
+          const result = this.autoUpdateLastResult;
+          return Boolean(
+            runtime.restart_pending ||
+            runtime.restart_scheduled ||
+            runtime.restarting ||
+            result?.restart_required ||
+            result?.reason === 'updated'
+          );
+        },
         autoUpdateNeedsAttention() {
-          return Boolean(this.autoUpdateAvailable || this.autoUpdateBlockedMessage || this.autoUpdateStatus.runtime?.restart_pending || this.autoUpdateLastResult?.reason === 'updated');
+          return Boolean(this.autoUpdateAvailable || this.autoUpdateBlockedMessage || this.autoUpdateRestartRequired);
+        },
+        autoUpdateOverviewVisible() {
+          return Boolean(this.autoUpdateNeedsAttention || ['pull_update', 'upgrade_anyway', 'restart_proxy'].includes(this.autoUpdateAction));
         },
         autoUpdateModeLabel() {
           const mode = this.autoUpdateStatus.mode === 'developer' ? 'Developer' : 'User';
@@ -5226,7 +5258,7 @@
           if (this.autoUpdateAction === 'pull_update' || this.autoUpdateAction === 'upgrade_anyway') return 'Applying update';
           if (this.autoUpdateAction === 'check_now') return 'Checking for updates';
           if (this.autoUpdateBlockedMessage) return 'Update needs attention';
-          if (this.autoUpdateStatus.runtime?.restart_pending || this.autoUpdateLastResult?.reason === 'updated') return 'Restart ready';
+          if (this.autoUpdateRestartRequired) return 'Restart ready';
           if (this.autoUpdateAvailable) return 'Update available';
           return 'Proxy is up to date';
         },
@@ -5235,7 +5267,7 @@
           if (this.autoUpdateAction === 'pull_update' || this.autoUpdateAction === 'upgrade_anyway') return 'Pulling the latest proxy code and preparing the restart step.';
           if (this.autoUpdateAction === 'check_now') return 'Checking the configured upstream branch now.';
           if (this.autoUpdateBlockedMessage) return 'Local changes blocked the upgrade. Review or use the override only if those edits can be discarded.';
-          if (this.autoUpdateStatus.runtime?.restart_pending || this.autoUpdateLastResult?.reason === 'updated') return 'The update was pulled. Restart the proxy to run the new code.';
+          if (this.autoUpdateRestartRequired) return 'The update was pulled. Restart the proxy to run the new code.';
           if (this.autoUpdateAvailable) return 'A newer proxy build is available. Pull it when you are ready.';
           if (!this.autoUpdateStatus.enabled) return 'Automatic update checks are disabled.';
           return `Checks every ${this.autoUpdateIntervalLabel}; last check ${this.autoUpdateLastCheckLabel}.`;
@@ -5243,7 +5275,7 @@
         autoUpdateStatusClass() {
           if (this.autoUpdateStatus.error || this.autoUpdateBlockedMessage) return 'error';
           const result = this.autoUpdateLastResult;
-          if (this.autoUpdateStatus.runtime?.restart_pending) return 'warn';
+          if (this.autoUpdateRestartRequired) return 'warn';
           if (this.autoUpdateAvailable) return 'warn';
           if (!this.autoUpdateStatus.enabled) return 'warn';
           if (result?.updated || result?.reason === 'up-to-date') return 'good';
@@ -5255,10 +5287,9 @@
           if (!this.autoUpdateStatus.enabled) return 'Auto-update disabled';
           if (this.autoUpdateStatus.runtime?.restarting) return 'Update applied; restarting GHCP Proxy';
           if (this.autoUpdateStatus.runtime?.restart_scheduled) return 'Restart scheduled';
-          if (this.autoUpdateStatus.runtime?.restart_pending) return 'Update pulled; restart GHCP Proxy to use it';
+          if (this.autoUpdateRestartRequired) return 'Update pulled; restart GHCP Proxy to use it';
           if (this.autoUpdateAvailable) return 'Update available';
           const result = this.autoUpdateLastResult;
-          if (result?.reason === 'updated') return 'Update pulled; restart GHCP Proxy to use it';
           if (result?.reason) return `Last check: ${result.reason}`;
           return 'Waiting for first auto-update check';
         },
@@ -6301,6 +6332,41 @@
             installed ? 'Shell commands removed.' : 'Shell commands installed.'
           );
         },
+        autoUpdatePayloadNeedsRestartRecheck(payload) {
+          const status = payload || {};
+          const runtime = status.runtime || {};
+          if (runtime.restart_pending || runtime.restart_scheduled || runtime.restarting) return false;
+          const result = status.last_result || runtime.last_runtime_result || status.result || null;
+          return Boolean(result?.restart_required || result?.reason === 'updated');
+        },
+        async refreshAutoUpdatePostRestartStatus(statusMessage = '') {
+          if (this.autoUpdatePostRestartRefreshInFlight) return null;
+          this.autoUpdatePostRestartRefreshInFlight = true;
+          try {
+            const response = await fetch('/api/config/auto-update', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ action: 'check_now' }),
+              cache: 'no-store',
+            });
+            if (!response.ok) {
+              throw new Error(`post-restart status request failed: ${response.status}`);
+            }
+            const payload = await response.json();
+            this.autoUpdateStatus = {
+              ...this.autoUpdateStatus,
+              ...payload,
+              error: '',
+              statusMessage,
+            };
+            return payload;
+          } catch (error) {
+            this.autoUpdateStatus.error = error.message;
+            return null;
+          } finally {
+            this.autoUpdatePostRestartRefreshInFlight = false;
+          }
+        },
         async loadAutoUpdateStatus(markRefreshing = false) {
           const showRefreshing = markRefreshing === true;
           if (showRefreshing && this.savingAutoUpdate) return;
@@ -6319,6 +6385,9 @@
               ...payload,
               error: '',
             };
+            if (!showRefreshing && !this.savingAutoUpdate && this.autoUpdatePayloadNeedsRestartRecheck(payload)) {
+              this.refreshAutoUpdatePostRestartStatus();
+            }
           } catch (error) {
             this.autoUpdateStatus.error = error.message;
           } finally {
@@ -6405,23 +6474,43 @@
           return this.configureAutoUpdate('upgrade_anyway', {}, 'Upgrade override requested.');
         },
         async waitForAutoUpdateRestart() {
-          const deadline = Date.now() + 12000;
+          const deadline = Date.now() + 30000;
           const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-          await pause(700);
+          await pause(900);
           while (Date.now() < deadline) {
             try {
               const response = await fetch('/api/config/auto-update', { cache: 'no-store' });
               if (response.ok) {
-                const payload = await response.json();
+                let payload = await response.json();
                 this.autoUpdateStatus = {
                   ...this.autoUpdateStatus,
                   ...payload,
                   error: '',
-                  statusMessage: 'GHCP Proxy restarted and is back online.',
+                  statusMessage: 'Restart requested. Waiting for GHCP Proxy to finish reloading.',
                 };
-                this.savingAutoUpdate = false;
-                this.autoUpdateAction = '';
-                return;
+                const runtime = payload.runtime || {};
+                const stillRestarting = Boolean(runtime.restart_pending || runtime.restart_scheduled || runtime.restarting);
+                if (!stillRestarting) {
+                  const checkResponse = await fetch('/api/config/auto-update', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ action: 'check_now' }),
+                    cache: 'no-store',
+                  });
+                  if (!checkResponse.ok) {
+                    throw new Error(`post-restart status request failed: ${checkResponse.status}`);
+                  }
+                  payload = await checkResponse.json();
+                  this.autoUpdateStatus = {
+                    ...this.autoUpdateStatus,
+                    ...payload,
+                    error: '',
+                    statusMessage: 'GHCP Proxy restarted and update status is refreshed.',
+                  };
+                  this.savingAutoUpdate = false;
+                  this.autoUpdateAction = '';
+                  return;
+                }
               }
             } catch (_error) {}
             await pause(800);
@@ -6997,6 +7086,7 @@
         this.startDashboardStream();
         this.autoRefreshTimer = window.setInterval(() => {
           this.load(true);
+          this.loadAutoUpdateStatus();
         }, 60000);
         this._debugModalKeyHandler = (event) => {
           if (event.key === 'Escape' && this.debugModalRow) {
