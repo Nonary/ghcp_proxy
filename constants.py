@@ -387,7 +387,7 @@ PREMIUM_REQUEST_MULTIPLIERS = {
     "gpt-5.2-codex": 1.0,
     "gpt-5.3-codex": 1.0,
     "gpt-5.4": 1.0,
-    "gpt-5.5": 1.0,
+    "gpt-5.5": 7.5,
     "gpt-5.4-mini": 0.33,
     "gpt-5-mini": 0.0,
     "gemini-2.5-pro": 1.0,

@@ -182,7 +182,7 @@ class UsageTrackingTests(unittest.TestCase):
         self.assertEqual(normalized["native_service_tier_source"], "codex_logs_response_completed")
         self.assertAlmostEqual(normalized["cost_usd"], baseline * 2, places=8)
 
-    def test_normalize_recorded_usage_event_backfills_requested_fast_tier_and_multiplies_gpt55_cost(self):
+    def test_normalize_recorded_usage_event_backfills_requested_fast_tier_and_applies_gpt55_cost_multiplier(self):
         with mock.patch(
             "usage_tracking._codex_logs_service_tiers",
             return_value={
@@ -223,7 +223,22 @@ class UsageTrackingTests(unittest.TestCase):
         self.assertEqual(normalized["native_requested_service_tier_source"], "codex_logs_request")
         self.assertEqual(normalized["native_service_tier"], "default")
         self.assertEqual(normalized["native_service_tier_source"], "codex_logs_response_completed")
-        self.assertAlmostEqual(normalized["cost_usd"], baseline * 2.5, places=8)
+        self.assertAlmostEqual(normalized["cost_usd"], baseline * 7.5, places=8)
+
+    def test_finish_usage_event_counts_gpt55_as_seven_and_half_premium_requests(self):
+        tracker = self._make_usage_tracker()
+        log_path = self._make_usage_log_path()
+        event = {
+            "request_id": "req-gpt55-premium",
+            "initiator": "user",
+            "resolved_model": "gpt-5.5",
+        }
+
+        tracker.usage_log_file = str(log_path)
+        tracker.finish_event(event, 200)
+
+        finished = tracker.snapshot_usage_events()[0]
+        self.assertEqual(finished["premium_requests"], 7.5)
 
     def test_normalize_recorded_usage_event_drops_proxied_codex_native_rows(self):
         normalized = usage_tracking._normalize_recorded_usage_event(
