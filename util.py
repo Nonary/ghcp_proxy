@@ -523,7 +523,7 @@ def _usage_event_cost(model_name: str | None, usage: dict | None) -> float:
 
 def _fast_service_tier_cost_multiplier(event: dict | None) -> float:
     if _usage_event_model_name(event) == "gpt-5.5":
-        return 7.5
+        return 2.5
     return 2.0
 
 
