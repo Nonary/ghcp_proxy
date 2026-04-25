@@ -199,7 +199,7 @@ class AutoUpdateManager:
 
         state = self._load_state()
         now = self.clock()
-        if not force and not self._is_check_due(state, now):
+        if not force and not self._is_check_due(state, now) and self._recent_state_matches_checkout(state):
             return {
                 "attempted": False,
                 "updated": False,
@@ -540,6 +540,25 @@ class AutoUpdateManager:
         if not isinstance(last_check, (int, float)):
             return True
         return now - float(last_check) >= interval
+
+    def _recent_state_matches_checkout(self, state: dict[str, object]) -> bool:
+        expected_head = self._state_expected_head(state)
+        if not expected_head:
+            return True
+        current_head_result = self._git("rev-parse", "HEAD")
+        if current_head_result.returncode != 0:
+            return False
+        return _single_line(current_head_result.stdout) == expected_head
+
+    def _state_expected_head(self, state: dict[str, object]) -> str:
+        result = state.get("last_result")
+        if not isinstance(result, dict):
+            return ""
+        for key in ("head", "new_head", "old_head"):
+            value = _single_line(str(result.get(key) or ""))
+            if value:
+                return value
+        return ""
 
     def _load_state(self) -> dict[str, object]:
         try:
