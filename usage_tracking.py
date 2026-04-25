@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from threading import Lock
 from typing import Callable
 from uuid import uuid4
+from urllib.parse import parse_qs, unquote
 
 import httpx
 from fastapi import Request
@@ -69,6 +70,121 @@ class UsageTrackingState:
 # ---------------------------------------------------------------------------
 # Pure helper functions (module-level)
 # ---------------------------------------------------------------------------
+
+def _header_value_to_float(val: str | None) -> float | None:
+    if val is None:
+        return None
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_urlencoded_header_fields(header_value: str | None) -> dict[str, str]:
+    raw: dict[str, str] = {}
+    if header_value is None:
+        return raw
+    for key, values in parse_qs(unquote(str(header_value)), keep_blank_values=True).items():
+        if values:
+            raw[key] = values[0]
+    return raw
+
+
+def extract_quota_snapshots_from_headers(headers) -> dict[str, dict[str, object]]:
+    """Parse Copilot x-quota-snapshot-* headers into dashboard-ready payloads."""
+    quota_snapshots: dict[str, dict[str, object]] = {}
+    if headers is None:
+        return quota_snapshots
+    for header_name, header_value in headers.items():
+        lowered = str(header_name).lower()
+        if not lowered.startswith("x-quota-snapshot-"):
+            continue
+        bucket = lowered[len("x-quota-snapshot-"):]
+        if not bucket:
+            continue
+        raw = _parse_urlencoded_header_fields(header_value)
+
+        ent_value = _header_value_to_float(raw.get("ent"))
+        rem_percent = _header_value_to_float(raw.get("rem"))
+        overage = _header_value_to_float(raw.get("ov"))
+        overage_permitted = (raw.get("ovPerm", "").lower() == "true") if "ovPerm" in raw else None
+        reset_at = raw.get("rst")
+        unlimited = ent_value is not None and ent_value < 0
+        included: int | None = (
+            int(ent_value) if (ent_value is not None and not unlimited) else None
+        )
+
+        percent_remaining: float | None = None
+        percent_used: float | None = None
+        if rem_percent is not None:
+            percent_remaining = round(max(0.0, min(rem_percent, 100.0)), 2)
+            percent_used = round(100.0 - percent_remaining, 2)
+
+        absolute_remaining: float | None = None
+        absolute_used: float | None = None
+        if included is not None and percent_remaining is not None:
+            absolute_remaining = round(included * percent_remaining / 100.0, 2)
+            absolute_used = round(included - absolute_remaining, 2)
+
+        quota_snapshots[bucket] = {
+            "included": included,
+            "unlimited": unlimited,
+            "percent_remaining": percent_remaining,
+            "percent_used": percent_used,
+            "absolute_remaining": absolute_remaining,
+            "absolute_used": absolute_used,
+            "overage": overage,
+            "overage_permitted": overage_permitted,
+            "reset_at": reset_at,
+            "raw": raw,
+        }
+    return quota_snapshots
+
+
+def extract_usage_ratelimits_from_headers(headers) -> dict[str, dict[str, object]]:
+    """Parse upstream x-usage-ratelimit-* headers.
+
+    Copilot CLI's chat completions emit per-window usage gauges:
+      x-usage-ratelimit-session: ent=0&ov=0.0&ovPerm=false&rem=93.2&rst=...
+      x-usage-ratelimit-weekly:  ent=0&ov=0.0&ovPerm=false&rem=99.0&rst=...
+
+    `rem` is a remaining percentage (0..100), not an absolute request count.
+    """
+    usage_ratelimits: dict[str, dict[str, object]] = {}
+    if headers is None:
+        return usage_ratelimits
+    for header_name, header_value in headers.items():
+        lowered = str(header_name).lower()
+        if not lowered.startswith("x-usage-ratelimit-"):
+            continue
+        window = lowered[len("x-usage-ratelimit-"):]
+        if not window:
+            continue
+        raw = _parse_urlencoded_header_fields(header_value)
+        rem_percent = _header_value_to_float(raw.get("rem"))
+        ent_value = _header_value_to_float(raw.get("ent"))
+        overage = _header_value_to_float(raw.get("ov"))
+        ov_perm_raw = raw.get("ovPerm")
+        overage_permitted = (
+            ov_perm_raw.lower() == "true" if isinstance(ov_perm_raw, str) and ov_perm_raw else None
+        )
+        reset_at = raw.get("rst")
+        percent_remaining = (
+            round(max(0.0, min(rem_percent, 100.0)), 2) if rem_percent is not None else None
+        )
+        percent_used = (
+            round(100.0 - percent_remaining, 2) if percent_remaining is not None else None
+        )
+        usage_ratelimits[window] = {
+            "percent_remaining": percent_remaining,
+            "percent_used": percent_used,
+            "entitlement": int(ent_value) if (ent_value is not None and ent_value > 0) else ent_value,
+            "overage": overage,
+            "overage_permitted": overage_permitted,
+            "reset_at": reset_at,
+            "raw": raw,
+        }
+    return usage_ratelimits
 
 def request_session_id(request: Request, request_body: dict | None = None) -> str | None:
     for header_name in (
@@ -1079,116 +1195,19 @@ class UsageTracker:
                 finished_event["response_content_type"] = content_type
 
             # Copilot upstream emits x-quota-snapshot-{chat,completions,premium_interactions}
-            # with URL-encoded "ent=...&ov=...&ovPerm=...&rem=...&rst=..." values:
-            #   ent     = monthly entitlement (-1 means unlimited)
-            #   ov      = current overage (absolute count)
-            #   ovPerm  = whether overage is permitted
-            #   rem     = REMAINING PERCENT (0..100), NOT an absolute count
-            #   rst     = reset timestamp (ISO-8601 UTC)
-            # This is more authoritative than the user-scoped /settings/billing endpoint
-            # (which often 403s for ghu_* device-flow tokens) because it ships on every
-            # successful chat completion.
-            from urllib.parse import parse_qs, unquote
-
-            def _to_float(val: str | None) -> float | None:
-                if val is None:
-                    return None
-                try:
-                    return float(val)
-                except (TypeError, ValueError):
-                    return None
-
-            quota_snapshots: dict[str, dict[str, object]] = {}
-            for header_name, header_value in upstream.headers.items():
-                lowered = header_name.lower()
-                if not lowered.startswith("x-quota-snapshot-"):
-                    continue
-                bucket = lowered[len("x-quota-snapshot-"):]
-                if not bucket:
-                    continue
-                raw: dict[str, str] = {}
-                for key, values in parse_qs(unquote(header_value), keep_blank_values=True).items():
-                    if values:
-                        raw[key] = values[0]
-
-                ent_value = _to_float(raw.get("ent"))
-                rem_percent = _to_float(raw.get("rem"))
-                overage = _to_float(raw.get("ov"))
-                overage_permitted = (raw.get("ovPerm", "").lower() == "true") if "ovPerm" in raw else None
-                reset_at = raw.get("rst")
-                unlimited = ent_value is not None and ent_value < 0
-                included: int | None = (
-                    int(ent_value) if (ent_value is not None and not unlimited) else None
-                )
-
-                percent_remaining: float | None = None
-                percent_used: float | None = None
-                if rem_percent is not None:
-                    percent_remaining = round(max(0.0, min(rem_percent, 100.0)), 2)
-                    percent_used = round(100.0 - percent_remaining, 2)
-
-                absolute_remaining: float | None = None
-                absolute_used: float | None = None
-                if included is not None and percent_remaining is not None:
-                    absolute_remaining = round(included * percent_remaining / 100.0, 2)
-                    absolute_used = round(included - absolute_remaining, 2)
-
-                quota_snapshots[bucket] = {
-                    "included": included,
-                    "unlimited": unlimited,
-                    "percent_remaining": percent_remaining,
-                    "percent_used": percent_used,
-                    "absolute_remaining": absolute_remaining,
-                    "absolute_used": absolute_used,
-                    "overage": overage,
-                    "overage_permitted": overage_permitted,
-                    "reset_at": reset_at,
-                    "raw": raw,
-                }
+            # with URL-encoded "ent=...&ov=...&ovPerm=...&rem=...&rst=..." values.
+            # `rem` is a remaining percentage, not an absolute count. This is more
+            # authoritative than the user-scoped /settings/billing endpoint because
+            # it ships on every successful chat completion.
+            quota_snapshots = extract_quota_snapshots_from_headers(upstream.headers)
             if quota_snapshots:
                 finished_event["quota_snapshots"] = quota_snapshots
 
-            # Copilot CLI's chat completions also emit per-window usage gauges:
-            #   x-usage-ratelimit-session: ent=0&ov=0.0&ovPerm=false&rem=93.2&rst=2026-04-21T06:22:37Z
-            #   x-usage-ratelimit-weekly:  ent=0&ov=0.0&ovPerm=false&rem=99.0&rst=2026-04-27T00:00:00Z
-            # `rem` is REMAINING PERCENT (0..100) for that rolling window, `rst` the reset
-            # timestamp. We surface them so the dashboard can show the live session/weekly
-            # throttles GitHub uses to slow Copilot down before the monthly premium cap bites.
-            usage_ratelimits: dict[str, dict[str, object]] = {}
-            for header_name, header_value in upstream.headers.items():
-                lowered = header_name.lower()
-                if not lowered.startswith("x-usage-ratelimit-"):
-                    continue
-                window = lowered[len("x-usage-ratelimit-"):]
-                if not window:
-                    continue
-                raw: dict[str, str] = {}
-                for key, values in parse_qs(unquote(header_value), keep_blank_values=True).items():
-                    if values:
-                        raw[key] = values[0]
-                rem_percent = _to_float(raw.get("rem"))
-                ent_value = _to_float(raw.get("ent"))
-                overage = _to_float(raw.get("ov"))
-                ov_perm_raw = raw.get("ovPerm")
-                overage_permitted = (
-                    ov_perm_raw.lower() == "true" if isinstance(ov_perm_raw, str) and ov_perm_raw else None
-                )
-                reset_at = raw.get("rst")
-                percent_remaining = (
-                    round(max(0.0, min(rem_percent, 100.0)), 2) if rem_percent is not None else None
-                )
-                percent_used = (
-                    round(100.0 - percent_remaining, 2) if percent_remaining is not None else None
-                )
-                usage_ratelimits[window] = {
-                    "percent_remaining": percent_remaining,
-                    "percent_used": percent_used,
-                    "entitlement": int(ent_value) if (ent_value is not None and ent_value > 0) else ent_value,
-                    "overage": overage,
-                    "overage_permitted": overage_permitted,
-                    "reset_at": reset_at,
-                    "raw": raw,
-                }
+            # Copilot CLI's chat completions also emit per-window usage gauges.
+            # We surface them so the dashboard and response reminders can show the
+            # live session/weekly throttles GitHub uses to slow Copilot down before
+            # the monthly premium cap bites.
+            usage_ratelimits = extract_usage_ratelimits_from_headers(upstream.headers)
             if usage_ratelimits:
                 finished_event["usage_ratelimits"] = usage_ratelimits
 

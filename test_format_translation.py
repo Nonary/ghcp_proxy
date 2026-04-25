@@ -1087,6 +1087,46 @@ class FormatTranslationTests(unittest.TestCase):
         for item in sanitized:
             self.assertNotIn("content", item, item)
 
+    def test_sanitize_input_can_strip_unverifiable_reasoning_ciphertext(self):
+        sanitized = format_translation.sanitize_input(
+            [
+                {
+                    "type": "reasoning",
+                    "id": "rs_keep",
+                    "summary": [{"type": "summary_text", "text": "visible reasoning summary"}],
+                    "encrypted_content": "foreign-ciphertext",
+                    "content": [{"type": "reasoning_text", "text": "hidden"}],
+                },
+                {
+                    "type": "reasoning",
+                    "id": "rs_drop",
+                    "encrypted_content": "ciphertext-only",
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "continue"}],
+                },
+            ],
+            preserve_encrypted_content=False,
+        )
+
+        self.assertEqual(
+            sanitized,
+            [
+                {
+                    "type": "reasoning",
+                    "id": "rs_keep",
+                    "summary": [{"type": "summary_text", "text": "visible reasoning summary"}],
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "continue"}],
+                },
+            ],
+        )
+
     def test_anthropic_request_to_chat_stream_requests_usage_chunks(self):
         body = {
             "model": "claude-sonnet-4.6",

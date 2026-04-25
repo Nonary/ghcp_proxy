@@ -2143,9 +2143,36 @@ def _sanitize_function_call_output_item(item: dict) -> dict:
     }
 
 
-def sanitize_input(input_items):
+def _reasoning_summary_has_text(summary) -> bool:
+    if isinstance(summary, str):
+        return bool(summary.strip())
+    if not isinstance(summary, list):
+        return False
+    for part in summary:
+        if isinstance(part, str) and part.strip():
+            return True
+        if isinstance(part, dict):
+            text = part.get("text")
+            if isinstance(text, str) and text.strip():
+                return True
+    return False
+
+
+def _reasoning_item_has_replay_value(item: dict) -> bool:
+    if not isinstance(item, dict):
+        return False
+    encrypted = item.get("encrypted_content")
+    if isinstance(encrypted, str) and encrypted:
+        return True
+    return _reasoning_summary_has_text(item.get("summary"))
+
+
+def sanitize_input(input_items, *, preserve_encrypted_content: bool = True):
     """
-    Preserve encrypted_content in reasoning items for multi-turn correctness.
+    Preserve encrypted_content in reasoning items for normal multi-turn correctness.
+    Callers may disable preservation for forked/subagent contexts where encrypted
+    reasoning blobs came from a different prompt-cache lineage and upstream will
+    reject them as unverifiable.
     Treat the latest compaction item as the active handoff boundary so older
     pre-compaction prompt items are not replayed upstream.
     Expand locally synthesized compaction items into a readable summary message.
@@ -2170,12 +2197,16 @@ def sanitize_input(input_items):
                 result.append(_summary_message_item(summary_text))
                 continue
             if isinstance(encrypted_content, str) and encrypted_content:
-                result.append(
-                    {
-                        "type": "reasoning",
-                        "encrypted_content": encrypted_content,
-                    }
-                )
+                if preserve_encrypted_content:
+                    result.append(
+                        {
+                            "type": "reasoning",
+                            "encrypted_content": encrypted_content,
+                        }
+                    )
+                # If the caller disabled encrypted replay, an opaque compaction
+                # token has no local text we can safely forward. Drop it rather
+                # than sending unverifiable ciphertext upstream.
                 continue
             result.append(item)
             continue
@@ -2204,8 +2235,8 @@ def sanitize_input(input_items):
         filtered = {}
         for k, v in item.items():
             if k == "encrypted_content":
-                if v is not None:
-                    filtered[k] = v   # always preserve if present
+                if v is not None and preserve_encrypted_content:
+                    filtered[k] = v   # preserve during normal same-lineage replay
                 continue
             if k == "status" and v is None:
                 continue              # strip status=None
@@ -2217,7 +2248,8 @@ def sanitize_input(input_items):
                 continue
             if v is not None:
                 filtered[k] = v
-        result.append(filtered)
+        if preserve_encrypted_content or _reasoning_item_has_replay_value(filtered):
+            result.append(filtered)
     return result
 
 

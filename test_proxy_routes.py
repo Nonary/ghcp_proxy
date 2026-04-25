@@ -881,6 +881,85 @@ class ProxyRoutesTests(unittest.TestCase):
         self.assertEqual(response_payload["id"], "resp_123")
         self.assertEqual(response_payload["output"][0]["content"][0]["text"], "done")
 
+    def test_responses_route_strips_encrypted_reasoning_for_forked_context(self):
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/responses"),
+            method="POST",
+            headers={},
+        )
+        body = {
+            "model": "gpt-5.5",
+            "stream": False,
+            "input": [
+                {
+                    "type": "message",
+                    "role": "developer",
+                    "content": [{"type": "input_text", "text": "parent developer"}],
+                },
+                {
+                    "type": "message",
+                    "role": "developer",
+                    "content": [{"type": "input_text", "text": "fork developer"}],
+                },
+                {
+                    "type": "reasoning",
+                    "id": "rs_parent",
+                    "summary": [{"type": "summary_text", "text": "summary survives"}],
+                    "encrypted_content": "foreign-parent-ciphertext",
+                },
+                {
+                    "type": "reasoning",
+                    "id": "rs_empty",
+                    "encrypted_content": "ciphertext-only",
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "subtask"}],
+                },
+            ],
+        }
+        upstream = httpx.Response(
+            200,
+            json={
+                "id": "resp_123",
+                "model": "gpt-5.5",
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "done"}],
+                    }
+                ],
+            },
+            headers={"content-type": "application/json"},
+        )
+
+        with (
+            mock.patch.object(proxy, "parse_json_request", mock.AsyncMock(return_value=body)),
+            mock.patch.object(auth, "get_api_key", return_value="test-key"),
+            mock.patch.object(auth, "get_api_base", return_value="https://example.invalid"),
+            mock.patch.object(proxy.model_routing_config_service, "resolve_target_model", return_value="gpt-5.5"),
+            mock.patch.object(proxy.usage_tracker, "start_event", return_value=None),
+            mock.patch.object(proxy.usage_tracker, "finish_event"),
+            mock.patch.object(proxy, "throttled_client_post", mock.AsyncMock(return_value=upstream)) as post,
+        ):
+            response = proxy.asyncio.run(proxy.responses(request))
+
+        forwarded_input = post.await_args.kwargs["json"]["input"]
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn("encrypted_content", json.dumps(forwarded_input))
+        self.assertEqual(
+            [item for item in forwarded_input if item.get("type") == "reasoning"],
+            [
+                {
+                    "type": "reasoning",
+                    "id": "rs_parent",
+                    "summary": [{"type": "summary_text", "text": "summary survives"}],
+                }
+            ],
+        )
+
     def test_responses_route_strips_unsupported_image_generation_tool(self):
         request = SimpleNamespace(
             url=SimpleNamespace(path="/v1/responses"),

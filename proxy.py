@@ -66,6 +66,7 @@ import time
 import threading
 import safeguard_config as safeguard_config_module
 import update_notice
+import usage_reminder
 import usage_tracking
 import util
 from dataclasses import dataclass
@@ -161,10 +162,18 @@ INVALID_BRIDGE_REQUEST_MESSAGE = "Invalid request"
 safeguard_event_store = dashboard_module.create_safeguard_event_store()
 
 
-def _stream_with_update_notice(byte_iter, protocol: str):
-    notice_text = auto_update_runtime_controller.update_notice_text_if_due()
-    if not notice_text:
+def _stream_with_update_notice(byte_iter, protocol: str, upstream_headers=None):
+    notices: list[str] = []
+    update_text = auto_update_runtime_controller.update_notice_text_if_due()
+    if update_text:
+        notices.append(update_text)
+    usage_windows = usage_tracking.extract_usage_ratelimits_from_headers(upstream_headers)
+    usage_text = usage_reminder_controller.usage_notice_text_if_due(usage_windows)
+    if usage_text:
+        notices.append(usage_text)
+    if not notices:
         return byte_iter
+    notice_text = "\n\n".join(notices)
     return update_notice.inject_text_notice(byte_iter, protocol, notice_text)
 
 
@@ -215,6 +224,9 @@ usage_tracker = usage_tracking.UsageTracker(
     event_bus=usage_event_bus,
     on_request_finished=_initiator_policy.note_request_finished,
     on_usage_event_recorded=lambda _event: dashboard_service.notify_dashboard_stream_listeners(),
+)
+usage_reminder_controller = usage_reminder.UsageReminderController(
+    usage_tracker.snapshot_all_usage_events,
 )
 
 model_routing_config_service = ModelRoutingConfigService(ModelRoutingConfig())
@@ -1510,7 +1522,7 @@ async def proxy_streaming_response(
 
     async def stream_upstream():
         capture = usage_tracker.create_sse_capture(stream_type)
-        source_iter = _stream_with_update_notice(upstream.aiter_bytes(), stream_type)
+        source_iter = _stream_with_update_notice(upstream.aiter_bytes(), stream_type, getattr(upstream, "headers", None))
         try:
             async for chunk in source_iter:
                 if capture.feed(chunk):
@@ -1592,7 +1604,7 @@ async def proxy_anthropic_streaming_response(
             mark_first_output=lambda: usage_tracker.mark_first_output(usage_event),
         )
         try:
-            async for event in translator.translate(_stream_with_update_notice(upstream.aiter_bytes(), "chat")):
+            async for event in translator.translate(_stream_with_update_notice(upstream.aiter_bytes(), "chat", getattr(upstream, "headers", None))):
                 yield event
         finally:
             response_payload = translator.build_response_payload()
@@ -1664,7 +1676,7 @@ async def proxy_responses_from_chat_streaming_response(
             fallback_model,
             mark_first_output=lambda: usage_tracker.mark_first_output(usage_event),
         )
-        upstream_iter = _stream_with_update_notice(upstream.aiter_bytes(), "chat")
+        upstream_iter = _stream_with_update_notice(upstream.aiter_bytes(), "chat", getattr(upstream, "headers", None))
         try:
             async for event in translator.translate(upstream_iter):
                 yield event
@@ -1745,7 +1757,7 @@ async def proxy_anthropic_from_responses_streaming_response(
             mark_first_output=lambda: usage_tracker.mark_first_output(usage_event),
         )
         try:
-            async for event in translator.translate(_stream_with_update_notice(upstream.aiter_bytes(), "responses")):
+            async for event in translator.translate(_stream_with_update_notice(upstream.aiter_bytes(), "responses", getattr(upstream, "headers", None))):
                 yield event
         finally:
             response_payload = translator.build_response_payload()
@@ -1879,7 +1891,7 @@ async def proxy_anthropic_passthrough_streaming_response(
         first_output_marked = False
         buffer = ""
         try:
-            async for chunk in _stream_with_update_notice(upstream.aiter_bytes(), "anthropic"):
+            async for chunk in _stream_with_update_notice(upstream.aiter_bytes(), "anthropic", getattr(upstream, "headers", None)):
                 if chunk:
                     yield chunk
                     try:
@@ -1992,7 +2004,7 @@ async def proxy_responses_from_anthropic_streaming_response(
             mark_first_output=lambda: usage_tracker.mark_first_output(usage_event),
         )
         try:
-            async for evbytes in translator.translate(_stream_with_update_notice(upstream.aiter_bytes(), "anthropic")):
+            async for evbytes in translator.translate(_stream_with_update_notice(upstream.aiter_bytes(), "anthropic", getattr(upstream, "headers", None))):
                 yield evbytes
             yield b"data: [DONE]\n\n"
         finally:
@@ -2421,6 +2433,42 @@ async def client_proxy_install_api(request: Request):
     )
 
 
+
+
+def _responses_message_role(item) -> str | None:
+    if not isinstance(item, dict):
+        return None
+    if str(item.get("type", "")).lower() != "message":
+        return None
+    role = item.get("role")
+    if not isinstance(role, str):
+        return None
+    normalized = role.strip().lower()
+    return normalized or None
+
+
+def _responses_input_developer_message_count(input_value) -> int:
+    if not isinstance(input_value, list):
+        return 0
+    return sum(1 for item in input_value if _responses_message_role(item) == "developer")
+
+
+def _should_strip_encrypted_reasoning_for_forked_context(request: Request, input_value) -> bool:
+    """Return True when replayed encrypted reasoning is likely from another lineage.
+
+    Codex subagent/fork starts can replay the parent transcript, including
+    encrypted reasoning blobs, under a fresh prompt-cache key. Copilot/OpenAI
+    validates those blobs against the active lineage and rejects foreign ones
+    with ``invalid_request_body``. Keep normal same-thread replay intact, but
+    strip ciphertext when we have an explicit subagent marker or the input has
+    the fork shape Codex emits today (multiple developer messages). Summaries
+    remain available, so the visible transcript is preserved.
+    """
+    subagent = request.headers.get("x-openai-subagent") if hasattr(request, "headers") else None
+    if isinstance(subagent, str) and subagent.strip():
+        return True
+    return _responses_input_developer_message_count(input_value) > 1
+
 # ─── Route: /v1/responses  (Codex / Responses API) ───────────────────────────
 
 @app.get("/api/config/background-proxy")
@@ -2498,11 +2546,19 @@ async def responses(request: Request):
             format_translation.http_exception_detail_to_message(exc.detail),
         )
 
-    # Sanitize input (multi-turn encrypted_content passthrough)
+    # Sanitize input (multi-turn encrypted_content passthrough). Forked
+    # subagent contexts replay parent reasoning under a new lineage, so do not
+    # forward unverifiable encrypted reasoning blobs in that shape.
     raw_input = body.get("input")
     has_compaction_input = format_translation.input_contains_compaction(raw_input)
+    strip_forked_encrypted_reasoning = _should_strip_encrypted_reasoning_for_forked_context(
+        request, raw_input
+    )
     if raw_input is not None:
-        body["input"] = format_translation.sanitize_input(raw_input)
+        body["input"] = format_translation.sanitize_input(
+            raw_input,
+            preserve_encrypted_content=not strip_forked_encrypted_reasoning,
+        )
 
     try:
         api_key = auth.get_api_key()
