@@ -246,6 +246,41 @@ class AutoUpdateTests(unittest.TestCase):
         self.assertEqual(result["ahead"], 3)
         self.assertNotIn(("merge", "--ff-only", "origin/main"), calls)
 
+    def test_fetch_failure_includes_sanitized_credential_diagnostics(self):
+        def runner(command):
+            args = tuple(command[3:])
+            mapping = {
+                ("rev-parse", "--is-inside-work-tree"): auto_update.GitCommandResult(0, "true\n"),
+                ("rev-parse", "--show-toplevel"): auto_update.GitCommandResult(0, "/repo\n"),
+                ("rev-parse", "--abbrev-ref", "HEAD"): auto_update.GitCommandResult(0, "main\n"),
+                ("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"): auto_update.GitCommandResult(0, "origin/main\n"),
+                ("fetch", "--quiet", "--prune", "origin"): auto_update.GitCommandResult(
+                    128,
+                    "",
+                    "fatal: could not read Username for 'https://secret-token@github.com': terminal prompts disabled\n",
+                ),
+                ("remote", "get-url", "origin"): auto_update.GitCommandResult(
+                    0,
+                    "https://secret-token@github.com/Nonary/ghcp_proxy.git\n",
+                ),
+            }
+            if args in mapping:
+                return mapping[args]
+            raise AssertionError(f"unexpected git args: {args}")
+
+        with self._tempdir() as temp_dir, mock.patch.dict(
+            os.environ,
+            {"GHCP_AUTO_UPDATE": "1", "GHCP_AUTO_UPDATE_INTERVAL_SECONDS": "0"},
+        ):
+            manager = self._manager(runner, temp_dir)
+            result = manager.startup_check_and_update()
+
+        self.assertEqual(result["reason"], "fetch-failed")
+        self.assertEqual(result["remote_transport"], "https")
+        self.assertEqual(result["remote_url"], "https://github.com/Nonary/ghcp_proxy.git")
+        self.assertNotIn("secret-token", result["error"])
+        self.assertIn("credential manager", result["user_message"].lower())
+
     def test_recent_state_skips_network_check(self):
         calls = []
 
@@ -318,6 +353,155 @@ class AutoUpdateTests(unittest.TestCase):
             self.assertFalse(status["restart_pending"])
             self.assertFalse(status["restart_scheduled"])
             self.assertEqual(reexec_calls, ["reexec"])
+
+        asyncio.run(exercise())
+
+    def test_state_from_different_checkout_does_not_skip_check(self):
+        calls = []
+
+        def runner(command):
+            calls.append(tuple(command[3:]))
+            args = tuple(command[3:])
+            mapping = {
+                ("rev-parse", "--is-inside-work-tree"): auto_update.GitCommandResult(0, "true\n"),
+                ("rev-parse", "--show-toplevel"): auto_update.GitCommandResult(0, "/repo/current\n"),
+                ("rev-parse", "--abbrev-ref", "HEAD"): auto_update.GitCommandResult(0, "main\n"),
+                ("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"): auto_update.GitCommandResult(0, "origin/main\n"),
+                ("fetch", "--quiet", "--prune", "origin"): auto_update.GitCommandResult(0, ""),
+                ("rev-list", "--left-right", "--count", "HEAD...@{u}"): auto_update.GitCommandResult(0, "0 0\n"),
+                ("status", "--porcelain", "--untracked-files=all"): auto_update.GitCommandResult(0, ""),
+            }
+            if args in mapping:
+                return mapping[args]
+            raise AssertionError(f"unexpected git args: {args}")
+
+        with self._tempdir() as temp_dir, mock.patch.dict(
+            os.environ,
+            {"GHCP_AUTO_UPDATE": "1", "GHCP_AUTO_UPDATE_INTERVAL_SECONDS": "3600"},
+        ):
+            manager = self._manager(runner, temp_dir, now=2000.0)
+            Path(manager.state_file).parent.mkdir(parents=True)
+            Path(manager.state_file).write_text(
+                json.dumps(
+                    {
+                        "last_check_epoch": 1990.0,
+                        "last_result": {
+                            "reason": "fetch-failed",
+                            "repo_root": str(Path(temp_dir) / "other-checkout"),
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            result = manager.startup_check_and_update()
+
+        self.assertEqual(result["reason"], "up-to-date")
+        self.assertIn(("fetch", "--quiet", "--prune", "origin"), calls)
+
+    def test_pending_restart_state_does_not_skip_next_startup_check(self):
+        calls = []
+
+        def runner(command):
+            calls.append(tuple(command[3:]))
+            args = tuple(command[3:])
+            mapping = {
+                ("rev-parse", "--is-inside-work-tree"): auto_update.GitCommandResult(0, "true\n"),
+                ("rev-parse", "--show-toplevel"): auto_update.GitCommandResult(0, "/repo\n"),
+                ("rev-parse", "--abbrev-ref", "HEAD"): auto_update.GitCommandResult(0, "main\n"),
+                ("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"): auto_update.GitCommandResult(0, "origin/main\n"),
+                ("fetch", "--quiet", "--prune", "origin"): auto_update.GitCommandResult(0, ""),
+                ("rev-list", "--left-right", "--count", "HEAD...@{u}"): auto_update.GitCommandResult(0, "0 0\n"),
+                ("status", "--porcelain", "--untracked-files=all"): auto_update.GitCommandResult(0, ""),
+            }
+            if args in mapping:
+                return mapping[args]
+            raise AssertionError(f"unexpected git args: {args}")
+
+        with self._tempdir() as temp_dir, mock.patch.dict(
+            os.environ,
+            {"GHCP_AUTO_UPDATE": "1", "GHCP_AUTO_UPDATE_INTERVAL_SECONDS": "3600"},
+        ):
+            manager = self._manager(runner, temp_dir, now=2000.0)
+            Path(manager.state_file).parent.mkdir(parents=True)
+            Path(manager.state_file).write_text(
+                json.dumps(
+                    {
+                        "repo_dir": manager.repo_dir,
+                        "last_check_epoch": 1990.0,
+                        "last_result": {"reason": "updated", "restart_required": True},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            result = manager.startup_check_and_update()
+
+        self.assertEqual(result["reason"], "up-to-date")
+        self.assertIn(("fetch", "--quiet", "--prune", "origin"), calls)
+
+    def test_runtime_defers_idle_restart_until_after_result_returns(self):
+        class FakeManager:
+            def enabled(self):
+                return True
+
+            def startup_check_and_update(self, **_kwargs):
+                return {
+                    "attempted": True,
+                    "updated": True,
+                    "restart_required": True,
+                    "reason": "updated",
+                }
+
+            def status_payload(self):
+                return {"enabled": True}
+
+        async def exercise():
+            reexec_calls = []
+            controller = auto_update.AutoUpdateRuntimeController(
+                FakeManager(),
+                reexec_func=lambda: reexec_calls.append("reexec"),
+                logger=lambda _message: None,
+                restart_delay_seconds=0.01,
+            )
+            result = await controller.run_due_check()
+            self.assertEqual(result["reason"], "updated")
+            self.assertEqual(reexec_calls, [])
+            self.assertTrue(controller.status_payload()["runtime"]["restart_scheduled"])
+
+            await asyncio.sleep(0.03)
+            self.assertEqual(reexec_calls, ["reexec"])
+
+        asyncio.run(exercise())
+
+    def test_start_periodic_checks_runs_initial_check_without_waiting_interval(self):
+        class FakeManager:
+            def __init__(self):
+                self.calls = 0
+
+            def enabled(self):
+                return True
+
+            def check_interval_seconds(self):
+                return 3600
+
+            def startup_check_and_update(self, **_kwargs):
+                self.calls += 1
+                return {
+                    "attempted": True,
+                    "updated": False,
+                    "restart_required": False,
+                    "reason": "up-to-date",
+                }
+
+            def status_payload(self):
+                return {"enabled": True}
+
+        async def exercise():
+            manager = FakeManager()
+            controller = auto_update.AutoUpdateRuntimeController(manager, logger=lambda _message: None)
+            self.assertTrue(controller.start_periodic_checks())
+            await asyncio.sleep(0.01)
+            self.assertEqual(manager.calls, 1)
+            await controller.stop_periodic_checks()
 
         asyncio.run(exercise())
 

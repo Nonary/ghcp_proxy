@@ -1,15 +1,34 @@
 import os
-import tempfile
+import shutil
 import unittest
 from pathlib import Path
 from unittest import mock
+from contextlib import contextmanager
 
 import background_proxy
 
 
 class BackgroundProxyTests(unittest.TestCase):
+    _temp_counter = 0
+
+    @contextmanager
+    def _tempdir(self):
+        BackgroundProxyTests._temp_counter += 1
+        path = Path(os.getcwd()) / "__test_background_proxy_tmp__" / f"case-{BackgroundProxyTests._temp_counter}"
+        if path.exists():
+            shutil.rmtree(path)
+        path.mkdir(parents=True)
+        try:
+            yield str(path)
+        finally:
+            shutil.rmtree(path, ignore_errors=True)
+            try:
+                path.parent.rmdir()
+            except OSError:
+                pass
+
     def test_windows_startup_and_profile_commands(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
+        with self._tempdir() as temp_dir:
             root = Path(temp_dir)
             env = {
                 "APPDATA": str(root / "Roaming"),
@@ -44,7 +63,7 @@ class BackgroundProxyTests(unittest.TestCase):
                 self.assertNotIn("Start-GHProxy", profile_path.read_text(encoding="utf-8"))
 
     def test_macos_launch_agent_and_zsh_commands(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
+        with self._tempdir() as temp_dir:
             root = Path(temp_dir)
             home = root / "home"
             home.mkdir()
@@ -68,6 +87,39 @@ class BackgroundProxyTests(unittest.TestCase):
                 self.assertIn("start-ghproxy()", body)
                 self.assertIn("stop-ghproxy()", body)
                 self.assertTrue(status["shell_commands_installed"])
+
+    def test_existing_startup_entry_for_different_checkout_is_not_current(self):
+        with self._tempdir() as temp_dir:
+            root = Path(temp_dir)
+            env = {
+                "APPDATA": str(root / "Roaming"),
+                "USERPROFILE": str(root / "User"),
+            }
+            manager = background_proxy.BackgroundProxyManager(
+                repo_dir=str(root / "repo-current"),
+                python_executable=str(root / "Python" / "python.exe"),
+                platform="win32",
+            )
+
+            with mock.patch.dict(os.environ, env, clear=True):
+                startup_path = Path(manager.startup_path())
+                startup_path.parent.mkdir(parents=True)
+                startup_path.write_text(
+                    "@echo off\n"
+                    "powershell -Command \"Start-Process -FilePath 'python.exe' "
+                    "-ArgumentList @('C:\\old\\ghcp_proxy\\proxy.py')\"\n",
+                    encoding="utf-8",
+                )
+
+                status = manager.status_payload()
+                self.assertTrue(status["startup_installed"])
+                self.assertFalse(status["startup_current"])
+                self.assertFalse(status["startup_enabled"])
+
+                status = manager.enable_startup()
+                self.assertTrue(status["startup_current"])
+                self.assertTrue(status["startup_enabled"])
+
 
     def test_linux_reports_unsupported(self):
         manager = background_proxy.BackgroundProxyManager(platform="linux")

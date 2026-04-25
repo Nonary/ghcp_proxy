@@ -69,6 +69,7 @@ import usage_tracking
 import util
 from dataclasses import dataclass
 from threading import Lock, Thread
+from typing import Callable
 from urllib.parse import urlsplit
 from uuid import uuid4
 
@@ -377,6 +378,8 @@ class UpstreamRequestPlan:
     source_body: dict | None = None
     trace_context: dict | None = None
     auto_update_request_tracked: bool = False
+    header_builder: Callable[[str, str], dict] | None = None
+    auth_retry_attempted: bool = False
 
 
 def _env_flag(name: str) -> bool:
@@ -1093,6 +1096,7 @@ def _prepare_upstream_request(
             source_body=source_body if isinstance(source_body, dict) else body,
             trace_context=trace_context,
             auto_update_request_tracked=True,
+            header_builder=header_builder,
         ),
         None,
     )
@@ -1332,15 +1336,71 @@ def _bridge_error_response_from_upstream(bridge_plan: BridgeExecutionPlan, upstr
     return proxy_non_streaming_response(upstream)
 
 
+def _is_upstream_auth_failure(status_code: int) -> bool:
+    return status_code in {401, 403}
+
+
+def _refresh_plan_auth_headers(plan: UpstreamRequestPlan | None) -> bool:
+    """Refresh a stale Copilot API key and rebuild request headers once."""
+    if not isinstance(plan, UpstreamRequestPlan):
+        return False
+    if plan.auth_retry_attempted:
+        return False
+    if plan.header_builder is None:
+        return False
+    plan.auth_retry_attempted = True
+    try:
+        refreshed_key = auth.get_api_key(force_refresh=True)
+        plan.headers = plan.header_builder(refreshed_key, plan.request_id)
+        if isinstance(plan.trace_context, dict):
+            plan.trace_context["auth_retry"] = True
+        return True
+    except Exception as exc:
+        if isinstance(plan.trace_context, dict):
+            plan.trace_context["auth_retry_error"] = str(exc)
+        return False
+
+
+async def _post_plan_json_with_auth_retry(client: httpx.AsyncClient, plan: UpstreamRequestPlan) -> httpx.Response:
+    upstream = await throttled_client_post(
+        client,
+        plan.upstream_url,
+        headers=plan.headers,
+        json=plan.body,
+    )
+    if _is_upstream_auth_failure(upstream.status_code) and _refresh_plan_auth_headers(plan):
+        upstream = await throttled_client_post(
+            client,
+            plan.upstream_url,
+            headers=plan.headers,
+            json=plan.body,
+        )
+    return upstream
+
+
+async def _send_stream_request_with_auth_retry(
+    client: httpx.AsyncClient,
+    upstream_url: str,
+    headers: dict,
+    body: dict,
+    trace_plan: UpstreamRequestPlan | None,
+) -> httpx.Response:
+    request = client.build_request("POST", upstream_url, headers=headers, json=body)
+    upstream = await throttled_client_send(client, request, stream=True)
+    if _is_upstream_auth_failure(upstream.status_code) and _refresh_plan_auth_headers(trace_plan):
+        await upstream.aclose()
+        retry_url = trace_plan.upstream_url if isinstance(trace_plan, UpstreamRequestPlan) else upstream_url
+        retry_headers = trace_plan.headers if isinstance(trace_plan, UpstreamRequestPlan) else headers
+        retry_body = trace_plan.body if isinstance(trace_plan, UpstreamRequestPlan) else body
+        request = client.build_request("POST", retry_url, headers=retry_headers, json=retry_body)
+        upstream = await throttled_client_send(client, request, stream=True)
+    return upstream
+
+
 async def _post_non_streaming_request(plan: UpstreamRequestPlan, *, error_response) -> Response:
     try:
         async with httpx.AsyncClient(timeout=configured_upstream_timeout_seconds()) as client:
-            upstream = await throttled_client_post(
-                client,
-                plan.upstream_url,
-                headers=plan.headers,
-                json=plan.body,
-            )
+            upstream = await _post_plan_json_with_auth_retry(client, plan)
         _finish_usage_and_trace(
             plan,
             upstream.status_code,
@@ -1362,12 +1422,7 @@ async def _post_bridge_non_streaming_request(plan: UpstreamRequestPlan, bridge_p
     error_response = _bridge_error_response(bridge_plan)
     try:
         async with httpx.AsyncClient(timeout=configured_upstream_timeout_seconds()) as client:
-            upstream = await throttled_client_post(
-                client,
-                plan.upstream_url,
-                headers=plan.headers,
-                json=plan.body,
-            )
+            upstream = await _post_plan_json_with_auth_retry(client, plan)
     except httpx.RequestError as exc:
         status_code, message = format_translation.upstream_request_error_status_and_message(exc)
         _finish_usage_and_trace(plan, status_code, response_text=message)
@@ -1467,9 +1522,10 @@ async def proxy_streaming_response(
     error body as a normal HTTP response instead of masking it as 200 SSE.
     """
     client = httpx.AsyncClient(timeout=timeout)
-    request = client.build_request("POST", upstream_url, headers=headers, json=body)
     try:
-        upstream = await throttled_client_send(client, request, stream=True)
+        upstream = await _send_stream_request_with_auth_retry(
+            client, upstream_url, headers, body, trace_plan
+        )
     except httpx.RequestError as exc:
         status_code, message = format_translation.upstream_request_error_status_and_message(exc)
         _finish_usage_and_trace(trace_plan, status_code, response_text=message)
@@ -1537,9 +1593,10 @@ async def proxy_anthropic_streaming_response(
     Translate upstream chat-completions SSE into Anthropic Messages SSE.
     """
     client = httpx.AsyncClient(timeout=timeout)
-    request = client.build_request("POST", upstream_url, headers=headers, json=body)
     try:
-        upstream = await throttled_client_send(client, request, stream=True)
+        upstream = await _send_stream_request_with_auth_retry(
+            client, upstream_url, headers, body, trace_plan
+        )
     except httpx.RequestError as exc:
         status_code, message = format_translation.upstream_request_error_status_and_message(exc)
         _finish_usage_and_trace(trace_plan, status_code, response_text=message)
@@ -1616,9 +1673,10 @@ async def proxy_responses_from_chat_streaming_response(
     trace_plan: UpstreamRequestPlan | None = None,
 ) -> Response:
     client = httpx.AsyncClient(timeout=timeout)
-    request = client.build_request("POST", upstream_url, headers=headers, json=body)
     try:
-        upstream = await throttled_client_send(client, request, stream=True)
+        upstream = await _send_stream_request_with_auth_retry(
+            client, upstream_url, headers, body, trace_plan
+        )
     except httpx.RequestError as exc:
         status_code, message = format_translation.upstream_request_error_status_and_message(exc)
         _finish_usage_and_trace(trace_plan, status_code, response_text=message)
@@ -1690,9 +1748,10 @@ async def proxy_anthropic_from_responses_streaming_response(
     trace_plan: UpstreamRequestPlan | None = None,
 ) -> Response:
     client = httpx.AsyncClient(timeout=timeout)
-    request = client.build_request("POST", upstream_url, headers=headers, json=body)
     try:
-        upstream = await throttled_client_send(client, request, stream=True)
+        upstream = await _send_stream_request_with_auth_retry(
+            client, upstream_url, headers, body, trace_plan
+        )
     except httpx.RequestError as exc:
         status_code, message = format_translation.upstream_request_error_status_and_message(exc)
         _finish_usage_and_trace(trace_plan, status_code, response_text=message)
@@ -1778,9 +1837,10 @@ async def proxy_anthropic_passthrough_streaming_response(
     del fallback_model  # unused; kept for signature symmetry with siblings.
 
     client = httpx.AsyncClient(timeout=timeout)
-    request = client.build_request("POST", upstream_url, headers=headers, json=body)
     try:
-        upstream = await throttled_client_send(client, request, stream=True)
+        upstream = await _send_stream_request_with_auth_retry(
+            client, upstream_url, headers, body, trace_plan
+        )
     except httpx.RequestError as exc:
         status_code, message = format_translation.upstream_request_error_status_and_message(exc)
         _finish_usage_and_trace(trace_plan, status_code, response_text=message)
@@ -1931,9 +1991,10 @@ async def proxy_responses_from_anthropic_streaming_response(
 ) -> Response:
     """Translate upstream Anthropic Messages SSE into Responses SSE."""
     client = httpx.AsyncClient(timeout=timeout)
-    request = client.build_request("POST", upstream_url, headers=headers, json=body)
     try:
-        upstream = await throttled_client_send(client, request, stream=True)
+        upstream = await _send_stream_request_with_auth_retry(
+            client, upstream_url, headers, body, trace_plan
+        )
     except httpx.RequestError as exc:
         status_code, message = format_translation.upstream_request_error_status_and_message(exc)
         _finish_usage_and_trace(trace_plan, status_code, response_text=message)
@@ -2223,6 +2284,14 @@ async def _proxy_models_request() -> Response:
         async with httpx.AsyncClient(timeout=configured_upstream_timeout_seconds()) as client:
             request = client.build_request("GET", upstream_url, headers=headers)
             upstream = await throttled_client_send(client, request)
+            if _is_upstream_auth_failure(upstream.status_code):
+                try:
+                    api_key = auth.get_api_key(force_refresh=True)
+                    headers = format_translation.build_copilot_headers(api_key)
+                    request = client.build_request("GET", upstream_url, headers=headers)
+                    upstream = await throttled_client_send(client, request)
+                except Exception:
+                    pass
     except httpx.RequestError as exc:
         status_code, message = format_translation.upstream_request_error_status_and_message(exc)
         return format_translation.openai_error_response(status_code, message)

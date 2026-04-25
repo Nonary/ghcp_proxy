@@ -31,12 +31,16 @@ def _quote_xml(value: str) -> str:
     )
 
 
-def _profile_has_block(path: str) -> bool:
+def _read_text(path: str) -> str:
     try:
         with open(path, encoding="utf-8") as f:
-            return START_MARKER in f.read()
+            return f.read()
     except OSError:
-        return False
+        return ""
+
+
+def _profile_has_block(path: str) -> bool:
+    return START_MARKER in _read_text(path)
 
 
 def _expand_user_path(path: str) -> str:
@@ -84,9 +88,12 @@ class BackgroundProxyManager:
         return {
             "platform": self.platform,
             "startup_supported": self.startup_supported(),
+            "startup_installed": self.startup_installed(),
+            "startup_current": self.startup_current(),
             "startup_enabled": self.startup_enabled(),
             "startup_path": self.startup_path(),
             "shell_commands_supported": self.shell_commands_supported(),
+            "shell_commands_current": self.shell_commands_current(),
             "shell_commands_installed": self.shell_commands_installed(),
             "shell_profile_path": self.shell_profile_path(),
             "commands": self.command_names(),
@@ -132,13 +139,39 @@ class BackgroundProxyManager:
             return _expand_user_path("~/.zshrc")
         return ""
 
-    def startup_enabled(self) -> bool:
+    def startup_installed(self) -> bool:
         path = self.startup_path()
         return bool(path and os.path.exists(path))
 
-    def shell_commands_installed(self) -> bool:
+    def startup_current(self) -> bool:
+        path = self.startup_path()
+        if not path or not os.path.exists(path):
+            return False
+        return self._text_targets_current_proxy(_read_text(path))
+
+    def startup_enabled(self) -> bool:
+        return self.startup_current()
+
+    def shell_commands_current(self) -> bool:
         path = self.shell_profile_path()
-        return bool(path and _profile_has_block(path))
+        if not path or not _profile_has_block(path):
+            return False
+        return self._text_targets_current_proxy(_read_text(path))
+
+    def shell_commands_installed(self) -> bool:
+        return self.shell_commands_current()
+
+    def _text_targets_current_proxy(self, text: str) -> bool:
+        if not text:
+            return False
+        proxy_script = os.path.abspath(self.proxy_script)
+        candidates = {
+            proxy_script,
+            proxy_script.replace("\\", "/"),
+            _quote_xml(proxy_script),
+            _quote_xml(proxy_script.replace("\\", "/")),
+        }
+        return any(candidate and candidate in text for candidate in candidates)
 
     def enable_startup(self) -> dict[str, object]:
         if not self.startup_supported():

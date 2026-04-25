@@ -73,3 +73,15 @@ class AuthTests(unittest.TestCase):
         self.assertTrue(payload["authenticated"])
         self.assertEqual(payload["state"], "authenticated")
         self.assertTrue(payload["has_access_token"])
+
+    def test_get_api_key_force_refresh_bypasses_cached_api_key(self):
+        with (
+            mock.patch.object(auth, "load_api_key", return_value="cached-api-key") as load_api_key,
+            mock.patch.object(auth, "load_access_token", return_value="access-token"),
+            mock.patch.object(auth, "_refresh_api_key", return_value="fresh-api-key") as refresh,
+        ):
+            key = auth.get_api_key(force_refresh=True)
+
+        self.assertEqual(key, "fresh-api-key")
+        load_api_key.assert_not_called()
+        refresh.assert_called_once_with("access-token")

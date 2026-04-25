@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -17,6 +18,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from threading import RLock
 from typing import Callable
+from urllib.parse import urlsplit, urlunsplit
 
 from constants import TOKEN_DIR
 
@@ -247,13 +249,15 @@ class AutoUpdateManager:
 
         fetch_result = self._git("fetch", "--quiet", "--prune", remote)
         if fetch_result.returncode != 0:
+            remote_url = self._remote_url(remote)
             return self._result(
                 False,
                 "fetch-failed",
                 branch=branch,
                 upstream=upstream,
                 remote=remote,
-                error=fetch_result.stderr or fetch_result.stdout,
+                error=self._sanitize_git_output(fetch_result.stderr or fetch_result.stdout),
+                **self._fetch_failure_diagnostics(remote, remote_url),
             )
 
         counts = self._ahead_behind()
@@ -504,6 +508,76 @@ class AutoUpdateManager:
             return ""
         return upstream.split("/", 1)[0]
 
+    def _remote_url(self, remote: str) -> str:
+        if not remote:
+            return ""
+        result = self._git("remote", "get-url", remote)
+        if result.returncode != 0:
+            return ""
+        return _single_line(result.stdout)
+
+    def _fetch_failure_diagnostics(self, remote: str, remote_url: str) -> dict[str, object]:
+        sanitized_url = self._sanitize_remote_url(remote_url)
+        transport = self._remote_transport(remote_url)
+        hint = ""
+        if transport == "ssh":
+            hint = (
+                "The configured git remote uses SSH. Background/login-startup processes may not have access to "
+                "your SSH key or agent, especially after Windows sign-in. Start GHCP Proxy from a shell where "
+                "ssh-agent works, configure SSH keys for startup, or switch the remote to HTTPS."
+            )
+        elif transport in {"http", "https"}:
+            hint = (
+                "The configured git remote uses HTTPS. If fetch keeps failing in the background, refresh the "
+                "Git credential manager entry for this repository or run git fetch once from an interactive shell."
+            )
+        else:
+            hint = (
+                "Run git fetch for this repository from an interactive shell to reveal any credential or network "
+                "prompt that the background updater cannot answer."
+            )
+        return {
+            "remote_url": sanitized_url,
+            "remote_transport": transport,
+            "user_message": f"Auto-update could not fetch from {remote}. {hint}",
+        }
+
+    def _remote_transport(self, remote_url: str) -> str:
+        candidate = str(remote_url or "").strip()
+        if not candidate:
+            return "unknown"
+        parsed = urlsplit(candidate)
+        if parsed.scheme:
+            scheme = parsed.scheme.lower()
+            if scheme in {"ssh", "git+ssh"}:
+                return "ssh"
+            if scheme in {"http", "https"}:
+                return scheme
+            return scheme
+        if re.match(r"^[^/\s@]+@[^:\s]+:.+", candidate):
+            return "ssh"
+        if candidate.startswith("\\\\") or re.match(r"^[A-Za-z]:[\\/]", candidate):
+            return "file"
+        return "unknown"
+
+    def _sanitize_remote_url(self, remote_url: str) -> str:
+        candidate = str(remote_url or "").strip()
+        if not candidate:
+            return ""
+        parsed = urlsplit(candidate)
+        if parsed.scheme and parsed.netloc:
+            hostname = parsed.hostname or ""
+            netloc = hostname
+            if parsed.port is not None:
+                netloc = f"{netloc}:{parsed.port}"
+            return urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
+        return self._sanitize_git_output(candidate)
+
+    def _sanitize_git_output(self, text: str) -> str:
+        # Avoid persisting tokens embedded in HTTPS remotes while keeping the
+        # actual git error useful for dashboard diagnostics.
+        return re.sub(r"([a-z][a-z0-9+.-]*://)([^/@\s]+)@", r"\1<credentials>@", str(text or ""), flags=re.IGNORECASE)
+
     def _git(self, *args: str) -> GitCommandResult:
         return self.command_runner(["git", "-C", self.repo_dir, *args])
 
@@ -533,6 +607,11 @@ class AutoUpdateManager:
         return GitCommandResult(completed.returncode, completed.stdout or "", completed.stderr or "")
 
     def _is_check_due(self, state: dict[str, object], now: float) -> bool:
+        if not self._state_matches_current_checkout(state):
+            return True
+        last_result = state.get("last_result")
+        if isinstance(last_result, dict) and last_result.get("restart_required"):
+            return True
         interval = self.check_interval_seconds()
         if interval <= 0:
             return True
@@ -540,6 +619,26 @@ class AutoUpdateManager:
         if not isinstance(last_check, (int, float)):
             return True
         return now - float(last_check) >= interval
+
+    def _state_matches_current_checkout(self, state: dict[str, object]) -> bool:
+        current_repo_dir = self._normalize_path_for_compare(self.repo_dir)
+        state_repo_dir = state.get("repo_dir")
+        if isinstance(state_repo_dir, str) and state_repo_dir.strip():
+            return self._normalize_path_for_compare(state_repo_dir) == current_repo_dir
+
+        # Older state files did not record repo_dir.  Fall back to the repo_root
+        # captured in last_result so one checkout cannot throttle another.
+        last_result = state.get("last_result")
+        if isinstance(last_result, dict):
+            state_repo_root = last_result.get("repo_root")
+            if isinstance(state_repo_root, str) and state_repo_root.strip():
+                normalized_root = self._normalize_path_for_compare(state_repo_root)
+                return current_repo_dir == normalized_root or current_repo_dir.startswith(normalized_root + os.sep)
+
+        return True
+
+    def _normalize_path_for_compare(self, path: str) -> str:
+        return os.path.normcase(os.path.abspath(os.path.expanduser(str(path or ""))))
 
     def _load_state(self) -> dict[str, object]:
         try:
@@ -567,6 +666,7 @@ class AutoUpdateManager:
 
     def _save_state(self, result: dict[str, object], *, now: float) -> None:
         payload = {
+            "repo_dir": self.repo_dir,
             "last_check_epoch": now,
             "last_check": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
             "last_result": result,
@@ -643,7 +743,7 @@ class AutoUpdateRuntimeController:
         if should_try_restart:
             self._schedule_restart_if_idle("request-drained")
 
-    def start_periodic_checks(self) -> bool:
+    def start_periodic_checks(self, *, run_immediately: bool = True) -> bool:
         if not self.manager.enabled():
             return False
         try:
@@ -653,7 +753,10 @@ class AutoUpdateRuntimeController:
         with self._lock:
             if self._task and not self._task.done():
                 return False
-            self._task = loop.create_task(self._periodic_loop(), name="ghcp-auto-update")
+            self._task = loop.create_task(
+                self._periodic_loop(run_immediately=run_immediately),
+                name="ghcp-auto-update",
+            )
             return True
 
     async def stop_periodic_checks(self) -> None:
@@ -717,13 +820,17 @@ class AutoUpdateRuntimeController:
                 self._last_restart_error = None
 
         if restart_required:
-            self._restart_if_idle("auto-update")
+            self._schedule_restart_if_idle("auto-update")
         return result
 
-    async def _periodic_loop(self) -> None:
+    async def _periodic_loop(self, *, run_immediately: bool = False) -> None:
+        first_check = bool(run_immediately)
         while True:
-            interval = max(1.0, self.manager.check_interval_seconds())
-            await asyncio.sleep(interval)
+            if first_check:
+                first_check = False
+            else:
+                interval = max(1.0, self.manager.check_interval_seconds())
+                await asyncio.sleep(interval)
             try:
                 await self.run_due_check()
             except asyncio.CancelledError:

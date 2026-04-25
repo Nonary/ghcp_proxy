@@ -92,6 +92,17 @@ def get_api_base() -> str:
         return GITHUB_COPILOT_API_BASE
 
 
+def clear_api_key_cache() -> bool:
+    """Remove the cached short-lived Copilot API key, if present."""
+    try:
+        os.remove(API_KEY_FILE)
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return False
+
+
 def _utc_timestamp() -> float:
     return datetime.now(timezone.utc).timestamp()
 
@@ -207,6 +218,16 @@ def _refresh_api_key(access_token: str) -> str:
     with open(API_KEY_FILE, "w") as f:
         json.dump(data, f)
     return data["token"]
+
+
+def refresh_api_key(*, interactive: bool = False) -> str:
+    """Force-refresh the short-lived Copilot API key using the cached OAuth token."""
+    access_token = load_access_token()
+    if not access_token:
+        if not interactive:
+            raise RuntimeError("GitHub Copilot authorization required.")
+        access_token = _device_flow()
+    return _refresh_api_key(access_token)
 
 
 def _authenticated_snapshot(*, message: str | None = None, warning: str | None = None) -> dict:
@@ -436,17 +457,12 @@ def begin_device_flow() -> dict:
         return _flow_snapshot_unlocked()
 
 
-def get_api_key(*, interactive: bool = False) -> str:
+def get_api_key(*, interactive: bool = False, force_refresh: bool = False) -> str:
     """Returns a valid GHCP API key, refreshing transparently when expired."""
-    key = load_api_key()
+    key = None if force_refresh else load_api_key()
     if key:
         return key
-    access_token = load_access_token()
-    if not access_token:
-        if not interactive:
-            raise RuntimeError("GitHub Copilot authorization required.")
-        access_token = _device_flow()
-    return _refresh_api_key(access_token)
+    return refresh_api_key(interactive=interactive)
 
 
 def ensure_authenticated():

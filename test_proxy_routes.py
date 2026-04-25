@@ -1546,6 +1546,48 @@ class AnthropicMessagesPassthroughRouteTests(unittest.TestCase):
         self.assertEqual(start_event.call_args.args[3], "agent")
 
 
+    def test_non_streaming_upstream_auth_failure_refreshes_api_key_once(self):
+        built_headers = []
+
+        def header_builder(api_key, request_id):
+            headers = {"authorization": f"Bearer {api_key}", "x-request-id": request_id}
+            built_headers.append(headers)
+            return headers
+
+        plan = proxy.UpstreamRequestPlan(
+            request_id="req-auth-retry",
+            upstream_url="https://example.invalid/v1/chat/completions",
+            headers=header_builder("stale-key", "req-auth-retry"),
+            body={"model": "gpt-test", "messages": []},
+            usage_event=None,
+            requested_model="gpt-test",
+            resolved_model="gpt-test",
+            header_builder=header_builder,
+        )
+        stale_response = httpx.Response(401, json={"error": {"message": "bad token"}}, headers={"content-type": "application/json"})
+        fresh_response = httpx.Response(200, json={"ok": True}, headers={"content-type": "application/json"})
+
+        with (
+            mock.patch.object(auth, "get_api_key", return_value="fresh-key") as get_api_key,
+            mock.patch.object(proxy, "throttled_client_post", mock.AsyncMock(side_effect=[stale_response, fresh_response])) as post,
+            mock.patch.object(proxy, "_finish_usage_and_trace") as finish,
+        ):
+            response = proxy.asyncio.run(
+                proxy._post_non_streaming_request(
+                    plan,
+                    error_response=format_translation.openai_error_response,
+                )
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(post.await_count, 2)
+        self.assertEqual(post.await_args_list[0].kwargs["headers"]["authorization"], "Bearer stale-key")
+        self.assertEqual(post.await_args_list[1].kwargs["headers"]["authorization"], "Bearer fresh-key")
+        get_api_key.assert_called_once_with(force_refresh=True)
+        self.assertTrue(plan.auth_retry_attempted)
+        finish.assert_called_once()
+
+
     def test_bridge_planner_end_to_end_dispatches_to_messages_url(self):
         """Regression: feed the *real* bridge_planner through to dispatch.
 

@@ -2458,7 +2458,7 @@
           </article>
           <article class="mini-card" style="margin-top: 12px;">
             <div class="eyebrow">Background Proxy</div>
-            <div :class="['status', backgroundProxyStatus.startup_enabled ? 'good' : 'warn']">
+            <div :class="['status', backgroundProxyStatus.startup_enabled ? 'good' : (backgroundProxyStatus.startup_installed && !backgroundProxyStatus.startup_current ? 'error' : 'warn')]">
               {{ backgroundProxyStartupLabel }}
             </div>
             <label style="display:flex; align-items:center; gap:10px; margin-top:6px;">
@@ -3707,9 +3707,12 @@
           backgroundProxyStatus: {
             platform: '',
             startup_supported: false,
+            startup_installed: false,
+            startup_current: false,
             startup_enabled: false,
             startup_path: '',
             shell_commands_supported: false,
+            shell_commands_current: false,
             shell_commands_installed: false,
             shell_profile_path: '',
             commands: {},
@@ -4982,6 +4985,9 @@
         },
         backgroundProxyStartupLabel() {
           if (!this.backgroundProxyStatus.startup_supported) return 'Login startup is not supported on this OS';
+          if (this.backgroundProxyStatus.startup_installed && !this.backgroundProxyStatus.startup_current) {
+            return 'Login startup points to a different checkout';
+          }
           return this.backgroundProxyStatus.startup_enabled ? 'Starts at login' : 'Manual start only';
         },
         autoUpdateLastResult() {
