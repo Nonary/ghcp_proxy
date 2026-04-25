@@ -103,10 +103,27 @@ def _apply_forwarded_request_headers(
     return session_id
 
 
-def _strip_responses_cache_affinity_fields(body: dict) -> None:
-    if isinstance(body, dict):
-        for key in ("prompt_cache_key", "promptCacheKey", "session_id", "sessionId", "previous_response_id"):
-            body.pop(key, None)
+def _normalize_responses_prompt_cache_key(body: dict, session_id: str | None) -> None:
+    if not isinstance(body, dict):
+        return
+
+    prompt_cache_key = None
+    for key in ("prompt_cache_key", "promptCacheKey"):
+        value = body.get(key)
+        if isinstance(value, str):
+            normalized = value.strip()
+            if normalized:
+                prompt_cache_key = normalized
+                break
+
+    if prompt_cache_key is None and isinstance(session_id, str):
+        normalized_session_id = session_id.strip()
+        if normalized_session_id:
+            prompt_cache_key = normalized_session_id
+
+    body.pop("promptCacheKey", None)
+    if prompt_cache_key is not None:
+        body["prompt_cache_key"] = prompt_cache_key
 
 
 def build_responses_headers_for_request(
@@ -121,10 +138,6 @@ def build_responses_headers_for_request(
     verdict_sink: dict | None = None,
 ) -> dict:
     headers = build_copilot_headers(api_key)
-    request_path = getattr(getattr(request, "url", None), "path", "")
-    is_compact = isinstance(request_path, str) and "compact" in request_path.lower()
-    if is_compact:
-        _strip_responses_cache_affinity_fields(body)
     session_id = _apply_forwarded_request_headers(
         headers,
         request,
@@ -133,7 +146,7 @@ def build_responses_headers_for_request(
         forward_session_header=False,
         synthesize_client_request_id=False,
     )
-    _strip_responses_cache_affinity_fields(body)
+    _normalize_responses_prompt_cache_key(body, session_id)
 
     had_input = "input" in body
     effective_input, initiator = initiator_policy.resolve_responses_input(
@@ -148,7 +161,7 @@ def build_responses_headers_for_request(
         body["input"] = effective_input
     headers["X-Initiator"] = initiator
     headers["x-interaction-type"] = _interaction_type_for_initiator(initiator)
-    headers.update(_responses_affinity_headers(initiator, session_id, reset=is_compact))
+    headers.update(_responses_affinity_headers(initiator, session_id))
 
     if has_vision_input(effective_input):
         headers["Copilot-Vision-Request"] = "true"

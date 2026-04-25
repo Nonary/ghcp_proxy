@@ -751,7 +751,7 @@ class ProxyRoutesTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 200)
 
-    def test_responses_route_strips_body_cache_affinity_fields(self):
+    def test_responses_route_preserves_body_cache_affinity_fields(self):
         request = SimpleNamespace(
             url=SimpleNamespace(path="/v1/responses"),
             method="POST",
@@ -760,7 +760,7 @@ class ProxyRoutesTests(unittest.TestCase):
         body = {
             "model": "gpt-5.4",
             "sessionId": "session-123",
-            "promptCacheKey": "cache-123",
+            "prompt_cache_key": "cache-123",
             "previous_response_id": "resp_prev",
             "tools": [
                 {
@@ -822,10 +822,10 @@ class ProxyRoutesTests(unittest.TestCase):
         self.assertIn("x-agent-task-id", forwarded_headers)
         self.assertNotIn("session_id", forwarded_headers)
         self.assertNotIn("x-client-request-id", forwarded_headers)
-        self.assertNotIn("sessionId", forwarded_body)
-        self.assertNotIn("prompt_cache_key", forwarded_body)
+        self.assertEqual(forwarded_body["sessionId"], "session-123")
+        self.assertEqual(forwarded_body["prompt_cache_key"], "cache-123")
         self.assertNotIn("promptCacheKey", forwarded_body)
-        self.assertNotIn("previous_response_id", forwarded_body)
+        self.assertEqual(forwarded_body["previous_response_id"], "resp_prev")
         self.assertEqual(forwarded_body["tools"], body["tools"])
         self.assertEqual(forwarded_body["include"], body["include"])
         self.assertTrue(forwarded_body["parallel_tool_calls"])
@@ -912,7 +912,7 @@ class ProxyRoutesTests(unittest.TestCase):
         self.assertTrue(forwarded_body["parallel_tool_calls"])
         self.assertEqual(response.status_code, 200)
 
-    def test_responses_compact_strips_body_cache_affinity_fields(self):
+    def test_responses_compact_preserves_body_cache_affinity_fields(self):
         request = SimpleNamespace(
             url=SimpleNamespace(path="/v1/responses/compact"),
             method="POST",
@@ -921,7 +921,7 @@ class ProxyRoutesTests(unittest.TestCase):
         body = {
             "model": "gpt-5.4",
             "sessionId": "session-123",
-            "promptCacheKey": "cache-123",
+            "prompt_cache_key": "cache-123",
             "previous_response_id": "resp_prev",
             "tools": [
                 {
@@ -983,10 +983,10 @@ class ProxyRoutesTests(unittest.TestCase):
         self.assertIn("x-agent-task-id", forwarded_headers)
         self.assertNotIn("session_id", forwarded_headers)
         self.assertNotIn("x-client-request-id", forwarded_headers)
-        self.assertNotIn("sessionId", forwarded_body)
-        self.assertNotIn("prompt_cache_key", forwarded_body)
+        self.assertEqual(forwarded_body["sessionId"], "session-123")
+        self.assertEqual(forwarded_body["prompt_cache_key"], "cache-123")
         self.assertNotIn("promptCacheKey", forwarded_body)
-        self.assertNotIn("previous_response_id", forwarded_body)
+        self.assertEqual(forwarded_body["previous_response_id"], "resp_prev")
         self.assertEqual(forwarded_body["tools"], body["tools"])
         self.assertEqual(forwarded_body["include"], body["include"])
         self.assertTrue(forwarded_body["parallel_tool_calls"])

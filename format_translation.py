@@ -68,11 +68,6 @@ _COPILOT_UNSUPPORTED_RESPONSES_TOOL_TYPES = {"image_generation"}
 # Responses endpoint rejects (e.g. priority/flex routing hints).
 _COPILOT_UNSUPPORTED_RESPONSES_BODY_KEYS = {
     "service_tier",
-    "session_id",
-    "sessionId",
-    "prompt_cache_key",
-    "promptCacheKey",
-    "previous_response_id",
 }
 
 
@@ -2223,7 +2218,15 @@ def _copy_compaction_passthrough_fields(source: dict, target: dict) -> None:
     if not isinstance(source, dict) or not isinstance(target, dict):
         return
 
-    for key in ("metadata", "user"):
+    for key in (
+        "session_id",
+        "sessionId",
+        "prompt_cache_key",
+        "promptCacheKey",
+        "previous_response_id",
+        "metadata",
+        "user",
+    ):
         if key in source:
             target[key] = source.get(key)
 
@@ -2233,14 +2236,7 @@ def _apply_compaction_request_config(source: dict, target: dict) -> None:
         return
 
     for key, value in source.items():
-        if key in {
-            "input",
-            "session_id",
-            "sessionId",
-            "prompt_cache_key",
-            "promptCacheKey",
-            "previous_response_id",
-        }:
+        if key == "input":
             continue
         target[key] = value
 

@@ -65,7 +65,7 @@ class ProtocolBridgePlannerTests(unittest.TestCase):
         self.assertNotIn("tool_choice", plan.upstream_body)
         self.assertNotIn("parallel_tool_calls", plan.upstream_body)
 
-    def test_planner_strips_service_tier_for_native_responses(self):
+    def test_planner_strips_service_tier_but_preserves_cache_affinity_for_native_responses(self):
         planner = ProtocolBridgePlanner(_RoutingConfigStub())
         body = {
             "model": "gpt-5.4",
@@ -73,7 +73,7 @@ class ProtocolBridgePlannerTests(unittest.TestCase):
             "stream": False,
             "service_tier": "priority",
             "sessionId": "session-123",
-            "promptCacheKey": "cache-123",
+            "prompt_cache_key": "cache-123",
             "previous_response_id": "resp_prev",
         }
 
@@ -83,9 +83,9 @@ class ProtocolBridgePlannerTests(unittest.TestCase):
 
         self.assertEqual(plan.strategy_name, "responses_to_responses")
         self.assertNotIn("service_tier", plan.upstream_body)
-        self.assertNotIn("sessionId", plan.upstream_body)
-        self.assertNotIn("promptCacheKey", plan.upstream_body)
-        self.assertNotIn("previous_response_id", plan.upstream_body)
+        self.assertEqual(plan.upstream_body["sessionId"], "session-123")
+        self.assertEqual(plan.upstream_body["prompt_cache_key"], "cache-123")
+        self.assertEqual(plan.upstream_body["previous_response_id"], "resp_prev")
 
     def test_planner_strips_invalid_deferred_tools_for_native_responses(self):
         planner = ProtocolBridgePlanner(_RoutingConfigStub())

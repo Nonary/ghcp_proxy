@@ -641,8 +641,8 @@ class RequestHeadersTests(unittest.TestCase):
         self.assertIn("x-client-session-id", headers)
         self.assertIn("x-interaction-id", headers)
         self.assertIn("x-agent-task-id", headers)
-        self.assertNotIn("sessionId", body)
-        self.assertNotIn("prompt_cache_key", body)
+        self.assertEqual(body["sessionId"], "session-123")
+        self.assertEqual(body["prompt_cache_key"], "session-123")
 
     def test_build_responses_headers_for_request_uses_conversation_agent_intent(self):
         request = SimpleNamespace(
@@ -659,7 +659,7 @@ class RequestHeadersTests(unittest.TestCase):
 
         self.assertEqual(headers["Openai-Intent"], "conversation-agent")
 
-    def test_build_responses_headers_for_request_strips_prompt_cache_key_alias(self):
+    def test_build_responses_headers_for_request_normalizes_prompt_cache_key_alias(self):
         request = SimpleNamespace(
             headers={},
             url=SimpleNamespace(path="/v1/responses"),
@@ -677,7 +677,7 @@ class RequestHeadersTests(unittest.TestCase):
         self.assertIn("x-client-session-id", headers)
         self.assertIn("x-interaction-id", headers)
         self.assertIn("x-agent-task-id", headers)
-        self.assertNotIn("prompt_cache_key", body)
+        self.assertEqual(body["prompt_cache_key"], "cache-123")
         self.assertNotIn("promptCacheKey", body)
 
     def test_build_responses_headers_for_request_preserves_incoming_client_request_id(self):
@@ -698,7 +698,7 @@ class RequestHeadersTests(unittest.TestCase):
         self.assertIn("x-interaction-id", headers)
         self.assertIn("x-agent-task-id", headers)
 
-    def test_build_responses_headers_for_compact_uses_fresh_affinity_and_ignores_body_session(self):
+    def test_build_responses_headers_for_compact_preserves_cache_affinity_fields(self):
         user_request = SimpleNamespace(headers={}, url=SimpleNamespace(path="/v1/responses"))
         user_body = {"model": "gpt-5.4", "input": "hello"}
         user_headers = format_translation.build_responses_headers_for_request(
@@ -727,9 +727,10 @@ class RequestHeadersTests(unittest.TestCase):
 
         self.assertNotIn("session_id", compact_headers)
         self.assertNotIn("x-client-request-id", compact_headers)
-        self.assertNotIn("sessionId", compact_body)
+        self.assertEqual(compact_body["sessionId"], "session-123")
+        self.assertEqual(compact_body["prompt_cache_key"], "cache-123")
         self.assertNotIn("promptCacheKey", compact_body)
-        self.assertNotIn("previous_response_id", compact_body)
+        self.assertEqual(compact_body["previous_response_id"], "resp_prev")
         self.assertNotEqual(compact_headers["x-interaction-id"], user_headers["x-interaction-id"])
         self.assertNotEqual(compact_headers["x-agent-task-id"], user_headers["x-agent-task-id"])
 
