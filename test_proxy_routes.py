@@ -751,7 +751,7 @@ class ProxyRoutesTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 200)
 
-    def test_responses_route_preserves_cache_affinity_fields(self):
+    def test_responses_route_strips_body_cache_affinity_fields(self):
         request = SimpleNamespace(
             url=SimpleNamespace(path="/v1/responses"),
             method="POST",
@@ -817,12 +817,15 @@ class ProxyRoutesTests(unittest.TestCase):
 
         forwarded_headers = post.await_args.kwargs["headers"]
         forwarded_body = post.await_args.kwargs["json"]
-        self.assertEqual(forwarded_headers["session_id"], "session-123")
-        self.assertEqual(forwarded_headers["x-client-request-id"], "session-123")
-        self.assertEqual(forwarded_body["sessionId"], "session-123")
-        self.assertEqual(forwarded_body["prompt_cache_key"], "cache-123")
+        self.assertIn("x-client-session-id", forwarded_headers)
+        self.assertIn("x-interaction-id", forwarded_headers)
+        self.assertIn("x-agent-task-id", forwarded_headers)
+        self.assertNotIn("session_id", forwarded_headers)
+        self.assertNotIn("x-client-request-id", forwarded_headers)
+        self.assertNotIn("sessionId", forwarded_body)
+        self.assertNotIn("prompt_cache_key", forwarded_body)
         self.assertNotIn("promptCacheKey", forwarded_body)
-        self.assertEqual(forwarded_body["previous_response_id"], "resp_prev")
+        self.assertNotIn("previous_response_id", forwarded_body)
         self.assertEqual(forwarded_body["tools"], body["tools"])
         self.assertEqual(forwarded_body["include"], body["include"])
         self.assertTrue(forwarded_body["parallel_tool_calls"])
@@ -909,7 +912,7 @@ class ProxyRoutesTests(unittest.TestCase):
         self.assertTrue(forwarded_body["parallel_tool_calls"])
         self.assertEqual(response.status_code, 200)
 
-    def test_responses_compact_preserves_cache_affinity_fields(self):
+    def test_responses_compact_strips_body_cache_affinity_fields(self):
         request = SimpleNamespace(
             url=SimpleNamespace(path="/v1/responses/compact"),
             method="POST",
@@ -975,12 +978,15 @@ class ProxyRoutesTests(unittest.TestCase):
 
         forwarded_headers = post.await_args.kwargs["headers"]
         forwarded_body = post.await_args.kwargs["json"]
-        self.assertEqual(forwarded_headers["session_id"], "session-123")
-        self.assertEqual(forwarded_headers["x-client-request-id"], "session-123")
-        self.assertEqual(forwarded_body["sessionId"], "session-123")
-        self.assertEqual(forwarded_body["prompt_cache_key"], "cache-123")
+        self.assertIn("x-client-session-id", forwarded_headers)
+        self.assertIn("x-interaction-id", forwarded_headers)
+        self.assertIn("x-agent-task-id", forwarded_headers)
+        self.assertNotIn("session_id", forwarded_headers)
+        self.assertNotIn("x-client-request-id", forwarded_headers)
+        self.assertNotIn("sessionId", forwarded_body)
+        self.assertNotIn("prompt_cache_key", forwarded_body)
         self.assertNotIn("promptCacheKey", forwarded_body)
-        self.assertEqual(forwarded_body["previous_response_id"], "resp_prev")
+        self.assertNotIn("previous_response_id", forwarded_body)
         self.assertEqual(forwarded_body["tools"], body["tools"])
         self.assertEqual(forwarded_body["include"], body["include"])
         self.assertTrue(forwarded_body["parallel_tool_calls"])

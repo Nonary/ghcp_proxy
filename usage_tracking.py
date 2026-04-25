@@ -85,7 +85,7 @@ def request_session_id(request: Request, request_body: dict | None = None) -> st
                 return normalized
 
     if isinstance(request_body, dict):
-        for key in ("session_id", "sessionId", "prompt_cache_key", "promptCacheKey"):
+        for key in ("session_id", "sessionId"):
             value = request_body.get(key)
             if isinstance(value, str):
                 normalized = value.strip()
@@ -969,19 +969,15 @@ class UsageTracker:
         if isinstance(outbound_headers, dict):
             outbound_path = upstream_path or getattr(request.url, "path", None)
             uses_responses_affinity_headers = _is_responses_api_path(outbound_path)
-            if session_id:
-                outbound_headers["session_id"] = session_id
-                outbound_headers["x-interaction-id"] = session_id
             if uses_responses_affinity_headers:
                 _drop_outbound_headers(
                     outbound_headers,
-                    ("x-request-id", "request-id", "x-github-request-id"),
+                    ("x-request-id", "request-id", "x-github-request-id", "session_id", "session-id"),
                 )
-                if session_id:
-                    outbound_headers["x-agent-task-id"] = session_id
-                else:
-                    outbound_headers.setdefault("x-agent-task-id", server_request_id)
             else:
+                if session_id:
+                    outbound_headers["session_id"] = session_id
+                    outbound_headers["x-interaction-id"] = session_id
                 outbound_headers["x-request-id"] = server_request_id
                 outbound_headers["x-github-request-id"] = server_request_id
                 outbound_headers["x-agent-task-id"] = server_request_id

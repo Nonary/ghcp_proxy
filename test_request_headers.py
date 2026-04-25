@@ -28,8 +28,9 @@ class RequestHeadersTests(unittest.TestCase):
         )
 
         self.assertEqual(headers["X-Initiator"], "user")
-        self.assertEqual(headers["x-interaction-id"], headers["x-client-session-id"])
-        self.assertEqual(headers["x-agent-task-id"], headers["x-client-session-id"])
+        self.assertIn("x-interaction-id", headers)
+        self.assertIn("x-agent-task-id", headers)
+        self.assertIn("x-client-session-id", headers)
         self.assertEqual(body["input"], "hello")
 
     def test_gpt_5_4_mini_environment_bootstrap_is_agent(self):
@@ -617,9 +618,10 @@ class RequestHeadersTests(unittest.TestCase):
             session_id_resolver=usage_tracking.request_session_id,
         )
 
-        self.assertEqual(headers["session_id"], "session-123")
-        self.assertEqual(headers["x-interaction-id"], "session-123")
-        self.assertEqual(headers["x-agent-task-id"], "session-123")
+        self.assertNotIn("session_id", headers)
+        self.assertIn("x-client-session-id", headers)
+        self.assertIn("x-interaction-id", headers)
+        self.assertIn("x-agent-task-id", headers)
 
     def test_build_responses_headers_for_request_uses_body_session_id(self):
         request = SimpleNamespace(
@@ -634,11 +636,13 @@ class RequestHeadersTests(unittest.TestCase):
             session_id_resolver=usage_tracking.request_session_id,
         )
 
-        self.assertEqual(headers["session_id"], "session-123")
-        self.assertEqual(headers["x-client-request-id"], "session-123")
-        self.assertEqual(headers["x-interaction-id"], "session-123")
-        self.assertEqual(headers["x-agent-task-id"], "session-123")
-        self.assertEqual(body["prompt_cache_key"], "session-123")
+        self.assertNotIn("session_id", headers)
+        self.assertNotIn("x-client-request-id", headers)
+        self.assertIn("x-client-session-id", headers)
+        self.assertIn("x-interaction-id", headers)
+        self.assertIn("x-agent-task-id", headers)
+        self.assertNotIn("sessionId", body)
+        self.assertNotIn("prompt_cache_key", body)
 
     def test_build_responses_headers_for_request_uses_conversation_agent_intent(self):
         request = SimpleNamespace(
@@ -655,7 +659,7 @@ class RequestHeadersTests(unittest.TestCase):
 
         self.assertEqual(headers["Openai-Intent"], "conversation-agent")
 
-    def test_build_responses_headers_for_request_normalizes_prompt_cache_key_alias(self):
+    def test_build_responses_headers_for_request_strips_prompt_cache_key_alias(self):
         request = SimpleNamespace(
             headers={},
             url=SimpleNamespace(path="/v1/responses"),
@@ -668,11 +672,12 @@ class RequestHeadersTests(unittest.TestCase):
             session_id_resolver=usage_tracking.request_session_id,
         )
 
-        self.assertEqual(headers["session_id"], "cache-123")
-        self.assertEqual(headers["x-client-request-id"], "cache-123")
-        self.assertEqual(headers["x-interaction-id"], "cache-123")
-        self.assertEqual(headers["x-agent-task-id"], "cache-123")
-        self.assertEqual(body["prompt_cache_key"], "cache-123")
+        self.assertNotIn("session_id", headers)
+        self.assertNotIn("x-client-request-id", headers)
+        self.assertIn("x-client-session-id", headers)
+        self.assertIn("x-interaction-id", headers)
+        self.assertIn("x-agent-task-id", headers)
+        self.assertNotIn("prompt_cache_key", body)
         self.assertNotIn("promptCacheKey", body)
 
     def test_build_responses_headers_for_request_preserves_incoming_client_request_id(self):
@@ -688,10 +693,45 @@ class RequestHeadersTests(unittest.TestCase):
             session_id_resolver=usage_tracking.request_session_id,
         )
 
-        self.assertEqual(headers["session_id"], "session-123")
+        self.assertNotIn("session_id", headers)
         self.assertEqual(headers["x-client-request-id"], "client-123")
-        self.assertEqual(headers["x-interaction-id"], "session-123")
-        self.assertEqual(headers["x-agent-task-id"], "session-123")
+        self.assertIn("x-interaction-id", headers)
+        self.assertIn("x-agent-task-id", headers)
+
+    def test_build_responses_headers_for_compact_uses_fresh_affinity_and_ignores_body_session(self):
+        user_request = SimpleNamespace(headers={}, url=SimpleNamespace(path="/v1/responses"))
+        user_body = {"model": "gpt-5.4", "input": "hello"}
+        user_headers = format_translation.build_responses_headers_for_request(
+            user_request,
+            user_body,
+            "test-key",
+            initiator_policy=proxy._initiator_policy,
+            session_id_resolver=usage_tracking.request_session_id,
+        )
+
+        compact_request = SimpleNamespace(headers={}, url=SimpleNamespace(path="/v1/responses/compact"))
+        compact_body = {
+            "model": "gpt-5.4",
+            "input": "hello",
+            "sessionId": "session-123",
+            "promptCacheKey": "cache-123",
+            "previous_response_id": "resp_prev",
+        }
+        compact_headers = format_translation.build_responses_headers_for_request(
+            compact_request,
+            compact_body,
+            "test-key",
+            initiator_policy=proxy._initiator_policy,
+            session_id_resolver=usage_tracking.request_session_id,
+        )
+
+        self.assertNotIn("session_id", compact_headers)
+        self.assertNotIn("x-client-request-id", compact_headers)
+        self.assertNotIn("sessionId", compact_body)
+        self.assertNotIn("promptCacheKey", compact_body)
+        self.assertNotIn("previous_response_id", compact_body)
+        self.assertNotEqual(compact_headers["x-interaction-id"], user_headers["x-interaction-id"])
+        self.assertNotEqual(compact_headers["x-agent-task-id"], user_headers["x-agent-task-id"])
 
     def test_build_responses_headers_for_request_does_not_forward_incoming_server_request_id(self):
         request = SimpleNamespace(

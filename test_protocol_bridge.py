@@ -72,6 +72,9 @@ class ProtocolBridgePlannerTests(unittest.TestCase):
             "input": "hello",
             "stream": False,
             "service_tier": "priority",
+            "sessionId": "session-123",
+            "promptCacheKey": "cache-123",
+            "previous_response_id": "resp_prev",
         }
 
         plan = proxy.asyncio.run(
@@ -80,6 +83,9 @@ class ProtocolBridgePlannerTests(unittest.TestCase):
 
         self.assertEqual(plan.strategy_name, "responses_to_responses")
         self.assertNotIn("service_tier", plan.upstream_body)
+        self.assertNotIn("sessionId", plan.upstream_body)
+        self.assertNotIn("promptCacheKey", plan.upstream_body)
+        self.assertNotIn("previous_response_id", plan.upstream_body)
 
     def test_planner_strips_invalid_deferred_tools_for_native_responses(self):
         planner = ProtocolBridgePlanner(_RoutingConfigStub())

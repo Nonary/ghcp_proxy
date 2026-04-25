@@ -168,16 +168,12 @@ def normalize_usage_payload(usage: dict | None) -> dict | None:
     normalized_cached_tokens = _coerce_int(cached_tokens, default=0)
     normalized_cache_creation_tokens = _coerce_int(cache_creation_tokens, default=0)
     normalized_reasoning_tokens = _coerce_int(reasoning_tokens, default=0)
-    if cached_tokens_from_raw_details and normalized_cached_tokens > 0:
-        normalized_input_tokens = max(0, normalized_input_tokens - normalized_cached_tokens)
 
     normalized_total_tokens = _coerce_int(total_tokens, default=None)
-    if cached_tokens_from_raw_details:
-        normalized_total_tokens = normalized_input_tokens + normalized_output_tokens
-    elif normalized_total_tokens is None:
+    if normalized_total_tokens is None:
         normalized_total_tokens = normalized_input_tokens + normalized_output_tokens
 
-    return {
+    normalized = {
         "input_tokens": normalized_input_tokens,
         "output_tokens": normalized_output_tokens,
         "total_tokens": normalized_total_tokens,
@@ -185,6 +181,14 @@ def normalize_usage_payload(usage: dict | None) -> dict | None:
         "cache_creation_input_tokens": normalized_cache_creation_tokens,
         "reasoning_output_tokens": normalized_reasoning_tokens,
     }
+    fresh_input_tokens = usage.get("fresh_input_tokens")
+    if fresh_input_tokens is None:
+        fresh_input_tokens = usage.get("billable_input_tokens")
+    if fresh_input_tokens is not None:
+        normalized["fresh_input_tokens"] = _coerce_int(fresh_input_tokens, default=0)
+    elif cached_tokens_from_raw_details and normalized_cached_tokens > 0:
+        normalized["fresh_input_tokens"] = max(0, normalized_input_tokens - normalized_cached_tokens)
+    return normalized
 
 
 # ---------------------------------------------------------------------------
@@ -490,7 +494,12 @@ def _usage_event_cost_breakdown(model_name: str | None, usage: dict | None) -> d
     if not isinstance(entry, dict):
         return breakdown
 
-    input_tokens = _coerce_int(usage.get("input_tokens"))
+    fresh_input_tokens = usage.get("fresh_input_tokens")
+    if fresh_input_tokens is None:
+        fresh_input_tokens = usage.get("billable_input_tokens")
+    input_tokens = _coerce_int(
+        fresh_input_tokens if fresh_input_tokens is not None else usage.get("input_tokens")
+    )
     output_tokens = _coerce_int(usage.get("output_tokens"))
     cached_input_tokens = _coerce_int(usage.get("cached_input_tokens"))
     if cached_input_tokens == 0 and usage.get("cache_read_input_tokens") is not None:

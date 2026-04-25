@@ -10,6 +10,8 @@ from constants import (
 )
 
 _CLIENT_SESSION_ID = str(uuid.uuid4())
+_RESPONSES_AFFINITY_BY_SESSION: dict[str, dict[str, str]] = {}
+_RESPONSES_DEFAULT_AFFINITY: dict[str, str] | None = None
 
 
 def has_vision_input(value, depth=0, max_depth=10) -> bool:
@@ -42,12 +44,24 @@ def _interaction_id_for_session(session_id: str | None) -> str:
     return str(uuid.uuid4())
 
 
-def _responses_affinity_id_for_session(session_id: str | None) -> str:
+def _new_responses_affinity() -> dict[str, str]:
+    return {
+        "x-interaction-id": str(uuid.uuid4()),
+        "x-agent-task-id": str(uuid.uuid4()),
+    }
+
+
+def _responses_affinity_headers(initiator: str, session_id: str | None, *, reset: bool = False) -> dict[str, str]:
+    global _RESPONSES_DEFAULT_AFFINITY
     if isinstance(session_id, str):
         normalized = session_id.strip()
         if normalized:
-            return normalized
-    return _CLIENT_SESSION_ID
+            if reset or initiator == "user" or normalized not in _RESPONSES_AFFINITY_BY_SESSION:
+                _RESPONSES_AFFINITY_BY_SESSION[normalized] = _new_responses_affinity()
+            return _RESPONSES_AFFINITY_BY_SESSION[normalized]
+    if reset or initiator == "user" or _RESPONSES_DEFAULT_AFFINITY is None:
+        _RESPONSES_DEFAULT_AFFINITY = _new_responses_affinity()
+    return _RESPONSES_DEFAULT_AFFINITY
 
 
 def build_copilot_headers(api_key: str) -> dict:
@@ -63,9 +77,17 @@ def build_copilot_headers(api_key: str) -> dict:
     }
 
 
-def _apply_forwarded_request_headers(headers: dict, request: Request, request_body: dict | None = None, *, session_id_resolver=None):
+def _apply_forwarded_request_headers(
+    headers: dict,
+    request: Request,
+    request_body: dict | None = None,
+    *,
+    session_id_resolver=None,
+    forward_session_header: bool = True,
+    synthesize_client_request_id: bool = True,
+):
     session_id = session_id_resolver(request, request_body) if session_id_resolver else None
-    if session_id:
+    if session_id and forward_session_header:
         headers["session_id"] = session_id
 
     for header_name in FORWARDED_REQUEST_HEADERS:
@@ -73,7 +95,7 @@ def _apply_forwarded_request_headers(headers: dict, request: Request, request_bo
         if header_value:
             headers[header_name] = header_value
 
-    if "x-client-request-id" not in headers and isinstance(session_id, str):
+    if synthesize_client_request_id and "x-client-request-id" not in headers and isinstance(session_id, str):
         normalized_session_id = session_id.strip()
         if normalized_session_id:
             headers["x-client-request-id"] = normalized_session_id
@@ -81,27 +103,10 @@ def _apply_forwarded_request_headers(headers: dict, request: Request, request_bo
     return session_id
 
 
-def _normalize_responses_prompt_cache_key(body: dict, session_id: str | None) -> None:
-    if not isinstance(body, dict):
-        return
-
-    prompt_cache_key = None
-    for key in ("prompt_cache_key", "promptCacheKey"):
-        value = body.get(key)
-        if isinstance(value, str):
-            normalized = value.strip()
-            if normalized:
-                prompt_cache_key = normalized
-                break
-
-    if prompt_cache_key is None and isinstance(session_id, str):
-        normalized_session_id = session_id.strip()
-        if normalized_session_id:
-            prompt_cache_key = normalized_session_id
-
-    body.pop("promptCacheKey", None)
-    if prompt_cache_key is not None:
-        body["prompt_cache_key"] = prompt_cache_key
+def _strip_responses_cache_affinity_fields(body: dict) -> None:
+    if isinstance(body, dict):
+        for key in ("prompt_cache_key", "promptCacheKey", "session_id", "sessionId", "previous_response_id"):
+            body.pop(key, None)
 
 
 def build_responses_headers_for_request(
@@ -116,8 +121,19 @@ def build_responses_headers_for_request(
     verdict_sink: dict | None = None,
 ) -> dict:
     headers = build_copilot_headers(api_key)
-    session_id = _apply_forwarded_request_headers(headers, request, body, session_id_resolver=session_id_resolver)
-    _normalize_responses_prompt_cache_key(body, session_id)
+    request_path = getattr(getattr(request, "url", None), "path", "")
+    is_compact = isinstance(request_path, str) and "compact" in request_path.lower()
+    if is_compact:
+        _strip_responses_cache_affinity_fields(body)
+    session_id = _apply_forwarded_request_headers(
+        headers,
+        request,
+        body,
+        session_id_resolver=session_id_resolver,
+        forward_session_header=False,
+        synthesize_client_request_id=False,
+    )
+    _strip_responses_cache_affinity_fields(body)
 
     had_input = "input" in body
     effective_input, initiator = initiator_policy.resolve_responses_input(
@@ -132,9 +148,7 @@ def build_responses_headers_for_request(
         body["input"] = effective_input
     headers["X-Initiator"] = initiator
     headers["x-interaction-type"] = _interaction_type_for_initiator(initiator)
-    affinity_id = _responses_affinity_id_for_session(session_id)
-    headers["x-interaction-id"] = affinity_id
-    headers["x-agent-task-id"] = affinity_id
+    headers.update(_responses_affinity_headers(initiator, session_id, reset=is_compact))
 
     if has_vision_input(effective_input):
         headers["Copilot-Vision-Request"] = "true"

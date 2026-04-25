@@ -455,7 +455,7 @@ class FormatTranslationTests(unittest.TestCase):
         compact_request = format_translation.build_fake_compaction_request(body)
 
         self.assertEqual(compact_request["reasoning"], {"effort": "max"})
-    def test_build_fake_compaction_request_preserves_cache_affinity_fields(self):
+    def test_build_fake_compaction_request_strips_cache_affinity_fields(self):
         body = {
             "model": "gpt-5.4",
             "input": "hello",
@@ -468,9 +468,9 @@ class FormatTranslationTests(unittest.TestCase):
 
         compact_request = format_translation.build_fake_compaction_request(body)
 
-        self.assertEqual(compact_request["sessionId"], "session-123")
-        self.assertEqual(compact_request["promptCacheKey"], "cache-123")
-        self.assertEqual(compact_request["previous_response_id"], "resp_prev")
+        self.assertNotIn("sessionId", compact_request)
+        self.assertNotIn("promptCacheKey", compact_request)
+        self.assertNotIn("previous_response_id", compact_request)
         self.assertEqual(compact_request["metadata"], body["metadata"])
         self.assertEqual(compact_request["user"], "user-123")
 

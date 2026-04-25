@@ -120,9 +120,9 @@ class UsageTrackingTests(unittest.TestCase):
         )
 
         self.assertEqual(event["session_id"], "session-123")
-        self.assertEqual(outbound_headers["session_id"], "session-123")
-        self.assertEqual(outbound_headers["x-interaction-id"], "session-123")
-        self.assertEqual(outbound_headers["x-agent-task-id"], "session-123")
+        self.assertNotIn("session_id", outbound_headers)
+        self.assertNotIn("x-interaction-id", outbound_headers)
+        self.assertNotIn("x-agent-task-id", outbound_headers)
         self.assertNotIn("x-request-id", outbound_headers)
         self.assertNotIn("x-github-request-id", outbound_headers)
 
@@ -683,8 +683,9 @@ class UsageTrackingTests(unittest.TestCase):
         )
 
         self.assertEqual(event["prior_server_request_id"], "server-prev")
-        self.assertEqual(outbound_headers["x-interaction-id"], "session-123")
-        self.assertEqual(outbound_headers["x-agent-task-id"], "session-123")
+        self.assertNotIn("session_id", outbound_headers)
+        self.assertNotIn("x-interaction-id", outbound_headers)
+        self.assertNotIn("x-agent-task-id", outbound_headers)
         self.assertNotIn("x-request-id", outbound_headers)
         self.assertNotIn("x-github-request-id", outbound_headers)
 
@@ -707,8 +708,9 @@ class UsageTrackingTests(unittest.TestCase):
 
         self.assertEqual(event["prior_server_request_id"], "server-prev")
         self.assertNotEqual(event["server_request_id"], "server-prev")
-        self.assertEqual(outbound_headers["x-interaction-id"], "session-123")
-        self.assertEqual(outbound_headers["x-agent-task-id"], "session-123")
+        self.assertNotIn("session_id", outbound_headers)
+        self.assertNotIn("x-interaction-id", outbound_headers)
+        self.assertNotIn("x-agent-task-id", outbound_headers)
         self.assertNotIn("x-request-id", outbound_headers)
         self.assertNotIn("x-github-request-id", outbound_headers)
 
@@ -976,10 +978,11 @@ class UsageTrackingTests(unittest.TestCase):
         )
 
         self.assertTrue(saw_output)
-        self.assertEqual(capture.usage["input_tokens"], 2)
+        self.assertEqual(capture.usage["input_tokens"], 5)
         self.assertEqual(capture.usage["output_tokens"], 2)
-        self.assertEqual(capture.usage["total_tokens"], 4)
+        self.assertEqual(capture.usage["total_tokens"], 7)
         self.assertEqual(capture.usage["cached_input_tokens"], 3)
+        self.assertEqual(capture.usage["fresh_input_tokens"], 2)
         self.assertEqual(capture.usage["reasoning_output_tokens"], 1)
 
     def test_sse_usage_capture_normalizes_cached_prompt_tokens(self):
@@ -989,10 +992,11 @@ class UsageTrackingTests(unittest.TestCase):
             b'event: message\ndata: {"id":"chatcmpl_1","choices":[{"delta":{"content":"Hi"}}],"usage":{"prompt_tokens":20,"completion_tokens":4,"prompt_tokens_details":{"cached_tokens":7}}}\n\n'
         )
 
-        self.assertEqual(capture.usage["input_tokens"], 13)
+        self.assertEqual(capture.usage["input_tokens"], 20)
         self.assertEqual(capture.usage["output_tokens"], 4)
-        self.assertEqual(capture.usage["total_tokens"], 17)
+        self.assertEqual(capture.usage["total_tokens"], 24)
         self.assertEqual(capture.usage["cached_input_tokens"], 7)
+        self.assertEqual(capture.usage["fresh_input_tokens"], 13)
 
     def test_load_usage_history_normalizes_cached_tokens(self):
         tracker = self._make_usage_tracker()
@@ -1006,9 +1010,10 @@ class UsageTrackingTests(unittest.TestCase):
         tracker.load_history()
         events = tracker.snapshot_usage_events()
 
-        self.assertEqual(events[0]["usage"]["input_tokens"], 13)
-        self.assertEqual(events[0]["usage"]["total_tokens"], 17)
+        self.assertEqual(events[0]["usage"]["input_tokens"], 20)
+        self.assertEqual(events[0]["usage"]["total_tokens"], 24)
         self.assertEqual(events[0]["usage"]["cached_input_tokens"], 7)
+        self.assertEqual(events[0]["usage"]["fresh_input_tokens"], 13)
         self.assertEqual(
             tracker.latest_server_request_id("session-123", None, None),
             "server-abc",
@@ -1026,9 +1031,10 @@ class UsageTrackingTests(unittest.TestCase):
         tracker.load_history()
         events = tracker.snapshot_usage_events()
 
-        self.assertEqual(events[0]["usage"]["input_tokens"], 13)
-        self.assertEqual(events[0]["usage"]["total_tokens"], 17)
+        self.assertEqual(events[0]["usage"]["input_tokens"], 20)
+        self.assertEqual(events[0]["usage"]["total_tokens"], 24)
         self.assertEqual(events[0]["usage"]["cached_input_tokens"], 7)
+        self.assertEqual(events[0]["usage"]["fresh_input_tokens"], 13)
         self.assertEqual(events[0]["usage"]["reasoning_output_tokens"], 2)
         self.assertEqual(
             tracker.latest_server_request_id("session-123", None, None),
@@ -1050,6 +1056,23 @@ class UsageTrackingTests(unittest.TestCase):
         self.assertEqual(normalized["output_tokens"], 4)
         self.assertEqual(normalized["total_tokens"], 24)
         self.assertEqual(normalized["cached_input_tokens"], 7)
+
+    def test_normalize_usage_payload_preserves_copilot_responses_totals(self):
+        import util
+        normalized = util.normalize_usage_payload(
+            {
+                "input_tokens": 20344,
+                "output_tokens": 269,
+                "total_tokens": 20613,
+                "input_tokens_details": {"cached_tokens": 11776},
+            }
+        )
+
+        self.assertEqual(normalized["input_tokens"], 20344)
+        self.assertEqual(normalized["output_tokens"], 269)
+        self.assertEqual(normalized["total_tokens"], 20613)
+        self.assertEqual(normalized["cached_input_tokens"], 11776)
+        self.assertEqual(normalized["fresh_input_tokens"], 8568)
 
     def test_load_usage_history_compacts_old_requests_into_archive(self):
         from constants import DETAILED_REQUEST_HISTORY_LIMIT
