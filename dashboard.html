@@ -258,6 +258,119 @@
     .kpi-meta .row .k { color: var(--muted-2); font-size: 0.68rem; line-height: 1; white-space: nowrap; }
     .kpi-meta .row .v { color: var(--text); font-weight: 600; font-size: 0.8rem; line-height: 1.1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
+    /* Auto-update panel */
+    .update-panel {
+      display: grid;
+      gap: 12px;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 14px;
+      box-shadow: var(--shadow);
+    }
+    .update-panel.prominent {
+      border-color: rgba(255,122,58,0.28);
+      background: linear-gradient(180deg, rgba(255,122,58,0.08), rgba(255,255,255,0.015) 42%, var(--panel));
+    }
+    .update-panel-head {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 12px;
+      align-items: start;
+    }
+    .update-title-row {
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      min-width: 0;
+    }
+    .update-icon {
+      width: 34px;
+      height: 34px;
+      border-radius: 8px;
+      display: grid;
+      place-items: center;
+      color: var(--accent);
+      background: var(--accent-soft);
+      border: 1px solid rgba(255,122,58,0.20);
+      flex: 0 0 auto;
+    }
+    .update-title {
+      font-weight: 700;
+      font-size: 1rem;
+      line-height: 1.15;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .update-subtitle {
+      color: var(--muted);
+      font-size: 0.8rem;
+      margin-top: 3px;
+      line-height: 1.35;
+    }
+    .update-actions {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+    .update-actions button {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 7px;
+      min-height: 34px;
+    }
+    .update-meta-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 8px;
+    }
+    .update-meta {
+      background: var(--panel-soft);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 8px 9px;
+      min-width: 0;
+    }
+    .update-meta .k {
+      color: var(--muted-2);
+      font-size: 0.64rem;
+      text-transform: uppercase;
+      letter-spacing: 0.09em;
+      white-space: nowrap;
+    }
+    .update-meta .v {
+      color: var(--text);
+      font-size: 0.82rem;
+      font-weight: 600;
+      margin-top: 3px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .spinner {
+      width: 13px;
+      height: 13px;
+      border-radius: 50%;
+      border: 2px solid rgba(255,255,255,0.25);
+      border-top-color: currentColor;
+      animation: spin .8s linear infinite;
+      flex: 0 0 auto;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    @media (prefers-reduced-motion: reduce) {
+      .spinner { animation: none; }
+    }
+    @media (max-width: 760px) {
+      .update-panel-head { grid-template-columns: 1fr; }
+      .update-actions { width: 100%; }
+      .update-actions button { flex: 1 1 150px; }
+      .update-meta-grid { grid-template-columns: 1fr; }
+      .update-title { white-space: normal; }
+    }
+
     /* Sparkline strip */
     .spark-grid {
       display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 1px;
@@ -1352,6 +1465,60 @@
               </div>
             </article>
           </div>
+
+          <article :class="['update-panel', { prominent: autoUpdateNeedsAttention }]">
+            <div class="update-panel-head">
+              <div>
+                <div class="update-title-row">
+                  <div class="update-icon">
+                    <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M3 21v-5h5"/><path d="M3 12a9 9 0 0 1 15.74-6.26L21 8"/><path d="M21 3v5h-5"/></svg>
+                  </div>
+                  <div>
+                    <div class="eyebrow">Proxy Update</div>
+                    <div class="update-title">{{ autoUpdateOverviewTitle }}</div>
+                  </div>
+                </div>
+                <div class="update-subtitle">{{ autoUpdateOverviewSubtitle }}</div>
+              </div>
+              <div :class="['status', autoUpdateStatusClass]">{{ autoUpdateStatusLabel }}</div>
+            </div>
+            <div class="update-actions">
+              <button v-if="autoUpdateStatus.runtime?.restart_pending || autoUpdateLastResult?.reason === 'updated'"
+                      class="primary"
+                      @click="restartProxy"
+                      :disabled="savingAutoUpdate">
+                <span v-if="autoUpdateAction === 'restart_proxy'" class="spinner"></span>
+                {{ autoUpdateAction === 'restart_proxy' ? 'Restarting…' : 'Restart proxy' }}
+              </button>
+              <button v-else-if="autoUpdateAvailable"
+                      class="primary"
+                      @click="pullAutoUpdate"
+                      :disabled="savingAutoUpdate">
+                <span v-if="autoUpdateAction === 'pull_update'" class="spinner"></span>
+                {{ autoUpdateAction === 'pull_update' ? 'Updating…' : 'Pull update' }}
+              </button>
+              <button v-else
+                      @click="runAutoUpdateCheck"
+                      :disabled="savingAutoUpdate">
+                <span v-if="autoUpdateAction === 'check_now'" class="spinner"></span>
+                {{ autoUpdateAction === 'check_now' ? 'Checking…' : 'Check for updates' }}
+              </button>
+              <button v-if="autoUpdateBlockedMessage"
+                      class="danger"
+                      @click="applyAutoUpdateAnyway"
+                      :disabled="savingAutoUpdate">
+                <span v-if="autoUpdateAction === 'upgrade_anyway'" class="spinner"></span>
+                {{ autoUpdateAction === 'upgrade_anyway' ? 'Applying…' : 'Apply anyway' }}
+              </button>
+              <button @click="activeView = 'settings'">Update settings</button>
+            </div>
+            <div class="update-meta-grid">
+              <div class="update-meta"><div class="k">Mode</div><div class="v">{{ autoUpdateModeLabel }}</div></div>
+              <div class="update-meta"><div class="k">Last Check</div><div class="v">{{ autoUpdateLastCheckLabel }}</div></div>
+              <div class="update-meta"><div class="k">Repository</div><div class="v">{{ autoUpdateRepoLabel }}</div></div>
+            </div>
+            <div v-if="autoUpdateStatus.statusMessage" class="status good">{{ autoUpdateStatus.statusMessage }}</div>
+          </article>
 
           <!-- Sparkline strip -->
           <div class="spark-grid">
@@ -2487,13 +2654,26 @@
             <div v-if="backgroundProxyStatus.error" class="status error" style="margin-top: 10px;">{{ backgroundProxyStatus.error }}</div>
             <div v-else-if="backgroundProxyStatus.statusMessage" class="status good" style="margin-top: 10px;">{{ backgroundProxyStatus.statusMessage }}</div>
           </article>
-          <article class="mini-card" style="margin-top: 12px;">
-            <div class="eyebrow">Auto Update</div>
-            <div :class="['status', autoUpdateStatusClass]">{{ autoUpdateStatusLabel }}</div>
-            <div class="subtle" style="margin-top: 8px;">
-              Mode:
-              <strong>{{ autoUpdateStatus.mode === 'developer' ? 'Developer' : 'User' }}</strong>
-              · checks every {{ Math.round(Number(autoUpdateStatus.check_interval_seconds || 900) / 60) }} minutes
+          <article :class="['update-panel', { prominent: autoUpdateNeedsAttention }]" style="margin-top: 12px;">
+            <div class="update-panel-head">
+              <div>
+                <div class="update-title-row">
+                  <div class="update-icon">
+                    <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M3 21v-5h5"/><path d="M3 12a9 9 0 0 1 15.74-6.26L21 8"/><path d="M21 3v5h-5"/></svg>
+                  </div>
+                  <div>
+                    <div class="eyebrow">Auto Update</div>
+                    <div class="update-title">{{ autoUpdateOverviewTitle }}</div>
+                  </div>
+                </div>
+                <div class="update-subtitle">{{ autoUpdateOverviewSubtitle }}</div>
+              </div>
+              <div :class="['status', autoUpdateStatusClass]">{{ autoUpdateStatusLabel }}</div>
+            </div>
+            <div class="update-meta-grid">
+              <div class="update-meta"><div class="k">Mode</div><div class="v">{{ autoUpdateModeLabel }}</div></div>
+              <div class="update-meta"><div class="k">Interval</div><div class="v">{{ autoUpdateIntervalLabel }}</div></div>
+              <div class="update-meta"><div class="k">Last Check</div><div class="v">{{ autoUpdateLastCheckLabel }}</div></div>
             </div>
             <label style="display:flex; align-items:center; gap:10px; margin-top:8px;">
               <input type="checkbox"
@@ -2509,27 +2689,36 @@
               When an update is available, proxied AI responses will mention it at most once every 10 minutes. Pull the update here, then restart GHCP Proxy when you are ready.
             </div>
             <div v-if="autoUpdateStatus.mode_source === 'env'" class="subtle" style="margin-top: 4px;">Mode is controlled by GHCP_AUTO_UPDATE_MODE.</div>
-            <div class="toolbar" style="margin-top: 10px;">
-              <button @click="runAutoUpdateCheck" :disabled="savingAutoUpdate">Check now</button>
+            <div class="update-actions" style="margin-top: 10px;">
+              <button @click="runAutoUpdateCheck" :disabled="savingAutoUpdate">
+                <span v-if="autoUpdateAction === 'check_now'" class="spinner"></span>
+                {{ autoUpdateAction === 'check_now' ? 'Checking…' : 'Check now' }}
+              </button>
               <button v-if="autoUpdateAvailable"
                       class="primary"
                       @click="pullAutoUpdate"
                       :disabled="savingAutoUpdate">
-                Pull update
+                <span v-if="autoUpdateAction === 'pull_update'" class="spinner"></span>
+                {{ autoUpdateAction === 'pull_update' ? 'Updating…' : 'Pull update' }}
               </button>
               <button v-if="autoUpdateBlockedMessage"
                       class="danger"
                       @click="applyAutoUpdateAnyway"
                       :disabled="savingAutoUpdate">
-                Apply upgrade anyway
+                <span v-if="autoUpdateAction === 'upgrade_anyway'" class="spinner"></span>
+                {{ autoUpdateAction === 'upgrade_anyway' ? 'Applying…' : 'Apply upgrade anyway' }}
               </button>
-              <button v-if="autoUpdateStatus.runtime?.restart_pending"
+              <button v-if="autoUpdateStatus.runtime?.restart_pending || autoUpdateLastResult?.reason === 'updated'"
                       class="primary"
                       @click="restartProxy"
                       :disabled="savingAutoUpdate">
-                Restart proxy
+                <span v-if="autoUpdateAction === 'restart_proxy'" class="spinner"></span>
+                {{ autoUpdateAction === 'restart_proxy' ? 'Restarting…' : 'Restart proxy' }}
               </button>
-              <button @click="loadAutoUpdateStatus" :disabled="savingAutoUpdate">Refresh</button>
+              <button @click="loadAutoUpdateStatus(true)" :disabled="savingAutoUpdate">
+                <span v-if="autoUpdateAction === 'refresh'" class="spinner"></span>
+                {{ autoUpdateAction === 'refresh' ? 'Refreshing…' : 'Refresh' }}
+              </button>
             </div>
             <div v-if="autoUpdateLastResult?.dirty?.length" class="subtle" style="margin-top: 8px;">
               Pending changes detected: {{ autoUpdateLastResult.dirty.slice(0, 3).join('; ') }}{{ autoUpdateLastResult.dirty.length > 3 ? '…' : '' }}
@@ -3741,6 +3930,7 @@
             statusMessage: '',
           },
           savingAutoUpdate: false,
+          autoUpdateAction: '',
           activeTab: 'sessions',
           tabs: ['sessions', 'requests'],
           spendTrendRange: 'day',
@@ -5008,6 +5198,48 @@
           const result = this.autoUpdateLastResult;
           return Boolean(this.autoUpdateStatus.runtime?.update_available || result?.update_available || result?.reason === 'update-available');
         },
+        autoUpdateNeedsAttention() {
+          return Boolean(this.autoUpdateAvailable || this.autoUpdateBlockedMessage || this.autoUpdateStatus.runtime?.restart_pending || this.autoUpdateLastResult?.reason === 'updated');
+        },
+        autoUpdateModeLabel() {
+          const mode = this.autoUpdateStatus.mode === 'developer' ? 'Developer' : 'User';
+          return this.autoUpdateStatus.mode_source === 'env' ? `${mode} (env)` : mode;
+        },
+        autoUpdateIntervalLabel() {
+          const minutes = Math.round(Number(this.autoUpdateStatus.check_interval_seconds || 900) / 60);
+          return `${minutes} min`;
+        },
+        autoUpdateRepoLabel() {
+          const repo = String(this.autoUpdateStatus.repo_dir || '').trim();
+          if (!repo) return 'Loading...';
+          return repo.split('/').filter(Boolean).pop() || repo;
+        },
+        autoUpdateLastCheckLabel() {
+          const lastCheck = this.autoUpdateStatus.last_check;
+          if (!lastCheck) return 'Not yet';
+          const date = new Date(lastCheck);
+          if (Number.isNaN(date.getTime())) return String(lastCheck);
+          return date.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+        },
+        autoUpdateOverviewTitle() {
+          if (this.autoUpdateAction === 'restart_proxy') return 'Restarting proxy';
+          if (this.autoUpdateAction === 'pull_update' || this.autoUpdateAction === 'upgrade_anyway') return 'Applying update';
+          if (this.autoUpdateAction === 'check_now') return 'Checking for updates';
+          if (this.autoUpdateBlockedMessage) return 'Update needs attention';
+          if (this.autoUpdateStatus.runtime?.restart_pending || this.autoUpdateLastResult?.reason === 'updated') return 'Restart ready';
+          if (this.autoUpdateAvailable) return 'Update available';
+          return 'Proxy is up to date';
+        },
+        autoUpdateOverviewSubtitle() {
+          if (this.autoUpdateAction === 'restart_proxy') return 'Reload requested. Waiting for GHCP Proxy to come back online.';
+          if (this.autoUpdateAction === 'pull_update' || this.autoUpdateAction === 'upgrade_anyway') return 'Pulling the latest proxy code and preparing the restart step.';
+          if (this.autoUpdateAction === 'check_now') return 'Checking the configured upstream branch now.';
+          if (this.autoUpdateBlockedMessage) return 'Local changes blocked the upgrade. Review or use the override only if those edits can be discarded.';
+          if (this.autoUpdateStatus.runtime?.restart_pending || this.autoUpdateLastResult?.reason === 'updated') return 'The update was pulled. Restart the proxy to run the new code.';
+          if (this.autoUpdateAvailable) return 'A newer proxy build is available. Pull it when you are ready.';
+          if (!this.autoUpdateStatus.enabled) return 'Automatic update checks are disabled.';
+          return `Checks every ${this.autoUpdateIntervalLabel}; last check ${this.autoUpdateLastCheckLabel}.`;
+        },
         autoUpdateStatusClass() {
           if (this.autoUpdateStatus.error || this.autoUpdateBlockedMessage) return 'error';
           const result = this.autoUpdateLastResult;
@@ -6069,7 +6301,13 @@
             installed ? 'Shell commands removed.' : 'Shell commands installed.'
           );
         },
-        async loadAutoUpdateStatus() {
+        async loadAutoUpdateStatus(markRefreshing = false) {
+          const showRefreshing = markRefreshing === true;
+          if (showRefreshing && this.savingAutoUpdate) return;
+          if (showRefreshing) {
+            this.savingAutoUpdate = true;
+            this.autoUpdateAction = 'refresh';
+          }
           try {
             const response = await fetch('/api/config/auto-update', { cache: 'no-store' });
             if (!response.ok) {
@@ -6083,11 +6321,17 @@
             };
           } catch (error) {
             this.autoUpdateStatus.error = error.message;
+          } finally {
+            if (showRefreshing) {
+              this.savingAutoUpdate = false;
+              this.autoUpdateAction = '';
+            }
           }
         },
-        async configureAutoUpdate(action, body = {}, successMessage = '') {
+        async configureAutoUpdate(action, body = {}, successMessage = '', options = {}) {
           if (this.savingAutoUpdate) return;
           this.savingAutoUpdate = true;
+          this.autoUpdateAction = action;
           this.autoUpdateStatus.statusMessage = '';
           this.autoUpdateStatus.error = '';
           try {
@@ -6112,10 +6356,15 @@
               error: '',
               statusMessage: successMessage,
             };
+            return payload;
           } catch (error) {
             this.autoUpdateStatus.error = error.message;
+            return null;
           } finally {
-            this.savingAutoUpdate = false;
+            if (!options.keepBusy) {
+              this.savingAutoUpdate = false;
+              this.autoUpdateAction = '';
+            }
           }
         },
         async setAutoUpdateMode(mode) {
@@ -6132,13 +6381,55 @@
           return this.configureAutoUpdate('pull_update', {}, 'Update pulled. Restart GHCP Proxy to use it.');
         },
         async restartProxy() {
-          return this.configureAutoUpdate('restart_proxy', {}, 'Restart requested.');
+          if (!window.confirm('Restart GHCP Proxy now? Active requests will be allowed to finish first.')) {
+            return;
+          }
+          const payload = await this.configureAutoUpdate('restart_proxy', {}, 'Restart requested. Waiting for GHCP Proxy to come back online.', { keepBusy: true });
+          if (!payload) {
+            this.savingAutoUpdate = false;
+            this.autoUpdateAction = '';
+            return;
+          }
+          if (payload.scheduled === false && Number(payload.runtime?.active_requests || 0) > 0) {
+            this.autoUpdateStatus.statusMessage = 'Restart queued. GHCP Proxy will reload after active requests finish.';
+            this.savingAutoUpdate = false;
+            this.autoUpdateAction = '';
+            return;
+          }
+          await this.waitForAutoUpdateRestart();
         },
         async applyAutoUpdateAnyway() {
           if (!window.confirm('Apply the upgrade anyway? This discards pending local changes in the GHCP Proxy checkout.')) {
             return;
           }
           return this.configureAutoUpdate('upgrade_anyway', {}, 'Upgrade override requested.');
+        },
+        async waitForAutoUpdateRestart() {
+          const deadline = Date.now() + 12000;
+          const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+          await pause(700);
+          while (Date.now() < deadline) {
+            try {
+              const response = await fetch('/api/config/auto-update', { cache: 'no-store' });
+              if (response.ok) {
+                const payload = await response.json();
+                this.autoUpdateStatus = {
+                  ...this.autoUpdateStatus,
+                  ...payload,
+                  error: '',
+                  statusMessage: 'GHCP Proxy restarted and is back online.',
+                };
+                this.savingAutoUpdate = false;
+                this.autoUpdateAction = '';
+                return;
+              }
+            } catch (_error) {}
+            await pause(800);
+          }
+          this.autoUpdateStatus.statusMessage = '';
+          this.autoUpdateStatus.error = 'Restart was requested, but the dashboard could not confirm the proxy came back online yet.';
+          this.savingAutoUpdate = false;
+          this.autoUpdateAction = '';
         },
         async configureClientProxy(target, action) {
           if (this.savingProxyConfig) return;
