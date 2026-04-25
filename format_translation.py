@@ -368,6 +368,8 @@ def anthropic_tools_to_chat(tools) -> list[dict]:
         name = tool.get("name")
         if not isinstance(name, str):
             raise ValueError("Anthropic tools must include a string name")
+        if is_dangerous_code_execution_tool_name(name):
+            continue
         raw_desc = tool.get("description", "")
         desc = raw_desc if isinstance(raw_desc, str) and raw_desc else " "
         chat_tool = {
@@ -398,6 +400,8 @@ def anthropic_tool_choice_to_chat(tool_choice):
             name = tool_choice.get("name")
             if not isinstance(name, str):
                 raise ValueError("Anthropic tool_choice type=tool must include name")
+            if is_dangerous_code_execution_tool_name(name):
+                return None
             return {"type": "function", "function": {"name": name}}
         if choice_type == "none":
             return "none"
@@ -455,10 +459,14 @@ async def anthropic_request_to_chat(body: dict, api_base: str, api_key: str) -> 
         payload["reasoning_effort"] = reasoning_effort
 
     if body.get("tools") is not None:
-        payload["tools"] = anthropic_tools_to_chat(body.get("tools"))
+        translated_tools = anthropic_tools_to_chat(body.get("tools"))
+        if translated_tools:
+            payload["tools"] = translated_tools
 
     mapped_tool_choice = anthropic_tool_choice_to_chat(body.get("tool_choice"))
-    if mapped_tool_choice is not None:
+    if mapped_tool_choice is not None and (
+        payload.get("tools") or (isinstance(mapped_tool_choice, str) and mapped_tool_choice in {"auto", "none"})
+    ):
         payload["tool_choice"] = mapped_tool_choice
 
     return payload
@@ -597,6 +605,8 @@ def _responses_tool_to_chat(tool: dict) -> dict | None:
 
     if not isinstance(name, str):
         raise ValueError("Responses function tools must include a name")
+    if is_dangerous_code_execution_tool_name(name):
+        return None
 
     desc = description if isinstance(description, str) and description else " "
     chat_tool = {
@@ -668,6 +678,12 @@ def sanitize_responses_body_for_copilot(body: dict, *, diagnostics: list[dict] |
 
 
 _TOOL_SEARCH_TOOL_NAMES = {"tool_search", "tools.tool_search"}
+_DANGEROUS_CODE_EXECUTION_TOOL_NAMES = {"mcp__ide__executecode"}
+
+
+def is_dangerous_code_execution_tool_name(name) -> bool:
+    """Return True for request-provided tool names that expose local code execution."""
+    return isinstance(name, str) and name.strip().lower() in _DANGEROUS_CODE_EXECUTION_TOOL_NAMES
 
 
 def _responses_tool_name(tool: dict) -> str | None:
@@ -693,6 +709,108 @@ def _responses_tool_is_tool_search(tool: dict) -> bool:
         return False
     normalized = name.strip().lower()
     return normalized in _TOOL_SEARCH_TOOL_NAMES or normalized.endswith("__tool_search")
+
+
+def _drop_dangerous_responses_tools(node, *, path: str, removed: list[dict]):
+    if isinstance(node, list):
+        changed = False
+        new_items = []
+        for index, item in enumerate(node):
+            item_path = f"{path}[{index}]"
+            if isinstance(item, dict) and is_dangerous_code_execution_tool_name(_responses_tool_name(item)):
+                removed.append(
+                    {
+                        "path": item_path,
+                        "name": _responses_tool_name(item),
+                        "type": item.get("type"),
+                    }
+                )
+                changed = True
+                continue
+            new_item, item_changed = _drop_dangerous_responses_tools(
+                item,
+                path=item_path,
+                removed=removed,
+            )
+            changed = changed or item_changed
+            new_items.append(new_item)
+        return (new_items if changed else node), changed
+
+    if not isinstance(node, dict):
+        return node, False
+
+    if is_dangerous_code_execution_tool_name(_responses_tool_name(node)):
+        removed.append(
+            {
+                "path": path,
+                "name": _responses_tool_name(node),
+                "type": node.get("type"),
+            }
+        )
+        return None, True
+
+    nested = node.get("tools")
+    if not isinstance(nested, (list, dict)):
+        return node, False
+
+    new_nested, nested_changed = _drop_dangerous_responses_tools(
+        nested,
+        path=f"{path}.tools",
+        removed=removed,
+    )
+    if not nested_changed:
+        return node, False
+    new_node = dict(node)
+    if new_nested is None:
+        new_node.pop("tools", None)
+    else:
+        new_node["tools"] = new_nested
+    return new_node, True
+
+
+def _strip_dangerous_responses_tools(body: dict, *, diagnostics: list[dict] | None = None) -> dict:
+    tools = body.get("tools")
+    if not isinstance(tools, (list, dict)):
+        return body
+
+    removed: list[dict] = []
+    sanitized_tools, changed = _drop_dangerous_responses_tools(
+        tools,
+        path="tools",
+        removed=removed,
+    )
+    if not changed:
+        return body
+
+    sanitized = dict(body)
+    if sanitized_tools:
+        sanitized["tools"] = sanitized_tools
+    else:
+        sanitized.pop("tools", None)
+        sanitized.pop("parallel_tool_calls", None)
+
+    removed_names = {
+        str(item.get("name")).strip().lower()
+        for item in removed
+        if isinstance(item.get("name"), str) and str(item.get("name")).strip()
+    }
+    if (
+        not sanitized.get("tools")
+        or _responses_tool_choice_targets_removed_tool(sanitized.get("tool_choice"), set(), removed_names)
+    ):
+        sanitized.pop("tool_choice", None)
+
+    _append_sanitizer_diagnostic(
+        diagnostics,
+        {
+            "kind": "responses_tools",
+            "action": "drop_dangerous_code_execution_tools",
+            "tool_names": sorted(removed_names),
+            "tools": removed[:20],
+            "truncated": len(removed) > 20,
+        },
+    )
+    return sanitized
 
 
 def responses_tools_have_tool_search(tools) -> bool:
@@ -815,6 +933,11 @@ def sanitize_responses_tools_for_copilot(body: dict, *, diagnostics: list[dict] 
     if not isinstance(tools, (list, dict)):
         return body
 
+    body = _strip_dangerous_responses_tools(body, diagnostics=diagnostics)
+    tools = body.get("tools")
+    if not isinstance(tools, (list, dict)):
+        return body
+
     body = _strip_invalid_responses_defer_loading(body, diagnostics=diagnostics)
     tools = body.get("tools")
     if not isinstance(tools, list):
@@ -883,6 +1006,8 @@ def responses_tool_choice_to_chat(tool_choice):
         function = tool_choice.get("function") if isinstance(tool_choice.get("function"), dict) else tool_choice
         name = function.get("name")
         if isinstance(name, str):
+            if is_dangerous_code_execution_tool_name(name):
+                return None
             return {"type": "function", "function": {"name": name}}
     raise ValueError("Unsupported Responses tool_choice value")
 
@@ -1111,6 +1236,8 @@ def _chat_tool_to_responses(tool: dict) -> dict | None:
     name = function.get("name")
     if not isinstance(name, str):
         raise ValueError("Chat function tools must include a name")
+    if is_dangerous_code_execution_tool_name(name):
+        return None
     return {
         "type": "function",
         "name": name,
@@ -1133,6 +1260,8 @@ def chat_tool_choice_to_responses(tool_choice):
         function = tool_choice.get("function") if isinstance(tool_choice.get("function"), dict) else tool_choice
         name = function.get("name")
         if isinstance(name, str):
+            if is_dangerous_code_execution_tool_name(name):
+                return None
             return {"type": "function", "name": name}
     raise ValueError("Unsupported chat tool_choice value")
 
@@ -1273,14 +1402,20 @@ def anthropic_request_to_responses(body: dict) -> dict:
 
     tools = body.get("tools")
     if tools is not None:
-        payload["tools"] = [
-            _chat_tool_to_responses(tool)
-            for tool in anthropic_tools_to_chat(tools)
+        translated_tools = [
+            converted
+            for converted in (_chat_tool_to_responses(tool) for tool in anthropic_tools_to_chat(tools))
+            if converted is not None
         ]
+        if translated_tools:
+            payload["tools"] = translated_tools
 
     mapped_tool_choice = anthropic_tool_choice_to_chat(body.get("tool_choice"))
-    if mapped_tool_choice is not None:
-        payload["tool_choice"] = chat_tool_choice_to_responses(mapped_tool_choice)
+    responses_tool_choice = chat_tool_choice_to_responses(mapped_tool_choice)
+    if responses_tool_choice is not None and (
+        payload.get("tools") or (isinstance(responses_tool_choice, str) and responses_tool_choice in {"auto", "none"})
+    ):
+        payload["tool_choice"] = responses_tool_choice
 
     reasoning_effort = (
         _anthropic_effort_to_reasoning_effort(body.get("output_config"))
@@ -2499,6 +2634,8 @@ def _responses_tool_to_anthropic(tool: dict) -> dict | None:
     )
     if not isinstance(name, str):
         raise ValueError("Responses tools must include a name")
+    if is_dangerous_code_execution_tool_name(name):
+        return None
     description = tool.get("description")
     if not isinstance(description, str):
         function = tool.get("function") if isinstance(tool.get("function"), dict) else {}
@@ -2538,6 +2675,8 @@ def _responses_tool_choice_to_anthropic(tool_choice):
                 name = function.get("name") if isinstance(function.get("name"), str) else None
             if not isinstance(name, str):
                 raise ValueError("Responses tool_choice type=function must include name")
+            if is_dangerous_code_execution_tool_name(name):
+                return None
             return {"type": "tool", "name": name}
     raise ValueError("Unsupported Responses tool_choice value")
 
@@ -2763,16 +2902,25 @@ def responses_request_to_anthropic_messages(body: dict) -> dict:
             payload["tools"] = translated
 
     # tool_choice
-    tool_choice = _responses_tool_choice_to_anthropic(body.get("tool_choice"))
+    source_tool_choice = body.get("tool_choice")
+    dangerous_tool_choice_removed = _responses_tool_choice_targets_removed_tool(
+        source_tool_choice,
+        set(),
+        _DANGEROUS_CODE_EXECUTION_TOOL_NAMES,
+    )
+    tool_choice = None if dangerous_tool_choice_removed else _responses_tool_choice_to_anthropic(source_tool_choice)
     if tool_choice is not None:
         payload["tool_choice"] = tool_choice
 
-    # parallel_tool_calls (Responses) -> disable_parallel_tool_use (Anthropic)
-    # Only emit when explicitly disabling parallel calls; some Claude models
-    # reject the field, and the default is already to allow parallel.
+    # parallel_tool_calls (Responses) -> tool_choice.disable_parallel_tool_use
+    # (Anthropic). Only emit when explicitly disabling parallel calls and tools
+    # are present; the default is already to allow parallel.
     parallel = body.get("parallel_tool_calls")
-    if parallel is False:
-        payload["disable_parallel_tool_use"] = True
+    if parallel is False and payload.get("tools") and not dangerous_tool_choice_removed:
+        if isinstance(tool_choice, dict) and tool_choice.get("type") in ("auto", "any", "tool"):
+            payload["tool_choice"] = {**tool_choice, "disable_parallel_tool_use": True}
+        elif tool_choice is None:
+            payload["tool_choice"] = {"type": "auto", "disable_parallel_tool_use": True}
 
     # Reasoning effort -> thinking adaptive + output_config carry-through.
     # Anthropic models reject extended thinking when tool_choice forces a

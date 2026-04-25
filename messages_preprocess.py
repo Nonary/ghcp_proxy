@@ -29,6 +29,7 @@ __all__ = [
 
 
 IDE_EXECUTE_CODE_TOOL = "mcp__ide__executeCode"
+_IDE_EXECUTE_CODE_TOOL_NORMALIZED = IDE_EXECUTE_CODE_TOOL.lower()
 IDE_GET_DIAGNOSTICS_TOOL = "mcp__ide__getDiagnostics"
 IDE_GET_DIAGNOSTICS_DESCRIPTION = (
     "Get language diagnostics from VS Code. Returns errors, warnings, "
@@ -454,7 +455,7 @@ def strip_tool_reference_turn_boundary(body: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 def sanitize_ide_tools(body: dict) -> dict:
-    """Drop ``mcp__ide__executeCode`` (unless ``defer_loading`` is set) and
+    """Drop ``mcp__ide__executeCode`` unconditionally and
     rewrite ``mcp__ide__getDiagnostics`` description to match the VS Code
     Claude agent expectations.
     """
@@ -470,7 +471,7 @@ def sanitize_ide_tools(body: dict) -> dict:
             new_tools.append(tool)
             continue
         name = tool.get("name")
-        if name == IDE_EXECUTE_CODE_TOOL and not tool.get("defer_loading"):
+        if isinstance(name, str) and name.strip().lower() == _IDE_EXECUTE_CODE_TOOL_NORMALIZED:
             continue
         if name == IDE_GET_DIAGNOSTICS_TOOL:
             patched = dict(tool)

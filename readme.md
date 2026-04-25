@@ -35,6 +35,40 @@ panel can install shell helpers:
 - PowerShell on Windows: `Start-GHProxy` and `Stop-GHProxy`
 - zsh on macOS: `start-ghproxy` and `stop-ghproxy`
 
+## Auto Update
+
+When GHCP Proxy is started from a git checkout, it checks the configured
+upstream branch and fast-forwards itself when a safe update is available. The
+proxy restarts itself after a successful update.
+
+After startup, the proxy keeps checking for safe fast-forward updates every 15
+minutes. If an update is applied while upstream requests are active, the proxy
+lets those requests finish before restarting. The dashboard shows when a restart
+is pending or scheduled.
+
+The updater is conservative:
+
+- uses the checkout's existing upstream branch, such as `origin/main`
+- runs `git fetch` and only applies `git merge --ff-only`
+- skips updates when the checkout is ahead of or diverged from upstream
+- defaults to **user mode**, which stashes pending GHCP Proxy folder edits,
+  fast-forwards, then reapplies those edits
+- blocks the upgrade if pending changes cannot be safely reapplied, and the
+  dashboard offers an explicit "Apply upgrade anyway" override that discards
+  pending local changes before upgrading
+- supports **developer mode**, which never stashes or discards local code
+  changes during upgrades and instead blocks until you commit or remove them
+- records the most recent result in the user state directory
+
+Environment knobs:
+
+```bash
+export GHCP_AUTO_UPDATE=0                     # disable
+export GHCP_AUTO_UPDATE_MODE=developer        # default: user
+export GHCP_AUTO_UPDATE_INTERVAL_SECONDS=900  # default: 15 minutes
+export GHCP_AUTO_UPDATE_GIT_TIMEOUT_SECONDS=60 # default git command timeout
+```
+
 If upstream non-streaming requests are timing out, you can raise the proxy timeout before starting it:
 
 ```bash

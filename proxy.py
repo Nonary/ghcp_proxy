@@ -53,6 +53,7 @@ if __name__ == "__main__":
 import asyncio
 import auth
 import atexit
+import auto_update
 import background_proxy
 import dashboard as dashboard_module
 import format_translation
@@ -227,6 +228,8 @@ client_proxy_config_service = ProxyClientConfigService(
     model_routing_settings_provider=lambda: model_routing_config_service.load_settings(),
 )
 background_proxy_manager = background_proxy.BackgroundProxyManager()
+auto_update_manager = auto_update.AutoUpdateManager()
+auto_update_runtime_controller = auto_update.AutoUpdateRuntimeController(auto_update_manager)
 bridge_planner = ProtocolBridgePlanner(
     model_routing_config_service,
     capability_resolver=lambda model: model_supports_native_messages(model) if model else False,
@@ -327,10 +330,12 @@ except Exception as _codex_ingest_exc:  # pragma: no cover - best effort
 @app.on_event("startup")
 async def _app_startup_restore_client_proxy_configs():
     restore_client_proxy_configs_on_startup()
+    auto_update_runtime_controller.start_periodic_checks()
 
 
 @app.on_event("shutdown")
 async def _app_shutdown_revert_client_proxy_configs():
+    await auto_update_runtime_controller.stop_periodic_checks()
     revert_client_proxy_configs_on_shutdown()
 
 
@@ -371,6 +376,7 @@ class UpstreamRequestPlan:
     resolved_model: str | None
     source_body: dict | None = None
     trace_context: dict | None = None
+    auto_update_request_tracked: bool = False
 
 
 def _env_flag(name: str) -> bool:
@@ -944,40 +950,44 @@ def _finish_usage_and_trace(
     usage: dict | None = None,
 ) -> None:
     if isinstance(plan, UpstreamRequestPlan):
-        usage_tracker.finish_event(
-            plan.usage_event,
-            status_code,
-            upstream=upstream,
-            response_payload=response_payload,
-            response_text=response_text,
-            reasoning_text=reasoning_text,
-            usage=usage,
-        )
-        force_trace = _should_force_failure_trace(plan, status_code)
-        if request_tracing_enabled() or force_trace:
-            trace_payload = {
-                "event": "request_finished",
-                "time": util.utc_now_iso(),
-                **(plan.trace_context or {"request_id": plan.request_id}),
-                "requested_model": plan.requested_model,
-                "resolved_model": plan.resolved_model,
-                "response": _trace_response_summary(upstream=upstream, response_payload=response_payload, usage=usage),
-                "response_text_present": isinstance(response_text, str) and bool(response_text),
-                "reasoning_text_present": isinstance(reasoning_text, str) and bool(reasoning_text),
-            }
-            if isinstance(reasoning_text, str) and reasoning_text:
-                trace_payload["reasoning_text"] = _trim_trace_text(reasoning_text)
-            if status_code >= 400:
-                trace_payload["source_body"] = _trim_trace_field(
-                    plan.source_body if isinstance(plan.source_body, dict) else plan.body
-                )
-                trace_payload["upstream_body"] = _trim_trace_field(plan.body)
-                trace_payload["outbound_headers"] = _header_trace_subset(plan.headers)
-                if isinstance(response_payload, dict):
-                    trace_payload["response_payload"] = _trim_trace_field(response_payload)
-                if isinstance(response_text, str) and response_text:
-                    trace_payload["response_text"] = _trim_trace_text(response_text)
-            _append_request_trace(trace_payload, force=force_trace)
+        try:
+            usage_tracker.finish_event(
+                plan.usage_event,
+                status_code,
+                upstream=upstream,
+                response_payload=response_payload,
+                response_text=response_text,
+                reasoning_text=reasoning_text,
+                usage=usage,
+            )
+            force_trace = _should_force_failure_trace(plan, status_code)
+            if request_tracing_enabled() or force_trace:
+                trace_payload = {
+                    "event": "request_finished",
+                    "time": util.utc_now_iso(),
+                    **(plan.trace_context or {"request_id": plan.request_id}),
+                    "requested_model": plan.requested_model,
+                    "resolved_model": plan.resolved_model,
+                    "response": _trace_response_summary(upstream=upstream, response_payload=response_payload, usage=usage),
+                    "response_text_present": isinstance(response_text, str) and bool(response_text),
+                    "reasoning_text_present": isinstance(reasoning_text, str) and bool(reasoning_text),
+                }
+                if isinstance(reasoning_text, str) and reasoning_text:
+                    trace_payload["reasoning_text"] = _trim_trace_text(reasoning_text)
+                if status_code >= 400:
+                    trace_payload["source_body"] = _trim_trace_field(
+                        plan.source_body if isinstance(plan.source_body, dict) else plan.body
+                    )
+                    trace_payload["upstream_body"] = _trim_trace_field(plan.body)
+                    trace_payload["outbound_headers"] = _header_trace_subset(plan.headers)
+                    if isinstance(response_payload, dict):
+                        trace_payload["response_payload"] = _trim_trace_field(response_payload)
+                    if isinstance(response_text, str) and response_text:
+                        trace_payload["response_text"] = _trim_trace_text(response_text)
+                _append_request_trace(trace_payload, force=force_trace)
+        finally:
+            if plan.auto_update_request_tracked:
+                auto_update_runtime_controller.note_request_finished(plan.request_id)
         return
 
     usage_tracker.finish_event(
@@ -1048,6 +1058,7 @@ def _prepare_upstream_request(
         prompt_preview=prompt_preview,
         initiator_verdict=initiator_verdict if isinstance(initiator_verdict, dict) else None,
     )
+    auto_update_runtime_controller.note_request_started(request_id)
     trace_context = {
         "request_id": request_id,
         "client_path": request.url.path,
@@ -1081,6 +1092,7 @@ def _prepare_upstream_request(
             resolved_model=resolved_model,
             source_body=source_body if isinstance(source_body, dict) else body,
             trace_context=trace_context,
+            auto_update_request_tracked=True,
         ),
         None,
     )
@@ -2407,6 +2419,34 @@ async def background_proxy_status_api():
     return JSONResponse(content=background_proxy_manager.status_payload())
 
 
+@app.get("/api/config/auto-update")
+async def auto_update_status_api():
+    return JSONResponse(content=auto_update_runtime_controller.status_payload())
+
+
+@app.post("/api/config/auto-update")
+async def auto_update_config_api(request: Request):
+    payload = await parse_json_request(request)
+    action = str(payload.get("action") or "").strip().lower()
+    if action == "set_mode":
+        mode = str(payload.get("mode") or "").strip().lower()
+        try:
+            settings = auto_update_manager.set_mode(mode)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        return JSONResponse(content={**auto_update_runtime_controller.status_payload(), "settings": settings})
+    if action == "check_now":
+        result = await auto_update_runtime_controller.run_due_check(force=True)
+        return JSONResponse(content={**auto_update_runtime_controller.status_payload(), "result": result})
+    if action == "upgrade_anyway":
+        result = await auto_update_runtime_controller.run_due_check(
+            force=True,
+            override_local_changes=True,
+        )
+        return JSONResponse(content={**auto_update_runtime_controller.status_payload(), "result": result})
+    raise HTTPException(status_code=400, detail="unsupported auto-update action")
+
+
 @app.post("/api/config/background-proxy")
 async def background_proxy_config_api(request: Request):
     payload = await parse_json_request(request)
@@ -2650,6 +2690,15 @@ async def anthropic_messages(request: Request):
 # ─── Entrypoint ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    update_result = auto_update_manager.startup_check_and_update()
+    if update_result.get("attempted"):
+        print(f"Auto-update: {json.dumps(update_result, default=str)}", flush=True)
+    if update_result.get("restart_required"):
+        try:
+            auto_update.reexec_current_process()
+        except OSError as exc:
+            print(f"Warning: auto-update restart failed; continuing with current process: {exc}", flush=True)
+
     # Best-effort cleanup of legacy on-disk state from the pre-header-driven
     # quota implementation. Safe to remove unconditionally; if the user never
     # configured them, the unlinks are no-ops.

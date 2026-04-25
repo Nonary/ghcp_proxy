@@ -579,6 +579,72 @@ class FormatTranslationTests(unittest.TestCase):
         self.assertIs(sanitized, body)
         self.assertTrue(sanitized["tools"][1]["tools"][0]["defer_loading"])
 
+    def test_sanitize_responses_tools_drops_dangerous_execute_code_even_when_deferred(self):
+        diagnostics = []
+        body = {
+            "model": "gpt-5.5",
+            "input": "hello",
+            "tools": [
+                {"type": "function", "name": "read", "parameters": {"type": "object", "properties": {}}},
+                {
+                    "type": "function",
+                    "name": "mcp__ide__executeCode",
+                    "defer_loading": True,
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            ],
+            "tool_choice": {"type": "function", "name": "mcp__ide__executeCode"},
+        }
+
+        sanitized = format_translation.sanitize_responses_tools_for_copilot(
+            body,
+            diagnostics=diagnostics,
+        )
+
+        self.assertEqual([tool["name"] for tool in sanitized["tools"]], ["read"])
+        self.assertNotIn("tool_choice", sanitized)
+        self.assertEqual(diagnostics[0]["action"], "drop_dangerous_code_execution_tools")
+        self.assertEqual(diagnostics[0]["tool_names"], ["mcp__ide__executecode"])
+
+    def test_responses_request_to_chat_drops_dangerous_execute_code_tool_and_choice(self):
+        body = {
+            "model": "claude-opus-4.6",
+            "input": "hello",
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "mcp__ide__executeCode",
+                    "description": "Execute code",
+                    "parameters": {"type": "object", "properties": {}},
+                }
+            ],
+            "tool_choice": {"type": "function", "name": "mcp__ide__executeCode"},
+        }
+
+        translated = format_translation.responses_request_to_chat(body)
+
+        self.assertNotIn("tools", translated)
+        self.assertNotIn("tool_choice", translated)
+
+    def test_anthropic_request_to_responses_drops_dangerous_execute_code_tool_and_choice(self):
+        body = {
+            "model": "gpt-5.4",
+            "messages": [{"role": "user", "content": "hello"}],
+            "tools": [
+                {
+                    "name": "mcp__ide__executeCode",
+                    "description": "Execute code",
+                    "input_schema": {"type": "object", "properties": {}},
+                }
+            ],
+            "tool_choice": {"type": "tool", "name": "mcp__ide__executeCode"},
+        }
+
+        translated = format_translation.anthropic_request_to_responses(body)
+
+        self.assertNotIn("tools", translated)
+        self.assertNotIn("tool_choice", translated)
+
     def test_build_fake_compaction_request_keeps_tools_with_none_choice_for_claude_models(self):
         body = {
             "model": "claude-opus-4.6",
@@ -1899,6 +1965,52 @@ class ResponsesToAnthropicMessagesTests(unittest.TestCase):
             ],
         )
 
+    def test_drops_dangerous_execute_code_tool_and_choice(self):
+        body = {
+            "model": "claude-sonnet-4.6",
+            "input": [],
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "mcp__ide__executeCode",
+                    "description": "Execute code",
+                    "parameters": {"type": "object", "properties": {}},
+                }
+            ],
+            "tool_choice": {"type": "function", "name": "mcp__ide__executeCode"},
+            "parallel_tool_calls": False,
+        }
+
+        out = format_translation.responses_request_to_anthropic_messages(body)
+
+        self.assertNotIn("tools", out)
+        self.assertNotIn("tool_choice", out)
+
+    def test_dangerous_tool_choice_does_not_become_auto_when_safe_tools_remain(self):
+        body = {
+            "model": "claude-sonnet-4.6",
+            "input": [],
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "read",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+                {
+                    "type": "function",
+                    "name": "mcp__ide__executeCode",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            ],
+            "tool_choice": {"type": "function", "name": "mcp__ide__executeCode"},
+            "parallel_tool_calls": False,
+        }
+
+        out = format_translation.responses_request_to_anthropic_messages(body)
+
+        self.assertEqual([tool["name"] for tool in out["tools"]], ["read"])
+        self.assertNotIn("tool_choice", out)
+
     def test_responses_prompt_cache_key_adds_messages_cache_breakpoints(self):
         body = {
             "model": "claude-sonnet-4.6",
@@ -1965,10 +2077,42 @@ class ResponsesToAnthropicMessagesTests(unittest.TestCase):
         body = {
             "model": "claude-sonnet-4.6",
             "input": [],
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "do",
+                    "parameters": {"type": "object", "properties": {}},
+                }
+            ],
             "parallel_tool_calls": False,
         }
         out = format_translation.responses_request_to_anthropic_messages(body)
-        self.assertTrue(out["disable_parallel_tool_use"])
+        self.assertNotIn("disable_parallel_tool_use", out)
+        self.assertEqual(
+            out["tool_choice"],
+            {"type": "auto", "disable_parallel_tool_use": True},
+        )
+
+    def test_parallel_tool_calls_disables_existing_tool_choice(self):
+        body = {
+            "model": "claude-sonnet-4.6",
+            "input": [],
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "do",
+                    "parameters": {"type": "object", "properties": {}},
+                }
+            ],
+            "tool_choice": {"type": "function", "name": "do"},
+            "parallel_tool_calls": False,
+        }
+        out = format_translation.responses_request_to_anthropic_messages(body)
+        self.assertNotIn("disable_parallel_tool_use", out)
+        self.assertEqual(
+            out["tool_choice"],
+            {"type": "tool", "name": "do", "disable_parallel_tool_use": True},
+        )
 
     def test_developer_message_skipped_from_messages(self):
         body = {

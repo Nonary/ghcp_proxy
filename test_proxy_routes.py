@@ -32,6 +32,7 @@ class ProxyRoutesTests(unittest.TestCase):
         self.assertIn("/v1/chat/completions", paths)
         self.assertIn("/v1/models", paths)
         self.assertIn("/api/config/background-proxy", paths)
+        self.assertIn("/api/config/auto-update", paths)
 
     def test_background_proxy_status_route_uses_manager(self):
         manager = SimpleNamespace(status_payload=mock.Mock(return_value={"startup_enabled": True}))
@@ -41,6 +42,50 @@ class ProxyRoutesTests(unittest.TestCase):
         manager.status_payload.assert_called_once_with()
         self.assertEqual(response.status_code, 200)
         self.assertEqual(json.loads(response.body), {"startup_enabled": True})
+
+    def test_auto_update_status_route_uses_runtime_controller(self):
+        controller = SimpleNamespace(status_payload=mock.Mock(return_value={"enabled": True, "last_result": {"reason": "up-to-date"}}))
+        with mock.patch.object(proxy, "auto_update_runtime_controller", controller):
+            response = proxy.asyncio.run(proxy.auto_update_status_api())
+
+        controller.status_payload.assert_called_once_with()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(json.loads(response.body), {"enabled": True, "last_result": {"reason": "up-to-date"}})
+
+    def test_auto_update_config_route_sets_mode(self):
+        request = SimpleNamespace()
+        manager = SimpleNamespace(set_mode=mock.Mock(return_value={"mode": "developer"}))
+        controller = SimpleNamespace(status_payload=mock.Mock(return_value={"enabled": True, "mode": "developer"}))
+
+        with (
+            mock.patch.object(proxy, "parse_json_request", mock.AsyncMock(return_value={"action": "set_mode", "mode": "developer"})),
+            mock.patch.object(proxy, "auto_update_manager", manager),
+            mock.patch.object(proxy, "auto_update_runtime_controller", controller),
+        ):
+            response = proxy.asyncio.run(proxy.auto_update_config_api(request))
+
+        manager.set_mode.assert_called_once_with("developer")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(json.loads(response.body)["mode"], "developer")
+
+    def test_auto_update_config_route_can_override_local_changes(self):
+        request = SimpleNamespace()
+        result = {"attempted": True, "updated": True, "reason": "updated", "discarded_local_changes": True}
+        controller = SimpleNamespace(
+            run_due_check=mock.AsyncMock(return_value=result),
+            status_payload=mock.Mock(return_value={"enabled": True, "last_result": result}),
+        )
+
+        with (
+            mock.patch.object(proxy, "parse_json_request", mock.AsyncMock(return_value={"action": "upgrade_anyway"})),
+            mock.patch.object(proxy, "auto_update_runtime_controller", controller),
+        ):
+            response = proxy.asyncio.run(proxy.auto_update_config_api(request))
+
+        controller.run_due_check.assert_awaited_once_with(force=True, override_local_changes=True)
+        self.assertEqual(response.status_code, 200)
+        payload = json.loads(response.body)
+        self.assertTrue(payload["result"]["discarded_local_changes"])
 
     def test_models_route_proxies_upstream_copilot_models(self):
         upstream = httpx.Response(

@@ -158,10 +158,10 @@ class SanitizeIdeToolsTests(unittest.TestCase):
         diag = next(t for t in body["tools"] if t["name"] == "mcp__ide__getDiagnostics")
         self.assertIn("diagnostics from VS Code", diag["description"])
 
-    def test_keeps_execute_code_when_defer_loading(self):
+    def test_drops_execute_code_even_when_defer_loading(self):
         body = {"tools": [{"name": "mcp__ide__executeCode", "defer_loading": True}]}
         sanitize_ide_tools(body)
-        self.assertEqual(len(body["tools"]), 1)
+        self.assertEqual(body["tools"], [])
 
     def test_no_tools_noop(self):
         self.assertEqual(sanitize_ide_tools({}), {})

@@ -2487,6 +2487,44 @@
             <div v-if="backgroundProxyStatus.error" class="status error" style="margin-top: 10px;">{{ backgroundProxyStatus.error }}</div>
             <div v-else-if="backgroundProxyStatus.statusMessage" class="status good" style="margin-top: 10px;">{{ backgroundProxyStatus.statusMessage }}</div>
           </article>
+          <article class="mini-card" style="margin-top: 12px;">
+            <div class="eyebrow">Auto Update</div>
+            <div :class="['status', autoUpdateStatusClass]">{{ autoUpdateStatusLabel }}</div>
+            <div class="subtle" style="margin-top: 8px;">
+              Mode:
+              <strong>{{ autoUpdateStatus.mode === 'developer' ? 'Developer' : 'User' }}</strong>
+              · checks every {{ Math.round(Number(autoUpdateStatus.check_interval_seconds || 900) / 60) }} minutes
+            </div>
+            <label style="display:flex; align-items:center; gap:10px; margin-top:8px;">
+              <input type="checkbox"
+                     :checked="autoUpdateStatus.mode === 'developer'"
+                     :disabled="savingAutoUpdate || autoUpdateStatus.mode_source === 'env'"
+                     @change="setAutoUpdateMode($event.target.checked ? 'developer' : 'user')">
+              <span>Developer mode: never stash or discard local code changes during upgrades</span>
+            </label>
+            <div class="subtle" style="margin-top: 6px;">
+              User mode stashes GHCP Proxy folder edits before upgrading and reapplies them after. If they do not apply cleanly, the upgrade is blocked until you commit or remove them.
+            </div>
+            <div class="subtle" style="margin-top: 4px;">
+              If an update is applied, GHCP Proxy restarts itself after active requests finish.
+            </div>
+            <div v-if="autoUpdateStatus.mode_source === 'env'" class="subtle" style="margin-top: 4px;">Mode is controlled by GHCP_AUTO_UPDATE_MODE.</div>
+            <div class="toolbar" style="margin-top: 10px;">
+              <button @click="runAutoUpdateCheck" :disabled="savingAutoUpdate">Check now</button>
+              <button v-if="autoUpdateBlockedMessage"
+                      class="danger"
+                      @click="applyAutoUpdateAnyway"
+                      :disabled="savingAutoUpdate">
+                Apply upgrade anyway
+              </button>
+              <button @click="loadAutoUpdateStatus" :disabled="savingAutoUpdate">Refresh</button>
+            </div>
+            <div v-if="autoUpdateLastResult?.dirty?.length" class="subtle" style="margin-top: 8px;">
+              Pending changes detected: {{ autoUpdateLastResult.dirty.slice(0, 3).join('; ') }}{{ autoUpdateLastResult.dirty.length > 3 ? '…' : '' }}
+            </div>
+            <div class="subtle" style="margin-top: 4px;">{{ autoUpdateStatus.repo_dir }}</div>
+            <div v-if="autoUpdateStatus.statusMessage" class="status good" style="margin-top: 10px;">{{ autoUpdateStatus.statusMessage }}</div>
+          </article>
           <div v-if="proxyConfigError" class="status error" style="margin-top: 10px;">{{ proxyConfigError }}</div>
           <div v-else-if="proxyConfigStatusMessage" class="status good" style="margin-top: 10px;">{{ proxyConfigStatusMessage }}</div>
         </article>
@@ -3678,6 +3716,19 @@
             error: '',
             statusMessage: '',
           },
+          autoUpdateStatus: {
+            enabled: true,
+            mode: 'user',
+            mode_source: 'default',
+            repo_dir: '',
+            check_interval_seconds: 900,
+            last_check: '',
+            last_result: null,
+            runtime: {},
+            error: '',
+            statusMessage: '',
+          },
+          savingAutoUpdate: false,
           activeTab: 'sessions',
           tabs: ['sessions', 'requests'],
           spendTrendRange: 'day',
@@ -4933,6 +4984,34 @@
           if (!this.backgroundProxyStatus.startup_supported) return 'Login startup is not supported on this OS';
           return this.backgroundProxyStatus.startup_enabled ? 'Starts at login' : 'Manual start only';
         },
+        autoUpdateLastResult() {
+          return this.autoUpdateStatus.last_result || this.autoUpdateStatus.runtime?.last_runtime_result || null;
+        },
+        autoUpdateBlockedMessage() {
+          const result = this.autoUpdateLastResult;
+          if (!result || !result.upgrade_blocked) return '';
+          return result.user_message || 'Auto-update is blocked by local pending changes.';
+        },
+        autoUpdateStatusClass() {
+          if (this.autoUpdateStatus.error || this.autoUpdateBlockedMessage) return 'error';
+          const result = this.autoUpdateLastResult;
+          if (this.autoUpdateStatus.runtime?.restart_pending) return 'warn';
+          if (!this.autoUpdateStatus.enabled) return 'warn';
+          if (result?.updated || result?.reason === 'up-to-date') return 'good';
+          return 'warn';
+        },
+        autoUpdateStatusLabel() {
+          if (this.autoUpdateStatus.error) return this.autoUpdateStatus.error;
+          if (this.autoUpdateBlockedMessage) return this.autoUpdateBlockedMessage;
+          if (!this.autoUpdateStatus.enabled) return 'Auto-update disabled';
+          if (this.autoUpdateStatus.runtime?.restarting) return 'Update applied; restarting GHCP Proxy';
+          if (this.autoUpdateStatus.runtime?.restart_scheduled) return 'Update applied; restart scheduled';
+          if (this.autoUpdateStatus.runtime?.restart_pending) return 'Update applied; waiting for active requests before automatic restart';
+          const result = this.autoUpdateLastResult;
+          if (result?.reason === 'updated') return 'Updated; restarting GHCP Proxy';
+          if (result?.reason) return `Last check: ${result.reason}`;
+          return 'Waiting for first auto-update check';
+        },
 
         navItems() {
           const ico = (svg) => svg;
@@ -5972,6 +6051,71 @@
             installed ? 'Shell commands removed.' : 'Shell commands installed.'
           );
         },
+        async loadAutoUpdateStatus() {
+          try {
+            const response = await fetch('/api/config/auto-update', { cache: 'no-store' });
+            if (!response.ok) {
+              throw new Error(`auto-update status request failed: ${response.status}`);
+            }
+            const payload = await response.json();
+            this.autoUpdateStatus = {
+              ...this.autoUpdateStatus,
+              ...payload,
+              error: '',
+            };
+          } catch (error) {
+            this.autoUpdateStatus.error = error.message;
+          }
+        },
+        async configureAutoUpdate(action, body = {}, successMessage = '') {
+          if (this.savingAutoUpdate) return;
+          this.savingAutoUpdate = true;
+          this.autoUpdateStatus.statusMessage = '';
+          this.autoUpdateStatus.error = '';
+          try {
+            const response = await fetch('/api/config/auto-update', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ action, ...body }),
+            });
+            if (!response.ok) {
+              let message = `auto-update request failed: ${response.status}`;
+              try {
+                const data = await response.json();
+                if (data?.detail) message = data.detail;
+                else if (data?.error) message = data.error;
+              } catch (_error) {}
+              throw new Error(message);
+            }
+            const payload = await response.json();
+            this.autoUpdateStatus = {
+              ...this.autoUpdateStatus,
+              ...payload,
+              error: '',
+              statusMessage: successMessage,
+            };
+          } catch (error) {
+            this.autoUpdateStatus.error = error.message;
+          } finally {
+            this.savingAutoUpdate = false;
+          }
+        },
+        async setAutoUpdateMode(mode) {
+          return this.configureAutoUpdate(
+            'set_mode',
+            { mode },
+            mode === 'developer' ? 'Developer mode enabled.' : 'User mode enabled.'
+          );
+        },
+        async runAutoUpdateCheck() {
+          return this.configureAutoUpdate('check_now', {}, 'Auto-update check completed.');
+        },
+        async applyAutoUpdateAnyway() {
+          if (!window.confirm('Apply the upgrade anyway? This discards pending local changes in the GHCP Proxy checkout.')) {
+            return;
+          }
+          return this.configureAutoUpdate('upgrade_anyway', {}, 'Upgrade override requested.');
+        },
         async configureClientProxy(target, action) {
           if (this.savingProxyConfig) return;
 
@@ -6533,6 +6677,7 @@
         this.loadSafeguardConfig();
         this.loadClientProxyStatus();
         this.loadBackgroundProxyStatus();
+        this.loadAutoUpdateStatus();
         this.loadModelRoutingConfig();
         this.startDashboardStream();
         this.autoRefreshTimer = window.setInterval(() => {
