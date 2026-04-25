@@ -96,6 +96,10 @@ class UsageTrackingTests(unittest.TestCase):
 
         self.assertEqual(event["session_id"], "session-123")
         self.assertEqual(outbound_headers["session_id"], "session-123")
+        self.assertEqual(outbound_headers["x-interaction-id"], "session-123")
+        self.assertEqual(outbound_headers["x-request-id"], event["server_request_id"])
+        self.assertEqual(outbound_headers["x-github-request-id"], event["server_request_id"])
+        self.assertEqual(outbound_headers["x-agent-task-id"], event["server_request_id"])
 
     def test_start_usage_event_uses_request_body_session_id(self):
         tracker = self._make_usage_tracker()
@@ -117,6 +121,10 @@ class UsageTrackingTests(unittest.TestCase):
 
         self.assertEqual(event["session_id"], "session-123")
         self.assertEqual(outbound_headers["session_id"], "session-123")
+        self.assertEqual(outbound_headers["x-interaction-id"], "session-123")
+        self.assertEqual(outbound_headers["x-agent-task-id"], "session-123")
+        self.assertNotIn("x-request-id", outbound_headers)
+        self.assertNotIn("x-github-request-id", outbound_headers)
 
     def test_normalize_recorded_usage_event_backfills_codex_native_session_and_chain(self):
         normalized = usage_tracking._normalize_recorded_usage_event(
@@ -655,7 +663,7 @@ class UsageTrackingTests(unittest.TestCase):
         self.assertEqual(event["prior_server_request_id"], "server-prev")
         self.assertNotEqual(event["server_request_id"], "server-prev")
 
-    def test_start_usage_event_agent_sends_unique_request_id_when_linking_latest_session(self):
+    def test_start_usage_event_responses_uses_stable_affinity_when_linking_latest_session(self):
         tracker = self._make_usage_tracker()
         tracker.remember_latest_server_request_id("session-123", None, None, "server-prev")
         outbound_headers = {}
@@ -675,9 +683,34 @@ class UsageTrackingTests(unittest.TestCase):
         )
 
         self.assertEqual(event["prior_server_request_id"], "server-prev")
-        self.assertEqual(outbound_headers["x-request-id"], event["server_request_id"])
-        self.assertEqual(outbound_headers["x-github-request-id"], event["server_request_id"])
-        self.assertNotEqual(outbound_headers["x-request-id"], "server-prev")
+        self.assertEqual(outbound_headers["x-interaction-id"], "session-123")
+        self.assertEqual(outbound_headers["x-agent-task-id"], "session-123")
+        self.assertNotIn("x-request-id", outbound_headers)
+        self.assertNotIn("x-github-request-id", outbound_headers)
+
+    def test_start_usage_event_uses_forwarded_server_request_id_as_prior_only(self):
+        tracker = self._make_usage_tracker()
+        outbound_headers = {"x-request-id": "server-prev"}
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/responses"),
+            method="POST",
+            headers={"session_id": "session-123", "x-request-id": "server-prev"},
+        )
+
+        event = tracker.start_event(
+            request,
+            requested_model="gpt-5.4",
+            resolved_model="gpt-5.4",
+            initiator="agent",
+            outbound_headers=outbound_headers,
+        )
+
+        self.assertEqual(event["prior_server_request_id"], "server-prev")
+        self.assertNotEqual(event["server_request_id"], "server-prev")
+        self.assertEqual(outbound_headers["x-interaction-id"], "session-123")
+        self.assertEqual(outbound_headers["x-agent-task-id"], "session-123")
+        self.assertNotIn("x-request-id", outbound_headers)
+        self.assertNotIn("x-github-request-id", outbound_headers)
 
     def test_start_usage_event_agent_links_latest_body_session_server_request_id(self):
         tracker = self._make_usage_tracker()
@@ -784,6 +817,28 @@ class UsageTrackingTests(unittest.TestCase):
 
         self.assertEqual(outbound_headers["x-request-id"], event["server_request_id"])
         self.assertEqual(outbound_headers["x-github-request-id"], event["server_request_id"])
+
+    def test_start_usage_event_keeps_request_id_for_responses_to_messages_upstream(self):
+        tracker = self._make_usage_tracker()
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/responses"),
+            method="POST",
+            headers={},
+        )
+        outbound_headers = {}
+
+        event = tracker.start_event(
+            request,
+            requested_model="claude-sonnet-4.6",
+            resolved_model="claude-sonnet-4.6",
+            initiator="user",
+            upstream_path="/v1/messages",
+            outbound_headers=outbound_headers,
+        )
+
+        self.assertEqual(outbound_headers["x-request-id"], event["server_request_id"])
+        self.assertEqual(outbound_headers["x-github-request-id"], event["server_request_id"])
+        self.assertEqual(outbound_headers["x-agent-task-id"], event["server_request_id"])
 
     def test_finish_usage_event_tracks_usage_and_timing(self):
         tracker = self._make_usage_tracker()

@@ -28,6 +28,8 @@ class RequestHeadersTests(unittest.TestCase):
         )
 
         self.assertEqual(headers["X-Initiator"], "user")
+        self.assertEqual(headers["x-interaction-id"], headers["x-client-session-id"])
+        self.assertEqual(headers["x-agent-task-id"], headers["x-client-session-id"])
         self.assertEqual(body["input"], "hello")
 
     def test_gpt_5_4_mini_environment_bootstrap_is_agent(self):
@@ -584,7 +586,7 @@ class RequestHeadersTests(unittest.TestCase):
 
         self.assertEqual(headers["session_id"], "claude-session")
 
-    def test_build_responses_headers_for_request_forwards_latest_server_request_id(self):
+    def test_build_responses_headers_for_request_does_not_forward_latest_server_request_id(self):
         proxy.usage_tracker.remember_latest_server_request_id("session-123", None, None, "server-prev")
 
         request = SimpleNamespace(
@@ -616,6 +618,8 @@ class RequestHeadersTests(unittest.TestCase):
         )
 
         self.assertEqual(headers["session_id"], "session-123")
+        self.assertEqual(headers["x-interaction-id"], "session-123")
+        self.assertEqual(headers["x-agent-task-id"], "session-123")
 
     def test_build_responses_headers_for_request_uses_body_session_id(self):
         request = SimpleNamespace(
@@ -632,6 +636,8 @@ class RequestHeadersTests(unittest.TestCase):
 
         self.assertEqual(headers["session_id"], "session-123")
         self.assertEqual(headers["x-client-request-id"], "session-123")
+        self.assertEqual(headers["x-interaction-id"], "session-123")
+        self.assertEqual(headers["x-agent-task-id"], "session-123")
         self.assertEqual(body["prompt_cache_key"], "session-123")
 
     def test_build_responses_headers_for_request_uses_conversation_agent_intent(self):
@@ -664,6 +670,8 @@ class RequestHeadersTests(unittest.TestCase):
 
         self.assertEqual(headers["session_id"], "cache-123")
         self.assertEqual(headers["x-client-request-id"], "cache-123")
+        self.assertEqual(headers["x-interaction-id"], "cache-123")
+        self.assertEqual(headers["x-agent-task-id"], "cache-123")
         self.assertEqual(body["prompt_cache_key"], "cache-123")
         self.assertNotIn("promptCacheKey", body)
 
@@ -682,8 +690,10 @@ class RequestHeadersTests(unittest.TestCase):
 
         self.assertEqual(headers["session_id"], "session-123")
         self.assertEqual(headers["x-client-request-id"], "client-123")
+        self.assertEqual(headers["x-interaction-id"], "session-123")
+        self.assertEqual(headers["x-agent-task-id"], "session-123")
 
-    def test_build_responses_headers_for_request_preserves_incoming_server_request_id(self):
+    def test_build_responses_headers_for_request_does_not_forward_incoming_server_request_id(self):
         request = SimpleNamespace(
             headers={"x-request-id": "server-prev"},
             url=SimpleNamespace(path="/v1/responses"),
@@ -696,8 +706,8 @@ class RequestHeadersTests(unittest.TestCase):
             session_id_resolver=usage_tracking.request_session_id,
         )
 
-        self.assertEqual(headers["x-request-id"], "server-prev")
-        self.assertEqual(headers["x-github-request-id"], "server-prev")
+        self.assertNotIn("x-request-id", headers)
+        self.assertNotIn("x-github-request-id", headers)
 
 
 if __name__ == "__main__":

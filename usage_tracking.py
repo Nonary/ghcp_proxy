@@ -115,6 +115,31 @@ def request_session_id(request: Request, request_body: dict | None = None) -> st
     return None
 
 
+def _normalized_api_path(path: str | None) -> str | None:
+    if not isinstance(path, str):
+        return None
+    normalized = path.strip().split("?", 1)[0].lower()
+    if not normalized:
+        return None
+    if not normalized.startswith("/"):
+        normalized = f"/{normalized}"
+    normalized = normalized.rstrip("/") or "/"
+    if normalized.startswith("/v1/"):
+        normalized = normalized[3:]
+    return normalized
+
+
+def _is_responses_api_path(path: str | None) -> bool:
+    return _normalized_api_path(path) in {"/responses", "/responses/compact"}
+
+
+def _drop_outbound_headers(headers: dict, header_names: tuple[str, ...]) -> None:
+    names = {name.lower() for name in header_names}
+    for key in list(headers.keys()):
+        if isinstance(key, str) and key.lower() in names:
+            headers.pop(key, None)
+
+
 def _display_model_name(model_name: str | None) -> str | None:
     normalized = _normalize_model_name(model_name)
     if normalized is None:
@@ -646,13 +671,11 @@ class UsageTracker:
         subagent: str | None = None,
         allow_user_active_fallback: bool = False,
     ) -> tuple[str, str | None]:
-        explicit_server_request_id = (
+        forwarded_server_request_id = (
             request.headers.get("x-request-id")
             or request.headers.get("request-id")
             or request.headers.get("x-github-request-id")
         )
-        if explicit_server_request_id:
-            return explicit_server_request_id, explicit_server_request_id
 
         if session_id is None:
             session_id = request_session_id(request, request_body)
@@ -666,7 +689,7 @@ class UsageTracker:
             for value in (session_id, client_request_id, subagent)
         )
 
-        prior_server_request_id = None
+        prior_server_request_id = forwarded_server_request_id or None
 
         if initiator == "agent":
             active_server_request_id = self._get_active_server_request_id(
@@ -944,10 +967,24 @@ class UsageTracker:
             allow_user_active_fallback=is_claude_request and initiator == "user",
         )
         if isinstance(outbound_headers, dict):
+            outbound_path = upstream_path or getattr(request.url, "path", None)
+            uses_responses_affinity_headers = _is_responses_api_path(outbound_path)
             if session_id:
                 outbound_headers["session_id"] = session_id
-            outbound_headers["x-request-id"] = server_request_id
-            outbound_headers["x-github-request-id"] = server_request_id
+                outbound_headers["x-interaction-id"] = session_id
+            if uses_responses_affinity_headers:
+                _drop_outbound_headers(
+                    outbound_headers,
+                    ("x-request-id", "request-id", "x-github-request-id"),
+                )
+                if session_id:
+                    outbound_headers["x-agent-task-id"] = session_id
+                else:
+                    outbound_headers.setdefault("x-agent-task-id", server_request_id)
+            else:
+                outbound_headers["x-request-id"] = server_request_id
+                outbound_headers["x-github-request-id"] = server_request_id
+                outbound_headers["x-agent-task-id"] = server_request_id
         started_at = utc_now_iso()
         event = {
             "request_id": event_request_id,

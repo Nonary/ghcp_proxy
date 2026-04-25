@@ -6,7 +6,7 @@ from fastapi import Request
 
 from constants import (
     OPENCODE_VERSION, OPENCODE_INTEGRATION_ID, GITHUB_API_VERSION,
-    FORWARDED_REQUEST_HEADERS, FORWARDED_SERVER_REQUEST_ID_HEADERS,
+    FORWARDED_REQUEST_HEADERS,
 )
 
 _CLIENT_SESSION_ID = str(uuid.uuid4())
@@ -32,6 +32,22 @@ def _interaction_type_for_initiator(initiator: str) -> str:
     if initiator == "user":
         return "conversation-user"
     return "conversation-agent"
+
+
+def _interaction_id_for_session(session_id: str | None) -> str:
+    if isinstance(session_id, str):
+        normalized = session_id.strip()
+        if normalized:
+            return normalized
+    return str(uuid.uuid4())
+
+
+def _responses_affinity_id_for_session(session_id: str | None) -> str:
+    if isinstance(session_id, str):
+        normalized = session_id.strip()
+        if normalized:
+            return normalized
+    return _CLIENT_SESSION_ID
 
 
 def build_copilot_headers(api_key: str) -> dict:
@@ -61,18 +77,6 @@ def _apply_forwarded_request_headers(headers: dict, request: Request, request_bo
         normalized_session_id = session_id.strip()
         if normalized_session_id:
             headers["x-client-request-id"] = normalized_session_id
-
-    forwarded_server_request_id = None
-    for header_name in FORWARDED_SERVER_REQUEST_ID_HEADERS:
-        header_value = request.headers.get(header_name)
-        if header_value:
-            headers[header_name] = header_value
-            if forwarded_server_request_id is None:
-                forwarded_server_request_id = header_value
-
-    if forwarded_server_request_id is not None:
-        headers.setdefault("x-request-id", forwarded_server_request_id)
-        headers.setdefault("x-github-request-id", forwarded_server_request_id)
 
     return session_id
 
@@ -128,8 +132,9 @@ def build_responses_headers_for_request(
         body["input"] = effective_input
     headers["X-Initiator"] = initiator
     headers["x-interaction-type"] = _interaction_type_for_initiator(initiator)
-    headers["x-interaction-id"] = str(uuid.uuid4())
-    headers["x-agent-task-id"] = str(uuid.uuid4())
+    affinity_id = _responses_affinity_id_for_session(session_id)
+    headers["x-interaction-id"] = affinity_id
+    headers["x-agent-task-id"] = affinity_id
 
     if has_vision_input(effective_input):
         headers["Copilot-Vision-Request"] = "true"
@@ -149,7 +154,7 @@ def build_chat_headers_for_request(
     verdict_sink: dict | None = None,
 ) -> dict:
     headers = build_copilot_headers(api_key)
-    _apply_forwarded_request_headers(headers, request, session_id_resolver=session_id_resolver)
+    session_id = _apply_forwarded_request_headers(headers, request, session_id_resolver=session_id_resolver)
 
     initiator = initiator_policy.resolve_chat_messages(
         messages,
@@ -160,7 +165,7 @@ def build_chat_headers_for_request(
     )
     headers["X-Initiator"] = initiator
     headers["x-interaction-type"] = _interaction_type_for_initiator(initiator)
-    headers["x-interaction-id"] = str(uuid.uuid4())
+    headers["x-interaction-id"] = _interaction_id_for_session(session_id)
     headers["x-agent-task-id"] = str(uuid.uuid4())
 
     if isinstance(messages, list):
@@ -212,7 +217,7 @@ def build_anthropic_headers_for_request(
     verdict_sink: dict | None = None,
 ) -> dict:
     headers = build_copilot_headers(api_key)
-    _apply_forwarded_request_headers(headers, request, body, session_id_resolver=session_id_resolver)
+    session_id = _apply_forwarded_request_headers(headers, request, body, session_id_resolver=session_id_resolver)
 
     messages = body.get("messages")
     initiator = initiator_policy.resolve_anthropic_messages(
@@ -225,7 +230,7 @@ def build_anthropic_headers_for_request(
     )
     headers["X-Initiator"] = initiator
     headers["x-interaction-type"] = _interaction_type_for_initiator(initiator)
-    headers["x-interaction-id"] = str(uuid.uuid4())
+    headers["x-interaction-id"] = _interaction_id_for_session(session_id)
     headers["x-agent-task-id"] = str(uuid.uuid4())
 
     if _anthropic_messages_has_vision(messages):
