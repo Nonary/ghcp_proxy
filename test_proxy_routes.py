@@ -72,7 +72,7 @@ class ProxyRoutesTests(unittest.TestCase):
         request = SimpleNamespace()
         result = {"attempted": True, "updated": True, "reason": "updated", "discarded_local_changes": True}
         controller = SimpleNamespace(
-            run_due_check=mock.AsyncMock(return_value=result),
+            apply_update=mock.AsyncMock(return_value=result),
             status_payload=mock.Mock(return_value={"enabled": True, "last_result": result}),
         )
 
@@ -82,7 +82,7 @@ class ProxyRoutesTests(unittest.TestCase):
         ):
             response = proxy.asyncio.run(proxy.auto_update_config_api(request))
 
-        controller.run_due_check.assert_awaited_once_with(force=True, override_local_changes=True)
+        controller.apply_update.assert_awaited_once_with(override_local_changes=True)
         self.assertEqual(response.status_code, 200)
         payload = json.loads(response.body)
         self.assertTrue(payload["result"]["discarded_local_changes"])

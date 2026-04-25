@@ -65,6 +65,7 @@ import tempfile
 import time
 import threading
 import safeguard_config as safeguard_config_module
+import update_notice
 import usage_tracking
 import util
 from dataclasses import dataclass
@@ -158,6 +159,13 @@ AUTH_FAILURE_MESSAGE = "GitHub Copilot authorization required. Open /ui to sign 
 INVALID_BRIDGE_REQUEST_MESSAGE = "Invalid request"
 
 safeguard_event_store = dashboard_module.create_safeguard_event_store()
+
+
+def _stream_with_update_notice(byte_iter, protocol: str):
+    notice_text = auto_update_runtime_controller.update_notice_text_if_due()
+    if not notice_text:
+        return byte_iter
+    return update_notice.inject_text_notice(byte_iter, protocol, notice_text)
 
 
 def _record_safeguard_trigger(event: dict):
@@ -1502,8 +1510,9 @@ async def proxy_streaming_response(
 
     async def stream_upstream():
         capture = usage_tracker.create_sse_capture(stream_type)
+        source_iter = _stream_with_update_notice(upstream.aiter_bytes(), stream_type)
         try:
-            async for chunk in upstream.aiter_bytes():
+            async for chunk in source_iter:
                 if capture.feed(chunk):
                     usage_tracker.mark_first_output(usage_event)
                 yield chunk
@@ -1583,7 +1592,7 @@ async def proxy_anthropic_streaming_response(
             mark_first_output=lambda: usage_tracker.mark_first_output(usage_event),
         )
         try:
-            async for event in translator.translate(upstream.aiter_bytes()):
+            async for event in translator.translate(_stream_with_update_notice(upstream.aiter_bytes(), "chat")):
                 yield event
         finally:
             response_payload = translator.build_response_payload()
@@ -1655,7 +1664,7 @@ async def proxy_responses_from_chat_streaming_response(
             fallback_model,
             mark_first_output=lambda: usage_tracker.mark_first_output(usage_event),
         )
-        upstream_iter = upstream.aiter_bytes()
+        upstream_iter = _stream_with_update_notice(upstream.aiter_bytes(), "chat")
         try:
             async for event in translator.translate(upstream_iter):
                 yield event
@@ -1736,7 +1745,7 @@ async def proxy_anthropic_from_responses_streaming_response(
             mark_first_output=lambda: usage_tracker.mark_first_output(usage_event),
         )
         try:
-            async for event in translator.translate(upstream.aiter_bytes()):
+            async for event in translator.translate(_stream_with_update_notice(upstream.aiter_bytes(), "responses")):
                 yield event
         finally:
             response_payload = translator.build_response_payload()
@@ -1870,7 +1879,7 @@ async def proxy_anthropic_passthrough_streaming_response(
         first_output_marked = False
         buffer = ""
         try:
-            async for chunk in upstream.aiter_bytes():
+            async for chunk in _stream_with_update_notice(upstream.aiter_bytes(), "anthropic"):
                 if chunk:
                     yield chunk
                     try:
@@ -1983,7 +1992,7 @@ async def proxy_responses_from_anthropic_streaming_response(
             mark_first_output=lambda: usage_tracker.mark_first_output(usage_event),
         )
         try:
-            async for evbytes in translator.translate(upstream.aiter_bytes()):
+            async for evbytes in translator.translate(_stream_with_update_notice(upstream.aiter_bytes(), "anthropic")):
                 yield evbytes
             yield b"data: [DONE]\n\n"
         finally:
@@ -2438,12 +2447,17 @@ async def auto_update_config_api(request: Request):
     if action == "check_now":
         result = await auto_update_runtime_controller.run_due_check(force=True)
         return JSONResponse(content={**auto_update_runtime_controller.status_payload(), "result": result})
+    if action == "pull_update":
+        result = await auto_update_runtime_controller.apply_update()
+        return JSONResponse(content={**auto_update_runtime_controller.status_payload(), "result": result})
     if action == "upgrade_anyway":
-        result = await auto_update_runtime_controller.run_due_check(
-            force=True,
+        result = await auto_update_runtime_controller.apply_update(
             override_local_changes=True,
         )
         return JSONResponse(content={**auto_update_runtime_controller.status_payload(), "result": result})
+    if action == "restart_proxy":
+        scheduled = auto_update_runtime_controller.restart_when_idle("dashboard")
+        return JSONResponse(content={**auto_update_runtime_controller.status_payload(), "scheduled": scheduled})
     raise HTTPException(status_code=400, detail="unsupported auto-update action")
 
 
@@ -2690,14 +2704,9 @@ async def anthropic_messages(request: Request):
 # ─── Entrypoint ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    update_result = auto_update_manager.startup_check_and_update()
+    update_result = auto_update_manager.startup_check_for_update()
     if update_result.get("attempted"):
-        print(f"Auto-update: {json.dumps(update_result, default=str)}", flush=True)
-    if update_result.get("restart_required"):
-        try:
-            auto_update.reexec_current_process()
-        except OSError as exc:
-            print(f"Warning: auto-update restart failed; continuing with current process: {exc}", flush=True)
+        print(f"Auto-update check: {json.dumps(update_result, default=str)}", flush=True)
 
     # Best-effort cleanup of legacy on-disk state from the pre-header-driven
     # quota implementation. Safe to remove unconditionally; if the user never

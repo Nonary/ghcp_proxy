@@ -20,8 +20,9 @@ from typing import Callable
 
 from constants import TOKEN_DIR
 
-DEFAULT_CHECK_INTERVAL_SECONDS = 15 * 60
+DEFAULT_CHECK_INTERVAL_SECONDS = 10 * 60
 DEFAULT_GIT_TIMEOUT_SECONDS = 60
+DEFAULT_NOTICE_INTERVAL_SECONDS = 10 * 60
 AUTO_UPDATE_STATE_FILE = os.path.join(TOKEN_DIR, "auto-update.json")
 AUTO_UPDATE_SETTINGS_FILE = os.path.join(TOKEN_DIR, "auto-update-settings.json")
 AUTO_UPDATE_LOCK_FILE = os.path.join(TOKEN_DIR, "auto-update.lock")
@@ -183,6 +184,46 @@ class AutoUpdateManager:
             "last_result": state.get("last_result"),
         }
 
+    def startup_check_for_update(self, *, force: bool = False) -> dict[str, object]:
+        if not self.enabled():
+            return {
+                "attempted": False,
+                "updated": False,
+                "update_available": False,
+                "restart_required": False,
+                "reason": "disabled",
+            }
+
+        state = self._load_state()
+        now = self.clock()
+        if not force and not self._is_check_due(state, now) and self._recent_state_matches_checkout(state):
+            last_result = state.get("last_result") if isinstance(state.get("last_result"), dict) else {}
+            return {
+                "attempted": False,
+                "updated": False,
+                "update_available": bool(last_result.get("update_available")),
+                "restart_required": False,
+                "reason": "recently-checked",
+                "last_check": state.get("last_check"),
+                "last_result": state.get("last_result"),
+            }
+
+        try:
+            with _UpdateLock(self.lock_file):
+                result = self.check_for_update()
+        except (OSError, RuntimeError) as exc:
+            result = {
+                "attempted": False,
+                "updated": False,
+                "update_available": False,
+                "restart_required": False,
+                "reason": "locked" if isinstance(exc, RuntimeError) else "lock-failed",
+                "error": str(exc),
+            }
+
+        self._save_state(result, now=self.clock())
+        return result
+
     def startup_check_and_update(
         self,
         *,
@@ -223,6 +264,60 @@ class AutoUpdateManager:
 
         self._save_state(result, now=self.clock())
         return result
+
+    def check_for_update(self) -> dict[str, object]:
+        repo_check = self._git("rev-parse", "--is-inside-work-tree")
+        if repo_check.returncode != 0 or _single_line(repo_check.stdout).lower() != "true":
+            return self._result(False, "not-a-git-repo", update_available=False, error=repo_check.stderr)
+
+        toplevel = self._git("rev-parse", "--show-toplevel")
+        repo_root = _single_line(toplevel.stdout) if toplevel.returncode == 0 else self.repo_dir
+
+        branch_result = self._git("rev-parse", "--abbrev-ref", "HEAD")
+        branch = _single_line(branch_result.stdout) if branch_result.returncode == 0 else ""
+        if branch == "HEAD":
+            return self._result(False, "detached-head", update_available=False, branch=branch)
+
+        upstream_result = self._git("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")
+        if upstream_result.returncode != 0:
+            return self._result(False, "no-upstream", update_available=False, branch=branch, error=upstream_result.stderr)
+        upstream = _single_line(upstream_result.stdout)
+        remote = self._remote_from_upstream(upstream)
+        if not remote:
+            return self._result(False, "no-upstream-remote", update_available=False, branch=branch, upstream=upstream)
+
+        fetch_result = self._git("fetch", "--quiet", "--prune", remote)
+        if fetch_result.returncode != 0:
+            return self._result(
+                False,
+                "fetch-failed",
+                update_available=False,
+                branch=branch,
+                upstream=upstream,
+                remote=remote,
+                error=fetch_result.stderr or fetch_result.stdout,
+            )
+
+        counts = self._ahead_behind()
+        if counts is None:
+            return self._result(False, "ahead-behind-failed", update_available=False, branch=branch, upstream=upstream, remote=remote)
+        ahead, behind = counts
+        dirty = self._worktree_status(include_untracked=True)
+        base_payload = {
+            "branch": branch,
+            "upstream": upstream,
+            "remote": remote,
+            "ahead": ahead,
+            "behind": behind,
+            "repo_root": repo_root,
+            "mode": self.mode(),
+            "dirty": dirty,
+            "update_available": behind > 0,
+        }
+        if behind > 0:
+            return self._result(False, "update-available", **base_payload)
+        reason = "local-ahead" if ahead > 0 else "up-to-date"
+        return self._result(False, reason, **base_payload)
 
     def check_and_update(self, *, override_local_changes: bool = False) -> dict[str, object]:
         repo_check = self._git("rev-parse", "--is-inside-work-tree")
@@ -617,11 +712,13 @@ class AutoUpdateRuntimeController:
         reexec_func: Callable[[], None] | None = None,
         logger: Callable[[str], None] | None = None,
         restart_delay_seconds: float = 0.25,
+        notice_interval_seconds: float = DEFAULT_NOTICE_INTERVAL_SECONDS,
     ):
         self.manager = manager
         self.reexec_func = reexec_func or reexec_current_process
         self.logger = logger or (lambda message: print(message, flush=True))
         self.restart_delay_seconds = max(0.0, float(restart_delay_seconds))
+        self.notice_interval_seconds = max(0.0, float(notice_interval_seconds))
         self._lock = RLock()
         self._active_request_ids: set[str] = set()
         self._task: asyncio.Task | None = None
@@ -631,15 +728,18 @@ class AutoUpdateRuntimeController:
         self._restarting = False
         self._last_runtime_result: dict[str, object] | None = None
         self._last_restart_error: str | None = None
+        self._last_notice_epoch = 0.0
 
     def status_payload(self) -> dict[str, object]:
         payload = self.manager.status_payload()
         with self._lock:
             task_running = bool(self._task and not self._task.done())
+            update_available = self._update_available_from_result(self._last_runtime_result)
             runtime = {
                 "periodic_task_running": task_running,
                 "check_in_progress": self._check_in_progress,
                 "active_requests": len(self._active_request_ids),
+                "update_available": update_available,
                 "restart_pending": self._pending_restart,
                 "restart_scheduled": bool(self._restart_handle and not self._restart_handle.cancelled()),
                 "restarting": self._restarting,
@@ -648,6 +748,23 @@ class AutoUpdateRuntimeController:
             }
         payload["runtime"] = runtime
         return payload
+
+    def update_notice_text_if_due(self) -> str:
+        with self._lock:
+            if self._update_available_from_result(self._last_runtime_result):
+                update_available = True
+            else:
+                manager_status = self.manager.status_payload()
+                update_available = self._update_available_from_result(
+                    manager_status.get("last_result") if isinstance(manager_status, dict) else None
+                )
+            if not update_available:
+                return ""
+            now = float(self.manager.clock())
+            if self._last_notice_epoch and now - self._last_notice_epoch < self.notice_interval_seconds:
+                return ""
+            self._last_notice_epoch = now
+        return "By the way, an update is available for GHCP Proxy. Visit http://localhost:8000 to update the proxy from the dashboard."
 
     def note_request_started(self, request_id: str) -> None:
         request_id = str(request_id or "").strip()
@@ -704,6 +821,50 @@ class AutoUpdateRuntimeController:
             result = {
                 "attempted": False,
                 "updated": False,
+                "update_available": False,
+                "restart_required": False,
+                "reason": "disabled",
+            }
+            with self._lock:
+                self._last_runtime_result = result
+            return result
+
+        with self._lock:
+            if self._check_in_progress:
+                return {
+                    "attempted": False,
+                    "updated": False,
+                    "restart_required": False,
+                    "reason": "already-running",
+                }
+            self._check_in_progress = True
+
+        try:
+            result = await asyncio.to_thread(
+                self.manager.startup_check_for_update,
+                force=force,
+            )
+        finally:
+            with self._lock:
+                self._check_in_progress = False
+
+        if result.get("attempted"):
+            self.logger(f"Auto-update check: {json.dumps(result, default=str)}")
+
+        with self._lock:
+            self._last_runtime_result = result
+        return result
+
+    async def apply_update(
+        self,
+        *,
+        override_local_changes: bool = False,
+    ) -> dict[str, object]:
+        if not self.manager.enabled():
+            result = {
+                "attempted": False,
+                "updated": False,
+                "update_available": False,
                 "restart_required": False,
                 "reason": "disabled",
             }
@@ -724,7 +885,7 @@ class AutoUpdateRuntimeController:
         try:
             result = await asyncio.to_thread(
                 self.manager.startup_check_and_update,
-                force=force,
+                force=True,
                 override_local_changes=override_local_changes,
             )
         finally:
@@ -732,18 +893,20 @@ class AutoUpdateRuntimeController:
                 self._check_in_progress = False
 
         if result.get("attempted"):
-            self.logger(f"Auto-update: {json.dumps(result, default=str)}")
+            self.logger(f"Auto-update apply: {json.dumps(result, default=str)}")
 
-        restart_required = bool(result.get("restart_required"))
         with self._lock:
             self._last_runtime_result = result
-            if restart_required:
+            if result.get("restart_required"):
                 self._pending_restart = True
                 self._last_restart_error = None
-
-        if restart_required:
-            self._restart_if_idle("auto-update")
         return result
+
+    def restart_when_idle(self, reason: str = "dashboard") -> bool:
+        with self._lock:
+            self._pending_restart = True
+            self._last_restart_error = None
+        return self._schedule_restart_if_idle(reason)
 
     async def _periodic_loop(self) -> None:
         while True:
@@ -804,6 +967,13 @@ class AutoUpdateRuntimeController:
             self._restarting = False
             self._pending_restart = False
         return True
+
+    def _update_available_from_result(self, result: dict[str, object] | None) -> bool:
+        if not isinstance(result, dict):
+            return False
+        if bool(result.get("update_available")):
+            return True
+        return str(result.get("reason") or "") == "update-available"
 
 
 def run_startup_auto_update(

@@ -2506,16 +2506,28 @@
               User mode stashes GHCP Proxy folder edits before upgrading and reapplies them after. If they do not apply cleanly, the upgrade is blocked until you commit or remove them.
             </div>
             <div class="subtle" style="margin-top: 4px;">
-              If an update is applied, GHCP Proxy restarts itself after active requests finish.
+              When an update is available, proxied AI responses will mention it at most once every 10 minutes. Pull the update here, then restart GHCP Proxy when you are ready.
             </div>
             <div v-if="autoUpdateStatus.mode_source === 'env'" class="subtle" style="margin-top: 4px;">Mode is controlled by GHCP_AUTO_UPDATE_MODE.</div>
             <div class="toolbar" style="margin-top: 10px;">
               <button @click="runAutoUpdateCheck" :disabled="savingAutoUpdate">Check now</button>
+              <button v-if="autoUpdateAvailable"
+                      class="primary"
+                      @click="pullAutoUpdate"
+                      :disabled="savingAutoUpdate">
+                Pull update
+              </button>
               <button v-if="autoUpdateBlockedMessage"
                       class="danger"
                       @click="applyAutoUpdateAnyway"
                       :disabled="savingAutoUpdate">
                 Apply upgrade anyway
+              </button>
+              <button v-if="autoUpdateStatus.runtime?.restart_pending"
+                      class="primary"
+                      @click="restartProxy"
+                      :disabled="savingAutoUpdate">
+                Restart proxy
               </button>
               <button @click="loadAutoUpdateStatus" :disabled="savingAutoUpdate">Refresh</button>
             </div>
@@ -4992,10 +5004,15 @@
           if (!result || !result.upgrade_blocked) return '';
           return result.user_message || 'Auto-update is blocked by local pending changes.';
         },
+        autoUpdateAvailable() {
+          const result = this.autoUpdateLastResult;
+          return Boolean(this.autoUpdateStatus.runtime?.update_available || result?.update_available || result?.reason === 'update-available');
+        },
         autoUpdateStatusClass() {
           if (this.autoUpdateStatus.error || this.autoUpdateBlockedMessage) return 'error';
           const result = this.autoUpdateLastResult;
           if (this.autoUpdateStatus.runtime?.restart_pending) return 'warn';
+          if (this.autoUpdateAvailable) return 'warn';
           if (!this.autoUpdateStatus.enabled) return 'warn';
           if (result?.updated || result?.reason === 'up-to-date') return 'good';
           return 'warn';
@@ -5005,10 +5022,11 @@
           if (this.autoUpdateBlockedMessage) return this.autoUpdateBlockedMessage;
           if (!this.autoUpdateStatus.enabled) return 'Auto-update disabled';
           if (this.autoUpdateStatus.runtime?.restarting) return 'Update applied; restarting GHCP Proxy';
-          if (this.autoUpdateStatus.runtime?.restart_scheduled) return 'Update applied; restart scheduled';
-          if (this.autoUpdateStatus.runtime?.restart_pending) return 'Update applied; waiting for active requests before automatic restart';
+          if (this.autoUpdateStatus.runtime?.restart_scheduled) return 'Restart scheduled';
+          if (this.autoUpdateStatus.runtime?.restart_pending) return 'Update pulled; restart GHCP Proxy to use it';
+          if (this.autoUpdateAvailable) return 'Update available';
           const result = this.autoUpdateLastResult;
-          if (result?.reason === 'updated') return 'Updated; restarting GHCP Proxy';
+          if (result?.reason === 'updated') return 'Update pulled; restart GHCP Proxy to use it';
           if (result?.reason) return `Last check: ${result.reason}`;
           return 'Waiting for first auto-update check';
         },
@@ -6109,6 +6127,12 @@
         },
         async runAutoUpdateCheck() {
           return this.configureAutoUpdate('check_now', {}, 'Auto-update check completed.');
+        },
+        async pullAutoUpdate() {
+          return this.configureAutoUpdate('pull_update', {}, 'Update pulled. Restart GHCP Proxy to use it.');
+        },
+        async restartProxy() {
+          return this.configureAutoUpdate('restart_proxy', {}, 'Restart requested.');
         },
         async applyAutoUpdateAnyway() {
           if (!window.confirm('Apply the upgrade anyway? This discards pending local changes in the GHCP Proxy checkout.')) {

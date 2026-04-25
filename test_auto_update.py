@@ -397,11 +397,11 @@ class AutoUpdateTests(unittest.TestCase):
         self.assertEqual(result["reason"], "updated")
         self.assertIn(("fetch", "--quiet", "--prune", "origin"), calls)
 
-    def test_default_check_interval_is_fifteen_minutes(self):
+    def test_default_check_interval_is_ten_minutes(self):
         with self._tempdir() as temp_dir, mock.patch.dict(os.environ, {}, clear=True):
             manager = self._manager(lambda _command: auto_update.GitCommandResult(0, ""), temp_dir)
 
-        self.assertEqual(manager.check_interval_seconds(), 15 * 60)
+        self.assertEqual(manager.check_interval_seconds(), 10 * 60)
 
     def test_runtime_reexec_waits_for_active_requests_to_drain(self):
         class FakeManager:
@@ -409,10 +409,22 @@ class AutoUpdateTests(unittest.TestCase):
                 return True
 
             def check_interval_seconds(self):
-                return 15 * 60
+                return 10 * 60
+
+            def clock(self):
+                return 1000.0
 
             def status_payload(self):
                 return {"enabled": True}
+
+            def startup_check_for_update(self, **_kwargs):
+                return {
+                    "attempted": True,
+                    "updated": False,
+                    "update_available": True,
+                    "restart_required": False,
+                    "reason": "update-available",
+                }
 
             def startup_check_and_update(self, **_kwargs):
                 return {
@@ -432,6 +444,10 @@ class AutoUpdateTests(unittest.TestCase):
             )
             controller.note_request_started("request-1")
             result = await controller.run_due_check()
+            self.assertEqual(result["reason"], "update-available")
+            self.assertEqual(controller.update_notice_text_if_due(), "By the way, an update is available for GHCP Proxy. Visit http://localhost:8000 to update the proxy from the dashboard.")
+            self.assertEqual(controller.update_notice_text_if_due(), "")
+            result = await controller.apply_update()
             self.assertEqual(result["reason"], "updated")
             status = controller.status_payload()["runtime"]
             self.assertTrue(status["restart_pending"])
