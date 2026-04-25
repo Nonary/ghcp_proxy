@@ -2249,7 +2249,7 @@
               <span class="meta">Resets in {{ win.resetCountdown }}<span v-if="win.resetWhen"> &nbsp;·&nbsp; {{ win.resetWhen }}</span></span>
             </div>
             <div class="rl2-window-tiles">
-              <!-- Donut: limit consumed -->
+              <!-- Donut: limit remaining -->
               <div class="rl2-tile donut-tile">
                 <div class="rl2-mini-donut">
                   <svg viewBox="0 0 36 36">
@@ -2259,9 +2259,9 @@
                   </svg>
                 </div>
                 <div>
-                  <div class="tval">{{ win.percentUsedLabel }}</div>
-                  <div class="tlabel">Limit Consumed</div>
-                  <div class="thint">{{ win.percentRemainingLabel }} remaining</div>
+                  <div class="tval">{{ win.percentRemainingLabel }}</div>
+                  <div class="tlabel">Limit Remaining</div>
+                  <div class="thint">{{ win.percentUsedLabel }} used</div>
                 </div>
               </div>
               <!-- Burn rate -->
@@ -4272,8 +4272,8 @@
             const donutColor = row.toneClass === 'tone-red' ? 'var(--danger)'
                              : row.toneClass === 'tone-yellow' ? 'var(--warn)'
                              : 'var(--success)';
-            const usedPct = percentUsed != null ? percentUsed : 0;
-            const dash = `${usedPct.toFixed(2)}, ${(100 - usedPct).toFixed(2)}`;
+            const remainingPct = Number.isFinite(percentRem) ? Math.max(0, Math.min(100, percentRem)) : 0;
+            const dash = `${remainingPct.toFixed(2)}, ${(100 - remainingPct).toFixed(2)}`;
             return {
               key: row.key,
               title: titleMap[row.key] || (row.key.toUpperCase() + ' WINDOW'),
