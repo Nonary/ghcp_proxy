@@ -307,6 +307,10 @@ class ClientConfigTests(unittest.TestCase):
         self.assertTrue(catalog["models"])
         self.assertEqual(catalog["models"][0]["slug"], "gpt-5.4")
         self.assertEqual(catalog["models"][0]["context_window"], CODEX_PROXY_MODEL_CONTEXT_WINDOW)
+        self.assertEqual(
+            catalog["models"][0]["auto_compact_token_limit"],
+            CODEX_PROXY_MODEL_AUTO_COMPACT_TOKEN_LIMIT,
+        )
 
     def test_write_codex_proxy_config_removes_legacy_primary_context_keys(self):
         temp_dir = self._make_temp_dir("codex-write-legacy-")
@@ -372,10 +376,7 @@ class ClientConfigTests(unittest.TestCase):
         self.assertEqual(models["gpt-5.4"]["max_context_window"], 400000)
         gpt_efforts = [lvl["effort"] for lvl in models["gpt-5.4"]["supported_reasoning_levels"]]
         self.assertIn("xhigh", gpt_efforts)
-        self.assertGreater(
-            models["gpt-5.4"]["auto_compact_token_limit"],
-            CODEX_PROXY_MODEL_AUTO_COMPACT_TOKEN_LIMIT,
-        )
+        self.assertEqual(models["gpt-5.4"]["auto_compact_token_limit"], 352000)
         self.assertIn("claude-sonnet-4.6", models)
         self.assertEqual(models["claude-sonnet-4.6"]["context_window"], 200000)
         claude_efforts = [lvl["effort"] for lvl in models["claude-sonnet-4.6"]["supported_reasoning_levels"]]
@@ -487,6 +488,30 @@ class ClientConfigTests(unittest.TestCase):
         updated_models = {entry["slug"]: entry for entry in updated_catalog["models"]}
         self.assertEqual(updated_models["gpt-5.4"]["context_window"], 200000)
         self.assertIn("Routed to claude-sonnet-4.6 (Anthropic)", updated_models["gpt-5.4"]["description"])
+
+    def test_codex_catalog_clamps_default_auto_compact_to_model_ceiling(self):
+        temp_dir = self._make_temp_dir("codex-compact-clamp-")
+        catalog_path = temp_dir / "ghcp-proxy-models.json"
+        capabilities = {
+            "gpt-4.1": {
+                "context_window": 128000,
+                "max_context_window": 128000,
+                "reasoning_efforts": ["low", "medium", "high"],
+                "parallel_tool_calls": True,
+                "input_modalities": ["text"],
+            },
+        }
+        service = self._make_client_proxy_service(
+            codex_managed_config_file=str(temp_dir / "managed_config.toml"),
+            codex_model_catalog_file=str(catalog_path),
+            model_capabilities_provider=lambda: capabilities,
+        )
+
+        service.write_codex_proxy_config()
+
+        catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+        models = {entry["slug"]: entry for entry in catalog["models"]}
+        self.assertEqual(models["gpt-4.1"]["auto_compact_token_limit"], 120000)
 
     def test_claude_proxy_status_requires_token_caps(self):
         temp_dir = self._make_temp_dir("claude-status-")

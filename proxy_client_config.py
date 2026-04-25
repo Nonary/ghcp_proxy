@@ -968,12 +968,18 @@ class ProxyClientConfigService:
 
     def _resolve_auto_compact_limit(self, raw_value: object, context_window: int, default_compact: int) -> int:
         explicit = self._coerce_int(raw_value, 0)
+        # Leave at least a small request-building buffer even when an explicit
+        # provider value is present. For the 272k Codex proxy window this keeps
+        # the hard ceiling at 264k, while the default below lands at 240k.
+        ceiling = max(context_window - 8000, context_window // 2)
         if explicit > 0:
-            return min(explicit, max(context_window - 8000, context_window // 2))
-        # Aim for ~65% of the model's context, capped to leave headroom for the
-        # outbound request, but never lower than the global default.
-        scaled = int(context_window * 0.65)
-        return max(default_compact, min(scaled, max(context_window - 8000, context_window // 2)))
+            return min(explicit, ceiling)
+        # Auto-compact should be close to the advertised Codex model window, not
+        # the old ~100k/120k-era default. Target ~88% of the model context and
+        # use the global default as a floor only after clamping to the model's
+        # safe ceiling so smaller-window models are never over-advertised.
+        scaled = int(context_window * 0.88)
+        return min(max(default_compact, scaled), ceiling)
 
     def _resolve_input_modalities(self, modalities: object, vision_flag: object) -> list[str]:
         if isinstance(modalities, (list, tuple)):
