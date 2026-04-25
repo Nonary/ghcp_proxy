@@ -75,6 +75,8 @@ class BridgeStreamTranslatorTests(unittest.TestCase):
 
         self.assertIn("event: response.reasoning_summary_text.delta", body)
         self.assertIn("event: response.reasoning_summary_text.done", body)
+        self.assertIn("event: response.reasoning_summary_part.added", body)
+        self.assertIn("event: response.reasoning_summary_part.done", body)
         # Reasoning item is added before the message item.
         self.assertEqual(payload["output"][0]["type"], "reasoning")
         # The proxy prepends a synthetic "**Thinking**" bold header so Codex's
@@ -288,6 +290,8 @@ class ReasoningTextExtractionTests(unittest.TestCase):
         # in Codex even though the upstream stream relays the deltas.
         import json as _json
         self.assertIn('"type":"response.output_item.added"', body)
+        self.assertIn('"type":"response.reasoning_summary_part.added"', body)
+        self.assertIn('"type":"response.reasoning_summary_part.done"', body)
         added_lines = [
             line for line in body.splitlines()
             if line.startswith('data: {') and 'response.output_item.added' in line
@@ -299,6 +303,13 @@ class ReasoningTextExtractionTests(unittest.TestCase):
         self.assertIsInstance(added_item.get("id"), str)
         self.assertTrue(added_item["id"], "reasoning item id must be non-empty")
         self.assertIn("encrypted_content", added_item)
+        delta_lines = [
+            line for line in body.splitlines()
+            if line.startswith('data: {') and 'response.reasoning_summary_text.delta' in line
+        ]
+        self.assertTrue(delta_lines, "expected reasoning summary delta")
+        delta_payload = _json.loads(delta_lines[0][len("data: "):])
+        self.assertEqual(delta_payload["item_id"], added_item["id"])
         # build_response_payload must also carry the same shape so that Codex
         # can replay the rollout.
         self.assertIn("id", payload["output"][0])
@@ -407,7 +418,9 @@ class AnthropicToResponsesStreamTranslatorTests(unittest.TestCase):
 
         self.assertIn("event: response.created", body)
         self.assertIn("event: response.in_progress", body)
+        self.assertIn("event: response.reasoning_summary_part.added", body)
         self.assertIn("event: response.reasoning_summary_text.delta", body)
+        self.assertIn("event: response.reasoning_summary_part.done", body)
         self.assertIn("event: response.output_text.delta", body)
         self.assertIn("event: response.function_call_arguments.delta", body)
         self.assertIn("event: response.completed", body)

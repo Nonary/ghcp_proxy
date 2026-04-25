@@ -203,6 +203,16 @@ class ChatToResponsesStreamTranslator:
                     },
                 },
             ),
+            format_translation.sse_encode(
+                "response.reasoning_summary_part.added",
+                {
+                    "type": "response.reasoning_summary_part.added",
+                    "item_id": item_id,
+                    "output_index": output_index,
+                    "summary_index": 0,
+                    "part": {"type": "summary_text", "text": ""},
+                },
+            ),
         ]
 
     def _ensure_tool_item(self, tool_delta: dict) -> list[bytes]:
@@ -278,6 +288,7 @@ class ChatToResponsesStreamTranslator:
                         "response.reasoning_summary_text.delta",
                         {
                             "type": "response.reasoning_summary_text.delta",
+                            "item_id": self._reasoning_item.item_id,
                             "output_index": self._reasoning_item.output_index,
                             "summary_index": 0,
                             "delta": header,
@@ -288,6 +299,7 @@ class ChatToResponsesStreamTranslator:
                     "response.reasoning_summary_text.delta",
                     {
                         "type": "response.reasoning_summary_text.delta",
+                        "item_id": self._reasoning_item.item_id,
                         "output_index": self._reasoning_item.output_index,
                         "summary_index": 0,
                         "delta": reasoning_delta,
@@ -340,9 +352,20 @@ class ChatToResponsesStreamTranslator:
                 "response.reasoning_summary_text.done",
                 {
                     "type": "response.reasoning_summary_text.done",
+                    "item_id": self._reasoning_item.item_id,
                     "output_index": self._reasoning_item.output_index,
                     "summary_index": 0,
                     "text": reasoning_text,
+                },
+            )
+            yield format_translation.sse_encode(
+                "response.reasoning_summary_part.done",
+                {
+                    "type": "response.reasoning_summary_part.done",
+                    "item_id": self._reasoning_item.item_id,
+                    "output_index": self._reasoning_item.output_index,
+                    "summary_index": 0,
+                    "part": {"type": "summary_text", "text": reasoning_text},
                 },
             )
             yield format_translation.sse_encode(
@@ -1069,11 +1092,12 @@ class AnthropicToResponsesStreamTranslator:
                 },
             ),
             format_translation.sse_encode(
-                "response.content_part.added",
+                "response.reasoning_summary_part.added",
                 {
-                    "type": "response.content_part.added",
+                    "type": "response.reasoning_summary_part.added",
+                    "item_id": item_id,
                     "output_index": output_index,
-                    "content_index": 0,
+                    "summary_index": 0,
                     "part": {"type": "summary_text", "text": ""},
                 },
             ),
@@ -1178,6 +1202,7 @@ class AnthropicToResponsesStreamTranslator:
                     "response.reasoning_summary_text.done",
                     {
                         "type": "response.reasoning_summary_text.done",
+                        "item_id": reasoning_id,
                         "output_index": state.output_index,
                         "summary_index": 0,
                         "text": summary,
@@ -1186,11 +1211,12 @@ class AnthropicToResponsesStreamTranslator:
             )
             events.append(
                 format_translation.sse_encode(
-                    "response.content_part.done",
+                    "response.reasoning_summary_part.done",
                     {
-                        "type": "response.content_part.done",
+                        "type": "response.reasoning_summary_part.done",
+                        "item_id": reasoning_id,
                         "output_index": state.output_index,
-                        "content_index": 0,
+                        "summary_index": 0,
                         "part": {"type": "summary_text", "text": summary},
                     },
                 )
@@ -1357,6 +1383,7 @@ class AnthropicToResponsesStreamTranslator:
                         "response.reasoning_summary_text.delta",
                         {
                             "type": "response.reasoning_summary_text.delta",
+                            "item_id": state.item_id,
                             "output_index": state.output_index,
                             "summary_index": 0,
                             "delta": text,
