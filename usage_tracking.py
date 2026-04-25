@@ -666,6 +666,8 @@ class UsageTracker:
             for value in (session_id, client_request_id, subagent)
         )
 
+        prior_server_request_id = None
+
         if initiator == "agent":
             active_server_request_id = self._get_active_server_request_id(
                 session_id,
@@ -674,9 +676,9 @@ class UsageTracker:
                 initiator="user",
             )
             if isinstance(active_server_request_id, str) and active_server_request_id:
-                return active_server_request_id, active_server_request_id
+                prior_server_request_id = active_server_request_id
 
-        if initiator == "user" and allow_user_active_fallback and has_chain_context:
+        if prior_server_request_id is None and initiator == "user" and allow_user_active_fallback and has_chain_context:
             active_server_request_id = self._get_active_server_request_id(
                 session_id,
                 client_request_id,
@@ -684,19 +686,19 @@ class UsageTracker:
                 initiator="user",
             )
             if isinstance(active_server_request_id, str) and active_server_request_id:
-                return active_server_request_id, active_server_request_id
+                prior_server_request_id = active_server_request_id
 
-        if session_id is not None:
-            prior_server_request_id = self._get_latest_server_request_id(
+        if prior_server_request_id is None and session_id is not None:
+            latest_server_request_id = self._get_latest_server_request_id(
                 session_id,
                 client_request_id,
                 subagent,
             )
-            if isinstance(prior_server_request_id, str) and prior_server_request_id:
-                return prior_server_request_id, prior_server_request_id
+            if isinstance(latest_server_request_id, str) and latest_server_request_id:
+                prior_server_request_id = latest_server_request_id
 
         generated_server_request_id = str(uuid4())
-        return generated_server_request_id, explicit_server_request_id
+        return generated_server_request_id, prior_server_request_id
 
     # ------------------------------------------------------------------
     # Persistence (private methods)

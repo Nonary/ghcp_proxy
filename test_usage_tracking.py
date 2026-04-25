@@ -513,7 +513,7 @@ class UsageTrackingTests(unittest.TestCase):
         self.assertEqual(follow_up_event["session_id"], first_event["session_id"])
         self.assertEqual(follow_up_event["session_id_origin"], "request_id")
         self.assertEqual(follow_up_event["prior_server_request_id"], first_event["server_request_id"])
-        self.assertEqual(follow_up_event["server_request_id"], first_event["server_request_id"])
+        self.assertNotEqual(follow_up_event["server_request_id"], first_event["server_request_id"])
 
     def test_start_usage_event_agent_follow_up_attaches_to_active_claude_session(self):
         tracker = self._make_usage_tracker()
@@ -544,7 +544,7 @@ class UsageTrackingTests(unittest.TestCase):
         self.assertEqual(agent_event["session_id"], user_event["session_id"])
         self.assertEqual(agent_event["session_id_origin"], "request_id")
         self.assertEqual(agent_event["prior_server_request_id"], user_event["server_request_id"])
-        self.assertEqual(agent_event["server_request_id"], user_event["server_request_id"])
+        self.assertNotEqual(agent_event["server_request_id"], user_event["server_request_id"])
 
     def test_start_usage_event_agent_follow_up_after_user_finish_attaches_to_latest_claude_session(self):
         tracker = self._make_usage_tracker()
@@ -579,7 +579,7 @@ class UsageTrackingTests(unittest.TestCase):
         self.assertEqual(agent_event["session_id"], user_event["session_id"])
         self.assertEqual(agent_event["session_id_origin"], "request_id")
         self.assertEqual(agent_event["prior_server_request_id"], user_event["server_request_id"])
-        self.assertEqual(agent_event["server_request_id"], user_event["server_request_id"])
+        self.assertNotEqual(agent_event["server_request_id"], user_event["server_request_id"])
 
     def test_start_usage_event_user_non_claude_request_does_not_generate_implicit_session(self):
         tracker = self._make_usage_tracker()
@@ -634,7 +634,7 @@ class UsageTrackingTests(unittest.TestCase):
         self.assertNotEqual(second_event["server_request_id"], first_event["server_request_id"])
         self.assertIsNone(second_event["prior_server_request_id"])
 
-    def test_start_usage_event_agent_inherits_latest_session_server_request_id(self):
+    def test_start_usage_event_agent_links_latest_session_server_request_id(self):
         tracker = self._make_usage_tracker()
         tracker.remember_latest_server_request_id("session-123", None, None, "server-prev")
 
@@ -649,12 +649,37 @@ class UsageTrackingTests(unittest.TestCase):
             requested_model="gpt-5.4",
             resolved_model="gpt-5.4",
             initiator="agent",
+            outbound_headers={},
         )
 
         self.assertEqual(event["prior_server_request_id"], "server-prev")
-        self.assertEqual(event["server_request_id"], "server-prev")
+        self.assertNotEqual(event["server_request_id"], "server-prev")
 
-    def test_start_usage_event_agent_inherits_latest_body_session_server_request_id(self):
+    def test_start_usage_event_agent_sends_unique_request_id_when_linking_latest_session(self):
+        tracker = self._make_usage_tracker()
+        tracker.remember_latest_server_request_id("session-123", None, None, "server-prev")
+        outbound_headers = {}
+
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/responses"),
+            method="POST",
+            headers={"session_id": "session-123"},
+        )
+
+        event = tracker.start_event(
+            request,
+            requested_model="gpt-5.4",
+            resolved_model="gpt-5.4",
+            initiator="agent",
+            outbound_headers=outbound_headers,
+        )
+
+        self.assertEqual(event["prior_server_request_id"], "server-prev")
+        self.assertEqual(outbound_headers["x-request-id"], event["server_request_id"])
+        self.assertEqual(outbound_headers["x-github-request-id"], event["server_request_id"])
+        self.assertNotEqual(outbound_headers["x-request-id"], "server-prev")
+
+    def test_start_usage_event_agent_links_latest_body_session_server_request_id(self):
         tracker = self._make_usage_tracker()
         tracker.remember_latest_server_request_id("session-123", None, None, "server-prev")
 
@@ -673,7 +698,7 @@ class UsageTrackingTests(unittest.TestCase):
         )
 
         self.assertEqual(event["prior_server_request_id"], "server-prev")
-        self.assertEqual(event["server_request_id"], "server-prev")
+        self.assertNotEqual(event["server_request_id"], "server-prev")
 
     def test_start_usage_event_user_request_starts_new_server_request_id(self):
         tracker = self._make_usage_tracker()
@@ -720,7 +745,7 @@ class UsageTrackingTests(unittest.TestCase):
         )
 
         self.assertEqual(agent_event["prior_server_request_id"], user_event["server_request_id"])
-        self.assertEqual(agent_event["server_request_id"], user_event["server_request_id"])
+        self.assertNotEqual(agent_event["server_request_id"], user_event["server_request_id"])
 
     def test_start_usage_event_subagent_request_starts_its_own_server_request_id(self):
         tracker = self._make_usage_tracker()
