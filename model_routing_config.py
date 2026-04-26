@@ -66,6 +66,7 @@ class ModelRoutingConfigService:
         self._config = config
         self._available_models = _available_model_payloads()
         self._known_models = {row["model"] for row in self._available_models}
+        self._claude_code_default_slots = ("opus_model", "sonnet_model", "haiku_model")
 
     def config_payload(self) -> dict[str, object]:
         current = self.load_settings()
@@ -74,6 +75,7 @@ class ModelRoutingConfigService:
             "mappings": current["mappings"],
             "approval_enabled": current["approval_enabled"],
             "approval_mappings": current["approval_mappings"],
+            "claude_code_defaults": current["claude_code_defaults"],
             "available_models": self._available_models,
             "path": self._config.config_file,
         }
@@ -108,6 +110,7 @@ class ModelRoutingConfigService:
                     "mappings": normalized["mappings"],
                     "approval_enabled": normalized["approval_enabled"],
                     "approval_mappings": normalized["approval_mappings"],
+                    "claude_code_defaults": normalized["claude_code_defaults"],
                 },
                 f,
                 indent=2,
@@ -178,6 +181,11 @@ class ModelRoutingConfigService:
             "mappings": [],
             "approval_enabled": False,
             "approval_mappings": [],
+            "claude_code_defaults": {
+                "opus_model": "",
+                "sonnet_model": "",
+                "haiku_model": "",
+            },
         }
 
     def _normalize_settings_payload(self, payload: dict) -> dict[str, object]:
@@ -192,12 +200,16 @@ class ModelRoutingConfigService:
             payload.get("approval_mappings", []),
             label="Approval mapping",
         )
+        claude_code_defaults = self._normalize_claude_code_defaults(
+            payload.get("claude_code_defaults"),
+        )
 
         return {
             "enabled": enabled,
             "mappings": mappings,
             "approval_enabled": approval_enabled,
             "approval_mappings": approval_mappings,
+            "claude_code_defaults": claude_code_defaults,
         }
 
     def _normalize_mapping_list(self, raw_mappings, *, label: str) -> list[dict[str, str]]:
@@ -253,3 +265,30 @@ class ModelRoutingConfigService:
                 normalized_entry["compact_fallback_model"] = compact_fallback
             mappings.append(normalized_entry)
         return mappings
+
+    def _normalize_claude_code_defaults(self, raw_defaults: object) -> dict[str, str]:
+        if raw_defaults is None:
+            raw_defaults = {}
+        if not isinstance(raw_defaults, dict):
+            raise HTTPException(status_code=400, detail='"claude_code_defaults" must be an object.')
+
+        normalized_defaults: dict[str, str] = {}
+        for slot_key in self._claude_code_default_slots:
+            raw_value = raw_defaults.get(slot_key)
+            if raw_value is None or (isinstance(raw_value, str) and not raw_value.strip()):
+                normalized_defaults[slot_key] = ""
+                continue
+            model_name = normalize_routing_model_name(raw_value)
+            if not model_name:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f'claude_code_defaults.{slot_key} must be a recognized model.',
+                )
+            if model_name not in self._known_models:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"claude_code_defaults.{slot_key} is unsupported: {model_name}",
+                )
+            normalized_defaults[slot_key] = model_name
+
+        return normalized_defaults

@@ -228,7 +228,7 @@ class ProxyRoutesTests(unittest.TestCase):
         self.assertEqual(caps["gpt-4.1"]["context_window"], 128000)
         self.assertEqual(caps["gpt-4.1"]["max_context_window"], 128000)
 
-    def test_model_routing_config_route_refreshes_codex_catalog(self):
+    def test_model_routing_config_route_refreshes_client_model_metadata(self):
         request = SimpleNamespace()
         payload = {"enabled": True, "mappings": [{"source_model": "gpt-5.4", "target_model": "claude-sonnet-4.6"}]}
         saved = {
@@ -236,6 +236,7 @@ class ProxyRoutesTests(unittest.TestCase):
             "mappings": [{"source_model": "gpt-5.4", "target_model": "claude-sonnet-4.6"}],
             "approval_enabled": False,
             "approval_mappings": [],
+            "claude_code_defaults": {"opus_model": "", "sonnet_model": "", "haiku_model": ""},
             "available_models": [],
             "path": "ignored",
         }
@@ -243,12 +244,12 @@ class ProxyRoutesTests(unittest.TestCase):
         with (
             mock.patch.object(proxy, "parse_json_request", mock.AsyncMock(return_value=payload)),
             mock.patch.object(proxy.model_routing_config_service, "save_settings", return_value=saved) as save_settings,
-            mock.patch.object(proxy.client_proxy_config_service, "refresh_codex_model_catalog", return_value=True) as refresh_catalog,
+            mock.patch.object(proxy.client_proxy_config_service, "refresh_client_model_metadata", return_value={"codex": True, "claude": True}) as refresh_metadata,
         ):
             response = proxy.asyncio.run(proxy.model_routing_config_api(request))
 
         save_settings.assert_called_once_with(payload)
-        refresh_catalog.assert_called_once_with()
+        refresh_metadata.assert_called_once_with()
         self.assertEqual(response.status_code, 200)
         self.assertEqual(json.loads(response.body), saved)
 

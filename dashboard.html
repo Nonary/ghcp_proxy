@@ -2527,6 +2527,40 @@
                 </tbody>
               </table>
               <div v-else class="empty-state">{{ loadingModelRoutingConfig ? 'Loading…' : 'No mappings yet — add one to remap a model name.' }}</div>
+              <div class="detail-label" style="margin-top:4px;">Claude Code default model slots</div>
+              <div class="subtle">Populate Claude Code’s Opus/Sonnet/Haiku pickers with proxy-backed models. Sonnet also drives the global auto-compact window.</div>
+              <table class="mapping-table">
+                <thead><tr><th>Claude Code slot</th><th>Default model</th></tr></thead>
+                <tbody>
+                  <tr>
+                    <td>Opus</td>
+                    <td>
+                      <select v-model="modelRouting.claude_code_defaults.opus_model" :disabled="savingModelRoutingConfig || loadingModelRoutingConfig">
+                        <option value="">None</option>
+                        <option v-for="option in modelRouting.available_models" :key="`cc-opus-${option.model}`" :value="option.model">{{ option.provider }} · {{ option.model }}</option>
+                      </select>
+                    </td>
+                  </tr>
+                  <tr>
+                    <td>Sonnet</td>
+                    <td>
+                      <select v-model="modelRouting.claude_code_defaults.sonnet_model" :disabled="savingModelRoutingConfig || loadingModelRoutingConfig">
+                        <option value="">None</option>
+                        <option v-for="option in modelRouting.available_models" :key="`cc-sonnet-${option.model}`" :value="option.model">{{ option.provider }} · {{ option.model }}</option>
+                      </select>
+                    </td>
+                  </tr>
+                  <tr>
+                    <td>Haiku</td>
+                    <td>
+                      <select v-model="modelRouting.claude_code_defaults.haiku_model" :disabled="savingModelRoutingConfig || loadingModelRoutingConfig">
+                        <option value="">None</option>
+                        <option v-for="option in modelRouting.available_models" :key="`cc-haiku-${option.model}`" :value="option.model">{{ option.provider }} · {{ option.model }}</option>
+                      </select>
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
               <div class="toolbar">
                 <button @click="loadModelRoutingConfig" :disabled="savingModelRoutingConfig || loadingModelRoutingConfig">Reload</button>
                 <div class="spacer"></div>
@@ -3985,6 +4019,11 @@
           modelRouting: {
             enabled: false,
             mappings: [],
+            claude_code_defaults: {
+              opus_model: '',
+              sonnet_model: '',
+              haiku_model: '',
+            },
             available_models: [],
             path: '',
             error: '',
@@ -6644,6 +6683,11 @@
                   compact_fallback_model: mapping.compact_fallback_model || '',
                 }))
               : [];
+            this.modelRouting.claude_code_defaults = {
+              opus_model: payload?.claude_code_defaults?.opus_model || '',
+              sonnet_model: payload?.claude_code_defaults?.sonnet_model || '',
+              haiku_model: payload?.claude_code_defaults?.haiku_model || '',
+            };
             this.modelRouting.available_models = Array.isArray(payload.available_models) ? payload.available_models : [];
             this.modelRouting.path = payload.path || '';
             this.approvalModelRouting.enabled = Boolean(payload.approval_enabled);
@@ -6682,6 +6726,11 @@
                   }
                   return entry;
                 }),
+                claude_code_defaults: {
+                  opus_model: this.modelRouting.claude_code_defaults.opus_model || '',
+                  sonnet_model: this.modelRouting.claude_code_defaults.sonnet_model || '',
+                  haiku_model: this.modelRouting.claude_code_defaults.haiku_model || '',
+                },
                 approval_enabled: this.approvalModelRouting.enabled,
                 approval_mappings: this.approvalModelRouting.mappings,
               }),
@@ -6707,6 +6756,11 @@
                   compact_fallback_model: mapping.compact_fallback_model || '',
                 }))
               : [];
+            this.modelRouting.claude_code_defaults = {
+              opus_model: payload?.claude_code_defaults?.opus_model || '',
+              sonnet_model: payload?.claude_code_defaults?.sonnet_model || '',
+              haiku_model: payload?.claude_code_defaults?.haiku_model || '',
+            };
             this.modelRouting.available_models = Array.isArray(payload.available_models) ? payload.available_models : [];
             this.modelRouting.path = payload.path || '';
             this.approvalModelRouting.enabled = Boolean(payload.approval_enabled);

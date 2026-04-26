@@ -40,6 +40,10 @@ class ModelRoutingConfigTests(unittest.TestCase):
 
         self.assertFalse(payload["enabled"])
         self.assertEqual(payload["mappings"], [])
+        self.assertEqual(
+            payload["claude_code_defaults"],
+            {"opus_model": "", "sonnet_model": "", "haiku_model": ""},
+        )
         self.assertTrue(any(row["model"] == "claude-opus-4.6" for row in payload["available_models"]))
         self.assertTrue(any(row["model"] == "gpt-5.3-codex" for row in payload["available_models"]))
         self.assertTrue(any(row["model"] == "gemini-3.1-pro-preview" for row in payload["available_models"]))
@@ -82,6 +86,10 @@ class ModelRoutingConfigTests(unittest.TestCase):
                     "target_provider": "codex",
                 },
             ],
+        )
+        self.assertEqual(
+            payload["claude_code_defaults"],
+            {"opus_model": "", "sonnet_model": "", "haiku_model": ""},
         )
 
     def test_save_settings_normalizes_models_and_resolves_target(self):
@@ -150,6 +158,53 @@ class ModelRoutingConfigTests(unittest.TestCase):
         # Regular mapping unaffected
         self.assertIsNone(service.resolve_target_model("gpt-5.4"))
 
+    def test_claude_code_defaults_round_trip(self):
+        config_path = self._make_temp_file_path("model-routing-", ".json")
+        service = self._make_service(str(config_path))
+
+        payload = service.save_settings(
+            {
+                "enabled": True,
+                "mappings": [],
+                "claude_code_defaults": {
+                    "opus_model": "Claude Opus 4.7",
+                    "sonnet_model": "gpt-5.4",
+                    "haiku_model": "gpt-5.4-mini",
+                },
+            }
+        )
+
+        self.assertEqual(
+            payload["claude_code_defaults"],
+            {
+                "opus_model": "claude-opus-4.7",
+                "sonnet_model": "gpt-5.4",
+                "haiku_model": "gpt-5.4-mini",
+            },
+        )
+        written = json.loads(config_path.read_text(encoding="utf-8"))
+        self.assertEqual(written["claude_code_defaults"], payload["claude_code_defaults"])
+
+    def test_claude_code_defaults_reject_invalid_shape(self):
+        config_path = self._make_temp_file_path("model-routing-", ".json")
+        service = self._make_service(str(config_path))
+
+        with self.assertRaises(HTTPException) as exc:
+            service.save_settings({"claude_code_defaults": ["gpt-5.4"]})
+
+        self.assertEqual(exc.exception.status_code, 400)
+        self.assertIn("claude_code_defaults", str(exc.exception.detail))
+
+    def test_claude_code_defaults_reject_unsupported_model(self):
+        config_path = self._make_temp_file_path("model-routing-", ".json")
+        service = self._make_service(str(config_path))
+
+        with self.assertRaises(HTTPException) as exc:
+            service.save_settings({"claude_code_defaults": {"opus_model": "not-a-model"}})
+
+        self.assertEqual(exc.exception.status_code, 400)
+        self.assertIn("claude_code_defaults.opus_model", str(exc.exception.detail))
+
     def test_approval_mappings_skip_when_disabled(self):
         config_path = self._make_temp_file_path("model-routing-", ".json")
         service = self._make_service(str(config_path))
@@ -210,7 +265,8 @@ class ModelRoutingConfigTests(unittest.TestCase):
 
         with (
             mock.patch.object(proxy, "parse_json_request", mock.AsyncMock(return_value=payload)),
-            mock.patch.object(proxy.model_routing_config_service, "save_settings", return_value={"enabled": True, "mappings": [], "available_models": [], "path": "x"}) as save_settings,
+            mock.patch.object(proxy.model_routing_config_service, "save_settings", return_value={"enabled": True, "mappings": [], "approval_enabled": False, "approval_mappings": [], "claude_code_defaults": {"opus_model": "", "sonnet_model": "", "haiku_model": ""}, "available_models": [], "path": "x"}) as save_settings,
+            mock.patch.object(proxy.client_proxy_config_service, "refresh_client_model_metadata", return_value={"codex": False, "claude": False}),
         ):
             response = proxy.asyncio.run(proxy.model_routing_config_api(request))
 
@@ -218,14 +274,14 @@ class ModelRoutingConfigTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(
             response.body,
-            b'{"enabled":true,"mappings":[],"available_models":[],"path":"x"}',
+            b'{"enabled":true,"mappings":[],"approval_enabled":false,"approval_mappings":[],"claude_code_defaults":{"opus_model":"","sonnet_model":"","haiku_model":""},"available_models":[],"path":"x"}',
         )
 
     def test_model_routing_status_api_returns_current_payload(self):
         with mock.patch.object(
             proxy.model_routing_config_service,
             "config_payload",
-            return_value={"enabled": False, "mappings": [], "available_models": [], "path": "x"},
+            return_value={"enabled": False, "mappings": [], "approval_enabled": False, "approval_mappings": [], "claude_code_defaults": {"opus_model": "", "sonnet_model": "", "haiku_model": ""}, "available_models": [], "path": "x"},
         ) as config_payload:
             response = proxy.asyncio.run(proxy.model_routing_status_api())
 
@@ -233,7 +289,7 @@ class ModelRoutingConfigTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(
             response.body,
-            b'{"enabled":false,"mappings":[],"available_models":[],"path":"x"}',
+            b'{"enabled":false,"mappings":[],"approval_enabled":false,"approval_mappings":[],"claude_code_defaults":{"opus_model":"","sonnet_model":"","haiku_model":""},"available_models":[],"path":"x"}',
         )
 
     def test_compact_fallback_defaults_to_gpt_5_4_for_claude_target(self):

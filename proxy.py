@@ -2451,7 +2451,7 @@ async def model_routing_status_api():
 async def model_routing_config_api(request: Request):
     payload = await parse_json_request(request)
     result = model_routing_config_service.save_settings(payload)
-    client_proxy_config_service.refresh_codex_model_catalog()
+    client_proxy_config_service.refresh_client_model_metadata()
     return JSONResponse(content=result)
 
 

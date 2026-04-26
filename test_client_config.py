@@ -489,6 +489,71 @@ class ClientConfigTests(unittest.TestCase):
         self.assertEqual(updated_models["gpt-5.4"]["context_window"], 200000)
         self.assertIn("Routed to claude-sonnet-4.6 (Anthropic)", updated_models["gpt-5.4"]["description"])
 
+    def test_refresh_claude_proxy_settings_rewrites_existing_settings_for_updated_defaults(self):
+        temp_dir = self._make_temp_dir("claude-refresh-")
+        settings_path = temp_dir / "settings.json"
+        routing_settings = {
+            "enabled": False,
+            "mappings": [],
+            "claude_code_defaults": {
+                "opus_model": "",
+                "sonnet_model": "gpt-5.4",
+                "haiku_model": "",
+            },
+        }
+        capabilities = {
+            "gpt-5.4": {
+                "context_window": 400000,
+                "auto_compact_token_limit": 300000,
+            },
+            "claude-sonnet-4.6": {
+                "context_window": 200000,
+                "auto_compact_token_limit": 150000,
+            },
+        }
+        service = self._make_client_proxy_service(
+            claude_settings_file=str(settings_path),
+            model_capabilities_provider=lambda: capabilities,
+            model_routing_settings_provider=lambda: routing_settings,
+        )
+
+        service.write_claude_proxy_settings()
+        initial = json.loads(settings_path.read_text(encoding="utf-8"))
+        self.assertEqual(initial["env"]["ANTHROPIC_DEFAULT_SONNET_MODEL"], "gpt-5.4")
+        self.assertEqual(initial["autoCompactWindow"], 300000)
+
+        routing_settings["enabled"] = True
+        routing_settings["mappings"] = [
+            {"source_model": "gpt-5.4", "target_model": "claude-sonnet-4.6"}
+        ]
+
+        refreshed = service.refresh_claude_proxy_settings()
+
+        self.assertTrue(refreshed)
+        updated = json.loads(settings_path.read_text(encoding="utf-8"))
+        self.assertEqual(updated["env"]["ANTHROPIC_DEFAULT_SONNET_MODEL"], "gpt-5.4")
+        self.assertIn(
+            "Routed to claude-sonnet-4.6 (Anthropic)",
+            updated["env"]["ANTHROPIC_DEFAULT_SONNET_MODEL_DESCRIPTION"],
+        )
+        self.assertEqual(updated["autoCompactWindow"], 150000)
+
+    def test_refresh_client_model_metadata_refreshes_both_clients(self):
+        temp_dir = self._make_temp_dir("client-metadata-refresh-")
+        codex_catalog_path = temp_dir / "ghcp-proxy-models.json"
+        claude_settings_path = temp_dir / "settings.json"
+        service = self._make_client_proxy_service(
+            codex_managed_config_file=str(temp_dir / "managed_config.toml"),
+            codex_model_catalog_file=str(codex_catalog_path),
+            claude_settings_file=str(claude_settings_path),
+        )
+        codex_catalog_path.write_text('{"models":[]}\n', encoding="utf-8")
+        claude_settings_path.write_text('{"env":{}}\n', encoding="utf-8")
+
+        refreshed = service.refresh_client_model_metadata()
+
+        self.assertEqual(refreshed, {"codex": True, "claude": True})
+
     def test_codex_catalog_clamps_default_auto_compact_to_model_ceiling(self):
         temp_dir = self._make_temp_dir("codex-compact-clamp-")
         catalog_path = temp_dir / "ghcp-proxy-models.json"
@@ -569,6 +634,51 @@ class ClientConfigTests(unittest.TestCase):
         self.assertTrue(written["skipDangerousModePermissionPrompt"])
         self.assertEqual(written["model"], "opus")
         self.assertEqual(written["effortLevel"], "medium")
+
+    def test_write_claude_proxy_settings_adds_custom_default_models_and_auto_compact_window(self):
+        temp_dir = self._make_temp_dir("claude-defaults-")
+        settings_path = temp_dir / "settings.json"
+        routing_settings = {
+            "enabled": True,
+            "mappings": [
+                {"source_model": "gpt-5.4", "target_model": "claude-sonnet-4.6"},
+            ],
+            "claude_code_defaults": {
+                "opus_model": "claude-opus-4.7",
+                "sonnet_model": "gpt-5.4",
+                "haiku_model": "gpt-5.4-mini",
+            },
+        }
+        capabilities = {
+            "claude-opus-4.7": {
+                "context_window": 200000,
+            },
+            "claude-sonnet-4.6": {
+                "context_window": 200000,
+                "auto_compact_token_limit": 150000,
+            },
+            "gpt-5.4-mini": {
+                "context_window": 272000,
+            },
+        }
+        service = self._make_client_proxy_service(
+            claude_settings_file=str(settings_path),
+            model_capabilities_provider=lambda: capabilities,
+            model_routing_settings_provider=lambda: routing_settings,
+        )
+
+        status = service.write_claude_proxy_settings()
+
+        written = json.loads(settings_path.read_text(encoding="utf-8"))
+        self.assertTrue(status["configured"])
+        self.assertEqual(written["env"]["ANTHROPIC_DEFAULT_OPUS_MODEL"], "claude-opus-4.7")
+        self.assertEqual(written["env"]["ANTHROPIC_DEFAULT_OPUS_MODEL_NAME"], "claude-opus-4.7")
+        self.assertEqual(written["env"]["ANTHROPIC_DEFAULT_HAIKU_MODEL"], "gpt-5.4-mini")
+        self.assertIn(
+            "Routed to claude-sonnet-4.6 (Anthropic)",
+            written["env"]["ANTHROPIC_DEFAULT_SONNET_MODEL_DESCRIPTION"],
+        )
+        self.assertEqual(written["autoCompactWindow"], 150000)
 
 
 if __name__ == "__main__":

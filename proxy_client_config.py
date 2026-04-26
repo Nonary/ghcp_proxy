@@ -310,6 +310,28 @@ class ProxyClientConfigService:
         )
         return True
 
+    def refresh_claude_proxy_settings(self) -> bool:
+        if not os.path.exists(self._config.claude_settings_file):
+            return False
+        try:
+            with open(self._config.claude_settings_file, encoding="utf-8") as f:
+                payload = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return False
+        existing_payload = payload if isinstance(payload, dict) else {}
+        os.makedirs(self._config.claude_config_dir, exist_ok=True)
+        self._write_json_atomic(
+            self._config.claude_settings_file,
+            self._merged_claude_proxy_settings(existing_payload),
+        )
+        return True
+
+    def refresh_client_model_metadata(self) -> dict[str, bool]:
+        return {
+            "codex": self.refresh_codex_model_catalog(),
+            "claude": self.refresh_claude_proxy_settings(),
+        }
+
     def write_claude_proxy_settings(self) -> dict[str, bool | str | None]:
         status = self.claude_proxy_status()
         if status.get("error"):
@@ -654,12 +676,17 @@ class ProxyClientConfigService:
         existing_env = merged.get("env")
         merged_env = dict(existing_env) if isinstance(existing_env, dict) else {}
         merged_env.update(self._config.claude_proxy_settings.get("env", {}))
+        merged_env.update(self._build_claude_code_default_env())
         merged["env"] = merged_env
 
         for key, value in self._config.claude_proxy_settings.items():
             if key == "env":
                 continue
             merged.setdefault(key, value)
+
+        auto_compact_window = self._resolve_claude_auto_compact_window()
+        if auto_compact_window is not None:
+            merged["autoCompactWindow"] = auto_compact_window
 
         return merged
 
@@ -1086,6 +1113,84 @@ class ProxyClientConfigService:
             ):
                 remapped_targets[source_model] = target_model
         return remapped_targets
+
+    def _build_claude_code_default_env(self) -> dict[str, str]:
+        routing_settings = self._model_routing_settings()
+        capabilities = self._model_capabilities()
+        claude_defaults = routing_settings.get("claude_code_defaults")
+        if not isinstance(claude_defaults, Mapping):
+            return {}
+
+        env_updates: dict[str, str] = {}
+        slot_specs = (
+            ("opus_model", "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL_NAME", "ANTHROPIC_DEFAULT_OPUS_MODEL_DESCRIPTION"),
+            ("sonnet_model", "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME", "ANTHROPIC_DEFAULT_SONNET_MODEL_DESCRIPTION"),
+            ("haiku_model", "ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME", "ANTHROPIC_DEFAULT_HAIKU_MODEL_DESCRIPTION"),
+        )
+        for slot_key, model_key, name_key, description_key in slot_specs:
+            configured_model = claude_defaults.get(slot_key)
+            if not isinstance(configured_model, str) or not configured_model:
+                continue
+            env_updates[model_key] = configured_model
+            env_updates[name_key] = configured_model
+            env_updates[description_key] = self._build_claude_code_model_description(
+                configured_model,
+                capabilities=capabilities,
+                routing_settings=routing_settings,
+            )
+        return env_updates
+
+    def _resolve_claude_auto_compact_window(self) -> int | None:
+        routing_settings = self._model_routing_settings()
+        claude_defaults = routing_settings.get("claude_code_defaults")
+        if not isinstance(claude_defaults, Mapping):
+            return None
+        sonnet_model = claude_defaults.get("sonnet_model")
+        if not isinstance(sonnet_model, str) or not sonnet_model:
+            return None
+
+        capabilities = self._model_capabilities()
+        routed_target = self._resolved_catalog_target_name(sonnet_model, routing_settings)
+        caps = capabilities.get(routed_target) if isinstance(capabilities, Mapping) else None
+        caps = caps if isinstance(caps, Mapping) else {}
+        context_window = self._coerce_int(caps.get("context_window"), self._config.codex_model_context_window)
+        return self._resolve_auto_compact_limit(
+            caps.get("auto_compact_token_limit"),
+            context_window,
+            self._config.codex_model_auto_compact_token_limit,
+        )
+
+    def _build_claude_code_model_description(
+        self,
+        model_name: str,
+        *,
+        capabilities: Mapping[str, Mapping[str, object]] | None = None,
+        routing_settings: Mapping[str, object] | None = None,
+    ) -> str:
+        capabilities = capabilities if isinstance(capabilities, Mapping) else self._model_capabilities()
+        routing_settings = routing_settings if isinstance(routing_settings, Mapping) else self._model_routing_settings()
+        routed_model_name = self._resolved_catalog_target_name(model_name, routing_settings)
+        provider = str(MODEL_PRICING.get(routed_model_name, {}).get("provider") or "Unknown")
+        caps = capabilities.get(routed_model_name) if isinstance(capabilities, Mapping) else None
+        caps = caps if isinstance(caps, Mapping) else {}
+        context_window = self._coerce_int(caps.get("context_window"), self._config.codex_model_context_window)
+        multiplier = PREMIUM_REQUEST_MULTIPLIERS.get(routed_model_name, 1.0)
+        if multiplier == 1.0:
+            premium_text = "1 premium request"
+        else:
+            multiplier_str = f"{multiplier:.2f}".rstrip("0").rstrip(".")
+            premium_text = f"{multiplier_str} premium requests"
+        if routed_model_name == model_name:
+            return f"{provider} · {context_window:,} token context · {premium_text}."
+        return f"Routed to {routed_model_name} ({provider}) · {context_window:,} token context · {premium_text}."
+
+    def _resolved_catalog_target_name(
+        self,
+        model_name: str,
+        routing_settings: Mapping[str, object] | None = None,
+    ) -> str:
+        remapped_targets = self._catalog_remap_targets(routing_settings or self._model_routing_settings())
+        return remapped_targets.get(model_name, model_name)
 
     def _remove_file_if_exists(self, path: str):
         if os.path.exists(path):
