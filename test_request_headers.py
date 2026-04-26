@@ -28,6 +28,8 @@ class RequestHeadersTests(unittest.TestCase):
         )
 
         self.assertEqual(headers["X-Initiator"], "user")
+        self.assertEqual(headers["Copilot-Integration-Id"], "copilot-developer-cli")
+        self.assertIn("copilot/1.0.36", headers["User-Agent"])
         self.assertIn("x-interaction-id", headers)
         self.assertIn("x-agent-task-id", headers)
         self.assertIn("x-client-session-id", headers)
@@ -63,6 +65,7 @@ class RequestHeadersTests(unittest.TestCase):
         )
 
         self.assertEqual(headers["X-Initiator"], "agent")
+        self.assertNotIn("x-openai-subagent", headers)
 
     def test_gpt_5_4_mini_real_user_prompt_stays_user(self):
         request = SimpleNamespace(url=SimpleNamespace(path="/v1/responses"), headers={})
@@ -372,6 +375,7 @@ class RequestHeadersTests(unittest.TestCase):
         )
 
         self.assertEqual(headers["X-Initiator"], "agent")
+        self.assertNotIn("x-openai-subagent", headers)
 
     def test_chat_tool_message_follow_up_stays_agent(self):
         request = SimpleNamespace(url=SimpleNamespace(path="/v1/chat/completions"), headers={})
@@ -642,7 +646,7 @@ class RequestHeadersTests(unittest.TestCase):
         self.assertIn("x-interaction-id", headers)
         self.assertIn("x-agent-task-id", headers)
         self.assertEqual(body["sessionId"], "session-123")
-        self.assertEqual(body["prompt_cache_key"], "session-123")
+        self.assertNotIn("prompt_cache_key", body)
 
     def test_build_responses_headers_for_request_uses_conversation_agent_intent(self):
         request = SimpleNamespace(
@@ -659,7 +663,7 @@ class RequestHeadersTests(unittest.TestCase):
 
         self.assertEqual(headers["Openai-Intent"], "conversation-agent")
 
-    def test_build_responses_headers_for_request_normalizes_prompt_cache_key_alias(self):
+    def test_build_responses_headers_for_request_uses_prompt_cache_key_for_affinity_only(self):
         request = SimpleNamespace(
             headers={},
             url=SimpleNamespace(path="/v1/responses"),
@@ -677,10 +681,10 @@ class RequestHeadersTests(unittest.TestCase):
         self.assertIn("x-client-session-id", headers)
         self.assertIn("x-interaction-id", headers)
         self.assertIn("x-agent-task-id", headers)
-        self.assertEqual(body["prompt_cache_key"], "cache-123")
+        self.assertNotIn("prompt_cache_key", body)
         self.assertNotIn("promptCacheKey", body)
 
-    def test_build_responses_headers_for_request_preserves_incoming_client_request_id(self):
+    def test_build_responses_headers_for_request_uses_incoming_client_request_id_for_affinity_only(self):
         request = SimpleNamespace(
             headers={"x-client-request-id": "client-123"},
             url=SimpleNamespace(path="/v1/responses"),
@@ -694,9 +698,48 @@ class RequestHeadersTests(unittest.TestCase):
         )
 
         self.assertNotIn("session_id", headers)
-        self.assertEqual(headers["x-client-request-id"], "client-123")
+        self.assertNotIn("x-client-request-id", headers)
         self.assertIn("x-interaction-id", headers)
         self.assertIn("x-agent-task-id", headers)
+
+    def test_build_responses_headers_for_request_reuses_prompt_cache_affinity(self):
+        first_request = SimpleNamespace(headers={"x-openai-subagent": "worker"}, url=SimpleNamespace(path="/v1/responses"))
+        first_body = {"model": "gpt-5.4", "input": "hello", "prompt_cache_key": "cache-a"}
+        first_headers = format_translation.build_responses_headers_for_request(
+            first_request,
+            first_body,
+            "test-key",
+            initiator_policy=proxy._initiator_policy,
+            session_id_resolver=usage_tracking.request_session_id,
+        )
+
+        second_request = SimpleNamespace(headers={"x-openai-subagent": "worker"}, url=SimpleNamespace(path="/v1/responses"))
+        second_body = {"model": "gpt-5.4", "input": "hello", "prompt_cache_key": "cache-b"}
+        second_headers = format_translation.build_responses_headers_for_request(
+            second_request,
+            second_body,
+            "test-key",
+            initiator_policy=proxy._initiator_policy,
+            session_id_resolver=usage_tracking.request_session_id,
+        )
+
+        third_request = SimpleNamespace(headers={"x-openai-subagent": "worker"}, url=SimpleNamespace(path="/v1/responses"))
+        third_body = {"model": "gpt-5.4", "input": "continue", "prompt_cache_key": "cache-a"}
+        third_headers = format_translation.build_responses_headers_for_request(
+            third_request,
+            third_body,
+            "test-key",
+            initiator_policy=proxy._initiator_policy,
+            session_id_resolver=usage_tracking.request_session_id,
+        )
+
+        self.assertNotEqual(first_headers["x-interaction-id"], second_headers["x-interaction-id"])
+        self.assertNotEqual(first_headers["x-agent-task-id"], second_headers["x-agent-task-id"])
+        self.assertEqual(first_headers["x-interaction-id"], third_headers["x-interaction-id"])
+        self.assertEqual(first_headers["x-agent-task-id"], third_headers["x-agent-task-id"])
+        self.assertNotIn("prompt_cache_key", first_body)
+        self.assertNotIn("prompt_cache_key", second_body)
+        self.assertNotIn("prompt_cache_key", third_body)
 
     def test_build_responses_headers_for_compact_preserves_cache_affinity_fields(self):
         user_request = SimpleNamespace(headers={}, url=SimpleNamespace(path="/v1/responses"))
@@ -728,7 +771,7 @@ class RequestHeadersTests(unittest.TestCase):
         self.assertNotIn("session_id", compact_headers)
         self.assertNotIn("x-client-request-id", compact_headers)
         self.assertEqual(compact_body["sessionId"], "session-123")
-        self.assertEqual(compact_body["prompt_cache_key"], "cache-123")
+        self.assertNotIn("prompt_cache_key", compact_body)
         self.assertNotIn("promptCacheKey", compact_body)
         self.assertEqual(compact_body["previous_response_id"], "resp_prev")
         self.assertNotEqual(compact_headers["x-interaction-id"], user_headers["x-interaction-id"])

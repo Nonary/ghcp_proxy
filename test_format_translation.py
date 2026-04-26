@@ -606,6 +606,47 @@ class FormatTranslationTests(unittest.TestCase):
         self.assertEqual(diagnostics[0]["action"], "drop_dangerous_code_execution_tools")
         self.assertEqual(diagnostics[0]["tool_names"], ["mcp__ide__executecode"])
 
+    def test_sanitize_responses_body_matches_copilot_cli_cache_shape(self):
+        diagnostics = []
+        body = {
+            "model": "gpt-5.5",
+            "input": "hello",
+            "client_metadata": {"session_id": "local-only"},
+            "previous_response_id": "resp_prev",
+            "prompt_cache_key": "cache-local",
+            "service_tier": "priority",
+            "tool_choice": "auto",
+        }
+
+        sanitized = format_translation.sanitize_responses_body_for_copilot(
+            body,
+            diagnostics=diagnostics,
+        )
+
+        self.assertNotIn("client_metadata", sanitized)
+        self.assertNotIn("previous_response_id", sanitized)
+        self.assertNotIn("prompt_cache_key", sanitized)
+        self.assertNotIn("service_tier", sanitized)
+        self.assertNotIn("tool_choice", sanitized)
+        self.assertEqual(diagnostics[0]["action"], "drop_non_copilot_cli_fields")
+        self.assertEqual(
+            diagnostics[0]["fields"],
+            ["client_metadata", "previous_response_id", "prompt_cache_key", "service_tier", "tool_choice"],
+        )
+
+    def test_sanitize_responses_body_drops_explicit_tool_choice_for_cache_shape(self):
+        choice = {"type": "function", "name": "read"}
+        body = {
+            "model": "gpt-5.5",
+            "input": "hello",
+            "tool_choice": choice,
+        }
+
+        sanitized = format_translation.sanitize_responses_body_for_copilot(body)
+
+        self.assertIsNot(sanitized, body)
+        self.assertNotIn("tool_choice", sanitized)
+
     def test_responses_request_to_chat_drops_dangerous_execute_code_tool_and_choice(self):
         body = {
             "model": "claude-opus-4.6",
@@ -1123,6 +1164,57 @@ class FormatTranslationTests(unittest.TestCase):
                     "type": "message",
                     "role": "user",
                     "content": [{"type": "input_text", "text": "continue"}],
+                },
+            ],
+        )
+
+    def test_sanitize_input_can_drop_reasoning_items_for_tool_history_replay(self):
+        sanitized = format_translation.sanitize_input(
+            [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "start"}],
+                },
+                {
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": "volatile"}],
+                    "encrypted_content": "ciphertext",
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "spawn_agent",
+                    "arguments": "{}",
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "agent",
+                },
+            ],
+            preserve_encrypted_content=False,
+            drop_reasoning_items=True,
+        )
+
+        self.assertEqual(
+            sanitized,
+            [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "start"}],
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "spawn_agent",
+                    "arguments": "{}",
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "agent",
                 },
             ],
         )
@@ -1890,6 +1982,57 @@ class ResponsesToAnthropicMessagesTests(unittest.TestCase):
                     "tool_use_id": "call_1",
                     "content": [{"type": "text", "text": "result text"}],
                 }
+            ],
+        )
+
+    def test_sanitize_input_limits_old_encrypted_reasoning_ciphertext(self):
+        sanitized = format_translation.sanitize_input(
+            [
+                {
+                    "type": "reasoning",
+                    "id": "rs_1",
+                    "summary": [{"type": "summary_text", "text": "summary 1"}],
+                    "encrypted_content": "ciphertext-1",
+                },
+                {
+                    "type": "reasoning",
+                    "id": "rs_2",
+                    "encrypted_content": "ciphertext-2",
+                },
+                {
+                    "type": "reasoning",
+                    "id": "rs_3",
+                    "summary": [{"type": "summary_text", "text": "summary 3"}],
+                    "encrypted_content": "ciphertext-3",
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "continue"}],
+                },
+            ],
+            max_encrypted_reasoning_items=1,
+        )
+
+        self.assertEqual(
+            sanitized,
+            [
+                {
+                    "type": "reasoning",
+                    "id": "rs_1",
+                    "summary": [{"type": "summary_text", "text": "summary 1"}],
+                },
+                {
+                    "type": "reasoning",
+                    "id": "rs_3",
+                    "summary": [{"type": "summary_text", "text": "summary 3"}],
+                    "encrypted_content": "ciphertext-3",
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "continue"}],
+                },
             ],
         )
 

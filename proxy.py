@@ -57,6 +57,7 @@ import auto_update
 import background_proxy
 import dashboard as dashboard_module
 import format_translation
+import hashlib
 import messages_preprocess
 import migrate_runtime_paths
 import json
@@ -137,6 +138,8 @@ _CLIENT_PROXY_STARTUP_RESTORE_LOCK = Lock()
 _CLIENT_PROXY_STARTUP_RESTORE_COMPLETE = False
 _CLIENT_PROXY_SHUTDOWN_REVERT_LOCK = Lock()
 _CLIENT_PROXY_SHUTDOWN_REVERT_COMPLETE = False
+_RESPONSES_REASONING_TRIM_INPUT_ITEM_THRESHOLD = 48
+_RESPONSES_REASONING_ENCRYPTED_KEEP_LAST = 6
 migrated_runtime_files = migrate_runtime_paths.migrate_legacy_runtime_files()
 if migrated_runtime_files:
     print(f"runtime migration: copied {len(migrated_runtime_files)} legacy file(s)", flush=True)
@@ -153,6 +156,10 @@ _TRACE_HEADER_ALLOWLIST = {
     "session_id",
     "x-client-request-id",
     "x-openai-subagent",
+    "x-interaction-id",
+    "x-interaction-type",
+    "x-agent-task-id",
+    "x-client-session-id",
     "x-request-id",
     "x-github-request-id",
 }
@@ -580,7 +587,65 @@ def _trace_input_summary(input_value) -> dict:
         "roles": _count_trace_roles(input_value),
         "has_compaction": format_translation.input_contains_compaction(input_value),
         "encrypted_reasoning_items": encrypted_reasoning_items,
+        "sequence": _trace_input_sequence(input_value),
     }
+
+
+def _trace_hash(value) -> str | None:
+    try:
+        encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    except (TypeError, ValueError):
+        return None
+    return hashlib.sha256(encoded).hexdigest()[:16]
+
+
+def _trace_text_chars(value) -> int:
+    if isinstance(value, str):
+        return len(value)
+    if isinstance(value, list):
+        return sum(_trace_text_chars(item) for item in value)
+    if isinstance(value, dict):
+        total = 0
+        for key in ("text", "input_text", "output_text"):
+            text = value.get(key)
+            if isinstance(text, str):
+                total += len(text)
+        for key in ("content", "output"):
+            nested = value.get(key)
+            if isinstance(nested, (list, dict, str)):
+                total += _trace_text_chars(nested)
+        return total
+    return 0
+
+
+def _trace_input_sequence(input_value: list) -> list[dict]:
+    sequence = []
+    for index, item in enumerate(input_value):
+        if not isinstance(item, dict):
+            sequence.append({"index": index, "type": type(item).__name__})
+            continue
+        entry = {
+            "index": index,
+            "type": item.get("type"),
+        }
+        for key in ("role", "name", "status"):
+            value = item.get(key)
+            if isinstance(value, str) and value:
+                entry[key] = value
+        for key in ("id", "call_id"):
+            value = item.get(key)
+            if isinstance(value, str) and value:
+                entry[f"{key}_hash"] = _trace_hash(value)
+        if "content" in item:
+            entry["content_chars"] = _trace_text_chars(item.get("content"))
+        if "output" in item:
+            entry["output_chars"] = _trace_text_chars(item.get("output"))
+        encrypted = item.get("encrypted_content")
+        if isinstance(encrypted, str) and encrypted:
+            entry["encrypted_content_chars"] = len(encrypted)
+            entry["encrypted_content_hash"] = _trace_hash(encrypted)
+        sequence.append(entry)
+    return sequence
 
 
 def _trace_tools_deferred_count(tools) -> int:
@@ -655,6 +720,9 @@ def _trace_body_summary(body: dict | None) -> dict | None:
         summary["input"] = _trace_input_summary(body.get("input"))
     if "messages" in body:
         summary["messages"] = _trace_messages_summary(body.get("messages"))
+    body_fingerprint = _trace_hash(body)
+    if body_fingerprint:
+        summary["body_fingerprint"] = body_fingerprint
 
     metadata = body.get("metadata")
     if isinstance(metadata, dict):
@@ -1279,6 +1347,7 @@ def _prepare_bridge_request(
     api_base: str,
     api_key: str | None = None,
     force_initiator: str | None = None,
+    trace_metadata_extra: dict | None = None,
 ) -> tuple[UpstreamRequestPlan | None, Response | None]:
     upstream_url = f"{api_base.rstrip('/')}{bridge_plan.upstream_path}"
     verdict_sink: dict = {}
@@ -1292,6 +1361,8 @@ def _prepare_bridge_request(
     }
     if bridge_plan.diagnostics:
         trace_metadata["sanitizer_diagnostics"] = list(bridge_plan.diagnostics)
+    if isinstance(trace_metadata_extra, dict):
+        trace_metadata.update(trace_metadata_extra)
     return _prepare_upstream_request(
         request,
         body=bridge_plan.upstream_body,
@@ -2453,8 +2524,25 @@ def _responses_input_developer_message_count(input_value) -> int:
     return sum(1 for item in input_value if _responses_message_role(item) == "developer")
 
 
-def _should_strip_encrypted_reasoning_for_forked_context(request: Request, input_value) -> bool:
-    """Return True when replayed encrypted reasoning is likely from another lineage.
+def _responses_input_has_tool_history(input_value) -> bool:
+    if not isinstance(input_value, list):
+        return False
+    tool_item_types = {
+        "function_call",
+        "function_call_output",
+        "custom_tool_call",
+        "custom_tool_call_output",
+    }
+    for item in input_value:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("type", "")).lower() in tool_item_types:
+            return True
+    return False
+
+
+def _encrypted_reasoning_strip_reason_for_responses_context(request: Request, input_value) -> str | None:
+    """Classify contexts where replayed encrypted reasoning is not worth forwarding.
 
     Codex subagent/fork starts can replay the parent transcript, including
     encrypted reasoning blobs, under a fresh prompt-cache key. Copilot/OpenAI
@@ -2466,8 +2554,80 @@ def _should_strip_encrypted_reasoning_for_forked_context(request: Request, input
     """
     subagent = request.headers.get("x-openai-subagent") if hasattr(request, "headers") else None
     if isinstance(subagent, str) and subagent.strip():
-        return True
-    return _responses_input_developer_message_count(input_value) > 1
+        return "subagent_header"
+    if _responses_input_developer_message_count(input_value) > 1:
+        return "multiple_developer_messages"
+    if _responses_input_has_tool_history(input_value):
+        return "tool_history"
+    return None
+
+
+def _should_drop_reasoning_items_for_responses_context(strip_reason: str | None) -> bool:
+    return strip_reason is not None
+
+
+def _max_encrypted_reasoning_items_for_responses_input(input_value) -> int | None:
+    if not isinstance(input_value, list):
+        return None
+    if len(input_value) < _RESPONSES_REASONING_TRIM_INPUT_ITEM_THRESHOLD:
+        return None
+    return _RESPONSES_REASONING_ENCRYPTED_KEEP_LAST
+
+
+def _responses_input_encrypted_content_count(input_value) -> int:
+    if not isinstance(input_value, list):
+        return 0
+    count = 0
+    for item in input_value:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") not in {"reasoning", "compaction"}:
+            continue
+        encrypted_content = item.get("encrypted_content")
+        if isinstance(encrypted_content, str) and encrypted_content:
+            count += 1
+    return count
+
+
+def _responses_input_sanitization_trace(
+    raw_input,
+    sanitized_input,
+    *,
+    max_encrypted_reasoning_items: int | None,
+    encrypted_reasoning_strip_reason: str | None,
+    dropped_reasoning_items: bool,
+) -> dict | None:
+    if not isinstance(raw_input, list):
+        return None
+    before_encrypted = _responses_input_encrypted_content_count(raw_input)
+    after_encrypted = _responses_input_encrypted_content_count(sanitized_input)
+    if (
+        not before_encrypted
+        and max_encrypted_reasoning_items is None
+        and encrypted_reasoning_strip_reason is None
+        and not dropped_reasoning_items
+    ):
+        return None
+
+    if encrypted_reasoning_strip_reason is not None:
+        preservation = "disabled"
+    elif max_encrypted_reasoning_items is not None:
+        preservation = "limited"
+    else:
+        preservation = "preserved"
+
+    return {
+        "input_items_before": len(raw_input),
+        "input_items_after": len(sanitized_input) if isinstance(sanitized_input, list) else None,
+        "encrypted_content_items_before": before_encrypted,
+        "encrypted_content_items_after": after_encrypted,
+        "encrypted_content_items_dropped": max(0, before_encrypted - after_encrypted),
+        "encrypted_content_preservation": preservation,
+        "encrypted_content_strip_reason": encrypted_reasoning_strip_reason,
+        "encrypted_keep_last": max_encrypted_reasoning_items,
+        "reasoning_items_dropped": dropped_reasoning_items,
+        "trim_input_item_threshold": _RESPONSES_REASONING_TRIM_INPUT_ITEM_THRESHOLD,
+    }
 
 # ─── Route: /v1/responses  (Codex / Responses API) ───────────────────────────
 
@@ -2551,13 +2711,27 @@ async def responses(request: Request):
     # forward unverifiable encrypted reasoning blobs in that shape.
     raw_input = body.get("input")
     has_compaction_input = format_translation.input_contains_compaction(raw_input)
-    strip_forked_encrypted_reasoning = _should_strip_encrypted_reasoning_for_forked_context(
+    encrypted_reasoning_strip_reason = _encrypted_reasoning_strip_reason_for_responses_context(
         request, raw_input
     )
+    drop_reasoning_items = _should_drop_reasoning_items_for_responses_context(
+        encrypted_reasoning_strip_reason
+    )
+    max_encrypted_reasoning_items = _max_encrypted_reasoning_items_for_responses_input(raw_input)
+    input_sanitization_trace = None
     if raw_input is not None:
         body["input"] = format_translation.sanitize_input(
             raw_input,
-            preserve_encrypted_content=not strip_forked_encrypted_reasoning,
+            preserve_encrypted_content=encrypted_reasoning_strip_reason is None,
+            max_encrypted_reasoning_items=max_encrypted_reasoning_items,
+            drop_reasoning_items=drop_reasoning_items,
+        )
+        input_sanitization_trace = _responses_input_sanitization_trace(
+            raw_input,
+            body.get("input"),
+            max_encrypted_reasoning_items=max_encrypted_reasoning_items,
+            encrypted_reasoning_strip_reason=encrypted_reasoning_strip_reason,
+            dropped_reasoning_items=drop_reasoning_items,
         )
 
     try:
@@ -2584,6 +2758,11 @@ async def responses(request: Request):
         api_base=api_base,
         api_key=api_key,
         force_initiator="agent" if has_compaction_input else None,
+        trace_metadata_extra=(
+            {"responses_input_sanitization": input_sanitization_trace}
+            if input_sanitization_trace is not None
+            else None
+        ),
     )
     if error_response is not None:
         return error_response

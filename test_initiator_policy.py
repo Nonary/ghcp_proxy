@@ -242,6 +242,45 @@ class InitiatorPolicyTests(unittest.TestCase):
         self.assertIs(normalized_input, input_items)
         self.assertEqual(initiator, "user")
 
+    def test_codex_wrapped_prompt_after_tool_history_is_agent_continuation(self):
+        policy = initiator_policy.InitiatorPolicy()
+        input_items = [
+            {
+                "type": "message",
+                "role": "user",
+                "content": (
+                    "<environment_context>\n"
+                    "  <cwd>D:\\sources\\ghcp_proxy</cwd>\n"
+                    "</environment_context>\n\n"
+                    "why was 501ad942fbd14a1c832101cd713dca26 not flagged?"
+                ),
+            },
+            {"type": "function_call", "call_id": "call-1", "name": "shell_command", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call-1", "output": "fatal: unknown revision"},
+            {
+                "type": "message",
+                "role": "user",
+                "content": (
+                    "<environment_context>\n"
+                    "  <cwd>D:\\sources\\ghcp_proxy</cwd>\n"
+                    "</environment_context>\n\n"
+                    "why was 501ad942fbd14a1c832101cd713dca26 not flagged?\n\n"
+                    "thats a request id not a git commit"
+                ),
+            },
+        ]
+        verdict = {}
+
+        normalized_input, initiator = policy.resolve_responses_input(
+            input_items,
+            "gpt-5.5",
+            verdict_sink=verdict,
+        )
+
+        self.assertIs(normalized_input, input_items)
+        self.assertEqual(initiator, "agent")
+        self.assertEqual(verdict["candidate_initiator"], "agent")
+
     def test_codex_title_generation_mini_request_is_agent(self):
         policy = initiator_policy.InitiatorPolicy()
         input_items = [

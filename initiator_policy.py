@@ -308,12 +308,19 @@ def _determine_responses_candidate(input_param) -> tuple[object, str]:
             saw_agent_meta, saw_real_user_content = _responses_user_message_traits(item)
             if saw_agent_meta and not saw_real_user_content:
                 ignorable_meta_messages.add(id(item))
-        for item in reversed(input_param):
+        for index in range(len(input_param) - 1, -1, -1):
+            item = input_param[index]
             if isinstance(item, dict) and id(item) in ignorable_meta_messages:
                 if _contains_skill_block_marker(_responses_item_text(item)):
                     return input_param, AGENT_INITIATOR
                 continue
             candidate = _responses_item_candidate(item, explicit_initiators=explicit_initiators)
+            if (
+                candidate == USER_INITIATOR
+                and _is_codex_wrapped_user_prompt(item)
+                and _responses_has_agent_history_before(input_param, index)
+            ):
+                return input_param, AGENT_INITIATOR
             if candidate is not None:
                 return input_param, candidate
 
@@ -345,6 +352,36 @@ def _responses_item_text(item) -> str:
         if isinstance(value, str):
             return value
     return ""
+
+
+def _is_codex_wrapped_user_prompt(item) -> bool:
+    if not isinstance(item, dict):
+        return False
+    if str(item.get("role", "")).lower() != "user":
+        return False
+    text = _responses_item_text(item).lstrip()
+    if "<environment_context>" not in text:
+        return False
+    end_marker = "</environment_context>"
+    end_index = text.rfind(end_marker)
+    if end_index < 0:
+        return False
+    return bool(text[end_index + len(end_marker):].strip())
+
+
+def _responses_has_agent_history_before(items, index: int) -> bool:
+    if not isinstance(items, list) or index <= 0:
+        return False
+    for prior in items[:index]:
+        if not isinstance(prior, dict):
+            continue
+        item_type = str(prior.get("type", "")).lower()
+        role = str(prior.get("role", "")).lower()
+        if item_type in {"function_call", "function_call_output", "custom_tool_call", "custom_tool_call_output"}:
+            return True
+        if role == "assistant":
+            return True
+    return False
 
 
 def _responses_system_prompt_includes_security_monitor_prompt(input_param) -> bool:

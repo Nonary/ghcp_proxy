@@ -64,10 +64,20 @@ def _responses_model_disallows_temperature(model_name: str | None) -> bool:
 
 _COPILOT_UNSUPPORTED_RESPONSES_TOOL_TYPES = {"image_generation"}
 
-# Top-level Responses-API fields that Codex may send but Copilot's upstream
-# Responses endpoint rejects (e.g. priority/flex routing hints).
-_COPILOT_UNSUPPORTED_RESPONSES_BODY_KEYS = {
-    "service_tier",
+# Top-level native Responses fields observed in captured Copilot CLI
+# /responses requests. Unknown Codex-only fields are kept local so they cannot
+# perturb upstream cache keys.
+_COPILOT_RESPONSES_UPSTREAM_BODY_KEYS = {
+    "include",
+    "input",
+    "instructions",
+    "model",
+    "parallel_tool_calls",
+    "reasoning",
+    "store",
+    "stream",
+    "text",
+    "tools",
 }
 
 
@@ -649,29 +659,33 @@ def _append_sanitizer_diagnostic(diagnostics: list[dict] | None, diagnostic: dic
 
 
 def sanitize_responses_body_for_copilot(body: dict, *, diagnostics: list[dict] | None = None) -> dict:
-    """Strip top-level Responses-API fields that Copilot's upstream rejects.
+    """Keep native Responses upstream payloads aligned with Copilot CLI.
 
-    Codex sends fields such as ``service_tier`` (``priority``/``flex``) that
-    Copilot's GitHub-fronted Responses endpoint does not accept. Drop them so
-    the request is forwarded successfully; we still record the requested
-    service tier separately for usage tracking via the Codex logs scraper.
+    Codex sends local/client fields such as ``client_metadata``,
+    ``prompt_cache_key``, and ``service_tier``. They are useful to this proxy
+    but are absent from captured Copilot CLI /responses traffic and can split
+    upstream cache keys, so only the captured upstream contract is forwarded.
     """
     if not isinstance(body, dict):
         return body
-    removed = [k for k in _COPILOT_UNSUPPORTED_RESPONSES_BODY_KEYS if k in body]
+    removed = sorted(k for k in body if k not in _COPILOT_RESPONSES_UPSTREAM_BODY_KEYS)
     if not removed:
         return body
-    sanitized = {k: v for k, v in body.items() if k not in _COPILOT_UNSUPPORTED_RESPONSES_BODY_KEYS}
+    sanitized = {
+        k: v
+        for k, v in body.items()
+        if k in _COPILOT_RESPONSES_UPSTREAM_BODY_KEYS
+    }
     _append_sanitizer_diagnostic(
         diagnostics,
         {
             "kind": "responses_body",
-            "action": "drop_unsupported_fields",
-            "fields": sorted(removed),
+            "action": "drop_non_copilot_cli_fields",
+            "fields": removed,
         },
     )
     print(
-        f"Responses proxy dropped Copilot-unsupported fields: {', '.join(sorted(removed))}",
+        f"Responses proxy dropped non-Copilot-CLI fields: {', '.join(removed)}",
         flush=True,
     )
     return sanitized
@@ -2167,7 +2181,33 @@ def _reasoning_item_has_replay_value(item: dict) -> bool:
     return _reasoning_summary_has_text(item.get("summary"))
 
 
-def sanitize_input(input_items, *, preserve_encrypted_content: bool = True):
+def _encrypted_reasoning_indexes_to_keep(input_items, max_encrypted_reasoning_items: int | None) -> set[int] | None:
+    if max_encrypted_reasoning_items is None:
+        return None
+    if not isinstance(max_encrypted_reasoning_items, int) or max_encrypted_reasoning_items < 0:
+        return None
+
+    indexes: list[int] = []
+    for index, item in enumerate(input_items):
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") not in {"reasoning", "compaction"}:
+            continue
+        encrypted_content = item.get("encrypted_content")
+        if isinstance(encrypted_content, str) and encrypted_content:
+            indexes.append(index)
+    if max_encrypted_reasoning_items == 0:
+        return set()
+    return set(indexes[-max_encrypted_reasoning_items:])
+
+
+def sanitize_input(
+    input_items,
+    *,
+    preserve_encrypted_content: bool = True,
+    max_encrypted_reasoning_items: int | None = None,
+    drop_reasoning_items: bool = False,
+):
     """
     Preserve encrypted_content in reasoning items for normal multi-turn correctness.
     Callers may disable preservation for forked/subagent contexts where encrypted
@@ -2183,13 +2223,24 @@ def sanitize_input(input_items, *, preserve_encrypted_content: bool = True):
     if not isinstance(input_items, list):
         return input_items  # plain string — pass through untouched
 
+    window_items = _latest_compaction_window(input_items)
+    encrypted_indexes_to_keep = (
+        _encrypted_reasoning_indexes_to_keep(window_items, max_encrypted_reasoning_items)
+        if preserve_encrypted_content
+        else set()
+    )
+
     result = []
-    for item in _latest_compaction_window(input_items):
+    for index, item in enumerate(window_items):
         if not isinstance(item, dict):
             result.append(item)
             continue
 
         item_type = item.get("type")
+        preserve_item_encrypted_content = (
+            preserve_encrypted_content
+            and (encrypted_indexes_to_keep is None or index in encrypted_indexes_to_keep)
+        )
         if item_type == "compaction":
             encrypted_content = item.get("encrypted_content")
             summary_text = decode_fake_compaction(encrypted_content)
@@ -2197,7 +2248,7 @@ def sanitize_input(input_items, *, preserve_encrypted_content: bool = True):
                 result.append(_summary_message_item(summary_text))
                 continue
             if isinstance(encrypted_content, str) and encrypted_content:
-                if preserve_encrypted_content:
+                if preserve_item_encrypted_content:
                     result.append(
                         {
                             "type": "reasoning",
@@ -2213,6 +2264,9 @@ def sanitize_input(input_items, *, preserve_encrypted_content: bool = True):
 
         if item_type == "function_call_output":
             result.append(_sanitize_function_call_output_item(item))
+            continue
+
+        if item_type == "reasoning" and drop_reasoning_items:
             continue
 
         if item_type != "reasoning":
@@ -2235,7 +2289,7 @@ def sanitize_input(input_items, *, preserve_encrypted_content: bool = True):
         filtered = {}
         for k, v in item.items():
             if k == "encrypted_content":
-                if v is not None and preserve_encrypted_content:
+                if v is not None and preserve_item_encrypted_content:
                     filtered[k] = v   # preserve during normal same-lineage replay
                 continue
             if k == "status" and v is None:
@@ -2248,7 +2302,7 @@ def sanitize_input(input_items, *, preserve_encrypted_content: bool = True):
                 continue
             if v is not None:
                 filtered[k] = v
-        if preserve_encrypted_content or _reasoning_item_has_replay_value(filtered):
+        if preserve_item_encrypted_content or _reasoning_item_has_replay_value(filtered):
             result.append(filtered)
     return result
 

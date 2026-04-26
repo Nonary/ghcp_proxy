@@ -5,7 +5,9 @@ import uuid
 from fastapi import Request
 
 from constants import (
-    OPENCODE_VERSION, OPENCODE_INTEGRATION_ID, GITHUB_API_VERSION,
+    OPENCODE_VERSION, OPENCODE_INTEGRATION_ID,
+    COPILOT_CLI_INTEGRATION_ID, COPILOT_CLI_USER_AGENT,
+    GITHUB_API_VERSION,
     FORWARDED_REQUEST_HEADERS,
 )
 
@@ -77,6 +79,13 @@ def build_copilot_headers(api_key: str) -> dict:
     }
 
 
+def build_responses_copilot_headers(api_key: str) -> dict:
+    headers = build_copilot_headers(api_key)
+    headers["User-Agent"] = COPILOT_CLI_USER_AGENT
+    headers["Copilot-Integration-Id"] = COPILOT_CLI_INTEGRATION_ID
+    return headers
+
+
 def _apply_forwarded_request_headers(
     headers: dict,
     request: Request,
@@ -103,27 +112,39 @@ def _apply_forwarded_request_headers(
     return session_id
 
 
-def _normalize_responses_prompt_cache_key(body: dict, session_id: str | None) -> None:
+def _extract_responses_affinity_key(
+    body: dict,
+    session_id: str | None,
+    client_request_id: str | None = None,
+) -> str | None:
     if not isinstance(body, dict):
-        return
+        if isinstance(session_id, str) and session_id.strip():
+            return session_id.strip()
+        if isinstance(client_request_id, str) and client_request_id.strip():
+            return client_request_id.strip()
+        return None
 
-    prompt_cache_key = None
+    affinity_key = None
     for key in ("prompt_cache_key", "promptCacheKey"):
         value = body.get(key)
         if isinstance(value, str):
             normalized = value.strip()
             if normalized:
-                prompt_cache_key = normalized
+                affinity_key = normalized
                 break
 
-    if prompt_cache_key is None and isinstance(session_id, str):
+    if affinity_key is None and isinstance(session_id, str):
         normalized_session_id = session_id.strip()
         if normalized_session_id:
-            prompt_cache_key = normalized_session_id
+            affinity_key = normalized_session_id
+    if affinity_key is None and isinstance(client_request_id, str):
+        normalized_client_request_id = client_request_id.strip()
+        if normalized_client_request_id:
+            affinity_key = normalized_client_request_id
 
     body.pop("promptCacheKey", None)
-    if prompt_cache_key is not None:
-        body["prompt_cache_key"] = prompt_cache_key
+    body.pop("prompt_cache_key", None)
+    return affinity_key
 
 
 def build_responses_headers_for_request(
@@ -137,7 +158,7 @@ def build_responses_headers_for_request(
     session_id_resolver=None,
     verdict_sink: dict | None = None,
 ) -> dict:
-    headers = build_copilot_headers(api_key)
+    headers = build_responses_copilot_headers(api_key)
     session_id = _apply_forwarded_request_headers(
         headers,
         request,
@@ -146,7 +167,10 @@ def build_responses_headers_for_request(
         forward_session_header=False,
         synthesize_client_request_id=False,
     )
-    _normalize_responses_prompt_cache_key(body, session_id)
+    client_request_id = request.headers.get("x-client-request-id")
+    affinity_key = _extract_responses_affinity_key(body, session_id, client_request_id)
+    headers.pop("x-client-request-id", None)
+    headers.pop("x-openai-subagent", None)
 
     had_input = "input" in body
     effective_input, initiator = initiator_policy.resolve_responses_input(
@@ -161,7 +185,7 @@ def build_responses_headers_for_request(
         body["input"] = effective_input
     headers["X-Initiator"] = initiator
     headers["x-interaction-type"] = _interaction_type_for_initiator(initiator)
-    headers.update(_responses_affinity_headers(initiator, session_id))
+    headers.update(_responses_affinity_headers(initiator, affinity_key))
 
     if has_vision_input(effective_input):
         headers["Copilot-Vision-Request"] = "true"

@@ -796,7 +796,7 @@ class ProxyRoutesTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 200)
 
-    def test_responses_route_preserves_body_cache_affinity_fields(self):
+    def test_responses_route_uses_body_cache_affinity_fields_locally(self):
         request = SimpleNamespace(
             url=SimpleNamespace(path="/v1/responses"),
             method="POST",
@@ -867,21 +867,87 @@ class ProxyRoutesTests(unittest.TestCase):
         self.assertIn("x-agent-task-id", forwarded_headers)
         self.assertNotIn("session_id", forwarded_headers)
         self.assertNotIn("x-client-request-id", forwarded_headers)
-        self.assertEqual(forwarded_body["sessionId"], "session-123")
-        self.assertEqual(forwarded_body["prompt_cache_key"], "cache-123")
+        self.assertNotIn("sessionId", forwarded_body)
+        self.assertNotIn("prompt_cache_key", forwarded_body)
         self.assertNotIn("promptCacheKey", forwarded_body)
-        self.assertEqual(forwarded_body["previous_response_id"], "resp_prev")
+        self.assertNotIn("previous_response_id", forwarded_body)
         self.assertEqual(forwarded_body["tools"], body["tools"])
         self.assertEqual(forwarded_body["include"], body["include"])
         self.assertTrue(forwarded_body["parallel_tool_calls"])
-        self.assertEqual(forwarded_body["tool_choice"], "auto")
+        self.assertNotIn("tool_choice", forwarded_body)
         self.assertFalse(forwarded_body["stream"])
         self.assertEqual(response.status_code, 200)
         response_payload = json.loads(response.body)
         self.assertEqual(response_payload["id"], "resp_123")
         self.assertEqual(response_payload["output"][0]["content"][0]["text"], "done")
 
-    def test_responses_route_strips_encrypted_reasoning_for_forked_context(self):
+    def test_responses_route_returns_encrypted_reasoning_to_codex(self):
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/responses"),
+            method="POST",
+            headers={},
+        )
+        body = {
+            "model": "gpt-5.5",
+            "include": ["reasoning.encrypted_content"],
+            "stream": False,
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "hello"}],
+                }
+            ],
+        }
+        upstream_payload = {
+            "id": "resp_123",
+            "object": "response",
+            "created_at": 123,
+            "model": "gpt-5.5",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "reasoning",
+                    "id": "rs_123",
+                    "summary": [{"type": "summary_text", "text": "thought"}],
+                    "encrypted_content": "fresh-upstream-ciphertext",
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "done"}],
+                },
+            ],
+            "output_text": "done",
+            "usage": {
+                "input_tokens": 24,
+                "input_tokens_details": {"cached_tokens": 20},
+                "output_tokens": 5,
+                "total_tokens": 29,
+            },
+        }
+        upstream = httpx.Response(
+            200,
+            json=upstream_payload,
+            headers={"content-type": "application/json"},
+        )
+
+        with (
+            mock.patch.object(proxy, "parse_json_request", mock.AsyncMock(return_value=body)),
+            mock.patch.object(auth, "get_api_key", return_value="test-key"),
+            mock.patch.object(auth, "get_api_base", return_value="https://example.invalid"),
+            mock.patch.object(proxy.model_routing_config_service, "resolve_target_model", return_value="gpt-5.5"),
+            mock.patch.object(proxy.usage_tracker, "start_event", return_value=None),
+            mock.patch.object(proxy.usage_tracker, "finish_event"),
+            mock.patch.object(proxy, "throttled_client_post", mock.AsyncMock(return_value=upstream)) as post,
+        ):
+            response = proxy.asyncio.run(proxy.responses(request))
+
+        self.assertEqual(post.await_args.kwargs["json"]["include"], ["reasoning.encrypted_content"])
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(json.loads(response.body), upstream_payload)
+
+    def test_responses_route_drops_reasoning_for_forked_context(self):
         request = SimpleNamespace(
             url=SimpleNamespace(path="/v1/responses"),
             method="POST",
@@ -949,16 +1015,169 @@ class ProxyRoutesTests(unittest.TestCase):
         forwarded_input = post.await_args.kwargs["json"]["input"]
         self.assertEqual(response.status_code, 200)
         self.assertNotIn("encrypted_content", json.dumps(forwarded_input))
-        self.assertEqual(
-            [item for item in forwarded_input if item.get("type") == "reasoning"],
-            [
+        self.assertEqual([item for item in forwarded_input if item.get("type") == "reasoning"], [])
+
+    def test_responses_route_strips_encrypted_reasoning_for_tool_history(self):
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/responses"),
+            method="POST",
+            headers={},
+        )
+        body = {
+            "model": "gpt-5.5",
+            "stream": False,
+            "input": [
+                {
+                    "type": "message",
+                    "role": "developer",
+                    "content": [{"type": "input_text", "text": "developer"}],
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "spawn helpers"}],
+                },
                 {
                     "type": "reasoning",
-                    "id": "rs_parent",
+                    "id": "rs_keep_summary",
                     "summary": [{"type": "summary_text", "text": "summary survives"}],
-                }
+                    "encrypted_content": "old-ciphertext",
+                },
+                {
+                    "type": "reasoning",
+                    "id": "rs_drop_empty",
+                    "encrypted_content": "ciphertext-only",
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "spawn_agent",
+                    "arguments": "{}",
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "agent id",
+                },
             ],
+        }
+        upstream = httpx.Response(
+            200,
+            json={
+                "id": "resp_123",
+                "model": "gpt-5.5",
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "done"}],
+                    }
+                ],
+            },
+            headers={"content-type": "application/json"},
         )
+
+        with (
+            mock.patch.object(proxy, "parse_json_request", mock.AsyncMock(return_value=body)),
+            mock.patch.object(auth, "get_api_key", return_value="test-key"),
+            mock.patch.object(auth, "get_api_base", return_value="https://example.invalid"),
+            mock.patch.object(proxy.model_routing_config_service, "resolve_target_model", return_value="gpt-5.5"),
+            mock.patch.object(proxy.usage_tracker, "start_event", return_value=None),
+            mock.patch.object(proxy.usage_tracker, "finish_event"),
+            mock.patch.object(proxy, "_append_request_trace") as append_trace,
+            mock.patch.object(proxy, "throttled_client_post", mock.AsyncMock(return_value=upstream)) as post,
+        ):
+            response = proxy.asyncio.run(proxy.responses(request))
+
+        forwarded_input = post.await_args.kwargs["json"]["input"]
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn("encrypted_content", json.dumps(forwarded_input))
+        self.assertEqual([item for item in forwarded_input if item.get("type") == "reasoning"], [])
+        request_started = next(
+            call.args[0]
+            for call in append_trace.call_args_list
+            if call.args and call.args[0].get("event") == "request_started"
+        )
+        sanitization = request_started["trace"]["responses_input_sanitization"]
+        self.assertEqual(sanitization["encrypted_content_preservation"], "disabled")
+        self.assertEqual(sanitization["encrypted_content_strip_reason"], "tool_history")
+        self.assertEqual(sanitization["encrypted_content_items_dropped"], 2)
+        self.assertTrue(sanitization["reasoning_items_dropped"])
+
+    def test_responses_route_traces_encrypted_reasoning_trim(self):
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/responses"),
+            method="POST",
+            headers={},
+        )
+        input_items = []
+        for index in range(10):
+            input_items.append(
+                {
+                    "type": "reasoning",
+                    "id": f"rs_{index}",
+                    "summary": [{"type": "summary_text", "text": f"summary {index}"}],
+                    "encrypted_content": f"ciphertext-{index}",
+                }
+            )
+        for index in range(40):
+            input_items.append(
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": f"turn {index}"}],
+                }
+            )
+        body = {
+            "model": "gpt-5.5",
+            "stream": False,
+            "input": input_items,
+        }
+        upstream = httpx.Response(
+            200,
+            json={
+                "id": "resp_123",
+                "model": "gpt-5.5",
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "done"}],
+                    }
+                ],
+            },
+            headers={"content-type": "application/json"},
+        )
+
+        with (
+            mock.patch.object(proxy, "parse_json_request", mock.AsyncMock(return_value=body)),
+            mock.patch.object(auth, "get_api_key", return_value="test-key"),
+            mock.patch.object(auth, "get_api_base", return_value="https://example.invalid"),
+            mock.patch.object(proxy.model_routing_config_service, "resolve_target_model", return_value="gpt-5.5"),
+            mock.patch.object(proxy.usage_tracker, "start_event", return_value=None),
+            mock.patch.object(proxy.usage_tracker, "finish_event"),
+            mock.patch.object(proxy, "_append_request_trace") as append_trace,
+            mock.patch.object(proxy, "throttled_client_post", mock.AsyncMock(return_value=upstream)) as post,
+        ):
+            response = proxy.asyncio.run(proxy.responses(request))
+
+        forwarded_input = post.await_args.kwargs["json"]["input"]
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(proxy._responses_input_encrypted_content_count(forwarded_input), 6)
+
+        request_started = next(
+            call.args[0]
+            for call in append_trace.call_args_list
+            if call.args and call.args[0].get("event") == "request_started"
+        )
+        sanitization = request_started["trace"]["responses_input_sanitization"]
+        self.assertEqual(sanitization["input_items_before"], 50)
+        self.assertEqual(sanitization["input_items_after"], 50)
+        self.assertEqual(sanitization["encrypted_content_items_before"], 10)
+        self.assertEqual(sanitization["encrypted_content_items_after"], 6)
+        self.assertEqual(sanitization["encrypted_content_items_dropped"], 4)
+        self.assertEqual(sanitization["encrypted_content_preservation"], "limited")
+        self.assertEqual(sanitization["encrypted_keep_last"], 6)
 
     def test_responses_route_strips_unsupported_image_generation_tool(self):
         request = SimpleNamespace(
@@ -1032,11 +1251,11 @@ class ProxyRoutesTests(unittest.TestCase):
                 }
             ],
         )
-        self.assertEqual(forwarded_body["tool_choice"], "auto")
+        self.assertNotIn("tool_choice", forwarded_body)
         self.assertTrue(forwarded_body["parallel_tool_calls"])
         self.assertEqual(response.status_code, 200)
 
-    def test_responses_compact_preserves_body_cache_affinity_fields(self):
+    def test_responses_compact_uses_body_cache_affinity_fields_locally(self):
         request = SimpleNamespace(
             url=SimpleNamespace(path="/v1/responses/compact"),
             method="POST",
@@ -1107,14 +1326,14 @@ class ProxyRoutesTests(unittest.TestCase):
         self.assertIn("x-agent-task-id", forwarded_headers)
         self.assertNotIn("session_id", forwarded_headers)
         self.assertNotIn("x-client-request-id", forwarded_headers)
-        self.assertEqual(forwarded_body["sessionId"], "session-123")
-        self.assertEqual(forwarded_body["prompt_cache_key"], "cache-123")
+        self.assertNotIn("sessionId", forwarded_body)
+        self.assertNotIn("prompt_cache_key", forwarded_body)
         self.assertNotIn("promptCacheKey", forwarded_body)
-        self.assertEqual(forwarded_body["previous_response_id"], "resp_prev")
+        self.assertNotIn("previous_response_id", forwarded_body)
         self.assertEqual(forwarded_body["tools"], body["tools"])
         self.assertEqual(forwarded_body["include"], body["include"])
         self.assertTrue(forwarded_body["parallel_tool_calls"])
-        self.assertEqual(forwarded_body["tool_choice"], "auto")
+        self.assertNotIn("tool_choice", forwarded_body)
         self.assertFalse(forwarded_body["stream"])
         self.assertEqual(response.status_code, 200)
         response_payload = json.loads(response.body)
