@@ -19,6 +19,28 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(util.month_key_for_source_row("claude", {"month": "2026-04"}), "2026-04")
         self.assertEqual(util.month_key_for_source_row("codex", {"month": "Apr 2026"}), "2026-04")
 
+    def test_chat_completions_uses_model_for_source(self):
+        self.assertEqual(
+            util._usage_event_source(
+                {
+                    "path": "/v1/chat/completions",
+                    "requested_model": "claude-sonnet-4.6",
+                    "resolved_model": "claude-sonnet-4.6",
+                }
+            ),
+            "claude",
+        )
+        self.assertEqual(
+            util._usage_event_source(
+                {
+                    "path": "/v1/chat/completions",
+                    "requested_model": "gpt-5.4",
+                    "resolved_model": "gpt-5.4",
+                }
+            ),
+            "codex",
+        )
+
     def test_build_dashboard_payload_combines_claude_and_codex(self):
         fixed_now = datetime(2026, 4, 4, 18, 0, tzinfo=timezone.utc)
         usage_events = [
@@ -30,7 +52,7 @@ class DashboardTests(unittest.TestCase):
                 "finished_at": "2026-04-04T17:51:00+00:00",
                 "resolved_model": "claude-sonnet-4.6",
                 "premium_requests": 1.0,
-                "path": "/v1/responses",
+                "path": "/v1/messages",
                 "usage": {
                     "input_tokens": 100,
                     "output_tokens": 20,

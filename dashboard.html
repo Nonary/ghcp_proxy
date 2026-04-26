@@ -6873,15 +6873,18 @@
           if (!row || typeof row !== 'object') return 'codex';
           const native = String(row.native_source || '').trim().toLowerCase();
           if (native) return native;
+          // Path identifies native protocol callers (Claude Code -> /v1/messages,
+          // Codex -> /v1/responses). Chat completions is shared, so let model
+          // fallback classify it.
+          const path = String(row.path || '');
+          if (path.endsWith('/messages')) return 'claude';
+          if (path.endsWith('/responses') || path.endsWith('/responses/compact')) return 'codex';
           const requested = String(row.requested_model || '').trim().toLowerCase();
           if (requested.startsWith('claude-')) return 'claude';
           if (requested.startsWith('gpt-')) return 'codex';
           const resolved = String(row.resolved_model || row.response_model || '').trim().toLowerCase();
           if (resolved.startsWith('claude-')) return 'claude';
           if (resolved.startsWith('gpt-')) return 'codex';
-          const path = String(row.path || '');
-          if (path.endsWith('/messages')) return 'claude';
-          if (path.endsWith('/responses') || path.endsWith('/chat/completions')) return 'codex';
           return 'codex';
         },
         // The "proxy" filter option is the legacy "anything that went through

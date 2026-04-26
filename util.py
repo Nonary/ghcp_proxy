@@ -448,8 +448,23 @@ def _usage_event_source(event: dict | None) -> str:
     if isinstance(native_source, str) and native_source.strip():
         return native_source.strip()
 
-    # Derive source from the originally requested model so that remapped
-    # requests (e.g. Codex -> Claude) keep their original source identity.
+    # The request path identifies the calling CLI/client for the native
+    # protocol routes: Claude Code calls /v1/messages; Codex calls
+    # /v1/responses. Model-name heuristics are unreliable there because a
+    # remapped request (or a Claude Code default-slot override that injects
+    # e.g. "gpt-..." as the requested model) would otherwise misattribute the
+    # source to the *target* family. Chat completions is intentionally left to
+    # model fallback because it is a shared non-Codex route.
+    path = str(event.get("path") or "")
+    if path.endswith("/messages"):
+        return "claude"
+    if path.endswith("/responses") or path.endswith("/responses/compact"):
+        return "codex"
+
+    # Fall back to model-name heuristics only when path is unavailable
+    # (e.g. archived/ingested events without a recorded path). Prefer
+    # requested_model over resolved_model so remapped requests still
+    # attribute to the original source family.
     requested = _normalize_model_name(event.get("requested_model"))
     if isinstance(requested, str):
         if requested.startswith("claude-"):
@@ -457,7 +472,6 @@ def _usage_event_source(event: dict | None) -> str:
         if requested.startswith("gpt-"):
             return "codex"
 
-    # Fall back to the resolved/response model when no requested_model exists.
     model_name = _usage_event_model_name(event)
     if isinstance(model_name, str):
         if model_name.startswith("claude-"):
@@ -465,11 +479,6 @@ def _usage_event_source(event: dict | None) -> str:
         if model_name.startswith("gpt-"):
             return "codex"
 
-    path = str(event.get("path") or "")
-    if path.endswith("/messages"):
-        return "claude"
-    if path.endswith("/responses") or path.endswith("/responses/compact") or path.endswith("/chat/completions"):
-        return "codex"
     return "codex"
 
 # ---------------------------------------------------------------------------
