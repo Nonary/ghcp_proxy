@@ -213,8 +213,6 @@ def request_body_session_id(request_body: dict | None = None) -> str | None:
                     user_id_payload = json.loads(normalized)
                 except json.JSONDecodeError:
                     user_id_payload = None
-                if user_id_payload is None:
-                    return normalized
         elif isinstance(user_id, dict):
             user_id_payload = user_id
         if isinstance(user_id_payload, dict):
@@ -1109,19 +1107,14 @@ class UsageTracker:
                     ("x-request-id", "request-id", "x-github-request-id", "session_id", "session-id"),
                 )
             else:
+                uses_messages_affinity_headers = _is_messages_api_path(outbound_path)
                 if session_id:
                     outbound_headers["session_id"] = session_id
-                    outbound_headers["x-interaction-id"] = session_id
+                    if not uses_messages_affinity_headers or not outbound_headers.get("x-interaction-id"):
+                        outbound_headers["x-interaction-id"] = session_id
                 outbound_headers["x-request-id"] = server_request_id
                 outbound_headers["x-github-request-id"] = server_request_id
-                # Native Anthropic Messages uses x-agent-task-id as cache
-                # affinity. The header builder sets a stable per-session value;
-                # do not replace it with this proxy's per-request server id.
-                if (
-                    not _is_messages_api_path(outbound_path)
-                    or not outbound_headers.get("x-agent-task-id")
-                ):
-                    outbound_headers["x-agent-task-id"] = server_request_id
+                outbound_headers["x-agent-task-id"] = server_request_id
         started_at = utc_now_iso()
         event = {
             "request_id": event_request_id,

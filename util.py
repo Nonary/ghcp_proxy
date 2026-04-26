@@ -188,6 +188,18 @@ def normalize_usage_payload(usage: dict | None) -> dict | None:
         normalized["fresh_input_tokens"] = _coerce_int(fresh_input_tokens, default=0)
     elif cached_tokens_from_raw_details and normalized_cached_tokens > 0:
         normalized["fresh_input_tokens"] = max(0, normalized_input_tokens - normalized_cached_tokens)
+    pricing_fresh_input_tokens = usage.get("pricing_fresh_input_tokens")
+    if pricing_fresh_input_tokens is not None:
+        normalized["pricing_fresh_input_tokens"] = _coerce_int(pricing_fresh_input_tokens, default=0)
+    pricing_cached_input_tokens = usage.get("pricing_cached_input_tokens")
+    if pricing_cached_input_tokens is not None:
+        normalized["pricing_cached_input_tokens"] = _coerce_int(pricing_cached_input_tokens, default=0)
+    pricing_cache_creation_input_tokens = usage.get("pricing_cache_creation_input_tokens")
+    if pricing_cache_creation_input_tokens is not None:
+        normalized["pricing_cache_creation_input_tokens"] = _coerce_int(
+            pricing_cache_creation_input_tokens,
+            default=0,
+        )
     return normalized
 
 
@@ -494,17 +506,23 @@ def _usage_event_cost_breakdown(model_name: str | None, usage: dict | None) -> d
     if not isinstance(entry, dict):
         return breakdown
 
-    fresh_input_tokens = usage.get("fresh_input_tokens")
+    fresh_input_tokens = usage.get("pricing_fresh_input_tokens")
+    if fresh_input_tokens is None:
+        fresh_input_tokens = usage.get("fresh_input_tokens")
     if fresh_input_tokens is None:
         fresh_input_tokens = usage.get("billable_input_tokens")
     input_tokens = _coerce_int(
         fresh_input_tokens if fresh_input_tokens is not None else usage.get("input_tokens")
     )
     output_tokens = _coerce_int(usage.get("output_tokens"))
-    cached_input_tokens = _coerce_int(usage.get("cached_input_tokens"))
-    if cached_input_tokens == 0 and usage.get("cache_read_input_tokens") is not None:
-        cached_input_tokens = _coerce_int(usage.get("cache_read_input_tokens"))
-    cache_creation_input_tokens = _coerce_int(usage.get("cache_creation_input_tokens"))
+    cached_input_tokens = _coerce_int(usage.get("pricing_cached_input_tokens"), default=None)
+    if cached_input_tokens is None:
+        cached_input_tokens = _coerce_int(usage.get("cached_input_tokens"))
+        if cached_input_tokens == 0 and usage.get("cache_read_input_tokens") is not None:
+            cached_input_tokens = _coerce_int(usage.get("cache_read_input_tokens"))
+    cache_creation_input_tokens = _coerce_int(usage.get("pricing_cache_creation_input_tokens"), default=None)
+    if cache_creation_input_tokens is None:
+        cache_creation_input_tokens = _coerce_int(usage.get("cache_creation_input_tokens"))
     reasoning_output_tokens = _coerce_int(usage.get("reasoning_output_tokens"))
 
     input_rate = _coerce_float(entry.get("input_per_million"))

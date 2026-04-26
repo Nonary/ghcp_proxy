@@ -14,8 +14,6 @@ from constants import (
 _CLIENT_SESSION_ID = str(uuid.uuid4())
 _RESPONSES_AFFINITY_BY_SESSION: dict[str, dict[str, str]] = {}
 _RESPONSES_DEFAULT_AFFINITY: dict[str, str] | None = None
-_MESSAGES_AFFINITY_BY_SESSION: dict[str, dict[str, str]] = {}
-_MESSAGES_DEFAULT_AFFINITY: dict[str, str] | None = None
 
 
 def has_vision_input(value, depth=0, max_depth=10) -> bool:
@@ -69,18 +67,16 @@ def _responses_affinity_headers(initiator: str, session_id: str | None, *, reset
 
 
 def _messages_affinity_headers(initiator: str, interaction_id: str | None, request_id: str) -> dict[str, str]:
-    """Return stable native Messages affinity headers for a session.
+    """Return native Messages affinity headers for a request.
 
     Copilot's native Anthropic /v1/messages endpoint keys prompt-cache lineage
-    off both the body cache breakpoints and the request affinity headers. Using
-    a fresh per-request id (or rotating on every user turn) prevents upstream
-    from linking those breakpoints to the previously-cached prefix. Unlike the
-    Responses API there is no body-level ``prompt_cache_key`` we can pivot on,
-    so the affinity must remain stable for the entire session — including
-    across user-initiated turns — for cached_input_tokens to grow.
+    off the body cache breakpoints and request affinity headers. Keep the
+    conversation interaction stable when Claude Code supplies a real session
+    id, but leave the agent task request-scoped. Making both values stable
+    over-affinitizes separate internal requests and can make cache reads look
+    like one giant task-wide prefix.
     """
-    global _MESSAGES_DEFAULT_AFFINITY
-    del initiator, request_id  # affinity is per-session, not per-turn or per-request.
+    del initiator
 
     if isinstance(interaction_id, str):
         normalized = interaction_id.strip()
@@ -88,21 +84,9 @@ def _messages_affinity_headers(initiator: str, interaction_id: str | None, reque
         normalized = ""
 
     if normalized:
-        entry = _MESSAGES_AFFINITY_BY_SESSION.get(normalized)
-        if entry is None:
-            entry = {
-                "x-interaction-id": normalized,
-                "x-agent-task-id": str(uuid.uuid4()),
-            }
-            _MESSAGES_AFFINITY_BY_SESSION[normalized] = entry
-        return entry
+        return {"x-interaction-id": normalized}
 
-    if _MESSAGES_DEFAULT_AFFINITY is None:
-        _MESSAGES_DEFAULT_AFFINITY = {
-            "x-interaction-id": str(uuid.uuid4()),
-            "x-agent-task-id": str(uuid.uuid4()),
-        }
-    return _MESSAGES_DEFAULT_AFFINITY
+    return {"x-interaction-id": request_id}
 
 
 def build_copilot_headers(api_key: str) -> dict:

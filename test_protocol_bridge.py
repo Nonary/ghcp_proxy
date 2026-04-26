@@ -499,7 +499,7 @@ class NativeMessagesBridgeTests(unittest.TestCase):
         self.assertEqual(plan.caller_protocol, "anthropic")
         self.assertEqual(plan.upstream_body["model"], "claude-sonnet-4.6")
 
-    def test_messages_to_messages_expands_cache_breakpoints(self):
+    def test_messages_to_messages_preserves_native_cache_markers_without_expansion(self):
         planner = self._planner("claude-sonnet-4.6", supports=True)
         body = {
             "model": "claude-sonnet-4.6",
@@ -530,13 +530,9 @@ class NativeMessagesBridgeTests(unittest.TestCase):
         )
 
         self.assertEqual(plan.strategy_name, "messages_to_messages")
-        self.assertIsInstance(plan.upstream_body["system"], list)
-        self.assertEqual(plan.upstream_body["system"][0]["cache_control"], {"type": "ephemeral"})
-        self.assertEqual(plan.upstream_body["tools"][0]["cache_control"], {"type": "ephemeral"})
-        self.assertEqual(
-            plan.upstream_body["messages"][-2]["content"][-1]["cache_control"],
-            {"type": "ephemeral"},
-        )
+        self.assertEqual(plan.upstream_body["system"], "system prompt")
+        self.assertNotIn("cache_control", plan.upstream_body["tools"][0])
+        self.assertNotIn("cache_control", plan.upstream_body["messages"][-2]["content"][-1])
         merged_result = plan.upstream_body["messages"][-1]["content"][0]
         self.assertEqual(merged_result["type"], "tool_result")
         self.assertEqual(merged_result["cache_control"], {"type": "ephemeral"})

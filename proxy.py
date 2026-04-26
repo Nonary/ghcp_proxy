@@ -795,6 +795,82 @@ def _append_request_trace(payload: dict, *, force: bool = False) -> None:
         print(f"Warning: failed to write request trace log: {exc}", file=sys.stderr, flush=True)
 
 
+def _anthropic_messages_usage_for_tracking(usage: dict | None) -> dict | None:
+    """Internal accounting shape for Anthropic Messages prompt-cache usage.
+
+    Anthropic reports ``input_tokens`` as fresh non-cache-read input, then
+    reports cache reads/writes separately. Persist non-cache-read input while
+    preserving visible cache buckets, and keep pricing-only counters for cost
+    calculation so the display shape cannot double-charge cache usage.
+    """
+    if not isinstance(usage, dict):
+        return None
+    raw_input = util._coerce_int(usage.get("input_tokens"), default=0)
+    cache_read = util._coerce_int(usage.get("cache_read_input_tokens"), default=None)
+    if cache_read is None:
+        cache_read = util._coerce_int(usage.get("cached_input_tokens"), default=0)
+    cache_creation = util._coerce_int(usage.get("cache_creation_input_tokens"), default=0)
+    non_cache_read_input = raw_input + cache_creation
+    tracked = dict(usage)
+    tracked["input_tokens"] = non_cache_read_input
+    tracked["cached_input_tokens"] = cache_read
+    tracked["cache_read_input_tokens"] = cache_read
+    tracked["cache_creation_input_tokens"] = cache_creation
+    tracked.pop("fresh_input_tokens", None)
+    tracked["pricing_fresh_input_tokens"] = raw_input
+    tracked["pricing_cached_input_tokens"] = cache_read
+    tracked["pricing_cache_creation_input_tokens"] = cache_creation
+    cache_creation_detail = tracked.get("cache_creation")
+    if isinstance(cache_creation_detail, dict):
+        tracked["cache_creation"] = dict(cache_creation_detail)
+    output_tokens = util._coerce_int(usage.get("output_tokens"), default=None)
+    if output_tokens is not None:
+        tracked["total_tokens"] = non_cache_read_input + output_tokens
+    return tracked
+
+
+def _anthropic_messages_usage_for_client(usage: dict | None) -> tuple[dict | None, bool]:
+    """Return client-visible Anthropic usage with cache reads kept separate.
+
+    Anthropic's raw Messages usage reports cache writes separately from
+    ``input_tokens`` and cache reads under ``cache_read_input_tokens``. Claude
+    Code's aggregate usage display treats cache fields as separate buckets, so
+    ``input_tokens`` should exclude cache reads while still including cache
+    writes. Internal tracking keeps separate ``pricing_*`` counters for cost.
+    """
+    if not isinstance(usage, dict):
+        return None, False
+    raw_input = util._coerce_int(usage.get("input_tokens"), default=0)
+    cache_read = util._coerce_int(usage.get("cache_read_input_tokens"), default=None)
+    if cache_read is None:
+        cache_read = util._coerce_int(usage.get("cached_input_tokens"), default=0)
+    cache_creation = util._coerce_int(usage.get("cache_creation_input_tokens"), default=0)
+    non_cache_read_input = raw_input + cache_creation
+    if non_cache_read_input == raw_input and cache_read == 0:
+        return usage, False
+    client_usage = dict(usage)
+    client_usage["input_tokens"] = non_cache_read_input
+    client_usage["cache_read_input_tokens"] = cache_read
+    client_usage["cache_creation_input_tokens"] = cache_creation
+    client_usage["cached_input_tokens"] = cache_read
+    output_tokens = util._coerce_int(usage.get("output_tokens"), default=None)
+    if output_tokens is not None:
+        client_usage["total_tokens"] = client_usage["input_tokens"] + output_tokens
+    return client_usage, True
+
+
+def _anthropic_messages_payload_for_client(payload: dict | None) -> tuple[dict | None, bool]:
+    if not isinstance(payload, dict):
+        return payload, False
+    usage = payload.get("usage")
+    client_usage, changed = _anthropic_messages_usage_for_client(usage)
+    if not changed:
+        return payload, False
+    client_payload = dict(payload)
+    client_payload["usage"] = client_usage
+    return client_payload, True
+
+
 def _enforce_trace_retention_locked(trace_path: str) -> None:
     """Keep the trace log bounded at ``REQUEST_TRACE_HISTORY_LIMIT`` rows.
 
@@ -1270,8 +1346,7 @@ def _build_anthropic_messages_passthrough_headers(
         model=bridge_plan.resolved_model or "",
     )
 
-    interaction_id = usage_tracking.request_session_id(
-        request,
+    interaction_id = usage_tracking.request_body_session_id(
         original_body if isinstance(original_body, dict) else None,
     )
     headers = _request_headers_module.build_anthropic_messages_passthrough_headers(
@@ -1400,8 +1475,7 @@ def _translate_bridge_success_payload(bridge_plan: BridgeExecutionPlan, payload:
     if bridge_plan.caller_protocol == "anthropic" and bridge_plan.upstream_protocol == "chat":
         return format_translation.chat_completion_to_anthropic(payload, fallback_model=bridge_plan.resolved_model)
     if bridge_plan.caller_protocol == "anthropic" and bridge_plan.upstream_protocol == "messages":
-        # Native Anthropic passthrough: strip any internal-only fields
-        # (none defined yet) and return upstream payload as-is.
+        # Native Anthropic passthrough: return upstream payload as-is.
         return payload
     if bridge_plan.caller_protocol == "responses" and bridge_plan.upstream_protocol == "messages":
         return format_translation.anthropic_response_to_responses(
@@ -1495,6 +1569,8 @@ async def _post_bridge_non_streaming_request(plan: UpstreamRequestPlan, bridge_p
         return error_response(502, message)
 
     translated_payload = _translate_bridge_success_payload(bridge_plan, upstream_payload)
+    if bridge_plan.caller_protocol == "anthropic" and bridge_plan.upstream_protocol == "messages":
+        translated_payload, _ = _anthropic_messages_payload_for_client(translated_payload)
     _finish_usage_and_trace(
         plan,
         upstream.status_code,
@@ -1505,6 +1581,13 @@ async def _post_bridge_non_streaming_request(plan: UpstreamRequestPlan, bridge_p
             if bridge_plan.caller_protocol == "responses"
             else util.extract_item_text(translated_payload.get("content", [{}])[0])
             if isinstance(translated_payload.get("content"), list)
+            else None
+        ),
+        usage=(
+            _anthropic_messages_usage_for_tracking(upstream_payload.get("usage"))
+            if bridge_plan.caller_protocol == "anthropic"
+            and bridge_plan.upstream_protocol == "messages"
+            and isinstance(upstream_payload.get("usage"), dict)
             else None
         ),
     )
@@ -1865,9 +1948,13 @@ async def proxy_anthropic_passthrough_streaming_response(
     usage_event: dict | None = None,
     trace_plan: UpstreamRequestPlan | None = None,
 ) -> Response:
-    """Re-emit upstream Anthropic /v1/messages SSE bytes verbatim to the
-    client, while parsing message_start / message_delta usage so we can still
-    report token counts to the dashboard."""
+    """Re-emit upstream Anthropic /v1/messages SSE to the client.
+
+    The event payloads are otherwise passed through, but usage is normalized so
+    cache writes are reflected in ``input_tokens`` for Claude Code's aggregate
+    usage display. We still parse message_start / message_delta usage for the
+    local dashboard.
+    """
     del fallback_model  # unused; kept for signature symmetry with siblings.
 
     client = httpx.AsyncClient(timeout=timeout)
@@ -1925,10 +2012,6 @@ async def proxy_anthropic_passthrough_streaming_response(
                 return int(value)
             return None
 
-        input_tokens = read_int("input_tokens")
-        if input_tokens is not None:
-            usage_state["input_tokens"] = input_tokens
-
         output_tokens = read_int("output_tokens")
         if output_tokens is not None:
             usage_state["output_tokens"] = output_tokens
@@ -1937,20 +2020,26 @@ async def proxy_anthropic_passthrough_streaming_response(
         if cache_read is None:
             cache_read = read_int("cached_input_tokens")
         if cache_read is not None:
+            usage_state["pricing_cached_input_tokens"] = cache_read
             usage_state["cached_input_tokens"] = cache_read
+            usage_state["cache_read_input_tokens"] = cache_read
 
         cache_creation = read_int("cache_creation_input_tokens")
         if cache_creation is not None:
+            usage_state["pricing_cache_creation_input_tokens"] = cache_creation
             usage_state["cache_creation_input_tokens"] = cache_creation
 
-        total_tokens = read_int("total_tokens")
-        if total_tokens is not None:
-            usage_state["total_tokens"] = total_tokens
-        else:
-            usage_state["total_tokens"] = (
-                int(usage_state.get("input_tokens", 0) or 0)
-                + int(usage_state.get("output_tokens", 0) or 0)
-            )
+        input_tokens = read_int("input_tokens")
+        if input_tokens is not None:
+            usage_state["pricing_fresh_input_tokens"] = input_tokens
+
+        pricing_fresh = int(usage_state.get("pricing_fresh_input_tokens", 0) or 0)
+        pricing_cache_creation = int(usage_state.get("pricing_cache_creation_input_tokens", 0) or 0)
+        usage_state["input_tokens"] = pricing_fresh + pricing_cache_creation
+        usage_state["total_tokens"] = (
+            int(usage_state.get("input_tokens", 0) or 0)
+            + int(usage_state.get("output_tokens", 0) or 0)
+        )
 
     async def stream_passthrough():
         usage_state: dict = {
@@ -1958,44 +2047,66 @@ async def proxy_anthropic_passthrough_streaming_response(
             "output_tokens": 0,
             "total_tokens": 0,
             "cached_input_tokens": 0,
+            "cache_read_input_tokens": 0,
             "cache_creation_input_tokens": 0,
+            "pricing_fresh_input_tokens": 0,
+            "pricing_cached_input_tokens": 0,
+            "pricing_cache_creation_input_tokens": 0,
         }
         first_output_marked = False
         buffer = ""
         try:
             async for chunk in _stream_with_update_notice(upstream.aiter_bytes(), "anthropic", getattr(upstream, "headers", None)):
-                if chunk:
-                    yield chunk
-                    try:
-                        text = chunk.decode("utf-8", errors="replace")
-                    except Exception:
-                        text = ""
-                    buffer += text
-                    normalized = buffer.replace("\r\n", "\n")
-                    while "\n\n" in normalized:
-                        raw_block, normalized = normalized.split("\n\n", 1)
-                        event_name, data = format_translation.parse_sse_block(raw_block)
-                        if not data:
-                            continue
+                if not chunk:
+                    continue
+                try:
+                    text = chunk.decode("utf-8", errors="replace")
+                except Exception:
+                    text = ""
+                buffer += text
+                normalized = buffer.replace("\r\n", "\n")
+                while "\n\n" in normalized:
+                    raw_block, normalized = normalized.split("\n\n", 1)
+                    event_name, data = format_translation.parse_sse_block(raw_block)
+                    emit_block = (raw_block + "\n\n").encode("utf-8")
+                    if data:
                         try:
                             payload = json.loads(data)
                         except json.JSONDecodeError:
-                            continue
+                            payload = None
                         evt = (event_name or payload.get("type") if isinstance(payload, dict) else event_name) or ""
                         evt = str(evt).lower()
+                        client_payload = payload
+                        client_usage_changed = False
                         if evt == "message_start" and isinstance(payload, dict):
                             message = payload.get("message")
                             if isinstance(message, dict) and isinstance(message.get("usage"), dict):
-                                merge_anthropic_usage(usage_state, message["usage"])
+                                raw_usage = message["usage"]
+                                merge_anthropic_usage(usage_state, raw_usage)
+                                client_usage, client_usage_changed = _anthropic_messages_usage_for_client(raw_usage)
+                                if client_usage_changed:
+                                    client_payload = dict(payload)
+                                    client_message = dict(message)
+                                    client_message["usage"] = client_usage
+                                    client_payload["message"] = client_message
                         elif evt == "message_delta" and isinstance(payload, dict):
                             u = payload.get("usage")
                             if isinstance(u, dict):
                                 merge_anthropic_usage(usage_state, u)
+                                client_usage, client_usage_changed = _anthropic_messages_usage_for_client(u)
+                                if client_usage_changed:
+                                    client_payload = dict(payload)
+                                    client_payload["usage"] = client_usage
                         elif evt in ("content_block_delta", "content_block_start"):
                             if not first_output_marked:
                                 first_output_marked = True
                                 usage_tracker.mark_first_output(usage_event)
-                    buffer = normalized
+                        if client_usage_changed and isinstance(client_payload, dict):
+                            emit_block = format_translation.sse_encode(event_name or evt, client_payload)
+                    yield emit_block
+                buffer = normalized
+            if buffer:
+                yield buffer.encode("utf-8")
         finally:
             _finish_usage_and_trace(
                 trace_plan,

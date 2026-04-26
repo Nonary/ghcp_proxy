@@ -466,7 +466,7 @@ class UsageTrackingTests(unittest.TestCase):
         self.assertEqual(event["session_id_origin"], "request")
         self.assertEqual(outbound_headers["session_id"], "claude-session")
 
-    def test_start_usage_event_uses_plain_claude_metadata_user_id_as_session_id(self):
+    def test_start_usage_event_ignores_plain_claude_metadata_user_id_as_session_id(self):
         tracker = self._make_usage_tracker()
         request = SimpleNamespace(
             url=SimpleNamespace(path="/v1/messages"),
@@ -484,9 +484,9 @@ class UsageTrackingTests(unittest.TestCase):
             outbound_headers=outbound_headers,
         )
 
-        self.assertEqual(event["session_id"], "plain-claude-session")
-        self.assertEqual(event["session_id_origin"], "request")
-        self.assertEqual(outbound_headers["session_id"], "plain-claude-session")
+        self.assertEqual(event["session_id"], event["request_id"])
+        self.assertEqual(event["session_id_origin"], "request_id")
+        self.assertEqual(outbound_headers["session_id"], event["request_id"])
 
     def test_start_usage_event_uses_metadata_session_id(self):
         tracker = self._make_usage_tracker()
@@ -904,10 +904,36 @@ class UsageTrackingTests(unittest.TestCase):
             outbound_headers=outbound_headers,
         )
 
-        self.assertEqual(outbound_headers["x-agent-task-id"], "stable-task")
+        self.assertEqual(outbound_headers["x-agent-task-id"], event["server_request_id"])
         self.assertEqual(outbound_headers["x-request-id"], event["server_request_id"])
         self.assertEqual(outbound_headers["x-github-request-id"], event["server_request_id"])
         self.assertEqual(outbound_headers["x-interaction-id"], "claude-session")
+
+    def test_start_usage_event_preserves_native_messages_interaction_affinity(self):
+        tracker = self._make_usage_tracker()
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/messages"),
+            method="POST",
+            headers={"x-claude-code-session-id": "broad-claude-session"},
+        )
+        outbound_headers = {
+            "x-interaction-id": "request-scoped-interaction",
+            "x-agent-task-id": "request-scoped-task",
+        }
+
+        event = tracker.start_event(
+            request,
+            requested_model="claude-sonnet-4.6",
+            resolved_model="claude-sonnet-4.6",
+            initiator="user",
+            upstream_path="/v1/messages",
+            outbound_headers=outbound_headers,
+        )
+
+        self.assertEqual(outbound_headers["session_id"], "broad-claude-session")
+        self.assertEqual(outbound_headers["x-interaction-id"], "request-scoped-interaction")
+        self.assertEqual(outbound_headers["x-agent-task-id"], event["server_request_id"])
+        self.assertEqual(outbound_headers["x-request-id"], event["server_request_id"])
 
     def test_finish_usage_event_tracks_usage_and_timing(self):
         tracker = self._make_usage_tracker()
@@ -1032,6 +1058,35 @@ class UsageTrackingTests(unittest.TestCase):
 
         finished = tracker.snapshot_usage_events()[0]
         self.assertAlmostEqual(finished["cost_usd"], 17.75)
+
+    def test_finish_usage_event_cost_uses_pricing_cache_fields(self):
+        tracker = self._make_usage_tracker()
+        log_path = self._make_usage_log_path()
+        event = {
+            "request_id": "req-999",
+            "resolved_model": "claude-sonnet-4.6",
+        }
+        usage = {
+            "input_tokens": 2_000_000,
+            "output_tokens": 1_000_000,
+            "cached_input_tokens": 1_000_000,
+            "cache_creation_input_tokens": 1_000_000,
+            "pricing_fresh_input_tokens": 1_000_000,
+            "pricing_cached_input_tokens": 1_000_000,
+            "pricing_cache_creation_input_tokens": 1_000_000,
+        }
+
+        tracker.usage_log_file = str(log_path)
+        tracker.finish_event(event, 200, usage=usage)
+
+        finished = tracker.snapshot_usage_events()[0]
+        self.assertEqual(finished["usage"]["input_tokens"], 2_000_000)
+        self.assertEqual(finished["usage"]["cached_input_tokens"], 1_000_000)
+        self.assertEqual(finished["usage"]["cache_creation_input_tokens"], 1_000_000)
+        self.assertEqual(finished["usage"]["pricing_fresh_input_tokens"], 1_000_000)
+        self.assertEqual(finished["usage"]["pricing_cached_input_tokens"], 1_000_000)
+        self.assertEqual(finished["usage"]["pricing_cache_creation_input_tokens"], 1_000_000)
+        self.assertAlmostEqual(finished["cost_usd"], 22.05)
 
     def test_sse_usage_capture_extracts_token_usage(self):
         tracker = self._make_usage_tracker()
@@ -1259,9 +1314,3 @@ class UsageTrackingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
-
-
-
-
-

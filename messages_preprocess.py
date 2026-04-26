@@ -851,7 +851,6 @@ def prepare_messages_passthrough_payload(
     strip_tool_reference_turn_boundary(cleaned)
     merge_tool_result_with_reminder(cleaned, skip_last_message=bool(is_compact))
     strip_cache_control_scope(cleaned)
-    apply_prompt_cache_breakpoints(cleaned)
     filter_assistant_thinking_placeholders(cleaned)
     apply_adaptive_thinking(
         cleaned,

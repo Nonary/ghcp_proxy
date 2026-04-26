@@ -1655,6 +1655,7 @@ class AnthropicMessagesPassthroughRouteTests(unittest.TestCase):
         )
         body = {
             "model": "claude-sonnet-4.6",
+            "metadata": {"user_id": '{"session_id":"claude-session-1"}'},
             "system": "system prompt",
             "messages": [
                 {
@@ -1679,7 +1680,12 @@ class AnthropicMessagesPassthroughRouteTests(unittest.TestCase):
                 "model": "claude-sonnet-4.6",
                 "content": [{"type": "text", "text": "ok"}],
                 "stop_reason": "end_turn",
-                "usage": {"input_tokens": 5, "output_tokens": 1},
+                "usage": {
+                    "input_tokens": 5,
+                    "output_tokens": 1,
+                    "cache_creation_input_tokens": 42,
+                    "cache_read_input_tokens": 100,
+                },
             },
             headers={"content-type": "application/json"},
         )
@@ -1700,10 +1706,15 @@ class AnthropicMessagesPassthroughRouteTests(unittest.TestCase):
         self.assertEqual(sent_headers["x-interaction-id"], "claude-session-1")
         self.assertIn("x-agent-task-id", sent_headers)
         self.assertIn("x-request-id", sent_headers)
+        self.assertEqual(sent_headers["x-agent-task-id"], sent_headers["x-request-id"])
+        self.assertNotEqual(sent_headers["x-agent-task-id"], sent_headers["x-interaction-id"])
         sent_body = post.await_args.kwargs["json"]
-        self.assertIsInstance(sent_body["system"], list)
-        self.assertEqual(sent_body["system"][0]["cache_control"], {"type": "ephemeral"})
+        self.assertEqual(sent_body["system"], "system prompt")
         self.assertEqual(sent_body["messages"][-1]["content"][-1]["cache_control"], {"type": "ephemeral"})
+        payload = json.loads(response.body)
+        self.assertEqual(payload["usage"]["input_tokens"], 47)
+        self.assertEqual(payload["usage"]["cache_creation_input_tokens"], 42)
+        self.assertEqual(payload["usage"]["cache_read_input_tokens"], 100)
 
     def test_messages_route_uses_messages_passthrough_upstream(self):
         request = self._messages_request()
@@ -1837,12 +1848,19 @@ class AnthropicMessagesPassthroughRouteTests(unittest.TestCase):
         body, finish_usage = proxy.asyncio.run(run_stream())
 
         self.assertIn(b"cache_read_input_tokens", body)
+        self.assertIn(b'"input_tokens":1242', body)
+        self.assertIn(b'"cache_read_input_tokens":125000', body)
+        self.assertIn(b'"cache_creation_input_tokens":42', body)
+        self.assertNotIn(b'"input_tokens":1200', body)
         finish_usage.assert_called_once()
         usage = finish_usage.call_args.kwargs["usage"]
-        self.assertEqual(usage["input_tokens"], 1200)
+        self.assertEqual(usage["input_tokens"], 1242)
         self.assertEqual(usage["output_tokens"], 321)
         self.assertEqual(usage["cached_input_tokens"], 125000)
         self.assertEqual(usage["cache_creation_input_tokens"], 42)
+        self.assertEqual(usage["pricing_fresh_input_tokens"], 1200)
+        self.assertEqual(usage["pricing_cached_input_tokens"], 125000)
+        self.assertEqual(usage["pricing_cache_creation_input_tokens"], 42)
 
     def test_responses_route_to_messages_translates_back_to_responses(self):
         request = SimpleNamespace(

@@ -823,7 +823,7 @@ class RequestHeadersTests(unittest.TestCase):
         self.assertEqual(first_headers["x-interaction-id"], second_headers["x-interaction-id"])
         self.assertEqual(first_headers["x-agent-task-id"], second_headers["x-agent-task-id"])
 
-    def test_build_responses_headers_for_request_uses_plain_metadata_user_id_as_affinity(self):
+    def test_build_responses_headers_for_request_ignores_plain_metadata_user_id_as_affinity(self):
         request = SimpleNamespace(headers={}, url=SimpleNamespace(path="/v1/messages"))
         first_body = {
             "model": "gpt-5.4",
@@ -852,6 +852,8 @@ class RequestHeadersTests(unittest.TestCase):
             affinity_body=original_body,
         )
 
+        self.assertNotEqual(first_headers["x-interaction-id"], "plain-claude-session")
+        self.assertNotEqual(first_headers["x-agent-task-id"], "plain-claude-session")
         self.assertEqual(first_headers["x-interaction-id"], second_headers["x-interaction-id"])
         self.assertEqual(first_headers["x-agent-task-id"], second_headers["x-agent-task-id"])
 
@@ -999,7 +1001,7 @@ class BuildAnthropicMessagesPassthroughHeadersTests(unittest.TestCase):
             ],
             base_headers=base,
         )
-        self.assertNotEqual(headers["x-agent-task-id"], "req-123")
+        self.assertEqual(headers["x-agent-task-id"], "req-123")
         self.assertEqual(headers["x-request-id"], "req-123")
         self.assertEqual(headers["x-interaction-type"], "messages-proxy")
         self.assertEqual(headers["openai-intent"], "messages-proxy")
@@ -1048,8 +1050,9 @@ class BuildAnthropicMessagesPassthroughHeadersTests(unittest.TestCase):
         self.assertEqual(first["x-interaction-id"], "session-1")
         self.assertEqual(second["x-interaction-id"], "session-1")
         self.assertEqual(third["x-interaction-id"], "session-1")
-        self.assertEqual(first["x-agent-task-id"], second["x-agent-task-id"])
-        self.assertEqual(second["x-agent-task-id"], third["x-agent-task-id"])
+        self.assertEqual(first["x-agent-task-id"], "req-1")
+        self.assertEqual(second["x-agent-task-id"], "req-2")
+        self.assertEqual(third["x-agent-task-id"], "req-3")
         self.assertEqual(first["x-request-id"], "req-1")
         self.assertEqual(second["x-request-id"], "req-2")
         self.assertEqual(third["x-request-id"], "req-3")
@@ -1067,3 +1070,28 @@ class BuildAnthropicMessagesPassthroughHeadersTests(unittest.TestCase):
         self.assertIn("x-interaction-id", headers)
         self.assertNotIn("copilot-integration-id", headers)
         self.assertEqual(headers["x-initiator"], "user")
+        self.assertEqual(headers["x-interaction-id"], "r")
+        self.assertEqual(headers["x-agent-task-id"], "r")
+
+    def test_without_messages_interaction_id_does_not_reuse_default_affinity(self):
+        first = _rh.build_anthropic_messages_passthrough_headers(
+            request_id="req-a",
+            initiator="user",
+            interaction_id=None,
+            interaction_type=None,
+            anthropic_betas=[],
+            base_headers={},
+        )
+        second = _rh.build_anthropic_messages_passthrough_headers(
+            request_id="req-b",
+            initiator="user",
+            interaction_id=None,
+            interaction_type=None,
+            anthropic_betas=[],
+            base_headers={},
+        )
+
+        self.assertEqual(first["x-interaction-id"], "req-a")
+        self.assertEqual(first["x-agent-task-id"], "req-a")
+        self.assertEqual(second["x-interaction-id"], "req-b")
+        self.assertEqual(second["x-agent-task-id"], "req-b")
