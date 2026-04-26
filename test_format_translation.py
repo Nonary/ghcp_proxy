@@ -302,6 +302,17 @@ class FormatTranslationTests(unittest.TestCase):
 
         self.assertEqual(translated["reasoning_effort"], "xhigh")
 
+    def test_responses_request_to_chat_maps_max_to_xhigh_for_gpt_models(self):
+        body = {
+            "model": "openai/gpt-5.4",
+            "input": "hi",
+            "reasoning": {"effort": "max"},
+        }
+
+        translated = format_translation.responses_request_to_chat(body)
+
+        self.assertEqual(translated["reasoning_effort"], "xhigh")
+
     def test_responses_request_to_chat_maps_xhigh_to_max_for_claude_models(self):
         body = {
             "model": "anthropic/claude-sonnet-4.6",

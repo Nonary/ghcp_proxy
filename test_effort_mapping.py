@@ -5,11 +5,17 @@ import effort_mapping
 
 class EffortMappingTests(unittest.TestCase):
     def test_canonical_passthrough(self):
-        for effort in ("low", "medium", "high", "max"):
+        for effort in ("low", "medium", "high"):
             self.assertEqual(
                 effort_mapping.map_effort_for_model("gpt-5.4", effort),
                 effort,
             )
+
+    def test_max_maps_to_xhigh_for_gpt_models(self):
+        self.assertEqual(
+            effort_mapping.map_effort_for_model("gpt-5.4", "max"),
+            "xhigh",
+        )
 
     def test_xhigh_is_preserved_for_gpt_models(self):
         self.assertEqual(

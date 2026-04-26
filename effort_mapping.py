@@ -51,6 +51,16 @@ class ModelEffortStrategy(ABC):
         raise NotImplementedError
 
 
+class GptStrategy(ModelEffortStrategy):
+    def matches(self, normalized_model: str) -> bool:
+        return normalized_model.startswith("gpt-")
+
+    def map(self, canonical_effort: str) -> str | None:
+        if canonical_effort == "max":
+            return "xhigh"
+        return canonical_effort
+
+
 class ClaudeOpus47Strategy(ModelEffortStrategy):
     def matches(self, normalized_model: str) -> bool:
         return normalized_model == "claude-opus-4.7"
@@ -76,6 +86,7 @@ class PassthroughStrategy(ModelEffortStrategy):
 
 
 _STRATEGIES: list[ModelEffortStrategy] = [
+    GptStrategy(),
     ClaudeOpus47Strategy(),
     ClaudeHaiku45Strategy(),
     PassthroughStrategy(),
