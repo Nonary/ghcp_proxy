@@ -2,6 +2,28 @@
 
 Local reverse proxy for Codex and Claude Code using GitHub Copilot upstream.
 
+## Read This First
+
+GHCP Proxy is an unofficial local proxy. It uses GitHub Copilot upstream in a
+way GitHub may not support, and you should assume that misuse can violate
+GitHub's terms or acceptable-use rules. GitHub's API terms say abusive or
+excessive requests can lead to temporary or permanent suspension of API access,
+and GitHub's acceptable-use rules include service usage limits.
+
+Use your own account, respect GitHub's limits, and do not use this project to
+evade billing or quotas. Rate limits make runaway usage less likely than it used
+to be, but they are not permission to abuse the service. If you mark every
+ordinary request as free/agent traffic or try to bypass premium-request
+accounting, you are taking on account risk, including possible suspension or a
+permanent ban.
+
+GitHub remains the source of truth for billing and enforcement:
+
+- [GitHub Copilot premium requests](https://docs.github.com/copilot/managing-copilot/monitoring-usage-and-entitlements/about-premium-requests)
+- [GitHub Copilot usage limits](https://docs.github.com/en/copilot/concepts/rate-limits)
+- [GitHub API terms](https://docs.github.com/github/site-policy/github-terms-of-service#h-api-terms)
+- [GitHub Acceptable Use Policies](https://docs.github.com/site-policy/acceptable-use-policies/github-acceptable-use-policies)
+
 ## Setup
 
 You need Python 3.10 or newer, a GitHub account with Copilot access, and Codex
@@ -36,6 +58,33 @@ In the dashboard:
 
 That is the normal setup. You do not need Node.js, `npx`, or hand-edited
 `~/.codex` / `~/.claude` config files.
+
+## Premium Requests And Billing
+
+GitHub Copilot bills and limits usage through premium requests, model
+multipliers, monthly allowances, budgets, and rate limits. GHCP Proxy tries to
+mirror GitHub's billing semantics where it can, but the dashboard is only a
+local estimate. Your GitHub account and billing pages are the source of truth.
+
+Practical rules:
+
+- normal prompts you send should count as user traffic
+- autonomous tool calls should not add premium requests by themselves
+- model requests that produce or consume tool calls can still count
+- premium models can consume more than one premium request through model
+  multipliers
+- requests resolved as agent traffic are tracked locally but estimated as `0`
+  premium requests
+
+For responsible use, leave prompts unprefixed most of the time and let the proxy
+classify traffic. Use `_` only when you are deliberately continuing a tool-driven
+agent workflow. Use `+` only when you are starting a fresh user request
+immediately after prior proxy activity and want it counted as user traffic.
+
+The dashboard shows recent request classification, local premium-request
+estimates, and the latest upstream quota snapshot seen in GitHub's
+`x-quota-snapshot-*` response headers. Treat that display as guidance, not a
+guarantee.
 
 ## First-Time Python Setup
 
@@ -257,128 +306,3 @@ setup. It can:
 The dashboard writes the required local config files and keeps backups before
 replacing anything. Most users should not edit `~/.codex` or `~/.claude` by
 hand.
-
-## Premium Requests
-
-GHCP Proxy tries to match GitHub Copilot's billing semantics as closely as the
-local proxy can. The dashboard shows two related things:
-
-- the quota snapshot GitHub sends back in `x-quota-snapshot-*` response headers
-- the proxy's local premium-request estimate for requests it has seen
-
-For the local estimate, only requests resolved as user traffic count against
-premium usage. Requests resolved as agent traffic are recorded for history,
-cost, and debugging, but count as `0` premium requests locally.
-
-When a user request is counted, GHCP Proxy applies the model's premium-request
-multiplier. Examples:
-
-- most current Sonnet/GPT/Gemini Pro models: `1`
-- Haiku, GPT mini, Gemini Flash, and Grok code-fast style models: usually `0.33`
-- Opus-class and GPT-5.5-class models: higher multipliers such as `3` or `7.5`
-- some older or mini models: `0`
-
-The exact multiplier table lives in `constants.py`.
-
-Tool calls do not add premium requests on their own. What matters is the model
-request that produced or consumed the tool call.
-
-## Request Prefixes
-
-Most prompts should be sent without a prefix. GHCP Proxy inspects the request
-shape and chooses user or agent initiator semantics automatically.
-
-Use a prefix only when you want to override that default for a specific turn:
-
-- `_` asks the proxy to treat the request as agent traffic
-- `+` asks the proxy to treat the request as user traffic even if only the safeguard would have flipped it to agent traffic
-- the prefix is stripped before the prompt is forwarded upstream
-- `_foo` and `_ foo` both forward as `foo`; `+foo` and `+ foo` both forward as `foo`
-
-Examples:
-
-```text
-refactor the parser and run tests
-```
-
-This is sent as user traffic.
-
-```text
-_continue the tool-driven fix
-```
-
-This is sent as agent traffic. The upstream model receives
-`continue the tool-driven fix`.
-
-```text
-+summarize only the latest compiler error
-```
-
-This is sent as user traffic when only the safeguard would have flipped it to
-agent. The upstream model receives `summarize only the latest compiler error`.
-
-`+` is intentionally narrow. It does not override hard agent rules such as
-Claude Haiku, explicit subagent traffic, compaction, or approval/security
-monitor paths.
-
-## Safeguard
-
-The safeguard protects the boundary between user turns and tool-driven follow-up
-traffic. It exists because coding clients often replay transcripts, continue
-tool chains, or emit helper requests that can look user-like if you only inspect
-one message in isolation.
-
-The current rules are:
-
-- the first real unprefixed user prompt is user traffic
-- subagent traffic is agent traffic
-- Claude Haiku traffic is agent traffic
-- compaction and other forced internal paths are agent traffic
-- after a proxied request finishes, user-looking traffic inside the cooldown window is treated as agent traffic
-- `+` bypasses only that cooldown safeguard for the current request
-- `_` explicitly chooses agent traffic for the current request
-
-The default cooldown is `15` seconds. You can change it from the dashboard's
-Safeguards page, or by editing the persisted safeguard config in the user config
-directory. The file is `safeguard.json` under `GHCP_CONFIG_DIR` when that
-environment variable is set; otherwise it uses the platform app config
-directory, such as `~/Library/Application Support/ghcp_proxy` on macOS. The
-allowed range is `0` to `600` seconds.
-
-Practical guidance:
-
-- leave prompts unprefixed for ordinary work
-- use `_` when you are deliberately continuing an agent/tool chain
-- use `+` when you are starting a fresh user turn immediately after prior proxy activity and you want that turn counted as user traffic
-- do not use `+` to fight hard agent classifications; it is only a safeguard bypass
-
-The dashboard's Requests and Safeguards views show the resolved initiator,
-candidate initiator, cooldown, and safeguard reason for recent requests.
-
-## Dashboard Data Sources
-
-The dashboard combines two local data sources:
-
-- proxy request logs in the OS user state directory for tracked GitHub Copilot traffic
-- built-in token tracking and model pricing for Claude and GPT requests that pass through the proxy
-
-The local cost estimates use the common model rates configured in `proxy.py`, including cached-input pricing where the provider publishes it.
-
-### Premium Request Quota
-
-Premium-request quota is read directly from the `x-quota-snapshot-*` response headers that GitHub Copilot sends back on every chat completion. No billing token, GitHub REST call, or plan picker is required; the proxy just reflects whatever upstream reports for the most recent finished request.
-
-The dashboard surfaces the `premium_interactions` snapshot:
-
-- included quota for the current period (e.g. 300 for Pro, 1000 for Enterprise, etc.; "Unlimited" when upstream reports `ent=-1`)
-- absolute used / remaining and percent used / remaining
-- reset date and `resets in N days` countdown
-- overage and whether overage is permitted
-
-Until you make at least one request through the proxy in the current session, the panel shows "Awaiting first request to capture quota".
-
-The dashboard cache is also persisted in SQLite for fast startup/refreshes:
-
-```bash
-export GHCP_CACHE_DB_PATH="~/Library/Caches/ghcp_proxy/ghcp-dashboard-cache.sqlite3"
-```
