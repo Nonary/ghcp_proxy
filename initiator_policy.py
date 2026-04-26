@@ -20,7 +20,7 @@ _CONVERSATION_SUMMARIZER_PROMPT_MARKERS = (
 )
 _SKILL_DOLLAR_INVOCATION_RE = re.compile(r"(?<![\w`])\$[A-Za-z][A-Za-z0-9-]{1,63}\b")
 _SKILL_PHRASE_INVOCATION_RE = re.compile(
-    r"\b(?:apply|use|run|invoke|load|open)\s+(?:the\s+)?[A-Za-z][A-Za-z0-9-]{1,63}\s+skill\b",
+    r"\b(?:apply|use|run|invoke|load|open)\s+(?:the\s+)?(?!this\b|that\b|the\b|a\b|an\b)[A-Za-z][A-Za-z0-9-]{1,63}\s+skill\b",
     re.IGNORECASE,
 )
 

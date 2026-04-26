@@ -967,6 +967,33 @@ class InitiatorPolicyTests(unittest.TestCase):
         self.assertIs(normalized_input, input_items)
         self.assertEqual(initiator, "agent")
 
+    def test_generic_skill_catalog_description_does_not_force_agent(self):
+        policy = initiator_policy.InitiatorPolicy()
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            "<system-reminder>\n"
+                            "The following skills are available for use with the Skill tool:\n\n"
+                            "- update-config: Use this skill to configure the Claude Code harness via settings.json.\n"
+                            "</system-reminder>"
+                        ),
+                    },
+                    {
+                        "type": "text",
+                        "text": "Please fix the model routing source attribution bug.",
+                    },
+                ],
+            },
+        ]
+
+        initiator = policy.resolve_anthropic_messages(messages, "claude-opus-4.6")
+
+        self.assertEqual(initiator, "user")
+
     def test_plus_prefixed_prompt_overrides_trailing_skill_block_for_responses_input(self):
         policy = initiator_policy.InitiatorPolicy()
         input_items = [
