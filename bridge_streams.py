@@ -899,6 +899,12 @@ class AnthropicToResponsesStreamTranslator:
         self._model_name = model
         self._created_at = created_at if isinstance(created_at, int) else int(time.time())
         self._usage: dict = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+        # Raw upstream Anthropic-shape usage retained so the proxy can derive
+        # the internal tracking shape (with pricing_* counters) without
+        # round-tripping through the Responses-shape ``self._usage`` (which
+        # collapses cache writes into details and would lose them when the
+        # downstream tracker re-normalizes).
+        self._anthropic_raw_usage: dict = {}
         self._stop_reason: str | None = None
         self._response_started = False
         self._completed = False
@@ -934,6 +940,15 @@ class AnthropicToResponsesStreamTranslator:
         if not parts:
             return None
         return "".join(parts)
+
+    @property
+    def anthropic_raw_usage(self) -> dict:
+        """Latest raw Anthropic-shape usage seen on message_start/message_delta.
+
+        Empty dict if no usage was reported. Caller should treat empty as
+        "no usage available" rather than as zero counters.
+        """
+        return dict(self._anthropic_raw_usage)
 
     def build_response_payload(self) -> dict:
         output: list = []
@@ -1326,6 +1341,21 @@ class AnthropicToResponsesStreamTranslator:
             usage = message.get("usage")
             if isinstance(usage, dict):
                 self._usage = _anthropic_usage_to_responses_usage(usage)
+                # Anthropic Messages reports input_tokens (fresh non-cache),
+                # cache_read_input_tokens, and cache_creation_input_tokens
+                # separately. Persist the raw shape so the proxy can derive
+                # the internal tracking shape with pricing_* counters.
+                self._anthropic_raw_usage = {
+                    key: usage[key]
+                    for key in (
+                        "input_tokens",
+                        "output_tokens",
+                        "cache_read_input_tokens",
+                        "cache_creation_input_tokens",
+                        "cached_input_tokens",
+                    )
+                    if key in usage
+                }
             for evbytes in self._ensure_response_started():
                 yield evbytes
             return
@@ -1440,6 +1470,17 @@ class AnthropicToResponsesStreamTranslator:
                 if details:
                     merged["input_tokens_details"] = details
                 self._usage = merged
+                # Mirror the same upstream-shape fields into the raw cache so
+                # tracking-shape derivation reflects the latest counters.
+                for key in (
+                    "input_tokens",
+                    "output_tokens",
+                    "cache_read_input_tokens",
+                    "cache_creation_input_tokens",
+                    "cached_input_tokens",
+                ):
+                    if key in usage:
+                        self._anthropic_raw_usage[key] = usage[key]
             return
 
         if evt == "message_stop":

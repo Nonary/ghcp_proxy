@@ -1945,6 +1945,165 @@ class AnthropicMessagesPassthroughRouteTests(unittest.TestCase):
         self.assertEqual(payload["id"], "resp_translated")
         self.assertEqual(payload["output"][0]["content"][0]["text"], "translated")
 
+    def test_responses_route_to_messages_tracks_anthropic_cache_usage(self):
+        """Codex (responses) requests routed to Anthropic Messages upstream
+        should record the Anthropic-shape pricing buckets (cache writes/reads
+        and fresh input). Without this, the Responses-shape usage from the
+        translated payload would lose cache_creation_input_tokens entirely
+        and miscompute fresh_input_tokens."""
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/responses"),
+            method="POST",
+            headers={"x-client-request-id": "req-cache-1"},
+        )
+        body = {"model": "claude-sonnet-4.6", "input": "hi", "stream": False}
+        translated_anthropic = {
+            "model": "claude-sonnet-4.6",
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+        }
+        plan = _BridgeExecutionPlan_for_msgs(
+            strategy_name="responses_to_messages",
+            inbound_protocol="responses",
+            caller_protocol="responses",
+            upstream_protocol="messages",
+            header_kind="messages",
+            requested_model="claude-sonnet-4.6",
+            resolved_model="claude-sonnet-4.6",
+            upstream_body=translated_anthropic,
+            stream=False,
+            is_compact=False,
+        )
+        upstream = httpx.Response(
+            200,
+            json={
+                "id": "msg_z",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-sonnet-4.6",
+                "content": [{"type": "text", "text": "ok"}],
+                "stop_reason": "end_turn",
+                "usage": {
+                    "input_tokens": 1200,
+                    "output_tokens": 321,
+                    "cache_read_input_tokens": 125000,
+                    "cache_creation_input_tokens": 42,
+                },
+            },
+            headers={"content-type": "application/json"},
+        )
+
+        async def fake_plan(*args, **kwargs):
+            return plan
+
+        with (
+            mock.patch.object(proxy, "parse_json_request", mock.AsyncMock(return_value=body)),
+            mock.patch.object(auth, "get_api_key", return_value="test-key"),
+            mock.patch.object(auth, "get_api_base", return_value="https://example.invalid"),
+            mock.patch.object(proxy.bridge_planner, "plan", side_effect=fake_plan),
+            mock.patch.object(usage_tracking, "log_proxy_request"),
+            mock.patch.object(proxy.usage_tracker, "start_event", return_value=None),
+            mock.patch.object(proxy.usage_tracker, "finish_event") as finish_usage,
+            mock.patch.object(proxy, "throttled_client_post", mock.AsyncMock(return_value=upstream)),
+        ):
+            response = proxy.asyncio.run(proxy.responses(request))
+
+        self.assertEqual(response.status_code, 200)
+        finish_usage.assert_called_once()
+        usage = finish_usage.call_args.kwargs["usage"]
+        # Anthropic-shape cache writes survive into tracking shape and are
+        # rolled into input_tokens (so the dashboard's input bucket reflects
+        # cache writes); cache reads remain a separate bucket.
+        self.assertEqual(usage["input_tokens"], 1242)
+        self.assertEqual(usage["output_tokens"], 321)
+        self.assertEqual(usage["cached_input_tokens"], 125000)
+        self.assertEqual(usage["cache_read_input_tokens"], 125000)
+        self.assertEqual(usage["cache_creation_input_tokens"], 42)
+        self.assertEqual(usage["pricing_fresh_input_tokens"], 1200)
+        self.assertEqual(usage["pricing_cached_input_tokens"], 125000)
+        self.assertEqual(usage["pricing_cache_creation_input_tokens"], 42)
+
+    def test_responses_from_anthropic_stream_tracks_anthropic_cache_usage(self):
+        """Streaming responses-from-anthropic translator must surface raw
+        Anthropic cache_read/cache_creation/input_tokens to the proxy so
+        finish_event records the pricing buckets correctly. Without this,
+        the responses-shape usage on response.completed would lose the
+        cache_creation bucket and miscompute fresh_input_tokens."""
+        chunks = [
+            (
+                'event: message_start\n'
+                'data: {"type":"message_start","message":{"id":"msg_x","type":"message",'
+                '"role":"assistant","model":"claude-sonnet-4.6","usage":{"input_tokens":1200,'
+                '"output_tokens":0,"cache_read_input_tokens":125000,'
+                '"cache_creation_input_tokens":42}}}\n\n'
+            ).encode("utf-8"),
+            (
+                'event: message_delta\n'
+                'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},'
+                '"usage":{"output_tokens":321}}\n\n'
+            ).encode("utf-8"),
+            b'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+        ]
+
+        class FakeUpstream:
+            status_code = 200
+            headers = {"content-type": "text/event-stream"}
+
+            async def aiter_bytes(self):
+                for chunk in chunks:
+                    yield chunk
+
+            async def aclose(self):
+                return None
+
+        class FakeClient:
+            def build_request(self, *args, **kwargs):
+                return httpx.Request("POST", "https://example.invalid/v1/messages")
+
+            async def aclose(self):
+                return None
+
+        usage_event = {"request_id": "req-resp-stream-cache"}
+        trace_plan = proxy.UpstreamRequestPlan(
+            request_id="req-resp-stream-cache",
+            upstream_url="https://example.invalid/v1/messages",
+            headers={},
+            body={"stream": True},
+            usage_event=usage_event,
+            requested_model="claude-sonnet-4.6",
+            resolved_model="claude-sonnet-4.6",
+        )
+
+        async def run_stream():
+            with (
+                mock.patch.object(proxy.httpx, "AsyncClient", return_value=FakeClient()),
+                mock.patch.object(proxy, "throttled_client_send", mock.AsyncMock(return_value=FakeUpstream())),
+                mock.patch.object(proxy.usage_tracker, "finish_event") as finish_usage,
+            ):
+                response = await proxy.proxy_responses_from_anthropic_streaming_response(
+                    "https://example.invalid/v1/messages",
+                    {"Authorization": "Bearer test"},
+                    {"model": "claude-sonnet-4.6", "stream": True},
+                    "claude-sonnet-4.6",
+                    usage_event=usage_event,
+                    trace_plan=trace_plan,
+                )
+                body = b""
+                async for chunk in response.body_iterator:
+                    body += chunk
+                return body, finish_usage
+
+        body, finish_usage = proxy.asyncio.run(run_stream())
+
+        finish_usage.assert_called_once()
+        usage = finish_usage.call_args.kwargs["usage"]
+        self.assertEqual(usage["input_tokens"], 1242)
+        self.assertEqual(usage["output_tokens"], 321)
+        self.assertEqual(usage["cached_input_tokens"], 125000)
+        self.assertEqual(usage["cache_creation_input_tokens"], 42)
+        self.assertEqual(usage["pricing_fresh_input_tokens"], 1200)
+        self.assertEqual(usage["pricing_cached_input_tokens"], 125000)
+        self.assertEqual(usage["pricing_cache_creation_input_tokens"], 42)
+
 
     def test_responses_to_messages_upstream_error_returns_openai_error_shape(self):
         bridge_plan = SimpleNamespace(caller_protocol="responses", upstream_protocol="messages")

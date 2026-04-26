@@ -1583,10 +1583,14 @@ async def _post_bridge_non_streaming_request(plan: UpstreamRequestPlan, bridge_p
             if isinstance(translated_payload.get("content"), list)
             else None
         ),
+        # When upstream is Anthropic Messages, derive tracking-shape usage from
+        # the raw upstream usage regardless of caller protocol. The translated
+        # payload's usage (Responses-shape for responses callers) loses cache
+        # creation tokens and miscomputes ``fresh_input_tokens`` because the
+        # Responses-shape input_tokens already excludes cache reads.
         usage=(
             _anthropic_messages_usage_for_tracking(upstream_payload.get("usage"))
-            if bridge_plan.caller_protocol == "anthropic"
-            and bridge_plan.upstream_protocol == "messages"
+            if bridge_plan.upstream_protocol == "messages"
             and isinstance(upstream_payload.get("usage"), dict)
             else None
         ),
@@ -2192,6 +2196,12 @@ async def proxy_responses_from_anthropic_streaming_response(
             yield b"data: [DONE]\n\n"
         finally:
             response_payload = translator.build_response_payload()
+            raw_anthropic_usage = translator.anthropic_raw_usage
+            tracking_usage = (
+                _anthropic_messages_usage_for_tracking(raw_anthropic_usage)
+                if raw_anthropic_usage
+                else response_payload.get("usage")
+            )
             _finish_usage_and_trace(
                 trace_plan,
                 upstream.status_code,
@@ -2199,7 +2209,7 @@ async def proxy_responses_from_anthropic_streaming_response(
                 response_payload=response_payload,
                 response_text=translator.response_text,
                 reasoning_text=translator.reasoning_text,
-                usage=response_payload.get("usage"),
+                usage=tracking_usage,
             )
             await upstream.aclose()
             await client.aclose()
