@@ -121,7 +121,49 @@ _CACHEABLE_BLOCK_TYPES = {"text", "image", "document", "tool_use", "tool_result"
 
 
 def _has_cache_control(block: Any) -> bool:
-    return isinstance(block, dict) and isinstance(block.get("cache_control"), dict)
+    if not isinstance(block, dict):
+        return False
+    if isinstance(block.get("cache_control"), dict):
+        return True
+    nested = block.get("content")
+    if isinstance(nested, list):
+        return any(_has_cache_control(child) for child in nested)
+    return False
+
+
+def _remove_cache_control_from_block(block: Any) -> None:
+    if not isinstance(block, dict):
+        return
+    block.pop("cache_control", None)
+    nested = block.get("content")
+    if isinstance(nested, list):
+        for child in nested:
+            _remove_cache_control_from_block(child)
+
+
+def _remove_cache_control_markers(body: dict) -> None:
+    if not isinstance(body, dict):
+        return
+
+    system = body.get("system")
+    if isinstance(system, list):
+        for block in system:
+            _remove_cache_control_from_block(block)
+
+    tools = body.get("tools")
+    if isinstance(tools, list):
+        for tool in tools:
+            _remove_cache_control_from_block(tool)
+
+    messages = body.get("messages")
+    if isinstance(messages, list):
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            content = message.get("content")
+            if isinstance(content, list):
+                for block in content:
+                    _remove_cache_control_from_block(block)
 
 
 def _add_cache_control(block: dict) -> bool:
@@ -188,6 +230,7 @@ def apply_prompt_cache_breakpoints(body: dict) -> dict:
     if not isinstance(body, dict) or not _body_has_cache_control(body):
         return body
 
+    _remove_cache_control_markers(body)
     remaining = 4
 
     def mark(block: dict | None) -> None:

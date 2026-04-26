@@ -61,6 +61,15 @@ class StripCacheControlScopeTests(unittest.TestCase):
 
 
 class ApplyPromptCacheBreakpointsTests(unittest.TestCase):
+    def _count_cache_controls(self, value):
+        if isinstance(value, dict):
+            return int(isinstance(value.get("cache_control"), dict)) + sum(
+                self._count_cache_controls(v) for v in value.values()
+            )
+        if isinstance(value, list):
+            return sum(self._count_cache_controls(v) for v in value)
+        return 0
+
     def test_expands_existing_cache_intent_to_stable_breakpoints(self):
         body = {
             "system": "sys",
@@ -89,6 +98,89 @@ class ApplyPromptCacheBreakpointsTests(unittest.TestCase):
         self.assertNotIn("cache_control", body["messages"][0]["content"][0])
         self.assertEqual(body["messages"][1]["content"][0]["cache_control"], {"type": "ephemeral"})
         self.assertEqual(body["messages"][2]["content"][0]["cache_control"], {"type": "ephemeral"})
+
+    def test_replaces_excess_existing_cache_markers_with_at_most_four_breakpoints(self):
+        body = {
+            "system": [
+                {"type": "text", "text": "sys-1", "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": "sys-2", "cache_control": {"type": "ephemeral"}},
+            ],
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "first", "cache_control": {"type": "ephemeral"}},
+                    ],
+                },
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": "second", "cache_control": {"type": "ephemeral"}},
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "t1",
+                            "cache_control": {"type": "ephemeral"},
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": "nested",
+                                    "cache_control": {"type": "ephemeral"},
+                                },
+                            ],
+                        },
+                    ],
+                },
+            ],
+            "tools": [
+                {"name": "Read", "input_schema": {"type": "object"}, "cache_control": {"type": "ephemeral"}},
+            ],
+        }
+
+        apply_prompt_cache_breakpoints(body)
+
+        self.assertEqual(self._count_cache_controls(body), 4)
+        self.assertNotIn("cache_control", body["system"][0])
+        self.assertEqual(body["system"][1]["cache_control"], {"type": "ephemeral"})
+        self.assertEqual(body["tools"][0]["cache_control"], {"type": "ephemeral"})
+        self.assertNotIn("cache_control", body["messages"][0]["content"][0])
+        self.assertEqual(body["messages"][1]["content"][0]["cache_control"], {"type": "ephemeral"})
+        self.assertEqual(body["messages"][2]["content"][0]["cache_control"], {"type": "ephemeral"})
+        self.assertNotIn("cache_control", body["messages"][2]["content"][0]["content"][0])
+
+    def test_nested_cache_marker_is_enough_to_trigger_stable_breakpoints(self):
+        body = {
+            "system": [{"type": "text", "text": "sys"}],
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "t1",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": "nested",
+                                    "cache_control": {"type": "ephemeral"},
+                                },
+                            ],
+                        },
+                    ],
+                },
+            ],
+        }
+
+        apply_prompt_cache_breakpoints(body)
+
+        self.assertEqual(self._count_cache_controls(body), 2)
+        self.assertEqual(body["system"][0]["cache_control"], {"type": "ephemeral"})
+        self.assertEqual(body["messages"][0]["content"][0]["cache_control"], {"type": "ephemeral"})
+        self.assertNotIn("cache_control", body["messages"][0]["content"][0]["content"][0])
 
     def test_noop_without_cache_intent(self):
         body = {"system": "sys", "messages": [{"role": "user", "content": "hi"}]}
