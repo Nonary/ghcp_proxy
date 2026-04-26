@@ -105,6 +105,99 @@ class InitiatorPolicyTests(unittest.TestCase):
                 "user",
             )
 
+    def test_responses_environment_context_only_stays_agent(self):
+        policy = initiator_policy.InitiatorPolicy()
+        input_items = [
+            {
+                "type": "message",
+                "role": "developer",
+                "content": [{"type": "input_text", "text": "developer instructions"}],
+            },
+            {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": (
+                            "# AGENTS.md instructions\n\n"
+                            "<INSTRUCTIONS>\nUse PowerShell.\n</INSTRUCTIONS>\n"
+                            "<environment_context>\n"
+                            "  <cwd>D:\\sources\\ghcp_proxy</cwd>\n"
+                            "  <shell>powershell</shell>\n"
+                            "</environment_context>"
+                        ),
+                    }
+                ],
+            },
+        ]
+
+        normalized_input, initiator = policy.resolve_responses_input(input_items, "gpt-5.5")
+
+        self.assertIs(normalized_input, input_items)
+        self.assertEqual(initiator, "agent")
+
+    def test_responses_environment_context_with_trailing_prompt_is_user(self):
+        policy = initiator_policy.InitiatorPolicy()
+        input_items = [
+            {
+                "type": "message",
+                "role": "developer",
+                "content": [{"type": "input_text", "text": "developer instructions"}],
+            },
+            {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": (
+                            "# AGENTS.md instructions\n\n"
+                            "<INSTRUCTIONS>\nUse PowerShell.\n</INSTRUCTIONS>\n"
+                            "<environment_context>\n"
+                            "  <cwd>D:\\sources\\sunshine</cwd>\n"
+                            "  <shell>powershell</shell>\n"
+                            "</environment_context>\n\n"
+                            "It appears our simple web server submodule is not pushed to remote."
+                        ),
+                    }
+                ],
+            },
+        ]
+        verdict = {}
+
+        normalized_input, initiator = policy.resolve_responses_input(
+            input_items,
+            "gpt-5.5",
+            verdict_sink=verdict,
+        )
+
+        self.assertIs(normalized_input, input_items)
+        self.assertEqual(initiator, "user")
+        self.assertEqual(verdict["candidate_initiator"], "user")
+
+    def test_responses_environment_context_with_trailing_agent_marker_stays_agent(self):
+        policy = initiator_policy.InitiatorPolicy()
+        input_items = [
+            {
+                "type": "message",
+                "role": "user",
+                "content": (
+                    "<environment_context>\n"
+                    "  <cwd>D:\\sources\\ghcp_proxy</cwd>\n"
+                    "</environment_context>\n\n"
+                    "_ summarize the current branch"
+                ),
+            },
+        ]
+
+        normalized_input, initiator = policy.resolve_responses_input(input_items, "gpt-5.5")
+
+        self.assertIs(normalized_input, input_items)
+        self.assertEqual(initiator, "agent")
+        self.assertTrue(input_items[-1]["content"].endswith("summarize the current branch"))
+        self.assertNotIn("\n_ ", input_items[-1]["content"])
+
     def test_subagent_requests_do_not_activate_safeguard(self):
         recorded = []
         policy = initiator_policy.InitiatorPolicy(on_safeguard_triggered=recorded.append)

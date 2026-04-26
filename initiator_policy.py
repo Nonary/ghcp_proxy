@@ -502,7 +502,20 @@ def _is_environment_context_message(item) -> bool:
     if str(item.get("role", "")).lower() != "user":
         return False
     text = _responses_item_text(item).lstrip()
-    return "<environment_context>" in text and "</environment_context>" in text
+    if "<environment_context>" not in text:
+        return False
+
+    end_marker = "</environment_context>"
+    end_index = text.rfind(end_marker)
+    if end_index < 0:
+        return False
+
+    # Codex/bootstrap turns often send a user-role message that is only
+    # machine metadata (possibly preceded by AGENTS.md/instructions text) and
+    # ends with <environment_context>...</environment_context>. Those are
+    # agent traffic. A real typed user prompt may be appended after the same
+    # environment block, though; do not swallow that trailing text as metadata.
+    return not text[end_index + len(end_marker):].strip()
 
 
 def _is_task_title_generation_message(item) -> bool:
