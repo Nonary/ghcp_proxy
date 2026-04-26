@@ -2,49 +2,88 @@
 
 Local reverse proxy for Codex and Claude Code using GitHub Copilot upstream.
 
-## Table Of Contents
+## Setup
 
-- [What It Does](#what-it-does)
-- [Setup Overview](#setup-overview)
-- [Quick Start For Technical Users](#quick-start-for-technical-users)
-- [Guided Setup For Non-Technical Users](#guided-setup-for-non-technical-users)
-- [Setup Troubleshooting](#setup-troubleshooting)
-- [Auto Update](#auto-update)
-- [Client Activation](#client-activation)
-- [Premium Requests](#premium-requests)
-- [Request Prefixes](#request-prefixes)
-- [Safeguard](#safeguard)
-- [Dashboard Data Sources](#dashboard-data-sources)
+You need Python 3.10 or newer, a GitHub account with Copilot access, and Codex
+or Claude Code installed if you want GHCP Proxy to configure those clients.
 
-## What It Does
+From this folder, start the proxy:
 
-- Serves a local OpenAI-compatible endpoint at `http://localhost:8000/v1`
-- Proxies Codex Responses API traffic to GitHub Copilot
-- Also works with Claude Code
-- Activates Codex and Claude Code from the local dashboard
-- Supports GitHub Copilot auth from the local dashboard on first run
-- Exposes a local dashboard at `http://localhost:8000/`
-- Shows tracked GitHub premium request usage for traffic that passes through the proxy
-- Tracks session, token, and estimated cost data from the proxy's own request log
+```bash
+python3 proxy.py
+```
 
-## Setup Overview
+On Windows PowerShell:
 
-GHCP Proxy is a Python app with a web dashboard. Setup has two parts:
+```powershell
+py -3 .\proxy.py
+```
 
-1. Start the local proxy with Python.
-2. Use the dashboard at `http://localhost:8000/` to sign in to GitHub and enable
-   Codex or Claude Code.
+Then open the dashboard:
 
-You need the following before starting:
+```text
+http://localhost:8000/
+```
 
-- a GitHub account with GitHub Copilot access
-- Python 3.10 or newer
-- a local copy of this GHCP Proxy folder
-- Codex and/or Claude Code installed, if you want the dashboard to configure them
+In the dashboard:
 
-Node.js is not required for normal proxy startup. Once `proxy.py` is running,
-client setup is handled from the web dashboard; you usually do not need to edit
-`~/.codex` or `~/.claude` by hand.
+1. Sign in to GitHub if prompted.
+2. Open **Integrations**.
+3. Enable Codex, Claude Code, or both.
+4. Install the shell commands.
+5. Optionally enable startup so GHCP Proxy starts at login.
+6. Restart any already-open Codex or Claude Code sessions.
+
+That is the normal setup. You do not need Node.js, `npx`, or hand-edited
+`~/.codex` / `~/.claude` config files.
+
+## First-Time Python Setup
+
+If `python3 proxy.py` fails because packages are missing, create a local Python
+environment once and install the dependencies:
+
+macOS/Linux:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+python proxy.py
+```
+
+Windows PowerShell:
+
+```powershell
+py -3 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install --upgrade pip
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe .\proxy.py
+```
+
+After the dashboard is working, use **Integrations** to install the convenient
+start/stop commands:
+
+- macOS zsh: `start-ghproxy` and `stop-ghproxy`
+- Windows PowerShell: `Start-GHProxy` and `Stop-GHProxy`
+
+## Daily Use
+
+If startup is enabled, GHCP Proxy starts automatically when you sign in.
+
+If you prefer manual control, use the installed command:
+
+macOS:
+
+```bash
+start-ghproxy
+```
+
+Windows PowerShell:
+
+```powershell
+Start-GHProxy
+```
 
 The proxy listens only on your local machine:
 
@@ -58,221 +97,9 @@ The dashboard is:
 http://localhost:8000/
 ```
 
-## Quick Start For Technical Users
+## Troubleshooting
 
-Use this path if you are comfortable with Python virtual environments and a
-terminal. Run these commands from the GHCP Proxy checkout.
-
-macOS/Linux:
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-python proxy.py
-```
-
-Windows PowerShell:
-
-```powershell
-py -3 -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-python .\proxy.py
-```
-
-If PowerShell blocks activation, run the venv Python directly:
-
-```powershell
-py -3 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install --upgrade pip
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-.\.venv\Scripts\python.exe .\proxy.py
-```
-
-Then open `http://localhost:8000/`, complete GitHub sign-in, go to
-Settings -> Client Proxy, enable Codex and/or Claude Code, and restart any
-already-open client sessions.
-
-## Guided Setup For Non-Technical Users
-
-Use this path if you want a little more context around each step. It does the
-same thing as the quick start, just with the checkpoints spelled out.
-
-### 1. Install Python
-
-Install Python 3.10 or newer for your platform. If you are not sure whether you
-already have Python, open a terminal and check.
-
-If you need to install it, download Python from
-[python.org/downloads](https://www.python.org/downloads/). On Windows, keep the
-Python launcher option enabled during install.
-
-Check your Python version.
-
-macOS/Linux:
-
-```bash
-python3 --version
-```
-
-Windows PowerShell:
-
-```powershell
-py -3 --version
-```
-
-If that prints a Python version, you can continue. If it says the command was
-not found, install Python first, then close and reopen your terminal.
-
-### 2. Open The Project Folder
-
-Open a terminal in the GHCP Proxy folder. That is the folder containing
-`proxy.py`, `requirements.txt`, and `readme.md`.
-
-Confirm you are in the right folder:
-
-```bash
-ls
-```
-
-Windows PowerShell:
-
-```powershell
-dir
-```
-
-You should see `proxy.py` and `requirements.txt`.
-
-### 3. Create A Python Environment
-
-The recommended setup is a `.venv` folder inside the GHCP Proxy folder. This
-keeps the proxy's Python packages separate from your system Python.
-
-macOS/Linux:
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-```
-
-Windows PowerShell:
-
-```powershell
-py -3 -m venv .venv
-.\.venv\Scripts\Activate.ps1
-```
-
-If PowerShell blocks `Activate.ps1`, skip activation and use the direct
-PowerShell commands in the install and launch steps below.
-
-Alternative: put the virtual environment in your user profile instead of this
-checkout.
-
-macOS/Linux:
-
-```bash
-python3 -m venv ~/.venvs/ghcp_proxy
-source ~/.venvs/ghcp_proxy/bin/activate
-```
-
-Windows PowerShell:
-
-```powershell
-py -3 -m venv "$env:USERPROFILE\.venvs\ghcp_proxy"
-& "$env:USERPROFILE\.venvs\ghcp_proxy\Scripts\Activate.ps1"
-```
-
-### 4. Install Dependencies
-
-With the environment active, install the required Python packages:
-
-```bash
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-```
-
-Windows PowerShell:
-
-```powershell
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-```
-
-If you are not using activation on Windows:
-
-```powershell
-.\.venv\Scripts\python.exe -m pip install --upgrade pip
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-```
-
-### 5. Start The Proxy
-
-With the environment active:
-
-```bash
-python proxy.py
-```
-
-Windows PowerShell:
-
-```powershell
-python .\proxy.py
-```
-
-Without activation on Windows:
-
-```powershell
-.\.venv\Scripts\python.exe .\proxy.py
-```
-
-When startup works, the terminal prints something like:
-
-```text
-Starting GHCP proxy on http://localhost:8000 (loopback only)
-Dashboard     : GET  /ui
-```
-
-Keep this terminal open while using GHCP Proxy. Closing it stops the proxy
-unless you install the background startup helper later.
-
-### 6. Finish Setup In The Dashboard
-
-Open this URL in your browser:
-
-```text
-http://localhost:8000/
-```
-
-On first run, the dashboard will guide you through GitHub sign-in. After GitHub
-authorizes the device code, return to the dashboard.
-
-Then:
-
-1. Open Settings -> Client Proxy.
-2. Enable Codex, Claude Code, or both.
-3. Restart any already-open Codex or Claude Code sessions.
-
-You are set up when:
-
-- the dashboard loads without an auth warning
-- Settings -> Client Proxy shows the client you want as enabled
-- new Codex or Claude Code sessions send requests through GHCP Proxy
-- the dashboard Requests view starts showing recent traffic
-
-### 7. Optional Background Startup
-
-Settings -> Background Proxy can install a login starter so GHCP Proxy starts in
-the background automatically. The same panel can install shell helpers:
-
-- PowerShell on Windows: `Start-GHProxy` and `Stop-GHProxy`
-- zsh on macOS: `start-ghproxy` and `stop-ghproxy`
-
-## Setup Troubleshooting
-
-If setup gets bumpy, start here.
+Start here if setup does not work.
 
 ### Python Command Not Found
 
@@ -294,25 +121,10 @@ Some Linux distributions package virtual environment support separately. If
 `python3 -m venv .venv` says `venv` is missing, install your distribution's
 Python venv package, then run the command again.
 
-### PowerShell Will Not Activate `.venv`
-
-If this command is blocked:
-
-```powershell
-.\.venv\Scripts\Activate.ps1
-```
-
-Run the venv's Python directly:
-
-```powershell
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-.\.venv\Scripts\python.exe .\proxy.py
-```
-
 ### `No module named fastapi` Or `No module named uvicorn`
 
 The dependencies were installed into a different Python than the one running
-`proxy.py`. Use the same virtual environment for install and launch:
+`proxy.py`. Use the local virtual environment for install and launch:
 
 ```bash
 source .venv/bin/activate
@@ -353,12 +165,12 @@ the device code, return to the dashboard and wait for it to refresh.
 
 ### Codex Or Claude Code Still Uses Its Old Provider
 
-After enabling a client from Settings -> Client Proxy, fully restart any open
-Codex or Claude Code sessions. These tools usually read their config only when a
-new session starts.
+After enabling a client from **Integrations**, fully restart any open Codex or
+Claude Code sessions. These tools usually read their config only when a new
+session starts.
 
-If it still does not work, return to Settings -> Client Proxy, disable the
-client, enable it again, then start a fresh client session.
+If it still does not work, return to **Integrations**, disable the client,
+enable it again, then start a fresh client session.
 
 ### Upstream Requests Time Out
 
@@ -382,9 +194,19 @@ including `/v1/responses/compact`. The default is `300` seconds.
 ### Background Startup Gets Confusing
 
 The first setup is easiest with a visible terminal running `proxy.py`. Install
-background startup only after the dashboard is working. If a background copy is
-already installed, use Settings -> Background Proxy or the installed helper
-commands to stop it before starting a manual copy.
+startup only after the dashboard is working. If a background copy is already
+installed, use **Integrations** or the installed helper commands to stop it
+before starting a manual copy.
+
+## What It Does
+
+- Serves a local OpenAI-compatible endpoint at `http://localhost:8000/v1`
+- Proxies Codex Responses API traffic to GitHub Copilot
+- Also works with Claude Code
+- Installs Codex and Claude Code integrations from the local dashboard
+- Supports GitHub Copilot auth from the local dashboard on first run
+- Shows tracked GitHub premium request usage for traffic that passes through the proxy
+- Tracks session, token, and estimated cost data from the proxy's own request log
 
 ## Auto Update
 
@@ -421,91 +243,20 @@ export GHCP_AUTO_UPDATE_INTERVAL_SECONDS=900  # default: 15 minutes
 export GHCP_AUTO_UPDATE_GIT_TIMEOUT_SECONDS=60 # default git command timeout
 ```
 
-## Client Activation
+## Integrations
 
-Use the dashboard's Settings -> Client Proxy controls to enable or disable
-Codex and Claude Code. Treat those controls as the source of truth: they write
-the required local files, preserve backups, and can restore the previous state
-when a client is disabled.
+Use the dashboard's **Integrations** page as the source of truth for local
+setup. It can:
 
-Activation currently manages:
+- connect Codex to GHCP Proxy
+- connect Claude Code to GHCP Proxy
+- install start/stop shell commands
+- enable or disable startup at login
+- restore the previous client configuration when an integration is disabled
 
-- Codex provider wiring and generated model catalog
-- Claude Code proxy environment settings
-- context and output caps needed for the Copilot-backed Claude path
-- backups of proxy-managed config files before first replacement
-
-You normally only need to start GHCP Proxy, open the dashboard, sign in to
-GitHub if prompted, then enable the clients you want.
-
-### Codex Details
-
-Codex activation writes proxy-managed files under `~/.codex`:
-
-- `managed_config.toml`
-- `ghcp-proxy-models.json`
-
-If `~/.codex/config.toml` already exists, activation also injects the proxy's
-provider/catalog wiring there so Codex loads the generated model catalog while
-preserving the user's selected `model`, reasoning effort, approvals, and
-project trust entries.
-
-The managed Codex config written by the dashboard is:
-
-```toml
-model_provider = "custom"
-approvals_reviewer = "user"
-model_catalog_json = "~/.codex/ghcp-proxy-models.json"
-model_context_window = 272000
-model_auto_compact_token_limit = 240000
-
-[model_providers.custom]
-name = "OpenAI"
-base_url = "http://localhost:8000/v1"
-wire_api = "responses"
-```
-
-The important parts are that Codex sees an OpenAI-compatible Responses provider
-at `http://localhost:8000/v1` and loads the proxy-generated model catalog.
-
-### Claude Code Details
-
-Claude Code activation writes the proxy environment into
-`~/.claude/settings.json`. The managed values look like this:
-
-```json
-{
-  "env": {
-    "ANTHROPIC_BASE_URL": "http://localhost:8000",
-    "ANTHROPIC_AUTH_TOKEN": "sk-dummy",
-    "CLAUDE_CODE_DISABLE_1M_CONTEXT": "1",
-    "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "128000",
-    "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "64000"
-  },
-  "effortLevel": "medium"
-}
-```
-
-The important parts are:
-
-- `ANTHROPIC_BASE_URL` should point at the proxy root, not `/v1`
-- `ANTHROPIC_AUTH_TOKEN` can be any placeholder string because the proxy handles upstream auth
-- `CLAUDE_CODE_MAX_CONTEXT_TOKENS` keeps Claude Code's local `/context` and auto-compact threshold aligned with the `128k` upstream input limit currently enforced on the Copilot-backed Claude path
-- `CLAUDE_CODE_MAX_OUTPUT_TOKENS` aligns Claude Code's default `max_tokens` budget with the `64k` upstream output limit
-- if you enabled Claude before these caps existed, disable and re-enable Claude
-  from the dashboard once so the missing values are written
-
-### Activation Behavior
-
-The dashboard activation controls are meant to behave like a light switch.
-
-- enabling a client that is already enabled is a no-op
-- disabling a client that is already disabled is a no-op
-- Codex activation writes `~/.codex/managed_config.toml` and `~/.codex/ghcp-proxy-models.json`
-- if `~/.codex/config.toml` exists, Codex activation injects the proxy/provider/catalog keys there too
-- an existing managed config is backed up only when the proxy first replaces it
-- disabling restores the latest managed-config backup when one exists
-- if no backup exists, disabling removes the proxy-managed files
+The dashboard writes the required local config files and keeps backups before
+replacing anything. Most users should not edit `~/.codex` or `~/.claude` by
+hand.
 
 ## Premium Requests
 
