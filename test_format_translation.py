@@ -2667,9 +2667,11 @@ class AnthropicResponseToResponsesTests(unittest.TestCase):
             },
         }
         out = format_translation.anthropic_response_to_responses(anth)
-        self.assertEqual(out["usage"]["input_tokens"], 7)
+        # Responses usage is gross input + cached details; Anthropic Messages
+        # usage is fresh input + separate cache read counters.
+        self.assertEqual(out["usage"]["input_tokens"], 11)
         self.assertEqual(out["usage"]["output_tokens"], 3)
-        self.assertEqual(out["usage"]["total_tokens"], 10)
+        self.assertEqual(out["usage"]["total_tokens"], 14)
         self.assertEqual(
             out["usage"]["input_tokens_details"],
             {"cached_tokens": 4, "cache_creation_input_tokens": 2},

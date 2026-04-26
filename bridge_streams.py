@@ -820,10 +820,14 @@ def _anthropic_usage_to_responses_usage(usage) -> dict:
     cached = int(cached) if isinstance(cached, (int, float)) else 0
     cache_create = usage.get("cache_creation_input_tokens")
     cache_create = int(cache_create) if isinstance(cache_create, (int, float)) else 0
+    # Responses API usage keeps input_tokens as gross prompt input and exposes
+    # cache reads as a detail. Anthropic Messages input_tokens is fresh-only, so
+    # add cache reads back when translating upstream Messages usage for Codex.
+    gross_in_t = in_t + cached
     out: dict = {
-        "input_tokens": in_t,
+        "input_tokens": gross_in_t,
         "output_tokens": out_t,
-        "total_tokens": in_t + out_t,
+        "total_tokens": gross_in_t + out_t,
     }
     details: dict = {}
     if cached:
@@ -1455,13 +1459,14 @@ class AnthropicToResponsesStreamTranslator:
                 merged = dict(self._usage)
                 in_t = usage.get("input_tokens")
                 out_t = usage.get("output_tokens")
+                cached = usage.get("cache_read_input_tokens")
                 if isinstance(in_t, (int, float)):
-                    merged["input_tokens"] = int(in_t)
+                    cache_read_for_input = int(cached) if isinstance(cached, (int, float)) else 0
+                    merged["input_tokens"] = int(in_t) + cache_read_for_input
                 if isinstance(out_t, (int, float)):
                     merged["output_tokens"] = int(out_t)
                 merged["total_tokens"] = int(merged.get("input_tokens", 0)) + int(merged.get("output_tokens", 0))
                 details = dict(merged.get("input_tokens_details") or {})
-                cached = usage.get("cache_read_input_tokens")
                 if isinstance(cached, (int, float)) and cached:
                     details["cached_tokens"] = int(cached)
                 cache_creation = usage.get("cache_creation_input_tokens")
