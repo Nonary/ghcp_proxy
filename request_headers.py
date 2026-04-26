@@ -14,6 +14,8 @@ from constants import (
 _CLIENT_SESSION_ID = str(uuid.uuid4())
 _RESPONSES_AFFINITY_BY_SESSION: dict[str, dict[str, str]] = {}
 _RESPONSES_DEFAULT_AFFINITY: dict[str, str] | None = None
+_MESSAGES_AFFINITY_BY_SESSION: dict[str, dict[str, str]] = {}
+_MESSAGES_DEFAULT_AFFINITY: dict[str, str] | None = None
 
 
 def has_vision_input(value, depth=0, max_depth=10) -> bool:
@@ -58,12 +60,49 @@ def _responses_affinity_headers(initiator: str, session_id: str | None, *, reset
     if isinstance(session_id, str):
         normalized = session_id.strip()
         if normalized:
-            if reset or initiator == "user" or normalized not in _RESPONSES_AFFINITY_BY_SESSION:
+            if reset or normalized not in _RESPONSES_AFFINITY_BY_SESSION:
                 _RESPONSES_AFFINITY_BY_SESSION[normalized] = _new_responses_affinity()
             return _RESPONSES_AFFINITY_BY_SESSION[normalized]
-    if reset or initiator == "user" or _RESPONSES_DEFAULT_AFFINITY is None:
+    if reset or _RESPONSES_DEFAULT_AFFINITY is None:
         _RESPONSES_DEFAULT_AFFINITY = _new_responses_affinity()
     return _RESPONSES_DEFAULT_AFFINITY
+
+
+def _messages_affinity_headers(initiator: str, interaction_id: str | None, request_id: str) -> dict[str, str]:
+    """Return stable native Messages affinity headers for a session.
+
+    Copilot's native Anthropic /v1/messages endpoint keys prompt-cache lineage
+    off both the body cache breakpoints and the request affinity headers. Using
+    a fresh per-request id (or rotating on every user turn) prevents upstream
+    from linking those breakpoints to the previously-cached prefix. Unlike the
+    Responses API there is no body-level ``prompt_cache_key`` we can pivot on,
+    so the affinity must remain stable for the entire session — including
+    across user-initiated turns — for cached_input_tokens to grow.
+    """
+    global _MESSAGES_DEFAULT_AFFINITY
+    del initiator, request_id  # affinity is per-session, not per-turn or per-request.
+
+    if isinstance(interaction_id, str):
+        normalized = interaction_id.strip()
+    else:
+        normalized = ""
+
+    if normalized:
+        entry = _MESSAGES_AFFINITY_BY_SESSION.get(normalized)
+        if entry is None:
+            entry = {
+                "x-interaction-id": normalized,
+                "x-agent-task-id": str(uuid.uuid4()),
+            }
+            _MESSAGES_AFFINITY_BY_SESSION[normalized] = entry
+        return entry
+
+    if _MESSAGES_DEFAULT_AFFINITY is None:
+        _MESSAGES_DEFAULT_AFFINITY = {
+            "x-interaction-id": str(uuid.uuid4()),
+            "x-agent-task-id": str(uuid.uuid4()),
+        }
+    return _MESSAGES_DEFAULT_AFFINITY
 
 
 def build_copilot_headers(api_key: str) -> dict:
@@ -157,18 +196,23 @@ def build_responses_headers_for_request(
     initiator_policy=None,
     session_id_resolver=None,
     verdict_sink: dict | None = None,
+    affinity_body: dict | None = None,
 ) -> dict:
     headers = build_responses_copilot_headers(api_key)
+    affinity_source = affinity_body if isinstance(affinity_body, dict) else body
     session_id = _apply_forwarded_request_headers(
         headers,
         request,
-        body,
+        affinity_source,
         session_id_resolver=session_id_resolver,
         forward_session_header=False,
         synthesize_client_request_id=False,
     )
     client_request_id = request.headers.get("x-client-request-id")
-    affinity_key = _extract_responses_affinity_key(body, session_id, client_request_id)
+    if affinity_source is body:
+        affinity_key = _extract_responses_affinity_key(body, session_id, client_request_id)
+    else:
+        affinity_key = _extract_responses_affinity_key(dict(affinity_source), session_id, client_request_id)
     headers.pop("x-client-request-id", None)
     headers.pop("x-openai-subagent", None)
 
@@ -407,7 +451,6 @@ def build_anthropic_messages_passthrough_headers(
     if isinstance(initiator, str) and initiator:
         headers["x-initiator"] = initiator
 
-    if isinstance(interaction_id, str) and interaction_id:
-        headers["x-interaction-id"] = interaction_id
+    headers.update(_messages_affinity_headers(initiator, interaction_id, request_id))
 
     return headers

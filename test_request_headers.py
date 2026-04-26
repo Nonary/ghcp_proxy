@@ -741,6 +741,120 @@ class RequestHeadersTests(unittest.TestCase):
         self.assertNotIn("prompt_cache_key", second_body)
         self.assertNotIn("prompt_cache_key", third_body)
 
+    def test_build_responses_headers_for_request_reuses_explicit_affinity_across_user_turns(self):
+        first_request = SimpleNamespace(headers={}, url=SimpleNamespace(path="/v1/responses"))
+        first_body = {"model": "gpt-5.4", "input": "first", "prompt_cache_key": "cache-user-turns"}
+        first_headers = format_translation.build_responses_headers_for_request(
+            first_request,
+            first_body,
+            "test-key",
+            initiator_policy=proxy._initiator_policy,
+            session_id_resolver=usage_tracking.request_session_id,
+        )
+
+        second_request = SimpleNamespace(headers={}, url=SimpleNamespace(path="/v1/responses"))
+        second_body = {"model": "gpt-5.4", "input": "follow up", "prompt_cache_key": "cache-user-turns"}
+        second_headers = format_translation.build_responses_headers_for_request(
+            second_request,
+            second_body,
+            "test-key",
+            initiator_policy=proxy._initiator_policy,
+            session_id_resolver=usage_tracking.request_session_id,
+        )
+
+        self.assertEqual(first_headers["X-Initiator"], "user")
+        self.assertEqual(second_headers["X-Initiator"], "user")
+        self.assertEqual(first_headers["x-interaction-id"], second_headers["x-interaction-id"])
+        self.assertEqual(first_headers["x-agent-task-id"], second_headers["x-agent-task-id"])
+        self.assertNotIn("prompt_cache_key", first_body)
+        self.assertNotIn("prompt_cache_key", second_body)
+
+    def test_build_responses_headers_for_request_can_use_unsent_affinity_body(self):
+        request = SimpleNamespace(headers={}, url=SimpleNamespace(path="/v1/messages"))
+        upstream_body = {"model": "gpt-5.4", "input": "hello"}
+        original_body = {
+            "model": "claude-opus-4.6",
+            "metadata": {"user_id": '{"session_id":"claude-cache-session"}'},
+            "messages": [{"role": "user", "content": "hello"}],
+        }
+
+        first_headers = format_translation.build_responses_headers_for_request(
+            request,
+            upstream_body,
+            "test-key",
+            initiator_policy=proxy._initiator_policy,
+            session_id_resolver=usage_tracking.request_session_id,
+            affinity_body=original_body,
+        )
+        second_headers = format_translation.build_responses_headers_for_request(
+            request,
+            {"model": "gpt-5.4", "input": "follow up"},
+            "test-key",
+            initiator_policy=proxy._initiator_policy,
+            session_id_resolver=usage_tracking.request_session_id,
+            affinity_body=original_body,
+        )
+
+        self.assertEqual(first_headers["X-Initiator"], "user")
+        self.assertEqual(first_headers["x-interaction-id"], second_headers["x-interaction-id"])
+        self.assertEqual(first_headers["x-agent-task-id"], second_headers["x-agent-task-id"])
+        self.assertNotIn("metadata", upstream_body)
+
+    def test_build_responses_headers_for_request_reuses_default_affinity_without_session(self):
+        request = SimpleNamespace(headers={}, url=SimpleNamespace(path="/v1/messages"))
+
+        first_headers = format_translation.build_responses_headers_for_request(
+            request,
+            {"model": "gpt-5.4", "input": "first"},
+            "test-key",
+            initiator_policy=proxy._initiator_policy,
+            session_id_resolver=usage_tracking.request_session_id,
+        )
+        second_headers = format_translation.build_responses_headers_for_request(
+            request,
+            {"model": "gpt-5.4", "input": "follow up"},
+            "test-key",
+            initiator_policy=proxy._initiator_policy,
+            session_id_resolver=usage_tracking.request_session_id,
+        )
+
+        self.assertEqual(first_headers["X-Initiator"], "user")
+        self.assertEqual(second_headers["X-Initiator"], "user")
+        self.assertEqual(first_headers["x-interaction-id"], second_headers["x-interaction-id"])
+        self.assertEqual(first_headers["x-agent-task-id"], second_headers["x-agent-task-id"])
+
+    def test_build_responses_headers_for_request_uses_plain_metadata_user_id_as_affinity(self):
+        request = SimpleNamespace(headers={}, url=SimpleNamespace(path="/v1/messages"))
+        first_body = {
+            "model": "gpt-5.4",
+            "input": "first",
+        }
+        original_body = {
+            "model": "claude-opus-4.6",
+            "metadata": {"user_id": "plain-claude-session"},
+            "messages": [{"role": "user", "content": "hello"}],
+        }
+
+        first_headers = format_translation.build_responses_headers_for_request(
+            request,
+            first_body,
+            "test-key",
+            initiator_policy=proxy._initiator_policy,
+            session_id_resolver=usage_tracking.request_session_id,
+            affinity_body=original_body,
+        )
+        second_headers = format_translation.build_responses_headers_for_request(
+            request,
+            {"model": "gpt-5.4", "input": "follow up"},
+            "test-key",
+            initiator_policy=proxy._initiator_policy,
+            session_id_resolver=usage_tracking.request_session_id,
+            affinity_body=original_body,
+        )
+
+        self.assertEqual(first_headers["x-interaction-id"], second_headers["x-interaction-id"])
+        self.assertEqual(first_headers["x-agent-task-id"], second_headers["x-agent-task-id"])
+
     def test_build_responses_headers_for_compact_preserves_cache_affinity_fields(self):
         user_request = SimpleNamespace(headers={}, url=SimpleNamespace(path="/v1/responses"))
         user_body = {"model": "gpt-5.4", "input": "hello"}
@@ -885,7 +999,7 @@ class BuildAnthropicMessagesPassthroughHeadersTests(unittest.TestCase):
             ],
             base_headers=base,
         )
-        self.assertEqual(headers["x-agent-task-id"], "req-123")
+        self.assertNotEqual(headers["x-agent-task-id"], "req-123")
         self.assertEqual(headers["x-request-id"], "req-123")
         self.assertEqual(headers["x-interaction-type"], "messages-proxy")
         self.assertEqual(headers["openai-intent"], "messages-proxy")
@@ -905,6 +1019,41 @@ class BuildAnthropicMessagesPassthroughHeadersTests(unittest.TestCase):
         # Input dict not mutated
         self.assertIn("Copilot-Integration-Id", base)
 
+    def test_reuses_messages_affinity_for_turns_in_same_session(self):
+        first = _rh.build_anthropic_messages_passthrough_headers(
+            request_id="req-1",
+            initiator="user",
+            interaction_id="session-1",
+            interaction_type=None,
+            anthropic_betas=[],
+            base_headers={},
+        )
+        second = _rh.build_anthropic_messages_passthrough_headers(
+            request_id="req-2",
+            initiator="agent",
+            interaction_id="session-1",
+            interaction_type=None,
+            anthropic_betas=[],
+            base_headers={},
+        )
+        third = _rh.build_anthropic_messages_passthrough_headers(
+            request_id="req-3",
+            initiator="user",
+            interaction_id="session-1",
+            interaction_type=None,
+            anthropic_betas=[],
+            base_headers={},
+        )
+
+        self.assertEqual(first["x-interaction-id"], "session-1")
+        self.assertEqual(second["x-interaction-id"], "session-1")
+        self.assertEqual(third["x-interaction-id"], "session-1")
+        self.assertEqual(first["x-agent-task-id"], second["x-agent-task-id"])
+        self.assertEqual(second["x-agent-task-id"], third["x-agent-task-id"])
+        self.assertEqual(first["x-request-id"], "req-1")
+        self.assertEqual(second["x-request-id"], "req-2")
+        self.assertEqual(third["x-request-id"], "req-3")
+
     def test_omits_anthropic_beta_when_empty_and_interaction_id_optional(self):
         headers = _rh.build_anthropic_messages_passthrough_headers(
             request_id="r",
@@ -915,6 +1064,6 @@ class BuildAnthropicMessagesPassthroughHeadersTests(unittest.TestCase):
             base_headers={"copilot-integration-id": "vscode-chat"},
         )
         self.assertNotIn("anthropic-beta", headers)
-        self.assertNotIn("x-interaction-id", headers)
+        self.assertIn("x-interaction-id", headers)
         self.assertNotIn("copilot-integration-id", headers)
         self.assertEqual(headers["x-initiator"], "user")

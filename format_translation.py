@@ -35,7 +35,7 @@ def normalize_upstream_model_name(model_name: str | None) -> str | None:
         return model_name
 
     normalized = model_name.strip().lower()
-    if normalized.startswith("anthropic/"):
+    if "/" in normalized:
         normalized = normalized.split("/", 1)[1]
     return normalized
 
@@ -237,6 +237,47 @@ def _anthropic_system_to_chat_content(system):
     if not has_copilot_cache_control:
         return "".join(part.get("text", "") for part in converted)
     return converted
+
+
+def _strip_anthropic_billing_header_text(text: str) -> str:
+    """Remove Claude Code's volatile Anthropic-only billing header.
+
+    Claude Code sends a leading ``x-anthropic-billing-header`` system block
+    whose ``cch`` value changes every request. Forwarding it into Responses
+    makes the first cacheable input item unstable, so the upstream prompt cache
+    can never extend past the static prefix.
+    """
+    prefix = "x-anthropic-billing-header:"
+    if not text.startswith(prefix):
+        return text
+    _first_line, separator, remainder = text.partition("\n")
+    if not separator:
+        return ""
+    return remainder.lstrip("\r\n")
+
+
+def _strip_anthropic_billing_header_from_system_content(system_content):
+    if isinstance(system_content, str):
+        return _strip_anthropic_billing_header_text(system_content)
+    if not isinstance(system_content, list):
+        return system_content
+
+    stripped = []
+    for item in system_content:
+        if not isinstance(item, dict):
+            continue
+        text = item.get("text")
+        if not isinstance(text, str):
+            stripped.append(item)
+            continue
+        sanitized_text = _strip_anthropic_billing_header_text(text)
+        if not sanitized_text:
+            continue
+        if sanitized_text == text:
+            stripped.append(item)
+        else:
+            stripped.append({**item, "text": sanitized_text})
+    return stripped
 
 
 def _anthropic_blocks_to_chat_content(blocks: list[dict]):
@@ -658,7 +699,11 @@ def _append_sanitizer_diagnostic(diagnostics: list[dict] | None, diagnostic: dic
         diagnostics.append(diagnostic)
 
 
-def sanitize_responses_body_for_copilot(body: dict, *, diagnostics: list[dict] | None = None) -> dict:
+def sanitize_responses_body_for_copilot(
+    body: dict,
+    *,
+    diagnostics: list[dict] | None = None,
+) -> dict:
     """Keep native Responses upstream payloads aligned with Copilot CLI.
 
     Codex sends local/client fields such as ``client_metadata``,
@@ -1280,13 +1325,31 @@ def chat_tool_choice_to_responses(tool_choice):
     raise ValueError("Unsupported chat tool_choice value")
 
 
+def _response_replay_id(source: dict) -> str | None:
+    for key in ("response_item_id", "openai_response_item_id", "id"):
+        value = source.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _response_replay_status(source: dict) -> str | None:
+    value = source.get("response_item_status") or source.get("status")
+    if isinstance(value, str) and value:
+        return value
+    return None
+
+
 def _chat_content_item_to_response_content(item: dict, *, role: str = "user") -> dict | None:
     item_type = str(item.get("type", "")).lower()
     if item_type == "text" and isinstance(item.get("text"), str):
         text_type = "output_text" if role == "assistant" else "input_text"
         content_item = {"type": text_type, "text": item["text"]}
-        if isinstance(item.get("copilot_cache_control"), dict):
-            content_item["copilot_cache_control"] = dict(item["copilot_cache_control"])
+        if role == "assistant":
+            annotations = item.get("annotations")
+            if not isinstance(annotations, list):
+                annotations = item.get("response_annotations")
+            content_item["annotations"] = annotations if isinstance(annotations, list) else []
         return content_item
     if item_type == "image_url":
         image_url = item.get("image_url")
@@ -1302,6 +1365,7 @@ def anthropic_request_to_responses(body: dict) -> dict:
 
     response_input = []
     system_content = _anthropic_system_to_chat_content(body.get("system"))
+    system_content = _strip_anthropic_billing_header_from_system_content(system_content)
     if isinstance(system_content, str) and system_content:
         response_input.append(
             {
@@ -1316,11 +1380,7 @@ def anthropic_request_to_responses(body: dict) -> dict:
                 "type": "message",
                 "role": "developer",
                 "content": [
-                    {
-                        "type": "input_text",
-                        "text": item.get("text", ""),
-                        **({"copilot_cache_control": item["copilot_cache_control"]} if isinstance(item.get("copilot_cache_control"), dict) else {}),
-                    }
+                    {"type": "input_text", "text": item.get("text", "")}
                     for item in system_content
                     if isinstance(item, dict) and isinstance(item.get("text"), str)
                 ],
@@ -1335,21 +1395,48 @@ def anthropic_request_to_responses(body: dict) -> dict:
 
         if role == "assistant":
             content = []
+            replay_id = None
+            replay_status = None
+
+            def flush_assistant_content() -> None:
+                nonlocal content, replay_id, replay_status
+                if not content:
+                    return
+                message_item = {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": content,
+                }
+                if replay_id:
+                    message_item["id"] = replay_id
+                if replay_status:
+                    message_item["status"] = replay_status
+                response_input.append(message_item)
+                content = []
+                replay_id = None
+                replay_status = None
+
             for item in blocks:
                 item_type = str(item.get("type", "")).lower()
                 if item_type == "tool_use":
+                    flush_assistant_content()
                     tool_name = item.get("name")
                     tool_id = item.get("id")
                     if not isinstance(tool_name, str) or not isinstance(tool_id, str):
                         raise ValueError("Anthropic tool_use blocks must include string id and name")
-                    response_input.append(
-                        {
-                            "type": "function_call",
-                            "call_id": tool_id,
-                            "name": tool_name,
-                            "arguments": json.dumps(item.get("input") or {}, separators=(",", ":"), ensure_ascii=False),
-                        }
-                    )
+                    function_call = {
+                        "type": "function_call",
+                        "call_id": tool_id,
+                        "name": tool_name,
+                        "arguments": json.dumps(item.get("input") or {}, separators=(",", ":"), ensure_ascii=False),
+                    }
+                    item_id = _response_replay_id(item)
+                    if item_id and item_id != tool_id:
+                        function_call["id"] = item_id
+                    status = _response_replay_status(item)
+                    if status:
+                        function_call["status"] = status
+                    response_input.append(function_call)
                     continue
                 if _anthropic_block_type_is_ignorable(item_type):
                     continue
@@ -1359,8 +1446,11 @@ def anthropic_request_to_responses(body: dict) -> dict:
                 response_content_item = _chat_content_item_to_response_content(content_item, role="assistant")
                 if response_content_item is not None:
                     content.append(response_content_item)
-            if content:
-                response_input.append({"type": "message", "role": "assistant", "content": content})
+                    if replay_id is None:
+                        replay_id = _response_replay_id(item)
+                    if replay_status is None:
+                        replay_status = _response_replay_status(item)
+            flush_assistant_content()
             continue
 
         if role != "user":
@@ -1383,6 +1473,9 @@ def anthropic_request_to_responses(body: dict) -> dict:
                         "output": _anthropic_tool_result_content_to_text(item.get("content", "")),
                     }
                 )
+                status = _response_replay_status(item)
+                if status:
+                    response_input[-1]["status"] = status
                 continue
             if _anthropic_block_type_is_ignorable(item_type):
                 continue
@@ -1400,13 +1493,16 @@ def anthropic_request_to_responses(body: dict) -> dict:
         "model": resolve_copilot_model_name(body.get("model")),
         "input": response_input,
         "stream": bool(body.get("stream", False)),
+        "store": False,
+        "parallel_tool_calls": True,
+        "include": ["reasoning.encrypted_content"],
+        "text": {"format": {"type": "text"}, "verbosity": "low"},
     }
 
     for source_key, target_key in (
         ("max_tokens", "max_output_tokens"),
         ("temperature", "temperature"),
         ("top_p", "top_p"),
-        ("metadata", "metadata"),
     ):
         value = body.get(source_key)
         if value is not None:
@@ -1440,9 +1536,6 @@ def anthropic_request_to_responses(body: dict) -> dict:
     )
     if reasoning_effort is not None:
         payload["reasoning"] = {"effort": reasoning_effort}
-
-    # copilot_cache_control is only valid for Chat Completions; strip for Responses API.
-    payload["input"] = _strip_copilot_cache_control(payload["input"])
 
     return payload
 
@@ -1586,16 +1679,31 @@ def _response_output_items_to_anthropic_content(output) -> list[dict]:
                     continue
                 text = part.get("text") or part.get("input_text") or part.get("output_text")
                 if isinstance(text, str):
-                    content.append({"type": "text", "text": text})
+                    block = {"type": "text", "text": text}
+                    item_id = item.get("id")
+                    if isinstance(item_id, str) and item_id:
+                        block["response_item_id"] = item_id
+                    status = item.get("status")
+                    if isinstance(status, str) and status:
+                        block["response_item_status"] = status
+                    annotations = part.get("annotations")
+                    if isinstance(annotations, list):
+                        block["response_annotations"] = annotations
+                    content.append(block)
         if item_type == "function_call":
-            content.append(
-                {
-                    "type": "tool_use",
-                    "id": item.get("call_id") or item.get("id") or f"toolu_{uuid4().hex}",
-                    "name": item.get("name") if isinstance(item.get("name"), str) else "",
-                    "input": _parse_tool_call_arguments(item.get("arguments")),
-                }
-            )
+            block = {
+                "type": "tool_use",
+                "id": item.get("call_id") or item.get("id") or f"toolu_{uuid4().hex}",
+                "name": item.get("name") if isinstance(item.get("name"), str) else "",
+                "input": _parse_tool_call_arguments(item.get("arguments")),
+            }
+            item_id = item.get("id")
+            if isinstance(item_id, str) and item_id and item_id != block["id"]:
+                block["response_item_id"] = item_id
+            status = item.get("status")
+            if isinstance(status, str) and status:
+                block["response_item_status"] = status
+            content.append(block)
     return content or [{"type": "text", "text": ""}]
 
 
@@ -2952,7 +3060,6 @@ def responses_request_to_anthropic_messages(body: dict) -> dict:
     for source_key, target_key in (
         ("temperature", "temperature"),
         ("top_p", "top_p"),
-        ("metadata", "metadata"),
     ):
         value = body.get(source_key)
         if value is not None:
@@ -3065,18 +3172,25 @@ def _anthropic_content_blocks_to_responses_output(content) -> list[dict]:
 
     output: list[dict] = []
     pending_message_parts: list[dict] = []
+    pending_message_id: str | None = None
+    pending_message_status: str | None = None
 
     def flush_message():
-        nonlocal pending_message_parts
+        nonlocal pending_message_parts, pending_message_id, pending_message_status
         if pending_message_parts:
-            output.append(
-                {
-                    "type": "message",
-                    "role": "assistant",
-                    "content": list(pending_message_parts),
-                }
-            )
+            message_item = {
+                "type": "message",
+                "role": "assistant",
+                "content": list(pending_message_parts),
+            }
+            if pending_message_id:
+                message_item["id"] = pending_message_id
+            if pending_message_status:
+                message_item["status"] = pending_message_status
+            output.append(message_item)
             pending_message_parts = []
+            pending_message_id = None
+            pending_message_status = None
 
     for block in content:
         if not isinstance(block, dict):
@@ -3086,9 +3200,20 @@ def _anthropic_content_blocks_to_responses_output(content) -> list[dict]:
         if block_type == "text":
             text = block.get("text")
             if isinstance(text, str):
+                annotations = block.get("annotations")
+                if not isinstance(annotations, list):
+                    annotations = block.get("response_annotations")
                 pending_message_parts.append(
-                    {"type": "output_text", "text": text, "annotations": []}
+                    {
+                        "type": "output_text",
+                        "text": text,
+                        "annotations": annotations if isinstance(annotations, list) else [],
+                    }
                 )
+                if pending_message_id is None:
+                    pending_message_id = _response_replay_id(block)
+                if pending_message_status is None:
+                    pending_message_status = _response_replay_status(block)
             continue
 
         # Anything other than ``text`` becomes its own top-level item.
@@ -3132,14 +3257,19 @@ def _anthropic_content_blocks_to_responses_output(content) -> list[dict]:
             if not isinstance(name, str) or not isinstance(tool_id, str):
                 continue
             tool_input = block.get("input") if isinstance(block.get("input"), (dict, list)) else {}
-            output.append(
-                {
-                    "type": "function_call",
-                    "call_id": tool_id,
-                    "name": name,
-                    "arguments": json.dumps(tool_input, separators=(",", ":"), ensure_ascii=False),
-                }
-            )
+            function_call = {
+                "type": "function_call",
+                "call_id": tool_id,
+                "name": name,
+                "arguments": json.dumps(tool_input, separators=(",", ":"), ensure_ascii=False),
+            }
+            item_id = _response_replay_id(block)
+            if item_id and item_id != tool_id:
+                function_call["id"] = item_id
+            status = _response_replay_status(block)
+            if status:
+                function_call["status"] = status
+            output.append(function_call)
             continue
 
         # Unknown block type — skip.

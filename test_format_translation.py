@@ -197,20 +197,22 @@ class FormatTranslationTests(unittest.TestCase):
         outbound = format_translation.anthropic_request_to_responses(body)
 
         self.assertEqual(
-            outbound["input"],
-            [
-                {
-                    "type": "message",
-                    "role": "user",
-                    "content": [{"type": "input_text", "text": "hi"}],
-                },
-                {
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [{"type": "output_text", "text": "visible answer"}],
-                },
-            ],
+            outbound["input"][0],
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "hi"}],
+            },
         )
+        self.assertEqual(outbound["input"][1]["type"], "message")
+        self.assertEqual(outbound["input"][1]["role"], "assistant")
+        self.assertEqual(
+            outbound["input"][1]["content"],
+            [{"type": "output_text", "text": "visible answer", "annotations": []}],
+        )
+        self.assertNotIn("status", outbound["input"][1])
+        self.assertNotIn("id", outbound["input"][1])
+        self.assertEqual(outbound["text"], {"format": {"type": "text"}, "verbosity": "low"})
 
     def test_anthropic_effort_to_reasoning_effort_helper(self):
         self.assertEqual(
@@ -1250,6 +1252,7 @@ class FormatTranslationTests(unittest.TestCase):
         body = {
             "model": "gpt-5.4",
             "system": "Follow the spec",
+            "metadata": {"user_id": "local-only"},
             "messages": [
                 {
                     "role": "user",
@@ -1281,13 +1284,20 @@ class FormatTranslationTests(unittest.TestCase):
 
         self.assertEqual(translated["model"], "gpt-5.4")
         self.assertEqual(translated["input"][0]["role"], "developer")
+        self.assertEqual(translated["input"][0]["content"][0]["text"], "Follow the spec")
         self.assertEqual(translated["input"][1]["role"], "user")
         self.assertEqual(translated["input"][1]["content"][0]["text"], "hello")
         self.assertEqual(translated["input"][2]["type"], "function_call")
         self.assertEqual(translated["input"][2]["call_id"], "tool_1")
+        self.assertNotIn("id", translated["input"][2])
+        self.assertNotIn("status", translated["input"][2])
         self.assertEqual(translated["input"][3]["type"], "function_call_output")
         self.assertEqual(translated["input"][3]["output"], "file contents")
+        self.assertNotIn("status", translated["input"][3])
         self.assertEqual(translated["tools"][0]["name"], "Read")
+        self.assertNotIn("metadata", translated)
+        self.assertNotIn("instructions", translated)
+        self.assertEqual(translated["text"], {"format": {"type": "text"}, "verbosity": "low"})
 
     def test_anthropic_request_to_responses_strips_temperature_for_gpt_5_4_mini(self):
         body = {
@@ -1821,6 +1831,91 @@ class FormatTranslationTests(unittest.TestCase):
             for part in user_msg.get("content", []):
                 self.assertEqual(part["type"], "input_text")
 
+    def test_anthropic_request_to_responses_replays_responses_item_metadata(self):
+        body = {
+            "model": "gpt-5.4",
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "hello"}]},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "hi",
+                            "response_item_id": "msg_prev",
+                            "response_item_status": "completed",
+                            "response_annotations": [],
+                        },
+                        {
+                            "type": "tool_use",
+                            "id": "call_1",
+                            "name": "Read",
+                            "input": {"file": "main.py"},
+                            "response_item_id": "fc_prev",
+                            "response_item_status": "completed",
+                        },
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "call_1",
+                            "content": "contents",
+                        }
+                    ],
+                },
+            ],
+        }
+
+        translated = format_translation.anthropic_request_to_responses(body)
+
+        assistant_msg = translated["input"][1]
+        self.assertEqual(assistant_msg["id"], "msg_prev")
+        self.assertEqual(assistant_msg["status"], "completed")
+        self.assertEqual(
+            assistant_msg["content"],
+            [{"type": "output_text", "text": "hi", "annotations": []}],
+        )
+        function_call = translated["input"][2]
+        self.assertEqual(function_call["id"], "fc_prev")
+        self.assertEqual(function_call["call_id"], "call_1")
+        self.assertEqual(function_call["status"], "completed")
+        tool_output = translated["input"][3]
+        self.assertNotIn("status", tool_output)
+
+    def test_anthropic_request_to_responses_does_not_synthesize_replay_item_ids(self):
+        body = {
+            "model": "gpt-5.4",
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "hello"}]},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": "checking"},
+                        {
+                            "type": "tool_use",
+                            "id": "tool_1",
+                            "name": "Read",
+                            "input": {"file": "main.py"},
+                        },
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [{"type": "tool_result", "tool_use_id": "tool_1", "content": "contents"}],
+                },
+            ],
+        }
+
+        first = format_translation.anthropic_request_to_responses(body)
+        second = format_translation.anthropic_request_to_responses(body)
+
+        self.assertNotIn("id", first["input"][1])
+        self.assertNotIn("id", first["input"][2])
+        self.assertEqual(first, second)
+
     def test_anthropic_request_to_responses_strips_copilot_cache_control(self):
         """copilot_cache_control is a Chat API extension and must not leak into Responses API payloads."""
         body = {
@@ -1852,14 +1947,54 @@ class FormatTranslationTests(unittest.TestCase):
         # The payload must not contain copilot_cache_control anywhere.
         import json
         raw = json.dumps(translated)
+        self.assertNotIn("cache_control", raw)
         self.assertNotIn("copilot_cache_control", raw)
 
         # Content should still be present (only the cache hint is stripped).
-        dev_msg = translated["input"][0]
-        self.assertEqual(dev_msg["role"], "developer")
-        self.assertTrue(any("cached system" in item.get("text", "") for item in dev_msg["content"]))
+        self.assertIn("cached system", translated["input"][0]["content"][1]["text"])
         user_msg = translated["input"][1]
         self.assertEqual(user_msg["content"][0]["text"], "hello")
+
+    def test_anthropic_request_to_responses_strips_volatile_billing_system_block(self):
+        body = {
+            "model": "gpt-5.4",
+            "system": [
+                {
+                    "type": "text",
+                    "text": "x-anthropic-billing-header: cc_version=2.1.98.134; cc_entrypoint=cli; cch=a38f0;",
+                },
+                {
+                    "type": "text",
+                    "text": "stable guidance",
+                    "cache_control": {"type": "ephemeral"},
+                },
+            ],
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hello"}]}],
+        }
+
+        first = format_translation.anthropic_request_to_responses(body)
+        body["system"][0]["text"] = (
+            "x-anthropic-billing-header: cc_version=2.1.98.134; cc_entrypoint=cli; cch=9b349;"
+        )
+        second = format_translation.anthropic_request_to_responses(body)
+
+        self.assertEqual(first["input"][0], second["input"][0])
+        self.assertEqual(first["input"][0]["content"], [{"type": "input_text", "text": "stable guidance"}])
+        self.assertNotIn("x-anthropic-billing-header", str(first))
+
+    def test_anthropic_request_to_responses_strips_leading_billing_line_from_system_string(self):
+        body = {
+            "model": "gpt-5.4",
+            "system": (
+                "x-anthropic-billing-header: cc_version=2.1.98.134; cc_entrypoint=cli; cch=a38f0;\n\n"
+                "stable guidance"
+            ),
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hello"}]}],
+        }
+
+        translated = format_translation.anthropic_request_to_responses(body)
+
+        self.assertEqual(translated["input"][0]["content"][0]["text"], "stable guidance")
 
     def test_anthropic_request_to_chat_keeps_copilot_cache_control(self):
         """copilot_cache_control must survive in the Chat API path so GHCP caching works."""
@@ -1930,6 +2065,7 @@ class ResponsesToAnthropicMessagesTests(unittest.TestCase):
         body = {
             "model": "claude-sonnet-4.6",
             "instructions": "You are helpful.",
+            "metadata": {"user_id": "local-only"},
             "input": [
                 {
                     "type": "message",
@@ -1942,6 +2078,7 @@ class ResponsesToAnthropicMessagesTests(unittest.TestCase):
         out = format_translation.responses_request_to_anthropic_messages(body)
         self.assertEqual(out["system"], "You are helpful.")
         self.assertEqual(out["max_tokens"], 1024)
+        self.assertNotIn("metadata", out)
         self.assertEqual(
             out["messages"],
             [{"role": "user", "content": [{"type": "text", "text": "Hi"}]}],
@@ -2436,6 +2573,40 @@ class AnthropicResponseToResponsesTests(unittest.TestCase):
         self.assertEqual(fc["call_id"], "toolu_9")
         self.assertEqual(fc["name"], "search")
         self.assertEqual(json.loads(fc["arguments"]), {"q": "y"})
+
+    def test_response_payload_to_anthropic_preserves_replay_metadata(self):
+        payload = {
+            "id": "resp_1",
+            "model": "gpt-5.4",
+            "output": [
+                {
+                    "type": "message",
+                    "id": "msg_prev",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": "hello", "annotations": []}],
+                },
+                {
+                    "type": "function_call",
+                    "id": "fc_prev",
+                    "call_id": "call_1",
+                    "name": "Read",
+                    "arguments": "{\"file\":\"main.py\"}",
+                    "status": "completed",
+                },
+            ],
+        }
+
+        translated = format_translation.response_payload_to_anthropic(payload)
+
+        text_block = translated["content"][0]
+        self.assertEqual(text_block["response_item_id"], "msg_prev")
+        self.assertEqual(text_block["response_item_status"], "completed")
+        self.assertEqual(text_block["response_annotations"], [])
+        tool_block = translated["content"][1]
+        self.assertEqual(tool_block["id"], "call_1")
+        self.assertEqual(tool_block["response_item_id"], "fc_prev")
+        self.assertEqual(tool_block["response_item_status"], "completed")
 
     def test_thinking_plus_text_with_signature(self):
         anth = {

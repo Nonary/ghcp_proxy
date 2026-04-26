@@ -83,9 +83,9 @@ class ProtocolBridgePlannerTests(unittest.TestCase):
 
         self.assertEqual(plan.strategy_name, "responses_to_responses")
         self.assertNotIn("service_tier", plan.upstream_body)
-        self.assertEqual(plan.upstream_body["sessionId"], "session-123")
-        self.assertEqual(plan.upstream_body["prompt_cache_key"], "cache-123")
-        self.assertEqual(plan.upstream_body["previous_response_id"], "resp_prev")
+        self.assertNotIn("sessionId", plan.upstream_body)
+        self.assertNotIn("prompt_cache_key", plan.upstream_body)
+        self.assertNotIn("previous_response_id", plan.upstream_body)
 
     def test_planner_strips_invalid_deferred_tools_for_native_responses(self):
         planner = ProtocolBridgePlanner(_RoutingConfigStub())
@@ -177,6 +177,31 @@ class ProtocolBridgePlannerTests(unittest.TestCase):
         self.assertEqual(plan.header_kind, "responses")
         self.assertEqual(plan.upstream_body["input"][0]["role"], "user")
         self.assertEqual(plan.upstream_body["input"][0]["content"][0]["text"], "hello")
+
+    def test_planner_uses_native_messages_to_responses_cache_shape(self):
+        planner = ProtocolBridgePlanner(_RoutingConfigStub("gpt-5.4"))
+        body = {
+            "model": "claude-opus-4.6",
+            "system": "system prompt",
+            "metadata": {"user_id": '{"session_id":"claude-cache-session"}'},
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "hello"}]},
+            ],
+            "stream": False,
+        }
+
+        plan = proxy.asyncio.run(
+            planner.plan("messages", body, api_base="https://example.invalid", api_key="test-key")
+        )
+
+        self.assertEqual(plan.strategy_name, "messages_to_responses")
+        self.assertNotIn("prompt_cache_key", plan.upstream_body)
+        self.assertNotIn("instructions", plan.upstream_body)
+        self.assertEqual(plan.upstream_body["text"], {"format": {"type": "text"}, "verbosity": "low"})
+        self.assertEqual(plan.upstream_body["input"][0]["role"], "developer")
+        self.assertEqual(plan.upstream_body["input"][0]["content"][0]["text"], "system prompt")
+        self.assertEqual(plan.upstream_body["input"][1]["role"], "user")
+        self.assertNotIn("metadata", plan.upstream_body)
 
     def test_planner_selects_messages_to_chat_strategy_when_mapping_targets_grok(self):
         planner = ProtocolBridgePlanner(_RoutingConfigStub("grok-code-fast-1"))
@@ -473,6 +498,48 @@ class NativeMessagesBridgeTests(unittest.TestCase):
         self.assertEqual(plan.header_kind, "messages")
         self.assertEqual(plan.caller_protocol, "anthropic")
         self.assertEqual(plan.upstream_body["model"], "claude-sonnet-4.6")
+
+    def test_messages_to_messages_expands_cache_breakpoints(self):
+        planner = self._planner("claude-sonnet-4.6", supports=True)
+        body = {
+            "model": "claude-sonnet-4.6",
+            "system": "system prompt",
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "first"}]},
+                {
+                    "role": "assistant",
+                    "content": [{"type": "tool_use", "id": "tool_1", "name": "Read", "input": {}}],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "tool_result", "tool_use_id": "tool_1", "content": "ok"},
+                        {
+                            "type": "text",
+                            "text": "<system-reminder>cache here</system-reminder>",
+                            "cache_control": {"type": "ephemeral", "scope": "session"},
+                        },
+                    ],
+                },
+            ],
+            "tools": [{"name": "Read", "description": "Read", "input_schema": {"type": "object"}}],
+        }
+
+        plan = proxy.asyncio.run(
+            planner.plan("messages", body, api_base="https://example.invalid", api_key="k")
+        )
+
+        self.assertEqual(plan.strategy_name, "messages_to_messages")
+        self.assertIsInstance(plan.upstream_body["system"], list)
+        self.assertEqual(plan.upstream_body["system"][0]["cache_control"], {"type": "ephemeral"})
+        self.assertEqual(plan.upstream_body["tools"][0]["cache_control"], {"type": "ephemeral"})
+        self.assertEqual(
+            plan.upstream_body["messages"][-2]["content"][-1]["cache_control"],
+            {"type": "ephemeral"},
+        )
+        merged_result = plan.upstream_body["messages"][-1]["content"][0]
+        self.assertEqual(merged_result["type"], "tool_result")
+        self.assertEqual(merged_result["cache_control"], {"type": "ephemeral"})
 
     def test_messages_to_messages_falls_back_when_capability_unsupported(self):
         planner = self._planner("claude-sonnet-4.6", supports=False)

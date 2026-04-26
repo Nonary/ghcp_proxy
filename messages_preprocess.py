@@ -14,6 +14,7 @@ from effort_mapping import map_effort_for_model
 
 __all__ = [
     "strip_cache_control_scope",
+    "apply_prompt_cache_breakpoints",
     "filter_assistant_thinking_placeholders",
     "merge_tool_result_with_reminder",
     "strip_tool_reference_turn_boundary",
@@ -113,6 +114,110 @@ def strip_cache_control_scope(body: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# 1b. Prompt-cache breakpoints for native Messages passthrough
+# ---------------------------------------------------------------------------
+
+_CACHEABLE_BLOCK_TYPES = {"text", "image", "document", "tool_use", "tool_result"}
+
+
+def _has_cache_control(block: Any) -> bool:
+    return isinstance(block, dict) and isinstance(block.get("cache_control"), dict)
+
+
+def _add_cache_control(block: dict) -> bool:
+    if not isinstance(block, dict):
+        return False
+    if not isinstance(block.get("cache_control"), dict):
+        block["cache_control"] = {"type": "ephemeral"}
+    return True
+
+
+def _last_cacheable_content_block(content: Any) -> dict | None:
+    if not isinstance(content, list):
+        return None
+    for block in reversed(content):
+        if not isinstance(block, dict):
+            continue
+        if str(block.get("type", "")).lower() in _CACHEABLE_BLOCK_TYPES:
+            return block
+    return None
+
+
+def _last_cacheable_tool(tools: Any) -> dict | None:
+    if not isinstance(tools, list):
+        return None
+    for tool in reversed(tools):
+        if isinstance(tool, dict):
+            return tool
+    return None
+
+
+def _body_has_cache_control(body: dict) -> bool:
+    if not isinstance(body, dict):
+        return False
+
+    system = body.get("system")
+    if isinstance(system, list) and any(_has_cache_control(block) for block in system):
+        return True
+
+    tools = body.get("tools")
+    if isinstance(tools, list) and any(_has_cache_control(tool) for tool in tools):
+        return True
+
+    messages = body.get("messages")
+    if isinstance(messages, list):
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            content = msg.get("content")
+            if isinstance(content, list) and any(_has_cache_control(block) for block in content):
+                return True
+    return False
+
+
+def apply_prompt_cache_breakpoints(body: dict) -> dict:
+    """Ensure native Anthropic Messages requests carry stable cache markers.
+
+    Claude Code usually sends Anthropic ``cache_control`` markers. Some of its
+    turns, however, put the marker on a trailing text/system-reminder block
+    that this proxy later merges into a ``tool_result`` for Copilot
+    compatibility. Rather than depending on the exact incoming placement,
+    re-assert the same four cache breakpoints we use when translating
+    Responses → Messages: last tool, system, and the last two messages.
+    """
+    if not isinstance(body, dict) or not _body_has_cache_control(body):
+        return body
+
+    remaining = 4
+
+    def mark(block: dict | None) -> None:
+        nonlocal remaining
+        if remaining <= 0 or not isinstance(block, dict):
+            return
+        if _add_cache_control(block):
+            remaining -= 1
+
+    mark(_last_cacheable_tool(body.get("tools")))
+
+    system = body.get("system")
+    if isinstance(system, str) and system:
+        system_block = {"type": "text", "text": system}
+        mark(system_block)
+        body["system"] = [system_block]
+    elif isinstance(system, list):
+        mark(_last_cacheable_content_block(system))
+
+    messages = body.get("messages")
+    if isinstance(messages, list):
+        for message in messages[-2:]:
+            if not isinstance(message, dict):
+                continue
+            mark(_last_cacheable_content_block(message.get("content")))
+
+    return body
+
+
+# ---------------------------------------------------------------------------
 # 2. Filter placeholder thinking blocks
 # ---------------------------------------------------------------------------
 
@@ -194,9 +299,12 @@ def _merge_content_with_texts(tr: dict, text_blocks: list[dict]) -> None:
     in which case we leave it alone — match TS `hasToolRef` guard).
     """
     tr_content = tr.get("content")
+    should_cache_result = any(_has_cache_control(tb) for tb in text_blocks)
     if isinstance(tr_content, str):
         joined = "\n\n".join(tb.get("text", "") for tb in text_blocks)
         tr["content"] = f"{tr_content}\n\n{joined}"
+        if should_cache_result:
+            _add_cache_control(tr)
         return
     if isinstance(tr_content, list):
         if _has_tool_reference(tr):
@@ -204,11 +312,15 @@ def _merge_content_with_texts(tr: dict, text_blocks: list[dict]) -> None:
         tr["content"] = list(tr_content) + [
             {"type": "text", "text": tb.get("text", "")} for tb in text_blocks
         ]
+        if should_cache_result:
+            _add_cache_control(tr)
         return
     # No existing content: initialize it with the new text blocks.
     tr["content"] = [
         {"type": "text", "text": tb.get("text", "")} for tb in text_blocks
     ]
+    if should_cache_result:
+        _add_cache_control(tr)
 
 
 def _merge_content_with_attachments(tr: dict, attachments: list[dict]) -> None:
@@ -696,6 +808,7 @@ def prepare_messages_passthrough_payload(
     strip_tool_reference_turn_boundary(cleaned)
     merge_tool_result_with_reminder(cleaned, skip_last_message=bool(is_compact))
     strip_cache_control_scope(cleaned)
+    apply_prompt_cache_breakpoints(cleaned)
     filter_assistant_thinking_placeholders(cleaned)
     apply_adaptive_thinking(
         cleaned,

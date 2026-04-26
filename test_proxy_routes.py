@@ -725,6 +725,74 @@ class ProxyRoutesTests(unittest.TestCase):
             b'{"id":"resp_123","type":"message","role":"assistant","model":"gpt-5.4","content":[{"type":"text","text":"hello from codex"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":12,"output_tokens":3,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}',
         )
 
+    def test_anthropic_messages_to_responses_reuses_claude_metadata_session_affinity(self):
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/messages"),
+            method="POST",
+            headers={},
+        )
+        body1 = {
+            "model": "claude-opus-4.6",
+            "metadata": {"user_id": '{"session_id":"claude-meta-cache-session"}'},
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "hello"}],
+                }
+            ],
+            "stream": False,
+        }
+        body2 = {
+            "model": "claude-opus-4.6",
+            "metadata": {"user_id": '{"session_id":"claude-meta-cache-session"}'},
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "follow up"}],
+                }
+            ],
+            "stream": False,
+        }
+        upstream = httpx.Response(
+            200,
+            json={
+                "id": "resp_123",
+                "model": "gpt-5.4",
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "ok"}],
+                    }
+                ],
+                "usage": {"input_tokens": 12, "output_tokens": 3},
+            },
+            headers={"content-type": "application/json"},
+        )
+
+        with (
+            mock.patch.object(proxy, "parse_json_request", mock.AsyncMock(side_effect=[body1, body2])),
+            mock.patch.object(auth, "get_api_key", return_value="test-key"),
+            mock.patch.object(auth, "get_api_base", return_value="https://example.invalid"),
+            mock.patch.object(proxy.model_routing_config_service, "resolve_target_model", return_value="gpt-5.4"),
+            mock.patch.object(proxy.usage_tracker, "start_event", return_value=None),
+            mock.patch.object(proxy.usage_tracker, "finish_event"),
+            mock.patch.object(proxy, "throttled_client_post", mock.AsyncMock(return_value=upstream)) as post,
+        ):
+            first_response = proxy.asyncio.run(proxy.anthropic_messages(request))
+            second_response = proxy.asyncio.run(proxy.anthropic_messages(request))
+
+        self.assertEqual(first_response.status_code, 200)
+        self.assertEqual(second_response.status_code, 200)
+        first_headers = post.await_args_list[0].kwargs["headers"]
+        second_headers = post.await_args_list[1].kwargs["headers"]
+        self.assertEqual(first_headers["X-Initiator"], "user")
+        self.assertEqual(second_headers["X-Initiator"], "user")
+        self.assertEqual(first_headers["x-interaction-id"], second_headers["x-interaction-id"])
+        self.assertEqual(first_headers["x-agent-task-id"], second_headers["x-agent-task-id"])
+        first_body = post.await_args_list[0].kwargs["json"]
+        self.assertNotIn("metadata", first_body)
+
     def test_responses_route_treats_local_compaction_as_handoff_boundary(self):
         request = SimpleNamespace(
             url=SimpleNamespace(path="/v1/responses"),
@@ -1575,6 +1643,67 @@ class AnthropicMessagesPassthroughRouteTests(unittest.TestCase):
             method="POST",
             headers={"x-client-request-id": "req-msg-1", "anthropic-beta": "context-management-2025-06-27"},
         )
+
+    def test_messages_route_forwards_claude_session_affinity_for_cache(self):
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/messages"),
+            method="POST",
+            headers={
+                "x-claude-code-session-id": "claude-session-1",
+                "anthropic-beta": "context-management-2025-06-27",
+            },
+        )
+        body = {
+            "model": "claude-sonnet-4.6",
+            "system": "system prompt",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "hi",
+                            "cache_control": {"type": "ephemeral"},
+                        }
+                    ],
+                }
+            ],
+            "stream": False,
+        }
+        upstream = httpx.Response(
+            200,
+            json={
+                "id": "msg_x",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-sonnet-4.6",
+                "content": [{"type": "text", "text": "ok"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 5, "output_tokens": 1},
+            },
+            headers={"content-type": "application/json"},
+        )
+
+        with (
+            mock.patch.object(proxy, "parse_json_request", mock.AsyncMock(return_value=body)),
+            mock.patch.object(auth, "get_api_key", return_value="test-key"),
+            mock.patch.object(auth, "get_api_base", return_value="https://example.invalid"),
+            mock.patch.object(proxy.model_routing_config_service, "resolve_target_model", return_value="claude-sonnet-4.6"),
+            mock.patch.object(usage_tracking, "log_proxy_request"),
+            mock.patch.object(proxy.usage_tracker, "_persist_event"),
+            mock.patch.object(proxy, "throttled_client_post", mock.AsyncMock(return_value=upstream)) as post,
+        ):
+            response = proxy.asyncio.run(proxy.anthropic_messages(request))
+
+        self.assertEqual(response.status_code, 200)
+        sent_headers = post.await_args.kwargs["headers"]
+        self.assertEqual(sent_headers["x-interaction-id"], "claude-session-1")
+        self.assertIn("x-agent-task-id", sent_headers)
+        self.assertIn("x-request-id", sent_headers)
+        sent_body = post.await_args.kwargs["json"]
+        self.assertIsInstance(sent_body["system"], list)
+        self.assertEqual(sent_body["system"][0]["cache_control"], {"type": "ephemeral"})
+        self.assertEqual(sent_body["messages"][-1]["content"][-1]["cache_control"], {"type": "ephemeral"})
 
     def test_messages_route_uses_messages_passthrough_upstream(self):
         request = self._messages_request()

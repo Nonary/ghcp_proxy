@@ -186,6 +186,48 @@ def extract_usage_ratelimits_from_headers(headers) -> dict[str, dict[str, object
         }
     return usage_ratelimits
 
+
+def request_body_session_id(request_body: dict | None = None) -> str | None:
+    if not isinstance(request_body, dict):
+        return None
+    for key in ("session_id", "sessionId"):
+        value = request_body.get(key)
+        if isinstance(value, str):
+            normalized = value.strip()
+            if normalized:
+                return normalized
+    metadata = request_body.get("metadata")
+    if isinstance(metadata, dict):
+        for key in ("session_id", "sessionId"):
+            value = metadata.get(key)
+            if isinstance(value, str):
+                normalized = value.strip()
+                if normalized:
+                    return normalized
+        user_id = metadata.get("user_id")
+        user_id_payload = None
+        if isinstance(user_id, str):
+            normalized = user_id.strip()
+            if normalized:
+                try:
+                    user_id_payload = json.loads(normalized)
+                except json.JSONDecodeError:
+                    user_id_payload = None
+                if user_id_payload is None:
+                    return normalized
+        elif isinstance(user_id, dict):
+            user_id_payload = user_id
+        if isinstance(user_id_payload, dict):
+            for key in ("session_id", "sessionId"):
+                value = user_id_payload.get(key)
+                if isinstance(value, str):
+                    normalized = value.strip()
+                    if normalized:
+                        return normalized
+
+    return None
+
+
 def request_session_id(request: Request, request_body: dict | None = None) -> str | None:
     for header_name in (
         "session_id",
@@ -200,35 +242,7 @@ def request_session_id(request: Request, request_body: dict | None = None) -> st
             if normalized:
                 return normalized
 
-    if isinstance(request_body, dict):
-        for key in ("session_id", "sessionId"):
-            value = request_body.get(key)
-            if isinstance(value, str):
-                normalized = value.strip()
-                if normalized:
-                    return normalized
-        metadata = request_body.get("metadata")
-        if isinstance(metadata, dict):
-            user_id = metadata.get("user_id")
-            user_id_payload = None
-            if isinstance(user_id, str):
-                normalized = user_id.strip()
-                if normalized:
-                    try:
-                        user_id_payload = json.loads(normalized)
-                    except json.JSONDecodeError:
-                        user_id_payload = None
-            elif isinstance(user_id, dict):
-                user_id_payload = user_id
-            if isinstance(user_id_payload, dict):
-                for key in ("session_id", "sessionId"):
-                    value = user_id_payload.get(key)
-                    if isinstance(value, str):
-                        normalized = value.strip()
-                        if normalized:
-                            return normalized
-
-    return None
+    return request_body_session_id(request_body)
 
 
 def _normalized_api_path(path: str | None) -> str | None:
@@ -247,6 +261,10 @@ def _normalized_api_path(path: str | None) -> str | None:
 
 def _is_responses_api_path(path: str | None) -> bool:
     return _normalized_api_path(path) in {"/responses", "/responses/compact"}
+
+
+def _is_messages_api_path(path: str | None) -> bool:
+    return _normalized_api_path(path) == "/messages"
 
 
 def _drop_outbound_headers(headers: dict, header_names: tuple[str, ...]) -> None:
@@ -1096,7 +1114,14 @@ class UsageTracker:
                     outbound_headers["x-interaction-id"] = session_id
                 outbound_headers["x-request-id"] = server_request_id
                 outbound_headers["x-github-request-id"] = server_request_id
-                outbound_headers["x-agent-task-id"] = server_request_id
+                # Native Anthropic Messages uses x-agent-task-id as cache
+                # affinity. The header builder sets a stable per-session value;
+                # do not replace it with this proxy's per-request server id.
+                if (
+                    not _is_messages_api_path(outbound_path)
+                    or not outbound_headers.get("x-agent-task-id")
+                ):
+                    outbound_headers["x-agent-task-id"] = server_request_id
         started_at = utc_now_iso()
         event = {
             "request_id": event_request_id,
@@ -1337,7 +1362,3 @@ def log_proxy_request(
     "log_proxy_request")``) don't break.
     """
     pass
-
-
-
-

@@ -6,6 +6,7 @@ import copy
 import unittest
 
 from messages_preprocess import (
+    apply_prompt_cache_breakpoints,
     apply_adaptive_thinking,
     budget_tokens_to_effort,
     filter_assistant_thinking_placeholders,
@@ -57,6 +58,43 @@ class StripCacheControlScopeTests(unittest.TestCase):
 
     def test_handles_empty_body(self):
         self.assertEqual(strip_cache_control_scope({}), {})
+
+
+class ApplyPromptCacheBreakpointsTests(unittest.TestCase):
+    def test_expands_existing_cache_intent_to_stable_breakpoints(self):
+        body = {
+            "system": "sys",
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "first"}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "second"}]},
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "third",
+                            "cache_control": {"type": "ephemeral"},
+                        }
+                    ],
+                },
+            ],
+            "tools": [{"name": "Read", "input_schema": {"type": "object"}}],
+        }
+
+        apply_prompt_cache_breakpoints(body)
+
+        self.assertIsInstance(body["system"], list)
+        self.assertEqual(body["system"][0]["cache_control"], {"type": "ephemeral"})
+        self.assertEqual(body["tools"][0]["cache_control"], {"type": "ephemeral"})
+        self.assertNotIn("cache_control", body["messages"][0]["content"][0])
+        self.assertEqual(body["messages"][1]["content"][0]["cache_control"], {"type": "ephemeral"})
+        self.assertEqual(body["messages"][2]["content"][0]["cache_control"], {"type": "ephemeral"})
+
+    def test_noop_without_cache_intent(self):
+        body = {"system": "sys", "messages": [{"role": "user", "content": "hi"}]}
+        snap = copy.deepcopy(body)
+        apply_prompt_cache_breakpoints(body)
+        self.assertEqual(body, snap)
 
 
 class FilterAssistantThinkingTests(unittest.TestCase):
@@ -130,6 +168,28 @@ class MergeToolResultWithReminderTests(unittest.TestCase):
         tr = body["messages"][0]["content"][0]
         self.assertEqual(tr["content"], "hello\n\n<system-reminder>R</system-reminder>")
         self.assertEqual(len(body["messages"][0]["content"]), 1)
+
+    def test_preserves_cache_control_from_merged_text_on_tool_result(self):
+        body = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "tool_result", "tool_use_id": "a", "content": "hello"},
+                        {
+                            "type": "text",
+                            "text": "<system-reminder>R</system-reminder>",
+                            "cache_control": {"type": "ephemeral", "scope": "x"},
+                        },
+                    ],
+                }
+            ]
+        }
+        cleaned = prepare_messages_passthrough_payload(body, model_supports_adaptive=False)
+
+        tr = cleaned["messages"][0]["content"][0]
+        self.assertEqual(tr["cache_control"], {"type": "ephemeral"})
+        self.assertEqual(len(cleaned["messages"][0]["content"]), 1)
 
     def test_no_tool_result_no_change(self):
         body = {

@@ -20,7 +20,7 @@ _CLAUDE_ALIASES = {
 
 def _normalize_model(model: str | None) -> str:
     normalized = (model or "").strip().lower()
-    if normalized.startswith("anthropic/"):
+    if "/" in normalized:
         normalized = normalized.split("/", 1)[1]
     return normalized
 

@@ -466,6 +466,50 @@ class UsageTrackingTests(unittest.TestCase):
         self.assertEqual(event["session_id_origin"], "request")
         self.assertEqual(outbound_headers["session_id"], "claude-session")
 
+    def test_start_usage_event_uses_plain_claude_metadata_user_id_as_session_id(self):
+        tracker = self._make_usage_tracker()
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/messages"),
+            method="POST",
+            headers={},
+        )
+        outbound_headers = {}
+
+        event = tracker.start_event(
+            request,
+            requested_model="claude-sonnet-4.6",
+            resolved_model="gpt-5.4",
+            initiator="user",
+            request_body={"metadata": {"user_id": "plain-claude-session"}},
+            outbound_headers=outbound_headers,
+        )
+
+        self.assertEqual(event["session_id"], "plain-claude-session")
+        self.assertEqual(event["session_id_origin"], "request")
+        self.assertEqual(outbound_headers["session_id"], "plain-claude-session")
+
+    def test_start_usage_event_uses_metadata_session_id(self):
+        tracker = self._make_usage_tracker()
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/messages"),
+            method="POST",
+            headers={},
+        )
+        outbound_headers = {}
+
+        event = tracker.start_event(
+            request,
+            requested_model="claude-sonnet-4.6",
+            resolved_model="gpt-5.4",
+            initiator="user",
+            request_body={"metadata": {"session_id": "metadata-session"}},
+            outbound_headers=outbound_headers,
+        )
+
+        self.assertEqual(event["session_id"], "metadata-session")
+        self.assertEqual(event["session_id_origin"], "request")
+        self.assertEqual(outbound_headers["session_id"], "metadata-session")
+
     def test_start_usage_event_user_uses_request_id_session_when_session_missing(self):
         tracker = self._make_usage_tracker()
         request = SimpleNamespace(
@@ -842,6 +886,29 @@ class UsageTrackingTests(unittest.TestCase):
         self.assertEqual(outbound_headers["x-github-request-id"], event["server_request_id"])
         self.assertEqual(outbound_headers["x-agent-task-id"], event["server_request_id"])
 
+    def test_start_usage_event_preserves_native_messages_agent_task_affinity(self):
+        tracker = self._make_usage_tracker()
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/messages"),
+            method="POST",
+            headers={"x-claude-code-session-id": "claude-session"},
+        )
+        outbound_headers = {"x-agent-task-id": "stable-task"}
+
+        event = tracker.start_event(
+            request,
+            requested_model="claude-sonnet-4.6",
+            resolved_model="claude-sonnet-4.6",
+            initiator="agent",
+            upstream_path="/v1/messages",
+            outbound_headers=outbound_headers,
+        )
+
+        self.assertEqual(outbound_headers["x-agent-task-id"], "stable-task")
+        self.assertEqual(outbound_headers["x-request-id"], event["server_request_id"])
+        self.assertEqual(outbound_headers["x-github-request-id"], event["server_request_id"])
+        self.assertEqual(outbound_headers["x-interaction-id"], "claude-session")
+
     def test_finish_usage_event_tracks_usage_and_timing(self):
         tracker = self._make_usage_tracker()
         log_path = self._make_usage_log_path()
@@ -1192,8 +1259,6 @@ class UsageTrackingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
-
 
 
 

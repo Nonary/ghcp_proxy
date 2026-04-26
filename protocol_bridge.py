@@ -256,6 +256,14 @@ class MessagesToResponsesStrategy(ProtocolBridgeStrategy):
         upstream_body = dict(body)
         upstream_body["model"] = resolved_model
         translated = format_translation.anthropic_request_to_responses(upstream_body)
+        diagnostics: list[dict] = []
+        translated = format_translation.sanitize_responses_tools_for_copilot(
+            translated, diagnostics=diagnostics
+        )
+        translated = format_translation.sanitize_responses_body_for_copilot(
+            translated,
+            diagnostics=diagnostics,
+        )
         return BridgeExecutionPlan(
             strategy_name=self.strategy_name,
             inbound_protocol=self.inbound_protocol,
@@ -267,6 +275,7 @@ class MessagesToResponsesStrategy(ProtocolBridgeStrategy):
             upstream_body=translated,
             stream=bool(translated.get("stream", False)),
             is_compact=is_compact,
+            diagnostics=tuple(diagnostics),
         )
 
 
