@@ -998,6 +998,29 @@ class RequestHeadersTests(unittest.TestCase):
         self.assertIs(first_session, request_headers._responses_affinity_headers("agent", " session-a "))
         self.assertIsNot(first_session, request_headers._responses_affinity_headers("user", "session-a"))
 
+    def test_stable_responses_affinity_survives_process_cache_reset(self):
+        first = request_headers._responses_affinity_headers(
+            "user",
+            " prompt-cache-key ",
+            stable_user_affinity=True,
+        )
+        request_headers._RESPONSES_AFFINITY_BY_SESSION.clear()
+        request_headers._RESPONSES_DEFAULT_AFFINITY = None
+        second = request_headers._responses_affinity_headers(
+            "user",
+            "prompt-cache-key",
+            stable_user_affinity=True,
+        )
+        different = request_headers._responses_affinity_headers(
+            "user",
+            "other-cache-key",
+            stable_user_affinity=True,
+        )
+
+        self.assertEqual(first, second)
+        self.assertNotEqual(first["x-interaction-id"], different["x-interaction-id"])
+        self.assertNotEqual(first["x-agent-task-id"], different["x-agent-task-id"])
+
     def test_interaction_id_for_blank_session_generates_new_id(self):
         generated = request_headers._interaction_id_for_session(" ")
 

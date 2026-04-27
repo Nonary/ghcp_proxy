@@ -533,7 +533,7 @@ class ProtocolBridgePlannerTests(unittest.TestCase):
 
         self.assertEqual(plan.strategy_name, "responses_to_responses")
         self.assertNotIn("service_tier", plan.upstream_body)
-        self.assertNotIn("sessionId", plan.upstream_body)
+        self.assertEqual(plan.upstream_body["sessionId"], "session-123")
         # Cache lineage stays on the upstream body so the Copilot prefix cache
         # can match across turns.
         self.assertEqual(plan.upstream_body["prompt_cache_key"], "cache-123")
@@ -541,10 +541,10 @@ class ProtocolBridgePlannerTests(unittest.TestCase):
         self.assertEqual(plan.upstream_body["input"], "hello")
         self.assertEqual(
             plan.diagnostics[0]["fields"],
-            ["service_tier", "sessionId"],
+            ["service_tier"],
         )
 
-    def test_planner_strips_invalid_deferred_tools_for_native_responses(self):
+    def test_planner_preserves_deferred_tools_for_native_responses(self):
         planner = ProtocolBridgePlanner(_RoutingConfigStub())
         body = {
             "model": "gpt-5.5",
@@ -570,9 +570,8 @@ class ProtocolBridgePlannerTests(unittest.TestCase):
         )
 
         self.assertEqual(plan.strategy_name, "responses_to_responses")
-        self.assertNotIn("defer_loading", plan.upstream_body["tools"][0]["tools"][0])
-        self.assertEqual(plan.diagnostics[0]["action"], "strip_defer_loading")
-        self.assertEqual(plan.diagnostics[0]["reason"], "deferred_tools_require_tool_search")
+        self.assertTrue(plan.upstream_body["tools"][0]["tools"][0]["defer_loading"])
+        self.assertEqual(plan.diagnostics, ())
 
     def test_planner_selects_responses_to_chat_strategy_when_mapping_targets_claude(self):
         planner = ProtocolBridgePlanner(_RoutingConfigStub("claude-opus-4.6"))

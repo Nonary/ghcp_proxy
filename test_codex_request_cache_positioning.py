@@ -246,16 +246,13 @@ class CodexRequestCachePositioningTests(unittest.TestCase):
         # prompt-prefix cache across turns.
         for key in ("prompt_cache_key", "promptCacheKey", "previous_response_id"):
             self.assertEqual(plan.upstream_body.get(key), body[key])
-        # Codex-only / unsupported fields are still stripped.
-        for key in ("service_tier", "client_metadata", "tool_choice"):
-            self.assertNotIn(key, plan.upstream_body)
-            self.assertIn(key, body)
+        # Only fields known to be rejected by Copilot are stripped; other
+        # request fields stay byte-stable for cache-sensitive follow-ups.
+        self.assertNotIn("service_tier", plan.upstream_body)
+        self.assertEqual(plan.upstream_body["client_metadata"], {"session_id": "local-only"})
+        self.assertEqual(plan.upstream_body["tool_choice"], "auto")
 
-        self.assertEqual(plan.diagnostics[0]["fields"], [
-            "client_metadata",
-            "service_tier",
-            "tool_choice",
-        ])
+        self.assertEqual(plan.diagnostics[0]["fields"], ["service_tier"])
 
     def test_responses_header_affinity_prefers_snake_prompt_cache_key_and_strips_aliases(self):
         first_request = SimpleNamespace(

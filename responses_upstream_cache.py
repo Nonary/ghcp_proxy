@@ -10,29 +10,9 @@ import util
 
 _COPILOT_UNSUPPORTED_RESPONSES_TOOL_TYPES = {"image_generation"}
 
-# Native Responses fields the upstream Copilot endpoint actually consumes —
-# either captured in CLI traffic or part of the documented Responses contract
-# that contributes to the upstream prompt-prefix cache key. Anything else is
-# treated as a Codex-only client field and stripped, since unknown keys
-# perturb the upstream cache hash with no behavioral upside.
-_COPILOT_RESPONSES_UPSTREAM_BODY_KEYS = {
-    "include",
-    "input",
-    "instructions",
-    "metadata",
-    "model",
-    "parallel_tool_calls",
-    "previous_response_id",
-    "prompt_cache_key",
-    "promptCacheKey",
-    "reasoning",
-    "safety_identifier",
-    "store",
-    "stream",
-    "text",
-    "tools",
-    "user",
-}
+# Native Responses fields are preserved by default. Only fields with a concrete
+# Copilot rejection are removed here.
+_COPILOT_UNSUPPORTED_RESPONSES_BODY_KEYS = {"service_tier"}
 
 _TOOL_SEARCH_TOOL_NAMES = {"tool_search", "tools.tool_search"}
 _DANGEROUS_CODE_EXECUTION_TOOL_NAMES = {"mcp__ide__executecode"}
@@ -60,35 +40,25 @@ def _append_sanitizer_diagnostic(diagnostics: list[dict] | None, diagnostic: dic
 
 
 def sanitize_responses_body_for_copilot(body: dict, *, diagnostics: list[dict] | None = None) -> dict:
-    """Keep native Responses upstream payloads aligned with Copilot CLI.
-
-    Codex sends local/client fields such as ``client_metadata`` that aren't
-    part of the upstream Responses contract and would split the upstream
-    prompt cache hash for no behavioral gain. Drop those, but preserve the
-    documented cache-bearing fields (``prompt_cache_key``,
-    ``previous_response_id``, ``metadata``, ``user``, ``safety_identifier``)
-    so upstream can keep its prefix cache stable across turns.
-    """
+    """Remove only native Responses fields known to be rejected by Copilot."""
     if not isinstance(body, dict):
         return body
-    removed = sorted(k for k in body if k not in _COPILOT_RESPONSES_UPSTREAM_BODY_KEYS)
+    removed = sorted(k for k in body if k in _COPILOT_UNSUPPORTED_RESPONSES_BODY_KEYS)
     if not removed:
         return body
-    sanitized = {
-        k: v
-        for k, v in body.items()
-        if k in _COPILOT_RESPONSES_UPSTREAM_BODY_KEYS
-    }
+    sanitized = dict(body)
+    for key in removed:
+        sanitized.pop(key, None)
     _append_sanitizer_diagnostic(
         diagnostics,
         {
             "kind": "responses_body",
-            "action": "drop_non_copilot_cli_fields",
+            "action": "drop_unsupported_copilot_fields",
             "fields": removed,
         },
     )
     print(
-        f"Responses proxy dropped non-Copilot-CLI fields: {', '.join(removed)}",
+        f"Responses proxy dropped unsupported Copilot field(s): {', '.join(removed)}",
         flush=True,
     )
     return sanitized
@@ -347,8 +317,6 @@ def sanitize_responses_tools_for_copilot(body: dict, *, diagnostics: list[dict] 
     if not isinstance(tools, (list, dict)):
         return body
 
-    body = _strip_invalid_responses_defer_loading(body, diagnostics=diagnostics)
-    tools = body.get("tools")
     if not isinstance(tools, list):
         return body
 

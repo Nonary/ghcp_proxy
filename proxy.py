@@ -1669,14 +1669,12 @@ def _build_bridge_headers(
     verdict_sink: dict | None = None,
 ) -> dict:
     if bridge_plan.header_kind == "responses":
-        # Stable affinity when the caller has supplied an explicit cache
-        # lineage hint (prompt_cache_key from Codex, or any caller using the
-        # Anthropic shape, which we anchor on session_id). Without that hint
-        # we fall back to the rotate-on-user behavior so unrelated requests
-        # don't silently merge into one bucket.
-        explicit_cache_lineage = isinstance(original_body, dict) and any(
+        # Stable affinity when the caller supplies a durable cache/session
+        # lineage hint. Without that hint we keep rotate-on-user behavior so
+        # unrelated one-off requests do not silently merge into one bucket.
+        stable_affinity_hint = isinstance(original_body, dict) and any(
             isinstance(original_body.get(k), str) and original_body.get(k).strip()
-            for k in ("prompt_cache_key", "promptCacheKey")
+            for k in ("prompt_cache_key", "promptCacheKey", "sessionId", "session_id")
         )
         return format_translation.build_responses_headers_for_request(
             request,
@@ -1689,7 +1687,7 @@ def _build_bridge_headers(
             verdict_sink=verdict_sink,
             affinity_body=original_body,
             stable_user_affinity=(
-                bridge_plan.caller_protocol == "anthropic" or explicit_cache_lineage
+                bridge_plan.caller_protocol == "anthropic" or stable_affinity_hint
             ),
         )
     if bridge_plan.header_kind == "chat":
@@ -3144,19 +3142,20 @@ def _encrypted_reasoning_strip_reason_for_responses_context(
     encrypted reasoning blobs, under a fresh prompt-cache key. Copilot/OpenAI
     validates those blobs against the active lineage and rejects foreign ones
     with ``invalid_request_body``. Keep normal same-thread replay intact when
-    the request carries an explicit lineage hint, but strip ciphertext when we
-    have an explicit subagent marker or the input has the fork shape Codex emits
-    today (multiple developer messages). Summaries remain available, so the
-    visible transcript is preserved.
+    the request carries an explicit lineage hint. Without that hint, strip
+    ciphertext when we have an explicit subagent marker or the input has a fork
+    shape Codex has emitted before. Summaries remain available, so the visible
+    transcript is preserved.
     """
     subagent = request.headers.get("x-openai-subagent") if hasattr(request, "headers") else None
     if isinstance(subagent, str) and subagent.strip():
         return "subagent_header"
+    if _responses_body_has_cache_lineage(request_body):
+        return None
     if _responses_input_developer_message_count(input_value) > 1:
-        return "multiple_developer_messages"
+        return "multiple_developer_messages_without_cache_lineage"
     if (
         _responses_input_has_tool_history(input_value)
-        and not _responses_body_has_cache_lineage(request_body)
     ):
         return "tool_history_without_cache_lineage"
     return None
@@ -3164,6 +3163,12 @@ def _encrypted_reasoning_strip_reason_for_responses_context(
 
 def _should_drop_reasoning_items_for_responses_context(strip_reason: str | None) -> bool:
     return strip_reason is not None
+
+
+def _responses_route_uses_native_responses_passthrough(body: dict) -> bool:
+    requested_model = body.get("model") if isinstance(body, dict) else None
+    resolved_target = model_routing_config_service.resolve_target_model(requested_model)
+    return model_provider_family(resolved_target or requested_model) == "codex"
 
 
 def _responses_input_encrypted_content_count(input_value) -> int:
@@ -3298,6 +3303,7 @@ async def responses(request: Request):
     # forward unverifiable encrypted reasoning blobs in that shape.
     raw_input = body.get("input")
     has_compaction_input = format_translation.input_contains_compaction(raw_input)
+    native_responses_passthrough = _responses_route_uses_native_responses_passthrough(body)
     encrypted_reasoning_strip_reason = _encrypted_reasoning_strip_reason_for_responses_context(
         request, raw_input, body
     )
@@ -3310,6 +3316,7 @@ async def responses(request: Request):
             raw_input,
             preserve_encrypted_content=encrypted_reasoning_strip_reason is None,
             drop_reasoning_items=drop_reasoning_items,
+            native_responses_passthrough=native_responses_passthrough,
         )
         input_sanitization_trace = _responses_input_sanitization_trace(
             raw_input,

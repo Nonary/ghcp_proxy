@@ -1961,6 +1961,7 @@ def sanitize_input(
     *,
     preserve_encrypted_content: bool = True,
     drop_reasoning_items: bool = False,
+    native_responses_passthrough: bool = False,
 ):
     """
     Preserve encrypted_content in reasoning items for normal multi-turn correctness.
@@ -1995,12 +1996,15 @@ def sanitize_input(
                 continue
             if isinstance(encrypted_content, str) and encrypted_content:
                 if preserve_item_encrypted_content:
-                    result.append(
-                        {
-                            "type": "reasoning",
-                            "encrypted_content": encrypted_content,
-                        }
-                    )
+                    if native_responses_passthrough:
+                        result.append(item)
+                    else:
+                        result.append(
+                            {
+                                "type": "reasoning",
+                                "encrypted_content": encrypted_content,
+                            }
+                        )
                 # If the caller disabled encrypted replay, an opaque compaction
                 # token has no local text we can safely forward. Drop it rather
                 # than sending unverifiable ciphertext upstream.
@@ -2008,7 +2012,7 @@ def sanitize_input(
             result.append(item)
             continue
 
-        if item_type == "function_call_output":
+        if item_type == "function_call_output" and not native_responses_passthrough:
             result.append(_sanitize_function_call_output_item(item))
             continue
 

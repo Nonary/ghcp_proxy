@@ -1,5 +1,6 @@
 """Build upstream request headers for GitHub Copilot proxy requests."""
 
+import os
 import uuid
 
 from fastapi import Request
@@ -11,7 +12,16 @@ from constants import (
     FORWARDED_REQUEST_HEADERS,
 )
 
-_CLIENT_SESSION_ID = str(uuid.uuid4())
+_STABLE_ID_NAMESPACE = uuid.UUID("8fd22b32-4ce1-4af7-a3d6-7156a8f0ef9d")
+
+
+def _stable_uuid(value: str) -> str:
+    return str(uuid.uuid5(_STABLE_ID_NAMESPACE, value))
+
+
+_CLIENT_SESSION_ID = _stable_uuid(
+    f"client-session:{os.path.expanduser('~')}:{uuid.getnode():012x}"
+)
 _RESPONSES_AFFINITY_BY_SESSION: dict[str, dict[str, str]] = {}
 _RESPONSES_DEFAULT_AFFINITY: dict[str, str] | None = None
 _RESPONSES_AFFINITY_RESET_DEFAULT = False
@@ -62,6 +72,14 @@ def _new_responses_affinity() -> dict[str, str]:
     }
 
 
+def _stable_responses_affinity(session_id: str) -> dict[str, str]:
+    normalized = session_id.strip()
+    return {
+        "x-interaction-id": _stable_uuid(f"responses-interaction:{normalized}"),
+        "x-agent-task-id": _stable_uuid(f"responses-agent-task:{normalized}"),
+    }
+
+
 def _responses_affinity_headers(
     initiator: str,
     session_id: str | None,
@@ -74,6 +92,8 @@ def _responses_affinity_headers(
     if isinstance(session_id, str):
         normalized = session_id.strip()
         if normalized:
+            if stable_user_affinity:
+                return _stable_responses_affinity(normalized)
             if reset or should_rotate_user_affinity or normalized not in _RESPONSES_AFFINITY_BY_SESSION:
                 _RESPONSES_AFFINITY_BY_SESSION[normalized] = _new_responses_affinity()
             return _RESPONSES_AFFINITY_BY_SESSION[normalized]

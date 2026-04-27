@@ -15,9 +15,9 @@ class ResponsesUpstreamCacheSanitizerTests(unittest.TestCase):
             {"model": "gpt-5.4", "input": "hi", "local": True},
             diagnostics=diagnostics,
         )
-        self.assertEqual(sanitized, {"model": "gpt-5.4", "input": "hi"})
+        self.assertEqual(sanitized, {"model": "gpt-5.4", "input": "hi", "local": True})
 
-    def test_body_sanitizer_exact_upstream_contract_and_diagnostic(self):
+    def test_body_sanitizer_drops_only_known_unsupported_fields(self):
         diagnostics = []
         body = {
             "model": "gpt-5.4",
@@ -32,6 +32,8 @@ class ResponsesUpstreamCacheSanitizerTests(unittest.TestCase):
             "tools": [{"type": "function", "name": "Read"}],
             "client_metadata": {"local": True},
             "service_tier": "priority",
+            "tool_choice": "auto",
+            "context_management": [{"type": "compaction", "compact_threshold": 100000}],
         }
         with mock.patch("builtins.print") as print_mock:
             sanitized = ruc.sanitize_responses_body_for_copilot(body, diagnostics=diagnostics)
@@ -49,6 +51,9 @@ class ResponsesUpstreamCacheSanitizerTests(unittest.TestCase):
                 "store": False,
                 "text": {"format": {"type": "text"}},
                 "tools": [{"type": "function", "name": "Read"}],
+                "client_metadata": {"local": True},
+                "tool_choice": "auto",
+                "context_management": [{"type": "compaction", "compact_threshold": 100000}],
             },
         )
         self.assertEqual(
@@ -56,17 +61,13 @@ class ResponsesUpstreamCacheSanitizerTests(unittest.TestCase):
             [
                 {
                     "kind": "responses_body",
-                    "action": "drop_non_copilot_cli_fields",
-                    "fields": [
-                        "client_metadata",
-                        "service_tier",
-                    ],
+                    "action": "drop_unsupported_copilot_fields",
+                    "fields": ["service_tier"],
                 }
             ],
         )
         print_mock.assert_called_once_with(
-            "Responses proxy dropped non-Copilot-CLI fields: "
-            "client_metadata, service_tier",
+            "Responses proxy dropped unsupported Copilot field(s): service_tier",
             flush=True,
         )
 
@@ -282,7 +283,7 @@ class ResponsesUpstreamCacheSanitizerTests(unittest.TestCase):
         self.assertEqual(len(diagnostics[0]["tools"]), 20)
         self.assertTrue(diagnostics[0]["truncated"])
 
-    def test_defer_loading_sanitizer_handles_absent_search_noops_and_nested_changes(self):
+    def test_defer_loading_sanitizer_is_not_applied_to_native_responses(self):
         with_search = {
             "tools": [
                 {"type": "function", "name": "tool_search"},
@@ -303,8 +304,8 @@ class ResponsesUpstreamCacheSanitizerTests(unittest.TestCase):
         }
         diagnostics = []
         sanitized = ruc.sanitize_responses_tools_for_copilot(nested, diagnostics=diagnostics)
-        self.assertNotIn("defer_loading", sanitized["tools"]["tools"][0])
-        self.assertEqual(diagnostics[0]["action"], "strip_defer_loading")
+        self.assertIs(sanitized, nested)
+        self.assertEqual(diagnostics, [])
 
         self.assertEqual(ruc._strip_invalid_responses_defer_loading({"tools": "bad"}), {"tools": "bad"})
         direct_defer = ruc._strip_responses_defer_loading_fields(
@@ -339,7 +340,7 @@ class ResponsesUpstreamCacheSanitizerTests(unittest.TestCase):
                 for index in range(22)
             ]
         }
-        sanitized = ruc.sanitize_responses_tools_for_copilot(body, diagnostics=diagnostics)
+        sanitized = ruc._strip_invalid_responses_defer_loading(body, diagnostics=diagnostics)
 
         self.assertEqual(
             sanitized,
@@ -367,7 +368,7 @@ class ResponsesUpstreamCacheSanitizerTests(unittest.TestCase):
             ]
         }
         with mock.patch("builtins.print") as print_mock:
-            ruc.sanitize_responses_tools_for_copilot(body, diagnostics=diagnostics)
+            ruc._strip_invalid_responses_defer_loading(body, diagnostics=diagnostics)
 
         self.assertFalse(diagnostics[0]["truncated"])
         print_mock.assert_called_once_with(
@@ -382,7 +383,7 @@ class ResponsesUpstreamCacheSanitizerTests(unittest.TestCase):
                 for index in range(21)
             ]
         }
-        ruc.sanitize_responses_tools_for_copilot(body, diagnostics=diagnostics)
+        ruc._strip_invalid_responses_defer_loading(body, diagnostics=diagnostics)
         self.assertTrue(diagnostics[0]["truncated"])
 
     def test_unsupported_responses_tools_filter_tool_choices_and_keep_non_dict_items(self):

@@ -1236,7 +1236,7 @@ class FormatTranslationTests(unittest.TestCase):
         self.assertTrue(compact_request["stream"])
         self.assertFalse(compact_request["store"])
 
-    def test_sanitize_responses_tools_strips_defer_loading_without_tool_search(self):
+    def test_sanitize_responses_tools_preserves_defer_loading_without_tool_search(self):
         diagnostics = []
         body = {
             "model": "gpt-5.5",
@@ -1262,31 +1262,11 @@ class FormatTranslationTests(unittest.TestCase):
             diagnostics=diagnostics,
         )
 
-        self.assertIsNot(sanitized, body)
+        self.assertIs(sanitized, body)
         nested_tool = sanitized["tools"][0]["tools"][0]
-        self.assertNotIn("defer_loading", nested_tool)
+        self.assertTrue(nested_tool["defer_loading"])
         self.assertEqual(nested_tool["name"], "automation_update")
-        self.assertEqual(
-            diagnostics,
-            [
-                {
-                    "kind": "responses_tools",
-                    "action": "strip_defer_loading",
-                    "reason": "deferred_tools_require_tool_search",
-                    "count": 1,
-                    "tool_names": ["automation_update"],
-                    "tools": [
-                        {
-                            "path": "tools[0].tools[0]",
-                            "name": "automation_update",
-                            "type": "function",
-                            "value": True,
-                        }
-                    ],
-                    "truncated": False,
-                }
-            ],
-        )
+        self.assertEqual(diagnostics, [])
 
     def test_sanitize_responses_tools_keeps_defer_loading_with_tool_search(self):
         body = {
@@ -1340,7 +1320,7 @@ class FormatTranslationTests(unittest.TestCase):
         self.assertEqual(diagnostics[0]["action"], "drop_dangerous_code_execution_tools")
         self.assertEqual(diagnostics[0]["tool_names"], ["mcp__ide__executecode"])
 
-    def test_sanitize_responses_body_matches_copilot_cli_cache_shape(self):
+    def test_sanitize_responses_body_drops_only_known_unsupported_fields(self):
         diagnostics = []
         body = {
             "model": "gpt-5.5",
@@ -1350,6 +1330,7 @@ class FormatTranslationTests(unittest.TestCase):
             "prompt_cache_key": "cache-local",
             "service_tier": "priority",
             "tool_choice": "auto",
+            "context_management": [{"type": "compaction", "compact_threshold": 100000}],
         }
 
         sanitized = format_translation.sanitize_responses_body_for_copilot(
@@ -1357,20 +1338,21 @@ class FormatTranslationTests(unittest.TestCase):
             diagnostics=diagnostics,
         )
 
-        self.assertNotIn("client_metadata", sanitized)
         self.assertNotIn("service_tier", sanitized)
-        self.assertNotIn("tool_choice", sanitized)
+        self.assertEqual(sanitized["client_metadata"], {"session_id": "local-only"})
+        self.assertEqual(sanitized["tool_choice"], "auto")
+        self.assertEqual(sanitized["context_management"], [{"type": "compaction", "compact_threshold": 100000}])
         # Cache-lineage fields stay on the body — they're the upstream prefix
         # cache hint and stripping them broke Codex's cache hit rate in prod.
         self.assertEqual(sanitized["previous_response_id"], "resp_prev")
         self.assertEqual(sanitized["prompt_cache_key"], "cache-local")
-        self.assertEqual(diagnostics[0]["action"], "drop_non_copilot_cli_fields")
+        self.assertEqual(diagnostics[0]["action"], "drop_unsupported_copilot_fields")
         self.assertEqual(
             diagnostics[0]["fields"],
-            ["client_metadata", "service_tier", "tool_choice"],
+            ["service_tier"],
         )
 
-    def test_sanitize_responses_body_drops_explicit_tool_choice_for_cache_shape(self):
+    def test_sanitize_responses_body_preserves_explicit_tool_choice(self):
         choice = {"type": "function", "name": "read"}
         body = {
             "model": "gpt-5.5",
@@ -1380,8 +1362,8 @@ class FormatTranslationTests(unittest.TestCase):
 
         sanitized = format_translation.sanitize_responses_body_for_copilot(body)
 
-        self.assertIsNot(sanitized, body)
-        self.assertNotIn("tool_choice", sanitized)
+        self.assertIs(sanitized, body)
+        self.assertEqual(sanitized["tool_choice"], choice)
 
     def test_responses_request_to_chat_drops_dangerous_execute_code_tool_and_choice(self):
         body = {
