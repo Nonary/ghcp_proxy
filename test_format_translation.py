@@ -2078,7 +2078,7 @@ class ResponsesToAnthropicMessagesTests(unittest.TestCase):
         out = format_translation.responses_request_to_anthropic_messages(body)
         self.assertEqual(out["system"], "You are helpful.")
         self.assertEqual(out["max_tokens"], 1024)
-        self.assertNotIn("metadata", out)
+        self.assertEqual(out["metadata"], {"user_id": "local-only"})
         self.assertEqual(
             out["messages"],
             [{"role": "user", "content": [{"type": "text", "text": "Hi"}]}],
