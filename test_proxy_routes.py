@@ -790,7 +790,7 @@ class ProxyRoutesTests(unittest.TestCase):
         self.assertEqual(first_headers["X-Initiator"], "user")
         self.assertEqual(second_headers["X-Initiator"], "user")
         self.assertEqual(first_headers["x-interaction-id"], second_headers["x-interaction-id"])
-        self.assertNotEqual(first_headers["x-agent-task-id"], second_headers["x-agent-task-id"])
+        self.assertEqual(first_headers["x-agent-task-id"], second_headers["x-agent-task-id"])
         self.assertEqual(first_headers["x-request-id"], first_headers["x-agent-task-id"])
         self.assertEqual(second_headers["x-request-id"], second_headers["x-agent-task-id"])
         first_body = post.await_args_list[0].kwargs["json"]
@@ -1010,6 +1010,60 @@ class ProxyRoutesTests(unittest.TestCase):
 
         self.assertEqual(forwarded_headers[0]["x-interaction-id"], forwarded_headers[1]["x-interaction-id"])
         self.assertEqual(forwarded_headers[0]["x-agent-task-id"], forwarded_headers[1]["x-agent-task-id"])
+
+    def test_responses_route_cache_key_affinity_is_stable_across_user_turns(self):
+        upstream = httpx.Response(
+            200,
+            json={
+                "id": "resp_123",
+                "model": "gpt-5.5",
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "done"}],
+                    }
+                ],
+            },
+            headers={"content-type": "application/json"},
+        )
+        forwarded_headers = []
+
+        for text in ("first", "follow up"):
+            request = SimpleNamespace(
+                url=SimpleNamespace(path="/v1/responses"),
+                method="POST",
+                headers={},
+            )
+            body = {
+                "model": "gpt-5.5",
+                "prompt_cache_key": "cache-user-turns",
+                "stream": False,
+                "input": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": text}],
+                    }
+                ],
+            }
+            with (
+                mock.patch.object(proxy, "parse_json_request", mock.AsyncMock(return_value=body)),
+                mock.patch.object(auth, "get_api_key", return_value="test-key"),
+                mock.patch.object(auth, "get_api_base", return_value="https://example.invalid"),
+                mock.patch.object(proxy.model_routing_config_service, "resolve_target_model", return_value="gpt-5.5"),
+                mock.patch.object(proxy.usage_tracker, "start_event", return_value=None),
+                mock.patch.object(proxy.usage_tracker, "finish_event"),
+                mock.patch.object(proxy, "throttled_client_post", mock.AsyncMock(return_value=upstream)) as post,
+            ):
+                response = proxy.asyncio.run(proxy.responses(request))
+
+            self.assertEqual(response.status_code, 200)
+            forwarded_headers.append(post.await_args.kwargs["headers"])
+
+        self.assertEqual(forwarded_headers[0]["x-interaction-id"], forwarded_headers[1]["x-interaction-id"])
+        self.assertEqual(forwarded_headers[0]["x-agent-task-id"], forwarded_headers[1]["x-agent-task-id"])
+        self.assertEqual(forwarded_headers[0]["x-request-id"], forwarded_headers[0]["x-agent-task-id"])
 
     def test_responses_route_returns_encrypted_reasoning_to_codex(self):
         request = SimpleNamespace(
