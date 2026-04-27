@@ -175,6 +175,8 @@ CACHE_SETTLE_DELAY_SECONDS = 2.0
 safeguard_event_store = dashboard_module.create_safeguard_event_store()
 _PROMPT_CACHE_SETTLE_LOCK = threading.Lock()
 _PROMPT_CACHE_LAST_FINISH_BY_LINEAGE: dict[tuple[str, str], float] = {}
+_PROMPT_CACHE_TRACE_LOCK = threading.Lock()
+_PROMPT_CACHE_LAST_INPUT_BY_LINEAGE: dict[tuple[str, str], dict] = {}
 
 
 def _stream_with_update_notice(byte_iter, protocol: str, upstream_headers=None):
@@ -824,6 +826,12 @@ def _trace_hash(value) -> str | None:
     return hashlib.sha256(encoded).hexdigest()[:16]
 
 
+def _trace_input_item_hashes(input_value) -> list[str | None] | None:
+    if not isinstance(input_value, list):
+        return None
+    return [_trace_hash(item) for item in input_value]
+
+
 def _trace_text_chars(value) -> int:
     if isinstance(value, str):
         return len(value)
@@ -847,11 +855,12 @@ def _trace_input_sequence(input_value: list) -> list[dict]:
     sequence = []
     for index, item in enumerate(input_value):
         if not isinstance(item, dict):
-            sequence.append({"index": index, "type": type(item).__name__})
+            sequence.append({"index": index, "type": type(item).__name__, "item_hash": _trace_hash(item)})
             continue
         entry = {
             "index": index,
             "type": item.get("type"),
+            "item_hash": _trace_hash(item),
         }
         for key in ("role", "name", "status"):
             value = item.get(key)
@@ -972,6 +981,83 @@ def _trace_body_summary(body: dict | None) -> dict | None:
                 summary[f"{key}_fingerprint"] = fingerprint
 
     return summary
+
+
+def _prompt_cache_trace_lineage(body: dict | None, model: str | None) -> tuple[str, str] | None:
+    if not isinstance(body, dict):
+        return None
+    model_name = str(model or body.get("model") or "").strip().lower()
+    if not model_name:
+        return None
+    prompt_cache_key = body.get("prompt_cache_key") or body.get("promptCacheKey")
+    if not isinstance(prompt_cache_key, str) or not prompt_cache_key.strip():
+        return None
+    return model_name, prompt_cache_key.strip()
+
+
+def _prompt_cache_prefix_diagnostics(
+    *,
+    request_id: str,
+    upstream_body: dict | None,
+    resolved_model: str | None,
+) -> dict | None:
+    lineage = _prompt_cache_trace_lineage(upstream_body, resolved_model)
+    if lineage is None or not isinstance(upstream_body, dict):
+        return None
+    item_hashes = _trace_input_item_hashes(upstream_body.get("input"))
+    if item_hashes is None:
+        return None
+
+    snapshot = {
+        "request_id": request_id,
+        "item_hashes": item_hashes,
+        "item_count": len(item_hashes),
+        "body_fingerprint": _trace_hash(upstream_body),
+    }
+    with _PROMPT_CACHE_TRACE_LOCK:
+        previous = _PROMPT_CACHE_LAST_INPUT_BY_LINEAGE.get(lineage)
+        _PROMPT_CACHE_LAST_INPUT_BY_LINEAGE[lineage] = snapshot
+
+    if not isinstance(previous, dict):
+        return {
+            "lineage_model": lineage[0],
+            "previous_request_id": None,
+            "current_item_count": len(item_hashes),
+        }
+
+    previous_hashes = previous.get("item_hashes")
+    if not isinstance(previous_hashes, list):
+        return None
+    common_prefix_items = 0
+    for previous_hash, current_hash in zip(previous_hashes, item_hashes):
+        if previous_hash != current_hash:
+            break
+        common_prefix_items += 1
+    previous_is_prefix = common_prefix_items == len(previous_hashes)
+    diagnostics = {
+        "lineage_model": lineage[0],
+        "previous_request_id": previous.get("request_id"),
+        "previous_item_count": previous.get("item_count"),
+        "current_item_count": len(item_hashes),
+        "common_prefix_items": common_prefix_items,
+        "previous_is_prefix": previous_is_prefix,
+        "current_extends_previous": previous_is_prefix and len(item_hashes) >= len(previous_hashes),
+        "previous_body_fingerprint": previous.get("body_fingerprint"),
+        "current_body_fingerprint": snapshot["body_fingerprint"],
+    }
+    if not previous_is_prefix:
+        diagnostics["first_mismatch_index"] = common_prefix_items
+        diagnostics["previous_item_hash"] = (
+            previous_hashes[common_prefix_items]
+            if common_prefix_items < len(previous_hashes)
+            else None
+        )
+        diagnostics["current_item_hash"] = (
+            item_hashes[common_prefix_items]
+            if common_prefix_items < len(item_hashes)
+            else None
+        )
+    return diagnostics
 
 
 def _trace_response_summary(
@@ -1313,6 +1399,15 @@ def _emit_request_trace_start(
         raw_verdict = trace_metadata.get("initiator_verdict")
         if isinstance(raw_verdict, dict):
             initiator_verdict = dict(raw_verdict)
+    trace_details = trace_metadata if isinstance(trace_metadata, dict) else {}
+    cache_prefix_diagnostics = _prompt_cache_prefix_diagnostics(
+        request_id=request_id,
+        upstream_body=upstream_body,
+        resolved_model=resolved_model,
+    )
+    if cache_prefix_diagnostics is not None:
+        trace_details = dict(trace_details)
+        trace_details["prompt_cache_prefix"] = cache_prefix_diagnostics
     payload = {
         "event": "request_started",
         "time": util.utc_now_iso(),
@@ -1323,7 +1418,7 @@ def _emit_request_trace_start(
         "request_body": _trace_body_summary(request_body),
         "upstream_body": _trace_body_summary(upstream_body),
         "outbound_headers": _header_trace_subset(outbound_headers),
-        "trace": trace_metadata or {},
+        "trace": trace_details,
     }
     if prompt_preview is None:
         prompt_preview = _extract_prompt_preview(

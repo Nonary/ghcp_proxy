@@ -22,8 +22,73 @@ class ProxyRoutesTests(unittest.TestCase):
         proxy._COPILOT_MODEL_CAPS_CACHE.update({"key": None, "ts": 0.0, "data": {}})
         with proxy._PROMPT_CACHE_SETTLE_LOCK:
             proxy._PROMPT_CACHE_LAST_FINISH_BY_LINEAGE.clear()
+        with proxy._PROMPT_CACHE_TRACE_LOCK:
+            proxy._PROMPT_CACHE_LAST_INPUT_BY_LINEAGE.clear()
         proxy._CLIENT_PROXY_STARTUP_RESTORE_COMPLETE = False
         proxy._CLIENT_PROXY_SHUTDOWN_REVERT_COMPLETE = False
+
+    def test_prompt_cache_prefix_diagnostics_uses_full_item_hashes(self):
+        first_body = {
+            "model": "gpt-5.5",
+            "prompt_cache_key": "cache-key",
+            "input": [
+                {"type": "function_call", "call_id": "call-1", "name": "Read", "arguments": "{\"path\":\"a\"}"},
+            ],
+        }
+        second_body = {
+            "model": "gpt-5.5",
+            "prompt_cache_key": "cache-key",
+            "input": [
+                {"type": "function_call", "call_id": "call-1", "name": "Read", "arguments": "{\"path\":\"b\"}"},
+            ],
+        }
+
+        first = proxy._prompt_cache_prefix_diagnostics(
+            request_id="req-1",
+            upstream_body=first_body,
+            resolved_model="gpt-5.5",
+        )
+        second = proxy._prompt_cache_prefix_diagnostics(
+            request_id="req-2",
+            upstream_body=second_body,
+            resolved_model="gpt-5.5",
+        )
+
+        self.assertIsNone(first["previous_request_id"])
+        self.assertEqual(second["previous_request_id"], "req-1")
+        self.assertFalse(second["previous_is_prefix"])
+        self.assertEqual(second["first_mismatch_index"], 0)
+        self.assertNotEqual(second["previous_item_hash"], second["current_item_hash"])
+
+    def test_prompt_cache_prefix_diagnostics_marks_append_only_prefix(self):
+        first_body = {
+            "model": "gpt-5.5",
+            "prompt_cache_key": "cache-key",
+            "input": [{"type": "message", "role": "user", "content": "one"}],
+        }
+        second_body = {
+            "model": "gpt-5.5",
+            "prompt_cache_key": "cache-key",
+            "input": [
+                {"type": "message", "role": "user", "content": "one"},
+                {"type": "message", "role": "assistant", "content": "two"},
+            ],
+        }
+
+        proxy._prompt_cache_prefix_diagnostics(
+            request_id="req-1",
+            upstream_body=first_body,
+            resolved_model="gpt-5.5",
+        )
+        diagnostics = proxy._prompt_cache_prefix_diagnostics(
+            request_id="req-2",
+            upstream_body=second_body,
+            resolved_model="gpt-5.5",
+        )
+
+        self.assertTrue(diagnostics["previous_is_prefix"])
+        self.assertTrue(diagnostics["current_extends_previous"])
+        self.assertEqual(diagnostics["common_prefix_items"], 1)
 
     def test_responses_cache_settle_waits_for_recent_same_lineage_finish(self):
         plan = proxy.UpstreamRequestPlan(
