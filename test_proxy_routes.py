@@ -20,8 +20,63 @@ class ProxyRoutesTests(unittest.TestCase):
         proxy.set_initiator_policy(initiator_policy.InitiatorPolicy())
         proxy.usage_tracker.clear_state()
         proxy._COPILOT_MODEL_CAPS_CACHE.update({"key": None, "ts": 0.0, "data": {}})
+        with proxy._PROMPT_CACHE_SETTLE_LOCK:
+            proxy._PROMPT_CACHE_LAST_FINISH_BY_LINEAGE.clear()
         proxy._CLIENT_PROXY_STARTUP_RESTORE_COMPLETE = False
         proxy._CLIENT_PROXY_SHUTDOWN_REVERT_COMPLETE = False
+
+    def test_responses_cache_settle_waits_for_recent_same_lineage_finish(self):
+        plan = proxy.UpstreamRequestPlan(
+            request_id="req-1",
+            upstream_url="https://example.invalid/responses",
+            headers={},
+            body={"model": "gpt-5.5", "prompt_cache_key": "cache-key", "input": "hello"},
+            usage_event=None,
+            requested_model="gpt-5.5",
+            resolved_model="gpt-5.5",
+        )
+
+        with mock.patch.object(proxy.time, "monotonic", return_value=100.0):
+            proxy._remember_responses_cache_settle_finish(plan, 200)
+
+        sleep = mock.AsyncMock()
+        with (
+            mock.patch.object(proxy.time, "monotonic", return_value=100.5),
+            mock.patch.object(proxy.asyncio, "sleep", sleep),
+        ):
+            proxy.asyncio.run(proxy._wait_for_responses_cache_settle(plan))
+
+        sleep.assert_awaited_once()
+        self.assertAlmostEqual(sleep.await_args.args[0], 1.5)
+
+    def test_responses_cache_settle_does_not_wait_for_other_model(self):
+        finished_plan = proxy.UpstreamRequestPlan(
+            request_id="req-1",
+            upstream_url="https://example.invalid/responses",
+            headers={},
+            body={"model": "gpt-5.5", "prompt_cache_key": "cache-key", "input": "hello"},
+            usage_event=None,
+            requested_model="gpt-5.5",
+            resolved_model="gpt-5.5",
+        )
+        other_model_plan = proxy.UpstreamRequestPlan(
+            request_id="req-2",
+            upstream_url="https://example.invalid/responses",
+            headers={},
+            body={"model": "gpt-5.4", "prompt_cache_key": "cache-key", "input": "hello"},
+            usage_event=None,
+            requested_model="gpt-5.4",
+            resolved_model="gpt-5.4",
+        )
+
+        with mock.patch.object(proxy.time, "monotonic", return_value=100.0):
+            proxy._remember_responses_cache_settle_finish(finished_plan, 200)
+
+        sleep = mock.AsyncMock()
+        with mock.patch.object(proxy.asyncio, "sleep", sleep):
+            proxy.asyncio.run(proxy._wait_for_responses_cache_settle(other_model_plan))
+
+        sleep.assert_not_awaited()
 
     def test_proxy_registers_copilot_native_root_aliases(self):
         paths = {route.path for route in proxy.app.routes}

@@ -170,8 +170,11 @@ CACHE_TRIPWIRE_INPUT_TOKEN_THRESHOLD = 30_000
 CACHE_TRIPWIRE_CACHED_INPUT_TOKEN_THRESHOLD = 30_000
 CACHE_TRIPWIRE_FRESH_CACHED_GAP_THRESHOLD = 50_000
 CACHE_TRIPWIRE_REASON = "token_tripwire"
+CACHE_SETTLE_DELAY_SECONDS = 2.0
 
 safeguard_event_store = dashboard_module.create_safeguard_event_store()
+_PROMPT_CACHE_SETTLE_LOCK = threading.Lock()
+_PROMPT_CACHE_LAST_FINISH_BY_LINEAGE: dict[tuple[str, str], float] = {}
 
 
 def _stream_with_update_notice(byte_iter, protocol: str, upstream_headers=None):
@@ -446,6 +449,54 @@ def _cache_tripwire_enabled() -> bool:
     if not isinstance(settings, dict):
         return True
     return bool(settings.get("token_tripwire_enabled", True))
+
+
+def _prompt_cache_settle_delay_seconds() -> float:
+    raw_value = os.environ.get("GHCP_PROXY_RESPONSES_CACHE_SETTLE_DELAY_SECONDS")
+    if raw_value is None:
+        return CACHE_SETTLE_DELAY_SECONDS
+    try:
+        return max(0.0, float(str(raw_value).strip()))
+    except (TypeError, ValueError):
+        return CACHE_SETTLE_DELAY_SECONDS
+
+
+def _responses_cache_settle_lineage(plan: "UpstreamRequestPlan | None") -> tuple[str, str] | None:
+    if not isinstance(plan, UpstreamRequestPlan) or not isinstance(plan.body, dict):
+        return None
+    model = str(plan.resolved_model or plan.requested_model or plan.body.get("model") or "").strip().lower()
+    if model != "gpt-5.5":
+        return None
+    prompt_cache_key = plan.body.get("prompt_cache_key") or plan.body.get("promptCacheKey")
+    if not isinstance(prompt_cache_key, str) or not prompt_cache_key.strip():
+        return None
+    return model, prompt_cache_key.strip()
+
+
+async def _wait_for_responses_cache_settle(plan: "UpstreamRequestPlan | None") -> None:
+    lineage = _responses_cache_settle_lineage(plan)
+    if lineage is None:
+        return
+    delay_seconds = _prompt_cache_settle_delay_seconds()
+    if delay_seconds <= 0:
+        return
+    with _PROMPT_CACHE_SETTLE_LOCK:
+        last_finished_at = _PROMPT_CACHE_LAST_FINISH_BY_LINEAGE.get(lineage)
+    if not isinstance(last_finished_at, (int, float)):
+        return
+    wait_seconds = delay_seconds - (time.monotonic() - float(last_finished_at))
+    if wait_seconds > 0:
+        await asyncio.sleep(wait_seconds)
+
+
+def _remember_responses_cache_settle_finish(plan: "UpstreamRequestPlan | None", status_code: int) -> None:
+    if status_code >= 400:
+        return
+    lineage = _responses_cache_settle_lineage(plan)
+    if lineage is None:
+        return
+    with _PROMPT_CACHE_SETTLE_LOCK:
+        _PROMPT_CACHE_LAST_FINISH_BY_LINEAGE[lineage] = time.monotonic()
 
 
 def _cache_tripwire_reply(usage: dict) -> upstream_errors.SyntheticReply:
@@ -1342,6 +1393,7 @@ def _finish_usage_and_trace(
                         trace_payload["response_text"] = _trim_trace_text(response_text)
                 _append_request_trace(trace_payload, force=force_trace)
         finally:
+            _remember_responses_cache_settle_finish(plan, status_code)
             if plan.auto_update_request_tracked:
                 auto_update_runtime_controller.note_request_finished(plan.request_id)
         return
@@ -1714,6 +1766,7 @@ def _bridge_error_response_from_upstream(bridge_plan: BridgeExecutionPlan, upstr
 
 async def _post_non_streaming_request(plan: UpstreamRequestPlan, *, error_response) -> Response:
     try:
+        await _wait_for_responses_cache_settle(plan)
         async with httpx.AsyncClient(timeout=configured_upstream_timeout_seconds()) as client:
             upstream = await throttled_client_post(
                 client,
@@ -1750,6 +1803,7 @@ async def _post_non_streaming_request(plan: UpstreamRequestPlan, *, error_respon
 async def _post_bridge_non_streaming_request(plan: UpstreamRequestPlan, bridge_plan: BridgeExecutionPlan) -> Response:
     error_response = _bridge_error_response(bridge_plan)
     try:
+        await _wait_for_responses_cache_settle(plan)
         async with httpx.AsyncClient(timeout=configured_upstream_timeout_seconds()) as client:
             upstream = await throttled_client_post(
                 client,
@@ -1998,6 +2052,7 @@ async def proxy_streaming_response(
     client = httpx.AsyncClient(timeout=timeout)
     request = client.build_request("POST", upstream_url, headers=headers, json=body)
     try:
+        await _wait_for_responses_cache_settle(trace_plan)
         upstream = await throttled_client_send(client, request, stream=True)
     except httpx.RequestError as exc:
         status_code, message = format_translation.upstream_request_error_status_and_message(exc)
