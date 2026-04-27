@@ -1085,7 +1085,7 @@ class ProxyRoutesTests(unittest.TestCase):
         self.assertNotIn("encrypted_content", json.dumps(forwarded_input))
         self.assertEqual([item for item in forwarded_input if item.get("type") == "reasoning"], [])
 
-    def test_responses_route_strips_encrypted_reasoning_for_tool_history(self):
+    def test_responses_route_strips_encrypted_reasoning_for_tool_history_without_lineage(self):
         request = SimpleNamespace(
             url=SimpleNamespace(path="/v1/responses"),
             method="POST",
@@ -1168,9 +1168,107 @@ class ProxyRoutesTests(unittest.TestCase):
         )
         sanitization = request_started["trace"]["responses_input_sanitization"]
         self.assertEqual(sanitization["encrypted_content_preservation"], "disabled")
-        self.assertEqual(sanitization["encrypted_content_strip_reason"], "tool_history")
+        self.assertEqual(sanitization["encrypted_content_strip_reason"], "tool_history_without_cache_lineage")
         self.assertEqual(sanitization["encrypted_content_items_dropped"], 2)
         self.assertTrue(sanitization["reasoning_items_dropped"])
+
+    def test_responses_route_preserves_encrypted_reasoning_for_tool_history_with_cache_lineage(self):
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/responses"),
+            method="POST",
+            headers={},
+        )
+        body = {
+            "model": "gpt-5.5",
+            "stream": False,
+            "prompt_cache_key": "session-cache",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "developer",
+                    "content": [{"type": "input_text", "text": "developer"}],
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "spawn helpers"}],
+                },
+                {
+                    "type": "reasoning",
+                    "id": "rs_keep_summary",
+                    "summary": [{"type": "summary_text", "text": "summary survives"}],
+                    "encrypted_content": "old-ciphertext",
+                },
+                {
+                    "type": "reasoning",
+                    "id": "rs_keep_empty",
+                    "encrypted_content": "ciphertext-only",
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "spawn_agent",
+                    "arguments": "{}",
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "agent id",
+                },
+            ],
+        }
+        upstream = httpx.Response(
+            200,
+            json={
+                "id": "resp_123",
+                "model": "gpt-5.5",
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "done"}],
+                    }
+                ],
+            },
+            headers={"content-type": "application/json"},
+        )
+
+        with (
+            mock.patch.object(proxy, "parse_json_request", mock.AsyncMock(return_value=body)),
+            mock.patch.object(auth, "get_api_key", return_value="test-key"),
+            mock.patch.object(auth, "get_api_base", return_value="https://example.invalid"),
+            mock.patch.object(proxy.model_routing_config_service, "resolve_target_model", return_value="gpt-5.5"),
+            mock.patch.object(proxy.usage_tracker, "start_event", return_value=None),
+            mock.patch.object(proxy.usage_tracker, "finish_event"),
+            mock.patch.object(proxy, "_append_request_trace") as append_trace,
+            mock.patch.object(proxy, "throttled_client_post", mock.AsyncMock(return_value=upstream)) as post,
+        ):
+            response = proxy.asyncio.run(proxy.responses(request))
+
+        forwarded = post.await_args.kwargs["json"]
+        forwarded_input = forwarded["input"]
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(forwarded["prompt_cache_key"], "session-cache")
+        self.assertEqual(proxy._responses_input_encrypted_content_count(forwarded_input), 2)
+        self.assertEqual([item.get("type") for item in forwarded_input], [
+            "message",
+            "message",
+            "reasoning",
+            "reasoning",
+            "function_call",
+            "function_call_output",
+        ])
+
+        request_started = next(
+            call.args[0]
+            for call in append_trace.call_args_list
+            if call.args and call.args[0].get("event") == "request_started"
+        )
+        sanitization = request_started["trace"].get("responses_input_sanitization")
+        self.assertEqual(sanitization["encrypted_content_preservation"], "preserved")
+        self.assertIsNone(sanitization["encrypted_content_strip_reason"])
+        self.assertEqual(sanitization["encrypted_content_items_dropped"], 0)
+        self.assertFalse(sanitization["reasoning_items_dropped"])
 
     def test_responses_route_traces_encrypted_reasoning_trim(self):
         request = SimpleNamespace(

@@ -2675,24 +2675,42 @@ def _responses_input_has_tool_history(input_value) -> bool:
     return False
 
 
-def _encrypted_reasoning_strip_reason_for_responses_context(request: Request, input_value) -> str | None:
+def _responses_body_has_cache_lineage(body: dict | None) -> bool:
+    if not isinstance(body, dict):
+        return False
+    for key in ("prompt_cache_key", "promptCacheKey", "previous_response_id"):
+        value = body.get(key)
+        if isinstance(value, str) and value.strip():
+            return True
+    return False
+
+
+def _encrypted_reasoning_strip_reason_for_responses_context(
+    request: Request,
+    input_value,
+    request_body: dict | None = None,
+) -> str | None:
     """Classify contexts where replayed encrypted reasoning is not worth forwarding.
 
     Codex subagent/fork starts can replay the parent transcript, including
     encrypted reasoning blobs, under a fresh prompt-cache key. Copilot/OpenAI
     validates those blobs against the active lineage and rejects foreign ones
-    with ``invalid_request_body``. Keep normal same-thread replay intact, but
-    strip ciphertext when we have an explicit subagent marker or the input has
-    the fork shape Codex emits today (multiple developer messages). Summaries
-    remain available, so the visible transcript is preserved.
+    with ``invalid_request_body``. Keep normal same-thread replay intact when
+    the request carries an explicit lineage hint, but strip ciphertext when we
+    have an explicit subagent marker or the input has the fork shape Codex emits
+    today (multiple developer messages). Summaries remain available, so the
+    visible transcript is preserved.
     """
     subagent = request.headers.get("x-openai-subagent") if hasattr(request, "headers") else None
     if isinstance(subagent, str) and subagent.strip():
         return "subagent_header"
     if _responses_input_developer_message_count(input_value) > 1:
         return "multiple_developer_messages"
-    if _responses_input_has_tool_history(input_value):
-        return "tool_history"
+    if (
+        _responses_input_has_tool_history(input_value)
+        and not _responses_body_has_cache_lineage(request_body)
+    ):
+        return "tool_history_without_cache_lineage"
     return None
 
 
@@ -2846,7 +2864,7 @@ async def responses(request: Request):
     raw_input = body.get("input")
     has_compaction_input = format_translation.input_contains_compaction(raw_input)
     encrypted_reasoning_strip_reason = _encrypted_reasoning_strip_reason_for_responses_context(
-        request, raw_input
+        request, raw_input, body
     )
     drop_reasoning_items = _should_drop_reasoning_items_for_responses_context(
         encrypted_reasoning_strip_reason
