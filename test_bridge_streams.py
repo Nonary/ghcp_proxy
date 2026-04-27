@@ -1,11 +1,57 @@
+import json
 import unittest
 
 from anthropic_stream import AnthropicStreamTranslator
-from bridge_streams import ChatToResponsesStreamTranslator, ResponsesToAnthropicStreamTranslator
+from bridge_streams import (
+    ChatToResponsesStreamTranslator,
+    ResponsesStreamIdSyncer,
+    ResponsesToAnthropicStreamTranslator,
+)
 import proxy
 
 
 class BridgeStreamTranslatorTests(unittest.TestCase):
+    def test_responses_stream_id_syncer_keeps_output_item_ids_consistent(self):
+        chunks = [
+            (
+                'event: response.output_item.added\n'
+                'data: {"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","summary":[]}}\n\n'
+            ).encode("utf-8"),
+            (
+                'event: response.reasoning_summary_text.delta\n'
+                'data: {"type":"response.reasoning_summary_text.delta","output_index":0,"summary_index":0,"delta":"hmm"}\n\n'
+            ).encode("utf-8"),
+            (
+                'event: response.output_item.done\n'
+                'data: {"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","summary":[],"encrypted_content":"ENC"}}\n\n'
+            ).encode("utf-8"),
+            b"data: [DONE]\n\n",
+        ]
+
+        async def byte_iter():
+            for chunk in chunks:
+                yield chunk
+
+        async def collect():
+            syncer = ResponsesStreamIdSyncer()
+            body = b""
+            async for event in syncer.sync(byte_iter()):
+                body += event
+            return body.decode("utf-8")
+
+        body = proxy.asyncio.run(collect())
+        payloads = [
+            json.loads(line[len("data: "):])
+            for line in body.splitlines()
+            if line.startswith("data: {")
+        ]
+
+        added_id = payloads[0]["item"]["id"]
+        self.assertTrue(added_id.startswith("oi_0_"))
+        self.assertEqual(payloads[1]["item_id"], added_id)
+        self.assertEqual(payloads[2]["item"]["id"], added_id)
+        self.assertIn("data: [DONE]", body)
+
     def test_chat_to_responses_stream_translator_emits_response_events(self):
         chunks = [
             (

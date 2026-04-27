@@ -791,6 +791,9 @@ class ProxyRoutesTests(unittest.TestCase):
         self.assertEqual(first_headers["x-interaction-id"], second_headers["x-interaction-id"])
         self.assertEqual(first_headers["x-agent-task-id"], second_headers["x-agent-task-id"])
         first_body = post.await_args_list[0].kwargs["json"]
+        second_body = post.await_args_list[1].kwargs["json"]
+        self.assertEqual(first_body["prompt_cache_key"], "claude-meta-cache-session")
+        self.assertEqual(second_body["prompt_cache_key"], "claude-meta-cache-session")
         self.assertNotIn("metadata", first_body)
 
     def test_responses_route_treats_local_compaction_as_handoff_boundary(self):

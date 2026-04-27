@@ -873,6 +873,28 @@ class FormatTranslationTests(unittest.TestCase):
                 {"type": "image", "source": {"type": "file"}}
             )
 
+    def test_anthropic_request_to_responses_uses_metadata_session_as_prompt_cache_key(self):
+        translated = format_translation.anthropic_request_to_responses(
+            {
+                "model": "claude-opus-4.6",
+                "metadata": {"user_id": '{"device_id":"device-1","session_id":"session-1"}'},
+                "messages": [{"role": "user", "content": "hello"}],
+            }
+        )
+
+        self.assertEqual(translated["prompt_cache_key"], "session-1")
+
+    def test_anthropic_request_to_responses_ignores_plain_metadata_user_id_for_prompt_cache(self):
+        translated = format_translation.anthropic_request_to_responses(
+            {
+                "model": "claude-opus-4.6",
+                "metadata": {"user_id": "plain-session"},
+                "messages": [{"role": "user", "content": "hello"}],
+            }
+        )
+
+        self.assertNotIn("prompt_cache_key", translated)
+
     def test_anthropic_system_content_and_tools_helpers_are_exact(self):
         self.assertEqual(
             format_translation._normalize_anthropic_cache_control(

@@ -652,7 +652,7 @@ class ProtocolBridgePlannerTests(unittest.TestCase):
         )
 
         self.assertEqual(plan.strategy_name, "messages_to_responses")
-        self.assertNotIn("prompt_cache_key", plan.upstream_body)
+        self.assertEqual(plan.upstream_body["prompt_cache_key"], "claude-cache-session")
         self.assertNotIn("instructions", plan.upstream_body)
         self.assertEqual(plan.upstream_body["text"], {"format": {"type": "text"}, "verbosity": "low"})
         self.assertEqual(plan.upstream_body["input"][0]["role"], "developer")

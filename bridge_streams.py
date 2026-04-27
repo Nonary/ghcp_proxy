@@ -453,6 +453,68 @@ class ChatToResponsesStreamTranslator:
         )
 
 
+class ResponsesStreamIdSyncer:
+    """Keep native Responses stream item ids stable across added/done events."""
+
+    def __init__(self):
+        self._output_items: dict[int, str] = {}
+
+    @staticmethod
+    def _encode(event_name: str | None, data: str) -> bytes:
+        lines = []
+        if event_name:
+            lines.append(f"event: {event_name}")
+        for line in data.split("\n"):
+            lines.append(f"data: {line}")
+        return ("\n".join(lines) + "\n\n").encode("utf-8")
+
+    @staticmethod
+    def _synthesized_item_id(output_index: int) -> str:
+        return f"oi_{output_index}_{uuid4().hex[:16]}"
+
+    def fix_event_data(self, event_name: str | None, data: str) -> str:
+        if not data or data == "[DONE]":
+            return data
+
+        try:
+            payload = json.loads(data)
+        except json.JSONDecodeError:
+            return data
+        if not isinstance(payload, dict):
+            return data
+
+        event_type = event_name or payload.get("type")
+        output_index = payload.get("output_index")
+        if not isinstance(output_index, int):
+            return json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+
+        if event_type == "response.output_item.added":
+            item = payload.get("item")
+            if isinstance(item, dict):
+                item_id = item.get("id")
+                if not isinstance(item_id, str) or not item_id:
+                    item_id = self._synthesized_item_id(output_index)
+                    item["id"] = item_id
+                self._output_items[output_index] = item_id
+        elif event_type == "response.output_item.done":
+            item_id = self._output_items.get(output_index)
+            item = payload.get("item")
+            if item_id and isinstance(item, dict):
+                item["id"] = item_id
+        else:
+            item_id = self._output_items.get(output_index)
+            if item_id:
+                payload["item_id"] = item_id
+
+        return json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+
+    async def sync(self, byte_iter) -> AsyncIterator[bytes]:
+        async for event_name, data in format_translation.iter_sse_messages(byte_iter):
+            if data is None:
+                continue
+            yield self._encode(event_name, self.fix_event_data(event_name, data))
+
+
 class ResponsesToAnthropicStreamTranslator:
     """Translate upstream Responses SSE into Anthropic Messages SSE."""
 

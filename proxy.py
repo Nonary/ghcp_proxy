@@ -83,6 +83,7 @@ from anthropic_stream import AnthropicStreamTranslator
 from bridge_streams import (
     AnthropicToResponsesStreamTranslator,
     ChatToResponsesStreamTranslator,
+    ResponsesStreamIdSyncer,
     ResponsesToAnthropicStreamTranslator,
 )
 from initiator_policy import InitiatorPolicy
@@ -1694,6 +1695,8 @@ async def proxy_streaming_response(
     async def stream_upstream():
         capture = usage_tracker.create_sse_capture(stream_type)
         source_iter = _stream_with_update_notice(upstream.aiter_bytes(), stream_type, getattr(upstream, "headers", None))
+        if stream_type == "responses":
+            source_iter = ResponsesStreamIdSyncer().sync(source_iter)
         try:
             async for chunk in source_iter:
                 if capture.feed(chunk):

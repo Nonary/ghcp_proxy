@@ -3,6 +3,7 @@
 import base64
 import codecs
 import json
+import re
 import time
 from uuid import uuid4
 
@@ -975,6 +976,39 @@ def _chat_content_item_to_response_content(item: dict, *, role: str = "user") ->
     return None
 
 
+def _anthropic_metadata_session_id(metadata) -> str | None:
+    if not isinstance(metadata, dict):
+        return None
+
+    for key in ("session_id", "sessionId"):
+        value = metadata.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+
+    user_id = metadata.get("user_id")
+    if isinstance(user_id, dict):
+        user_id_payload = user_id
+    elif isinstance(user_id, str) and user_id.strip():
+        normalized = user_id.strip()
+        legacy_match = re.search(r"_session_(.+)$", normalized)
+        if legacy_match and legacy_match.group(1).strip():
+            return legacy_match.group(1).strip()
+        try:
+            parsed_user_id = json.loads(normalized)
+        except json.JSONDecodeError:
+            parsed_user_id = None
+        user_id_payload = parsed_user_id if isinstance(parsed_user_id, dict) else None
+    else:
+        user_id_payload = None
+
+    if isinstance(user_id_payload, dict):
+        for key in ("session_id", "sessionId"):
+            value = user_id_payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return None
+
+
 def anthropic_request_to_responses(body: dict) -> dict:
     source_messages = body.get("messages")
     if not isinstance(source_messages, list):
@@ -1116,6 +1150,9 @@ def anthropic_request_to_responses(body: dict) -> dict:
         "include": ["reasoning.encrypted_content"],
         "text": {"format": {"type": "text"}, "verbosity": "low"},
     }
+    prompt_cache_key = _anthropic_metadata_session_id(body.get("metadata"))
+    if prompt_cache_key:
+        payload["prompt_cache_key"] = prompt_cache_key
 
     for source_key, target_key in (
         ("max_tokens", "max_output_tokens"),
