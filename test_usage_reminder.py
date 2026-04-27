@@ -41,9 +41,9 @@ class UsageReminderTests(unittest.TestCase):
 
         notice = controller.usage_notice_text_if_due(current)
         self.assertIn("88% remaining", notice)
-        self.assertIn("10% session-usage reminder", notice)
+        self.assertIn("10% 5h-usage reminder", notice)
         self.assertIn("burn-down", notice)
-        self.assertIn("not expected to run out before the session resets", notice)
+        self.assertIn("not expected to run out before the 5h limit resets", notice)
         self.assertIn("Weekly limit: 97.5% remaining", notice)
 
         self.assertEqual(controller.usage_notice_text_if_due(current), "")
@@ -55,7 +55,7 @@ class UsageReminderTests(unittest.TestCase):
         current["session"]["percent_remaining"] = 78.0
         current["session"]["percent_used"] = 22.0
         notice = controller.usage_notice_text_if_due(current)
-        self.assertIn("20% session-usage reminder", notice)
+        self.assertIn("20% 5h-usage reminder", notice)
 
     def test_history_threshold_prevents_duplicate_after_restart(self):
         now = datetime(2026, 4, 25, 18, 0, tzinfo=timezone.utc)
@@ -97,9 +97,9 @@ class UsageReminderTests(unittest.TestCase):
             threshold_percent=70,
         )
 
-        self.assertIn("70% session-usage reminder", text)
+        self.assertIn("70% 5h-usage reminder", text)
         self.assertIn("expected to run out", text)
-        self.assertIn("before the session resets", text)
+        self.assertIn("before the 5h limit resets", text)
 
     def test_friendly_limit_message_reports_session_and_weekly_reset_durations(self):
         import httpx
@@ -118,9 +118,9 @@ class UsageReminderTests(unittest.TestCase):
         with mock.patch.object(proxy.util, "utc_now", return_value=now):
             message = proxy._friendly_limit_message_from_upstream(upstream)
 
-        self.assertIn("session and weekly usage limits", message)
-        self.assertIn("Session resets in about 2 hours 30 minutes", message)
-        self.assertIn("Weekly resets in about 1 day 6 hours", message)
+        self.assertIn("5h and weekly usage limits", message)
+        self.assertIn("The 5h limit resets in about 2 hours 30 minutes", message)
+        self.assertIn("The weekly limit resets in about 1 day 6 hours", message)
 
     def test_friendly_limit_message_ignores_unexhausted_429(self):
         import httpx

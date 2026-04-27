@@ -221,6 +221,7 @@ class ProxyClientConfigService:
     def default_client_proxy_settings(self) -> dict[str, object]:
         return {
             "revert_on_shutdown": True,
+            "token_tripwire_enabled": True,
             "pending_restore_targets": [],
         }
 
@@ -231,6 +232,12 @@ class ProxyClientConfigService:
                 payload.get(
                     "revert_on_shutdown",
                     self.default_client_proxy_settings()["revert_on_shutdown"],
+                )
+            ),
+            "token_tripwire_enabled": bool(
+                payload.get(
+                    "token_tripwire_enabled",
+                    self.default_client_proxy_settings()["token_tripwire_enabled"],
                 )
             ),
             "pending_restore_targets": self._normalize_restore_targets(
@@ -247,14 +254,24 @@ class ProxyClientConfigService:
     def save_client_proxy_settings(self, payload: dict) -> dict[str, object]:
         if not isinstance(payload, dict):
             raise HTTPException(status_code=400, detail="Request body must be an object")
-        if "revert_on_shutdown" not in payload:
-            raise HTTPException(status_code=400, detail="revert_on_shutdown is required.")
-        if not isinstance(payload.get("revert_on_shutdown"), bool):
+        known_keys = {"revert_on_shutdown", "token_tripwire_enabled"}
+        if not any(key in payload for key in known_keys):
+            raise HTTPException(
+                status_code=400,
+                detail="At least one recognized setting is required.",
+            )
+        if "revert_on_shutdown" in payload and not isinstance(payload.get("revert_on_shutdown"), bool):
             raise HTTPException(status_code=400, detail="revert_on_shutdown must be true or false.")
+        if "token_tripwire_enabled" in payload and not isinstance(payload.get("token_tripwire_enabled"), bool):
+            raise HTTPException(status_code=400, detail="token_tripwire_enabled must be true or false.")
 
         existing = self.load_client_proxy_settings()
         settings = {
-            "revert_on_shutdown": payload.get("revert_on_shutdown"),
+            "revert_on_shutdown": payload.get("revert_on_shutdown", existing.get("revert_on_shutdown", True)),
+            "token_tripwire_enabled": payload.get(
+                "token_tripwire_enabled",
+                existing.get("token_tripwire_enabled", True),
+            ),
             "pending_restore_targets": existing.get("pending_restore_targets", []),
         }
         self._write_client_proxy_settings(settings)
@@ -576,6 +593,7 @@ class ProxyClientConfigService:
         os.makedirs(os.path.dirname(self._config.client_proxy_settings_file) or ".", exist_ok=True)
         normalized = {
             "revert_on_shutdown": bool(payload.get("revert_on_shutdown", True)),
+            "token_tripwire_enabled": bool(payload.get("token_tripwire_enabled", True)),
             "pending_restore_targets": self._normalize_restore_targets(payload.get("pending_restore_targets")),
         }
         self._write_json_atomic(self._config.client_proxy_settings_file, normalized)

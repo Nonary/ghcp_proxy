@@ -272,6 +272,27 @@ def _drop_outbound_headers(headers: dict, header_names: tuple[str, ...]) -> None
             headers.pop(key, None)
 
 
+def _outbound_header_value(headers: dict, header_name: str) -> str | None:
+    target = header_name.lower()
+    for key, value in headers.items():
+        if isinstance(key, str) and key.lower() == target and isinstance(value, str):
+            normalized = value.strip()
+            if normalized:
+                return normalized
+    return None
+
+
+def _prepare_responses_affinity_headers(outbound_headers: dict) -> None:
+    agent_task_id = _outbound_header_value(outbound_headers, "x-agent-task-id")
+    _drop_outbound_headers(
+        outbound_headers,
+        ("request-id", "x-github-request-id", "session_id", "session-id"),
+    )
+    _drop_outbound_headers(outbound_headers, ("x-request-id",))
+    if agent_task_id:
+        outbound_headers["x-request-id"] = agent_task_id
+
+
 def _display_model_name(model_name: str | None) -> str | None:
     normalized = _normalize_model_name(model_name)
     if normalized is None:
@@ -1102,10 +1123,7 @@ class UsageTracker:
             outbound_path = upstream_path or getattr(request.url, "path", None)
             uses_responses_affinity_headers = _is_responses_api_path(outbound_path)
             if uses_responses_affinity_headers:
-                _drop_outbound_headers(
-                    outbound_headers,
-                    ("x-request-id", "request-id", "x-github-request-id", "session_id", "session-id"),
-                )
+                _prepare_responses_affinity_headers(outbound_headers)
             else:
                 uses_messages_affinity_headers = _is_messages_api_path(outbound_path)
                 if session_id:

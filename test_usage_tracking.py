@@ -126,6 +126,35 @@ class UsageTrackingTests(unittest.TestCase):
         self.assertNotIn("x-request-id", outbound_headers)
         self.assertNotIn("x-github-request-id", outbound_headers)
 
+    def test_start_usage_event_preserves_responses_affinity_request_id_pair(self):
+        tracker = self._make_usage_tracker()
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/responses"),
+            method="POST",
+            headers={},
+        )
+        outbound_headers = {
+            "session_id": "session-123",
+            "x-agent-task-id": "stable-task",
+            "x-request-id": "stale-request",
+            "x-github-request-id": "server-prev",
+        }
+
+        event = tracker.start_event(
+            request,
+            requested_model="gpt-5.5",
+            resolved_model="gpt-5.5",
+            initiator="user",
+            request_body={"sessionId": "session-123"},
+            outbound_headers=outbound_headers,
+        )
+
+        self.assertEqual(event["session_id"], "session-123")
+        self.assertEqual(outbound_headers["x-agent-task-id"], "stable-task")
+        self.assertEqual(outbound_headers["x-request-id"], "stable-task")
+        self.assertNotIn("session_id", outbound_headers)
+        self.assertNotIn("x-github-request-id", outbound_headers)
+
     def test_normalize_recorded_usage_event_backfills_codex_native_session_and_chain(self):
         normalized = usage_tracking._normalize_recorded_usage_event(
             {

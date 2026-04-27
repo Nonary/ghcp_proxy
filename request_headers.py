@@ -1,5 +1,7 @@
 """Build upstream request headers for GitHub Copilot proxy requests."""
 
+import hashlib
+import json
 import os
 import uuid
 
@@ -22,9 +24,7 @@ def _stable_uuid(value: str) -> str:
 _CLIENT_SESSION_ID = _stable_uuid(
     f"client-session:{os.path.expanduser('~')}:{uuid.getnode():012x}"
 )
-_RESPONSES_AFFINITY_BY_SESSION: dict[str, dict[str, str]] = {}
-_RESPONSES_DEFAULT_AFFINITY: dict[str, str] | None = None
-_RESPONSES_AFFINITY_RESET_DEFAULT = False
+_COPILOT_MACHINE_ID = hashlib.sha256(f"{uuid.getnode():012x}".encode("utf-8")).hexdigest()
 _FORWARD_SESSION_HEADER_DEFAULT = True
 _VISION_INPUT_INITIAL_DEPTH = 0
 _VISION_INPUT_MAX_DEPTH = 10
@@ -65,41 +65,86 @@ def _interaction_id_for_session(session_id: str | None) -> str:
     return str(uuid.uuid4())
 
 
-def _new_responses_affinity() -> dict[str, str]:
-    return {
-        "x-interaction-id": str(uuid.uuid4()),
-        "x-agent-task-id": str(uuid.uuid4()),
+def _copilot_uuid(content: str) -> str:
+    uuid_bytes = bytearray(hashlib.sha256(content.encode("utf-8")).digest()[:16])
+    uuid_bytes[6] = (uuid_bytes[6] & 0x0F) | 0x40
+    uuid_bytes[8] = (uuid_bytes[8] & 0x3F) | 0x80
+    return str(uuid.UUID(bytes=bytes(uuid_bytes)))
+
+
+def _json_stringify_like(value) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def _strip_cache_control(value):
+    if not isinstance(value, dict):
+        return value
+    return {k: v for k, v in value.items() if k != "cache_control"}
+
+
+def _find_last_user_content(messages) -> str | None:
+    if not isinstance(messages, list):
+        return None
+    for message in reversed(messages):
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if isinstance(content, str) and content:
+            return content
+        if isinstance(content, list):
+            content_items = [
+                _strip_cache_control(item)
+                for item in content
+                if not (isinstance(item, dict) and item.get("type") == "tool_result")
+            ]
+            if content_items:
+                return _json_stringify_like(content_items)
+    return None
+
+
+def _responses_request_id_payload_messages(payload):
+    if not isinstance(payload, dict):
+        return None
+    if "messages" in payload:
+        return payload.get("messages")
+    return payload.get("input")
+
+
+def _generate_request_id_from_payload(payload, session_id: str | None = None) -> str:
+    messages = _responses_request_id_payload_messages(payload)
+    if isinstance(messages, str) and messages:
+        last_user_content = messages
+    else:
+        last_user_content = _find_last_user_content(messages)
+
+    if last_user_content:
+        return _copilot_uuid(f"{session_id or ''}{_COPILOT_MACHINE_ID}{last_user_content}")
+
+    return str(uuid.uuid4())
+
+
+def _responses_copilot_identity_headers(payload, session_id: str | None = None) -> dict[str, str]:
+    is_anthropic_messages_payload = isinstance(payload, dict) and "messages" in payload
+    root_session_id = None
+    if is_anthropic_messages_payload and isinstance(session_id, str) and session_id.strip():
+        root_session_id = _copilot_uuid(session_id.strip())
+
+    request_id = _generate_request_id_from_payload(
+        payload,
+        session_id=root_session_id if is_anthropic_messages_payload else None,
+    )
+    headers = {
+        "x-agent-task-id": request_id,
+        "x-request-id": request_id,
     }
-
-
-def _stable_responses_affinity(session_id: str) -> dict[str, str]:
-    normalized = session_id.strip()
-    return {
-        "x-interaction-id": _stable_uuid(f"responses-interaction:{normalized}"),
-        "x-agent-task-id": _stable_uuid(f"responses-agent-task:{normalized}"),
-    }
-
-
-def _responses_affinity_headers(
-    initiator: str,
-    session_id: str | None,
-    *,
-    reset: bool = _RESPONSES_AFFINITY_RESET_DEFAULT,
-    stable_user_affinity: bool = False,
-) -> dict[str, str]:
-    global _RESPONSES_DEFAULT_AFFINITY
-    should_rotate_user_affinity = initiator == "user" and not stable_user_affinity
-    if isinstance(session_id, str):
-        normalized = session_id.strip()
-        if normalized:
-            if stable_user_affinity:
-                return _stable_responses_affinity(normalized)
-            if reset or should_rotate_user_affinity or normalized not in _RESPONSES_AFFINITY_BY_SESSION:
-                _RESPONSES_AFFINITY_BY_SESSION[normalized] = _new_responses_affinity()
-            return _RESPONSES_AFFINITY_BY_SESSION[normalized]
-    if reset or should_rotate_user_affinity or _RESPONSES_DEFAULT_AFFINITY is None:
-        _RESPONSES_DEFAULT_AFFINITY = _new_responses_affinity()
-    return _RESPONSES_DEFAULT_AFFINITY
+    if is_anthropic_messages_payload:
+        if root_session_id:
+            headers["x-interaction-id"] = root_session_id
+    else:
+        headers["x-interaction-id"] = _copilot_uuid(request_id)
+    return headers
 
 
 def _messages_affinity_headers(initiator: str, interaction_id: str | None, request_id: str) -> dict[str, str]:
@@ -171,42 +216,6 @@ def _apply_forwarded_request_headers(
     return session_id
 
 
-def _extract_responses_affinity_key(
-    body: dict,
-    session_id: str | None,
-    client_request_id: str | None = None,
-) -> str | None:
-    if not isinstance(body, dict):
-        if isinstance(session_id, str) and session_id.strip():
-            return session_id.strip()
-        if isinstance(client_request_id, str) and client_request_id.strip():
-            return client_request_id.strip()
-        return None
-
-    affinity_key = None
-    for key in ("prompt_cache_key", "promptCacheKey"):
-        value = body.get(key)
-        if isinstance(value, str):
-            normalized = value.strip()
-            if normalized:
-                affinity_key = normalized
-                break
-
-    if affinity_key is None and isinstance(session_id, str):
-        normalized_session_id = session_id.strip()
-        if normalized_session_id:
-            affinity_key = normalized_session_id
-    if affinity_key is None and isinstance(client_request_id, str):
-        normalized_client_request_id = client_request_id.strip()
-        if normalized_client_request_id:
-            affinity_key = normalized_client_request_id
-
-    # NOTE: prompt_cache_key intentionally stays on the outbound body — it is
-    # the upstream Responses cache lineage hint, and dropping it would force
-    # the Copilot backend to recompute the prefix cache on every turn.
-    return affinity_key
-
-
 def build_responses_headers_for_request(
     request: Request,
     body: dict,
@@ -220,21 +229,17 @@ def build_responses_headers_for_request(
     affinity_body: dict | None = None,
     stable_user_affinity: bool = False,
 ) -> dict:
+    del stable_user_affinity
     headers = build_responses_copilot_headers(api_key)
-    affinity_source = affinity_body if isinstance(affinity_body, dict) else body
+    identity_source = affinity_body if isinstance(affinity_body, dict) else body
     session_id = _apply_forwarded_request_headers(
         headers,
         request,
-        affinity_source,
+        identity_source,
         session_id_resolver=session_id_resolver,
         forward_session_header=False,
         synthesize_client_request_id=False,
     )
-    client_request_id = request.headers.get("x-client-request-id")
-    if affinity_source is body:
-        affinity_key = _extract_responses_affinity_key(body, session_id, client_request_id)
-    else:
-        affinity_key = _extract_responses_affinity_key(dict(affinity_source), session_id, client_request_id)
     headers.pop("x-client-request-id", None)
     headers.pop("x-openai-subagent", None)
 
@@ -251,13 +256,7 @@ def build_responses_headers_for_request(
         body["input"] = effective_input
     headers["X-Initiator"] = initiator
     headers["x-interaction-type"] = _interaction_type_for_initiator(initiator)
-    headers.update(
-        _responses_affinity_headers(
-            initiator,
-            affinity_key,
-            stable_user_affinity=stable_user_affinity,
-        )
-    )
+    headers.update(_responses_copilot_identity_headers(identity_source, session_id))
 
     if has_vision_input(effective_input):
         headers["Copilot-Vision-Request"] = "true"

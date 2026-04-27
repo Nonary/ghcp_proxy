@@ -14,8 +14,6 @@ class RequestHeadersTests(unittest.TestCase):
     def setUp(self):
         proxy.set_initiator_policy(initiator_policy.InitiatorPolicy())
         proxy.usage_tracker.clear_state()
-        request_headers._RESPONSES_AFFINITY_BY_SESSION.clear()
-        request_headers._RESPONSES_DEFAULT_AFFINITY = None
 
     def test_base_copilot_header_contract_is_exact(self):
         self.assertEqual(
@@ -51,22 +49,40 @@ class RequestHeadersTests(unittest.TestCase):
         self.assertFalse(request_headers.has_vision_input(depth_11))
         self.assertFalse(request_headers.has_vision_input({"content": [{"content": [{"type": "input_image"}]}]}, max_depth=1))
 
-    def test_responses_affinity_reuses_agent_session_until_reset_or_user(self):
-        with mock.patch.object(
-            request_headers,
-            "_new_responses_affinity",
-            side_effect=[
-                {"x-interaction-id": "first", "x-agent-task-id": "first-task"},
-                {"x-interaction-id": "second", "x-agent-task-id": "second-task"},
-                {"x-interaction-id": "third", "x-agent-task-id": "third-task"},
-            ],
-        ):
-            first = request_headers._responses_affinity_headers("agent", " session ")
-            second = request_headers._responses_affinity_headers("agent", "session")
-            reset = request_headers._responses_affinity_headers("agent", "session", reset=True)
+    def test_generate_request_id_from_payload_uses_copilot_last_user_content(self):
+        first = request_headers._generate_request_id_from_payload(
+            {
+                "messages": [
+                    {"role": "user", "content": "old"},
+                    {"role": "assistant", "content": "ok"},
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "new", "cache_control": {"type": "ephemeral"}},
+                            {"type": "tool_result", "content": "ignored"},
+                        ],
+                    },
+                ]
+            },
+            session_id="session-a",
+        )
+        second = request_headers._generate_request_id_from_payload(
+            {
+                "messages": [
+                    {"role": "user", "content": "old"},
+                    {"role": "assistant", "content": "ok"},
+                    {"role": "user", "content": [{"type": "text", "text": "new"}]},
+                ]
+            },
+            session_id="session-a",
+        )
+        different_session = request_headers._generate_request_id_from_payload(
+            {"messages": [{"role": "user", "content": [{"type": "text", "text": "new"}]}]},
+            session_id="session-b",
+        )
 
-        self.assertIs(second, first)
-        self.assertEqual(reset, {"x-interaction-id": "second", "x-agent-task-id": "second-task"})
+        self.assertEqual(first, second)
+        self.assertNotEqual(first, different_session)
 
     def test_chat_vision_scan_stops_after_first_image_message(self):
         class RecordingPolicy:
@@ -157,24 +173,16 @@ class RequestHeadersTests(unittest.TestCase):
         }
         verdict_sink = {}
 
-        with mock.patch.object(
-            request_headers,
-            "_new_responses_affinity",
-            return_value={
-                "x-interaction-id": "interaction-id",
-                "x-agent-task-id": "agent-task-id",
-            },
-        ):
-            headers = request_headers.build_responses_headers_for_request(
-                request,
-                body,
-                "test-key",
-                force_initiator="user",
-                request_id="req-1",
-                initiator_policy=policy,
-                session_id_resolver=lambda req, body_arg: "session-id",
-                verdict_sink=verdict_sink,
-            )
+        headers = request_headers.build_responses_headers_for_request(
+            request,
+            body,
+            "test-key",
+            force_initiator="user",
+            request_id="req-1",
+            initiator_policy=policy,
+            session_id_resolver=lambda req, body_arg: "session-id",
+            verdict_sink=verdict_sink,
+        )
 
         self.assertEqual(
             policy.calls,
@@ -195,6 +203,11 @@ class RequestHeadersTests(unittest.TestCase):
                 }
             ],
         )
+        request_id_header = headers.pop("x-request-id")
+        agent_task_id = headers.pop("x-agent-task-id")
+        interaction_id = headers.pop("x-interaction-id")
+        self.assertEqual(request_id_header, agent_task_id)
+        self.assertEqual(interaction_id, request_headers._copilot_uuid(agent_task_id))
         self.assertEqual(
             headers,
             {
@@ -208,8 +221,6 @@ class RequestHeadersTests(unittest.TestCase):
                 "x-client-session-id": request_headers._CLIENT_SESSION_ID,
                 "X-Initiator": "user",
                 "x-interaction-type": "conversation-user",
-                "x-interaction-id": "interaction-id",
-                "x-agent-task-id": "agent-task-id",
                 "Copilot-Vision-Request": "true",
             },
         )
@@ -950,76 +961,33 @@ class RequestHeadersTests(unittest.TestCase):
             )
         )
 
-    def test_extract_responses_affinity_key_handles_non_dict_fallback_order(self):
-        self.assertEqual(
-            request_headers._extract_responses_affinity_key(None, " session-1 ", " client-1 "),
-            "session-1",
-        )
-        self.assertEqual(
-            request_headers._extract_responses_affinity_key(None, " ", " client-1 "),
-            "client-1",
-        )
-        self.assertIsNone(request_headers._extract_responses_affinity_key(None, " ", " "))
+    def test_responses_identity_headers_match_native_copilot_responses_shape(self):
+        payload = {
+            "input": [
+                {"role": "user", "content": [{"type": "input_text", "text": "hello"}]},
+                {"type": "function_call", "call_id": "call-1", "name": "Read", "arguments": "{}"},
+            ]
+        }
 
-        body = {"prompt_cache_key": " ", "promptCacheKey": " camel-cache "}
-        self.assertEqual(
-            request_headers._extract_responses_affinity_key(body, " session-ignored ", " client-ignored "),
-            "camel-cache",
-        )
-        self.assertEqual(body, {"prompt_cache_key": " ", "promptCacheKey": " camel-cache "})
-        self.assertEqual(request_headers._extract_responses_affinity_key({}, " ", " client-2 "), "client-2")
-        self.assertIsNone(request_headers._extract_responses_affinity_key({}, " ", " "))
+        headers = request_headers._responses_copilot_identity_headers(payload)
 
-    def test_responses_affinity_headers_reset_default_and_session_affinities(self):
-        with mock.patch.object(
-            request_headers,
-            "_new_responses_affinity",
-            side_effect=[
-                {"x-interaction-id": "default-first", "x-agent-task-id": "default-first-task"},
-                {"x-interaction-id": "default-reset", "x-agent-task-id": "default-reset-task"},
-            ],
-        ) as new_affinity:
-            first_default = request_headers._responses_affinity_headers("agent", None)
-            reused_default = request_headers._responses_affinity_headers("agent", None)
-            reset_default = request_headers._responses_affinity_headers("agent", None, reset=True)
-            reused_after_reset = request_headers._responses_affinity_headers("agent", None)
+        self.assertEqual(headers["x-request-id"], headers["x-agent-task-id"])
+        self.assertEqual(headers["x-interaction-id"], request_headers._copilot_uuid(headers["x-agent-task-id"]))
 
-        self.assertEqual(first_default, {"x-interaction-id": "default-first", "x-agent-task-id": "default-first-task"})
-        self.assertIs(reused_default, first_default)
-        self.assertEqual(reset_default, {"x-interaction-id": "default-reset", "x-agent-task-id": "default-reset-task"})
-        self.assertIsNot(reset_default, first_default)
-        self.assertIs(reused_after_reset, reset_default)
-        self.assertEqual(new_affinity.call_count, 2)
-
-        self.assertIsNot(reset_default, request_headers._responses_affinity_headers("user", None))
-        self.assertIsNot(first_default, request_headers._responses_affinity_headers("user", " "))
-
-        first_session = request_headers._responses_affinity_headers("agent", "session-a")
-        self.assertIs(first_session, request_headers._responses_affinity_headers("agent", " session-a "))
-        self.assertIsNot(first_session, request_headers._responses_affinity_headers("user", "session-a"))
-
-    def test_stable_responses_affinity_survives_process_cache_reset(self):
-        first = request_headers._responses_affinity_headers(
-            "user",
-            " prompt-cache-key ",
-            stable_user_affinity=True,
-        )
-        request_headers._RESPONSES_AFFINITY_BY_SESSION.clear()
-        request_headers._RESPONSES_DEFAULT_AFFINITY = None
-        second = request_headers._responses_affinity_headers(
-            "user",
-            "prompt-cache-key",
-            stable_user_affinity=True,
-        )
-        different = request_headers._responses_affinity_headers(
-            "user",
-            "other-cache-key",
-            stable_user_affinity=True,
+    def test_responses_identity_headers_match_anthropic_bridge_session_shape(self):
+        payload = {"messages": [{"role": "user", "content": "hello"}]}
+        first = request_headers._responses_copilot_identity_headers(payload, " session-a ")
+        second = request_headers._responses_copilot_identity_headers(payload, "session-a")
+        later_turn = request_headers._responses_copilot_identity_headers(
+            {"messages": [{"role": "user", "content": "follow up"}]},
+            "session-a",
         )
 
         self.assertEqual(first, second)
-        self.assertNotEqual(first["x-interaction-id"], different["x-interaction-id"])
-        self.assertNotEqual(first["x-agent-task-id"], different["x-agent-task-id"])
+        self.assertEqual(first["x-request-id"], first["x-agent-task-id"])
+        self.assertEqual(first["x-interaction-id"], request_headers._copilot_uuid("session-a"))
+        self.assertEqual(later_turn["x-interaction-id"], first["x-interaction-id"])
+        self.assertNotEqual(later_turn["x-agent-task-id"], first["x-agent-task-id"])
 
     def test_interaction_id_for_blank_session_generates_new_id(self):
         generated = request_headers._interaction_id_for_session(" ")
@@ -1256,7 +1224,9 @@ class RequestHeadersTests(unittest.TestCase):
             session_id_resolver=usage_tracking.request_session_id,
         )
 
-        self.assertNotIn("x-request-id", headers)
+        self.assertIn("x-request-id", headers)
+        self.assertEqual(headers["x-request-id"], headers["x-agent-task-id"])
+        self.assertNotEqual(headers["x-request-id"], "server-prev")
         self.assertNotIn("x-github-request-id", headers)
 
     def test_build_responses_headers_for_request_uses_hyphenated_session_header(self):
@@ -1384,7 +1354,7 @@ class RequestHeadersTests(unittest.TestCase):
         self.assertIn("x-interaction-id", headers)
         self.assertIn("x-agent-task-id", headers)
 
-    def test_build_responses_headers_for_request_reuses_prompt_cache_affinity(self):
+    def test_build_responses_headers_for_request_uses_payload_identity_not_prompt_cache_key(self):
         first_request = SimpleNamespace(headers={"x-openai-subagent": "worker"}, url=SimpleNamespace(path="/v1/responses"))
         first_body = {"model": "gpt-5.4", "input": "hello", "prompt_cache_key": "cache-a"}
         first_headers = format_translation.build_responses_headers_for_request(
@@ -1415,10 +1385,10 @@ class RequestHeadersTests(unittest.TestCase):
             session_id_resolver=usage_tracking.request_session_id,
         )
 
-        self.assertNotEqual(first_headers["x-interaction-id"], second_headers["x-interaction-id"])
-        self.assertNotEqual(first_headers["x-agent-task-id"], second_headers["x-agent-task-id"])
-        self.assertEqual(first_headers["x-interaction-id"], third_headers["x-interaction-id"])
-        self.assertEqual(first_headers["x-agent-task-id"], third_headers["x-agent-task-id"])
+        self.assertEqual(first_headers["x-interaction-id"], second_headers["x-interaction-id"])
+        self.assertEqual(first_headers["x-agent-task-id"], second_headers["x-agent-task-id"])
+        self.assertNotEqual(first_headers["x-interaction-id"], third_headers["x-interaction-id"])
+        self.assertNotEqual(first_headers["x-agent-task-id"], third_headers["x-agent-task-id"])
         self.assertEqual(first_body.get("prompt_cache_key"), "cache-a")
         self.assertEqual(second_body.get("prompt_cache_key"), "cache-b")
         self.assertEqual(third_body.get("prompt_cache_key"), "cache-a")
@@ -1451,22 +1421,81 @@ class RequestHeadersTests(unittest.TestCase):
         self.assertEqual(first_body.get("prompt_cache_key"), "cache-user-turns")
         self.assertEqual(second_body.get("prompt_cache_key"), "cache-user-turns")
 
-    def test_build_responses_headers_for_request_can_keep_claude_bridge_affinity_stable(self):
+    def test_build_responses_headers_for_request_uses_claude_bridge_session_as_interaction(self):
         first_request = SimpleNamespace(headers={}, url=SimpleNamespace(path="/v1/messages"))
         first_body = {"model": "gpt-5.4", "input": "first", "prompt_cache_key": "cache-user-turns"}
+        first_original_body = {
+            "model": "claude-opus-4.6",
+            "metadata": {"user_id": '{"session_id":"claude-cache-session"}'},
+            "messages": [{"role": "user", "content": "first"}],
+        }
         first_headers = format_translation.build_responses_headers_for_request(
             first_request,
             first_body,
             "test-key",
             initiator_policy=proxy._initiator_policy,
             session_id_resolver=usage_tracking.request_session_id,
+            affinity_body=first_original_body,
             stable_user_affinity=True,
         )
 
         second_request = SimpleNamespace(headers={}, url=SimpleNamespace(path="/v1/messages"))
         second_body = {"model": "gpt-5.4", "input": "follow up", "prompt_cache_key": "cache-user-turns"}
+        second_original_body = {
+            "model": "claude-opus-4.6",
+            "metadata": {"user_id": '{"session_id":"claude-cache-session"}'},
+            "messages": [{"role": "user", "content": "follow up"}],
+        }
         second_headers = format_translation.build_responses_headers_for_request(
             second_request,
+            second_body,
+            "test-key",
+            initiator_policy=proxy._initiator_policy,
+            session_id_resolver=usage_tracking.request_session_id,
+            affinity_body=second_original_body,
+            stable_user_affinity=True,
+        )
+
+        self.assertEqual(first_headers["X-Initiator"], "user")
+        self.assertEqual(second_headers["X-Initiator"], "user")
+        self.assertEqual(first_headers["x-interaction-id"], second_headers["x-interaction-id"])
+        self.assertNotEqual(first_headers["x-agent-task-id"], second_headers["x-agent-task-id"])
+        self.assertEqual(first_body.get("prompt_cache_key"), "cache-user-turns")
+        self.assertEqual(second_body.get("prompt_cache_key"), "cache-user-turns")
+
+    def test_build_responses_headers_for_request_keeps_agent_task_stable_within_user_turn(self):
+        request = SimpleNamespace(headers={}, url=SimpleNamespace(path="/v1/messages"))
+        first_body = {
+            "model": "gpt-5.4",
+            "prompt_cache_key": "cache-user-turns",
+            "input": [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "fix it"}]},
+                {"type": "function_call", "name": "Read", "call_id": "call_1", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_1", "output": "ok"},
+            ],
+        }
+        second_body = {
+            "model": "gpt-5.4",
+            "prompt_cache_key": "cache-user-turns",
+            "input": [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "fix it"}]},
+                {"type": "function_call", "name": "Read", "call_id": "call_1", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_1", "output": "ok"},
+                {"type": "reasoning", "encrypted_content": "ciphertext"},
+                {"type": "function_call", "name": "Edit", "call_id": "call_2", "arguments": "{}"},
+            ],
+        }
+
+        first_headers = format_translation.build_responses_headers_for_request(
+            request,
+            first_body,
+            "test-key",
+            initiator_policy=proxy._initiator_policy,
+            session_id_resolver=usage_tracking.request_session_id,
+            stable_user_affinity=True,
+        )
+        second_headers = format_translation.build_responses_headers_for_request(
+            request,
             second_body,
             "test-key",
             initiator_policy=proxy._initiator_policy,
@@ -1474,12 +1503,8 @@ class RequestHeadersTests(unittest.TestCase):
             stable_user_affinity=True,
         )
 
-        self.assertEqual(first_headers["X-Initiator"], "user")
-        self.assertEqual(second_headers["X-Initiator"], "user")
         self.assertEqual(first_headers["x-interaction-id"], second_headers["x-interaction-id"])
         self.assertEqual(first_headers["x-agent-task-id"], second_headers["x-agent-task-id"])
-        self.assertEqual(first_body.get("prompt_cache_key"), "cache-user-turns")
-        self.assertEqual(second_body.get("prompt_cache_key"), "cache-user-turns")
 
     def test_build_responses_headers_for_request_can_use_unsent_affinity_body(self):
         request = SimpleNamespace(headers={}, url=SimpleNamespace(path="/v1/messages"))
@@ -1568,9 +1593,9 @@ class RequestHeadersTests(unittest.TestCase):
             stable_user_affinity=True,
         )
 
-        self.assertNotEqual(first_headers["x-interaction-id"], "plain-claude-session")
         self.assertNotEqual(first_headers["x-agent-task-id"], "plain-claude-session")
-        self.assertEqual(first_headers["x-interaction-id"], second_headers["x-interaction-id"])
+        self.assertNotIn("x-interaction-id", first_headers)
+        self.assertNotIn("x-interaction-id", second_headers)
         self.assertEqual(first_headers["x-agent-task-id"], second_headers["x-agent-task-id"])
 
     def test_build_responses_headers_for_compact_preserves_cache_affinity_fields(self):
@@ -1605,8 +1630,8 @@ class RequestHeadersTests(unittest.TestCase):
         self.assertEqual(compact_body["sessionId"], "session-123")
         self.assertEqual(compact_body.get("promptCacheKey"), "cache-123")
         self.assertEqual(compact_body["previous_response_id"], "resp_prev")
-        self.assertNotEqual(compact_headers["x-interaction-id"], user_headers["x-interaction-id"])
-        self.assertNotEqual(compact_headers["x-agent-task-id"], user_headers["x-agent-task-id"])
+        self.assertEqual(compact_headers["x-interaction-id"], user_headers["x-interaction-id"])
+        self.assertEqual(compact_headers["x-agent-task-id"], user_headers["x-agent-task-id"])
 
     def test_build_responses_headers_for_request_does_not_forward_incoming_server_request_id(self):
         request = SimpleNamespace(
@@ -1621,7 +1646,9 @@ class RequestHeadersTests(unittest.TestCase):
             session_id_resolver=usage_tracking.request_session_id,
         )
 
-        self.assertNotIn("x-request-id", headers)
+        self.assertIn("x-request-id", headers)
+        self.assertEqual(headers["x-request-id"], headers["x-agent-task-id"])
+        self.assertNotEqual(headers["x-request-id"], "server-prev")
         self.assertNotIn("x-github-request-id", headers)
 
 

@@ -790,7 +790,9 @@ class ProxyRoutesTests(unittest.TestCase):
         self.assertEqual(first_headers["X-Initiator"], "user")
         self.assertEqual(second_headers["X-Initiator"], "user")
         self.assertEqual(first_headers["x-interaction-id"], second_headers["x-interaction-id"])
-        self.assertEqual(first_headers["x-agent-task-id"], second_headers["x-agent-task-id"])
+        self.assertNotEqual(first_headers["x-agent-task-id"], second_headers["x-agent-task-id"])
+        self.assertEqual(first_headers["x-request-id"], first_headers["x-agent-task-id"])
+        self.assertEqual(second_headers["x-request-id"], second_headers["x-agent-task-id"])
         first_body = post.await_args_list[0].kwargs["json"]
         second_body = post.await_args_list[1].kwargs["json"]
         self.assertEqual(first_body["prompt_cache_key"], "claude-meta-cache-session")
@@ -938,6 +940,8 @@ class ProxyRoutesTests(unittest.TestCase):
         self.assertIn("x-client-session-id", forwarded_headers)
         self.assertIn("x-interaction-id", forwarded_headers)
         self.assertIn("x-agent-task-id", forwarded_headers)
+        self.assertIn("x-request-id", forwarded_headers)
+        self.assertEqual(forwarded_headers["x-request-id"], forwarded_headers["x-agent-task-id"])
         self.assertNotIn("session_id", forwarded_headers)
         self.assertNotIn("x-client-request-id", forwarded_headers)
         self.assertEqual(forwarded_body["sessionId"], "session-123")
@@ -953,7 +957,7 @@ class ProxyRoutesTests(unittest.TestCase):
         self.assertEqual(response_payload["id"], "resp_123")
         self.assertEqual(response_payload["output"][0]["content"][0]["text"], "done")
 
-    def test_responses_route_session_affinity_survives_process_cache_reset(self):
+    def test_responses_route_session_affinity_is_deterministic_across_calls(self):
         body_template = {
             "model": "gpt-5.4",
             "sessionId": "session-123",
@@ -1003,9 +1007,6 @@ class ProxyRoutesTests(unittest.TestCase):
 
             self.assertEqual(response.status_code, 200)
             forwarded_headers.append(post.await_args.kwargs["headers"])
-            if index == 0:
-                proxy._request_headers_module._RESPONSES_AFFINITY_BY_SESSION.clear()
-                proxy._request_headers_module._RESPONSES_DEFAULT_AFFINITY = None
 
         self.assertEqual(forwarded_headers[0]["x-interaction-id"], forwarded_headers[1]["x-interaction-id"])
         self.assertEqual(forwarded_headers[0]["x-agent-task-id"], forwarded_headers[1]["x-agent-task-id"])
@@ -1075,6 +1076,295 @@ class ProxyRoutesTests(unittest.TestCase):
         self.assertEqual(post.await_args.kwargs["json"]["include"], ["reasoning.encrypted_content"])
         self.assertEqual(response.status_code, 200)
         self.assertEqual(json.loads(response.body), upstream_payload)
+
+    def test_responses_route_returns_tripwire_message_for_large_uncached_request(self):
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/responses"),
+            method="POST",
+            headers={},
+        )
+        body = {
+            "model": "gpt-5.5",
+            "stream": False,
+            "input": "hello",
+        }
+        upstream_payload = {
+            "id": "resp_123",
+            "object": "response",
+            "created_at": 123,
+            "model": "gpt-5.5",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "expensive answer"}],
+                }
+            ],
+            "output_text": "expensive answer",
+            "usage": {
+                "input_tokens": 60000,
+                "input_tokens_details": {"cached_tokens": 0},
+                "output_tokens": 5,
+                "total_tokens": 60005,
+            },
+        }
+        upstream = httpx.Response(
+            200,
+            json=upstream_payload,
+            headers={"content-type": "application/json"},
+        )
+
+        with (
+            mock.patch.object(proxy, "parse_json_request", mock.AsyncMock(return_value=body)),
+            mock.patch.object(auth, "get_api_key", return_value="test-key"),
+            mock.patch.object(auth, "get_api_base", return_value="https://example.invalid"),
+            mock.patch.object(proxy.model_routing_config_service, "resolve_target_model", return_value="gpt-5.5"),
+            mock.patch.object(proxy.usage_tracker, "start_event", return_value=None),
+            mock.patch.object(proxy.usage_tracker, "finish_event") as finish_usage,
+            mock.patch.object(proxy, "throttled_client_post", mock.AsyncMock(return_value=upstream)),
+        ):
+            response = proxy.asyncio.run(proxy.responses(request))
+
+        self.assertEqual(response.status_code, 200)
+        payload = json.loads(response.body)
+        self.assertIn("Safety tripwire activated", payload["output_text"])
+        self.assertIn("could burn through your Copilot session limit", payload["output_text"])
+        self.assertIn("0 cached tokens", payload["output_text"])
+        self.assertIn("60000 fresh input tokens", payload["output_text"])
+        self.assertIn("30000 cached input tokens", payload["output_text"])
+        self.assertIn("50000 token fresh/cache gap limit", payload["output_text"])
+        self.assertIn("disable the tripwire in Settings", payload["output_text"])
+        self.assertIn("debug the cache lineage", payload["output_text"])
+        self.assertNotIn("expensive answer", payload["output_text"])
+        finish_usage.assert_called_once()
+        self.assertEqual(finish_usage.call_args.kwargs["usage"]["input_tokens"], 60000)
+        self.assertEqual(finish_usage.call_args.kwargs["usage"]["cached_input_tokens"], 0)
+
+    def test_responses_route_does_not_tripwire_when_cache_is_above_threshold(self):
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/responses"),
+            method="POST",
+            headers={},
+        )
+        body = {
+            "model": "gpt-5.5",
+            "stream": False,
+            "input": "hello",
+        }
+        upstream_payload = {
+            "id": "resp_123",
+            "object": "response",
+            "created_at": 123,
+            "model": "gpt-5.5",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "cache acceptable"}],
+                }
+            ],
+            "output_text": "cache acceptable",
+            "usage": {
+                "input_tokens": 107092,
+                "input_tokens_details": {"cached_tokens": 90496},
+                "output_tokens": 5,
+                "total_tokens": 107097,
+            },
+        }
+        upstream = httpx.Response(
+            200,
+            json=upstream_payload,
+            headers={"content-type": "application/json"},
+        )
+
+        with (
+            mock.patch.object(proxy, "parse_json_request", mock.AsyncMock(return_value=body)),
+            mock.patch.object(auth, "get_api_key", return_value="test-key"),
+            mock.patch.object(auth, "get_api_base", return_value="https://example.invalid"),
+            mock.patch.object(proxy.model_routing_config_service, "resolve_target_model", return_value="gpt-5.5"),
+            mock.patch.object(proxy.usage_tracker, "start_event", return_value=None),
+            mock.patch.object(proxy.usage_tracker, "finish_event") as finish_usage,
+            mock.patch.object(proxy, "throttled_client_post", mock.AsyncMock(return_value=upstream)),
+        ):
+            response = proxy.asyncio.run(proxy.responses(request))
+
+        self.assertEqual(response.status_code, 200)
+        payload = json.loads(response.body)
+        self.assertEqual(payload["output_text"], "cache acceptable")
+        self.assertNotIn("Safety tripwire activated", payload["output_text"])
+        finish_usage.assert_called_once()
+
+    def test_responses_route_does_not_tripwire_when_low_cache_gap_is_below_threshold(self):
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/responses"),
+            method="POST",
+            headers={},
+        )
+        body = {
+            "model": "gpt-5.5",
+            "stream": False,
+            "input": "hello",
+        }
+        upstream_payload = {
+            "id": "resp_123",
+            "object": "response",
+            "created_at": 123,
+            "model": "gpt-5.5",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "low cache but tolerable"}],
+                }
+            ],
+            "output_text": "low cache but tolerable",
+            "usage": {
+                "input_tokens": 36000,
+                "input_tokens_details": {"cached_tokens": 0},
+                "output_tokens": 5,
+                "total_tokens": 36005,
+            },
+        }
+        upstream = httpx.Response(
+            200,
+            json=upstream_payload,
+            headers={"content-type": "application/json"},
+        )
+
+        with (
+            mock.patch.object(proxy, "parse_json_request", mock.AsyncMock(return_value=body)),
+            mock.patch.object(auth, "get_api_key", return_value="test-key"),
+            mock.patch.object(auth, "get_api_base", return_value="https://example.invalid"),
+            mock.patch.object(proxy.model_routing_config_service, "resolve_target_model", return_value="gpt-5.5"),
+            mock.patch.object(proxy.usage_tracker, "start_event", return_value=None),
+            mock.patch.object(proxy.usage_tracker, "finish_event") as finish_usage,
+            mock.patch.object(proxy, "throttled_client_post", mock.AsyncMock(return_value=upstream)),
+        ):
+            response = proxy.asyncio.run(proxy.responses(request))
+
+        self.assertEqual(response.status_code, 200)
+        payload = json.loads(response.body)
+        self.assertEqual(payload["output_text"], "low cache but tolerable")
+        self.assertNotIn("Safety tripwire activated", payload["output_text"])
+        finish_usage.assert_called_once()
+
+    def test_responses_route_does_not_tripwire_when_disabled_in_settings(self):
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/responses"),
+            method="POST",
+            headers={},
+        )
+        body = {
+            "model": "gpt-5.5",
+            "stream": False,
+            "input": "hello",
+        }
+        upstream_payload = {
+            "id": "resp_123",
+            "object": "response",
+            "created_at": 123,
+            "model": "gpt-5.5",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "tripwire disabled"}],
+                }
+            ],
+            "output_text": "tripwire disabled",
+            "usage": {
+                "input_tokens": 60000,
+                "input_tokens_details": {"cached_tokens": 0},
+                "output_tokens": 5,
+                "total_tokens": 60005,
+            },
+        }
+        upstream = httpx.Response(
+            200,
+            json=upstream_payload,
+            headers={"content-type": "application/json"},
+        )
+
+        with (
+            mock.patch.object(proxy, "parse_json_request", mock.AsyncMock(return_value=body)),
+            mock.patch.object(auth, "get_api_key", return_value="test-key"),
+            mock.patch.object(auth, "get_api_base", return_value="https://example.invalid"),
+            mock.patch.object(proxy.model_routing_config_service, "resolve_target_model", return_value="gpt-5.5"),
+            mock.patch.object(
+                proxy.client_proxy_config_service,
+                "load_client_proxy_settings",
+                return_value={"token_tripwire_enabled": False},
+            ),
+            mock.patch.object(proxy.usage_tracker, "start_event", return_value=None),
+            mock.patch.object(proxy.usage_tracker, "finish_event") as finish_usage,
+            mock.patch.object(proxy, "throttled_client_post", mock.AsyncMock(return_value=upstream)),
+        ):
+            response = proxy.asyncio.run(proxy.responses(request))
+
+        self.assertEqual(response.status_code, 200)
+        payload = json.loads(response.body)
+        self.assertEqual(payload["output_text"], "tripwire disabled")
+        self.assertNotIn("Safety tripwire activated", payload["output_text"])
+        finish_usage.assert_called_once()
+
+    def test_responses_route_does_not_tripwire_when_cache_is_above_threshold_even_with_high_fresh_tokens(self):
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/responses"),
+            method="POST",
+            headers={},
+        )
+        body = {
+            "model": "gpt-5.5",
+            "stream": False,
+            "input": "hello",
+        }
+        upstream_payload = {
+            "id": "resp_123",
+            "object": "response",
+            "created_at": 123,
+            "model": "gpt-5.5",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "large but cached enough"}],
+                }
+            ],
+            "output_text": "large but cached enough",
+            "usage": {
+                "input_tokens": 107092,
+                "input_tokens_details": {"cached_tokens": 40000},
+                "output_tokens": 5,
+                "total_tokens": 107097,
+            },
+        }
+        upstream = httpx.Response(
+            200,
+            json=upstream_payload,
+            headers={"content-type": "application/json"},
+        )
+
+        with (
+            mock.patch.object(proxy, "parse_json_request", mock.AsyncMock(return_value=body)),
+            mock.patch.object(auth, "get_api_key", return_value="test-key"),
+            mock.patch.object(auth, "get_api_base", return_value="https://example.invalid"),
+            mock.patch.object(proxy.model_routing_config_service, "resolve_target_model", return_value="gpt-5.5"),
+            mock.patch.object(proxy.usage_tracker, "start_event", return_value=None),
+            mock.patch.object(proxy.usage_tracker, "finish_event") as finish_usage,
+            mock.patch.object(proxy, "throttled_client_post", mock.AsyncMock(return_value=upstream)),
+        ):
+            response = proxy.asyncio.run(proxy.responses(request))
+
+        self.assertEqual(response.status_code, 200)
+        payload = json.loads(response.body)
+        self.assertEqual(payload["output_text"], "large but cached enough")
+        self.assertNotIn("Safety tripwire activated", payload["output_text"])
+        finish_usage.assert_called_once()
 
     def test_responses_route_drops_reasoning_for_forked_context(self):
         request = SimpleNamespace(
@@ -1750,6 +2040,8 @@ class ProxyRoutesTests(unittest.TestCase):
         self.assertIn("x-client-session-id", forwarded_headers)
         self.assertIn("x-interaction-id", forwarded_headers)
         self.assertIn("x-agent-task-id", forwarded_headers)
+        self.assertIn("x-request-id", forwarded_headers)
+        self.assertEqual(forwarded_headers["x-request-id"], forwarded_headers["x-agent-task-id"])
         self.assertNotIn("session_id", forwarded_headers)
         self.assertNotIn("x-client-request-id", forwarded_headers)
         self.assertEqual(forwarded_body["sessionId"], "session-123")
@@ -2046,7 +2338,7 @@ class AnthropicMessagesPassthroughRouteTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         payload = json.loads(response.body)
         self.assertEqual(payload["status"], "completed")
-        self.assertIn("session usage limit", payload["output_text"])
+        self.assertIn("5h usage limit", payload["output_text"])
         self.assertIn("2 hours", payload["output_text"])
         finish_usage.assert_called_once()
         self.assertEqual(finish_usage.call_args.args[1], 429)
@@ -2144,10 +2436,90 @@ class AnthropicMessagesPassthroughRouteTests(unittest.TestCase):
         response, body, finish_usage = proxy.asyncio.run(run_stream())
         self.assertEqual(response.status_code, 200)
         self.assertIn("weekly usage limit", body)
+        self.assertIn("The weekly limit resets", body)
         self.assertIn("1 day 6 hours", body)
         self.assertIn("[DONE]", body)
         finish_usage.assert_called_once()
         self.assertEqual(finish_usage.call_args.args[1], 429)
+
+    def test_responses_streaming_returns_tripwire_message_for_large_uncached_request(self):
+        chunks = [
+            (
+                'event: response.created\n'
+                'data: {"type":"response.created","response":{"id":"resp_123","status":"in_progress"}}\n\n'
+            ).encode("utf-8"),
+            (
+                'event: response.output_text.delta\n'
+                'data: {"type":"response.output_text.delta","delta":"expensive answer"}\n\n'
+            ).encode("utf-8"),
+            (
+                'event: response.completed\n'
+                'data: {"type":"response.completed","response":{"id":"resp_123","object":"response",'
+                '"status":"completed","output":[],"usage":{"input_tokens":60000,'
+                '"input_tokens_details":{"cached_tokens":0},"output_tokens":5,"total_tokens":60005}}}\n\n'
+            ).encode("utf-8"),
+            b"data: [DONE]\n\n",
+        ]
+
+        class FakeUpstream:
+            status_code = 200
+            headers = {"content-type": "text/event-stream"}
+
+            async def aiter_bytes(self):
+                for chunk in chunks:
+                    yield chunk
+
+            async def aclose(self):
+                return None
+
+        class FakeClient:
+            def build_request(self, *args, **kwargs):
+                return httpx.Request("POST", "https://example.invalid/responses")
+
+            async def aclose(self):
+                return None
+
+        usage_event = {"request_id": "req-tripwire-stream"}
+        trace_plan = proxy.UpstreamRequestPlan(
+            request_id="req-tripwire-stream",
+            upstream_url="https://example.invalid/responses",
+            headers={},
+            body={"stream": True},
+            usage_event=usage_event,
+            requested_model="gpt-5.5",
+            resolved_model="gpt-5.5",
+        )
+
+        async def run_stream():
+            with (
+                mock.patch.object(proxy.httpx, "AsyncClient", return_value=FakeClient()),
+                mock.patch.object(proxy, "throttled_client_send", mock.AsyncMock(return_value=FakeUpstream())),
+                mock.patch.object(proxy.usage_tracker, "finish_event") as finish_usage,
+            ):
+                response = await proxy.proxy_streaming_response(
+                    "https://example.invalid/responses",
+                    {},
+                    {"stream": True},
+                    stream_type="responses",
+                    usage_event=usage_event,
+                    trace_plan=trace_plan,
+                )
+                body_bytes = b""
+                async for chunk in response.body_iterator:
+                    body_bytes += chunk
+                return response, body_bytes.decode("utf-8"), finish_usage
+
+        response, body, finish_usage = proxy.asyncio.run(run_stream())
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("Safety tripwire activated", body)
+        self.assertIn("could burn through your Copilot session limit", body)
+        self.assertIn("disable the tripwire in Settings", body)
+        self.assertIn("[DONE]", body)
+        self.assertNotIn("expensive answer", body)
+        finish_usage.assert_called_once()
+        usage = finish_usage.call_args.kwargs["usage"]
+        self.assertEqual(usage["input_tokens"], 60000)
+        self.assertEqual(usage["cached_input_tokens"], 0)
 
     def test_messages_route_forwards_claude_session_affinity_for_cache(self):
         request = SimpleNamespace(
@@ -2669,6 +3041,39 @@ class AnthropicMessagesPassthroughRouteTests(unittest.TestCase):
         self.assertIsNone(error)
         self.assertIsNotNone(plan)
         self.assertEqual(start_event.call_args.args[3], "agent")
+
+    def test_prepare_upstream_request_preserves_responses_affinity_request_id_after_tracking(self):
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/responses"),
+            method="POST",
+            headers={},
+        )
+
+        plan, error = proxy._prepare_upstream_request(
+            request,
+            body={"model": "gpt-5.5", "input": "hello"},
+            requested_model="gpt-5.5",
+            resolved_model="gpt-5.5",
+            upstream_path="/responses",
+            upstream_url="https://example.invalid/responses",
+            header_builder=lambda _api_key, _request_id: {
+                "X-Initiator": "user",
+                "x-interaction-type": "conversation-user",
+                "x-agent-task-id": "stable-task",
+                "x-request-id": "stable-task",
+            },
+            error_response=format_translation.openai_error_response,
+            api_key="test-key",
+        )
+
+        self.assertIsNone(error)
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan.usage_event["initiator"], "user")
+        self.assertEqual(plan.headers["X-Initiator"], "user")
+        self.assertEqual(plan.headers["x-interaction-type"], "conversation-user")
+        self.assertEqual(plan.headers["x-agent-task-id"], "stable-task")
+        self.assertEqual(plan.headers["x-request-id"], "stable-task")
+        self.assertNotIn("x-github-request-id", plan.headers)
 
 
     def test_bridge_planner_end_to_end_dispatches_to_messages_url(self):

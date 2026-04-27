@@ -92,6 +92,7 @@ class ClientConfigTests(unittest.TestCase):
         settings = service.client_proxy_settings_payload()
 
         self.assertTrue(settings["revert_on_shutdown"])
+        self.assertTrue(settings["token_tripwire_enabled"])
         self.assertEqual(settings["path"], str(settings_path))
         self.assertEqual(settings["pending_restore_targets"], [])
 
@@ -106,9 +107,35 @@ class ClientConfigTests(unittest.TestCase):
         saved = service.save_client_proxy_settings({"revert_on_shutdown": False})
 
         self.assertFalse(saved["revert_on_shutdown"])
+        self.assertTrue(saved["token_tripwire_enabled"])
         self.assertEqual(
             json.loads(settings_path.read_text(encoding="utf-8")),
-            {"revert_on_shutdown": False, "pending_restore_targets": []},
+            {
+                "revert_on_shutdown": False,
+                "token_tripwire_enabled": True,
+                "pending_restore_targets": [],
+            },
+        )
+
+    def test_client_proxy_settings_persist_token_tripwire_toggle(self):
+        temp_dir = self._make_temp_dir("client-proxy-settings-tripwire-")
+        settings_path = temp_dir / "client-proxy.json"
+        service = self._make_client_proxy_service(
+            codex_managed_config_file=str(temp_dir / "managed_config.toml"),
+            client_proxy_settings_file=str(settings_path),
+        )
+
+        saved = service.save_client_proxy_settings({"token_tripwire_enabled": False})
+
+        self.assertTrue(saved["revert_on_shutdown"])
+        self.assertFalse(saved["token_tripwire_enabled"])
+        self.assertEqual(
+            json.loads(settings_path.read_text(encoding="utf-8")),
+            {
+                "revert_on_shutdown": True,
+                "token_tripwire_enabled": False,
+                "pending_restore_targets": [],
+            },
         )
 
     def test_revert_proxy_configs_on_shutdown_skips_when_disabled(self):

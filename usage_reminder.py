@@ -178,11 +178,11 @@ def _burn_projection_text(
     reset_suffix = ""
     seconds_to_reset = _seconds_until(reset_at, now)
     if reset_at:
-        reset_suffix = f" The session window resets at {reset_at} (in about {_format_duration(seconds_to_reset)})."
+        reset_suffix = f" The 5h window resets at {reset_at} (in about {_format_duration(seconds_to_reset)})."
 
     if burn_sample is None or current_used is None or current_remaining is None:
         return (
-            "There is not enough prior session history in this reset window to estimate a burn-down rate yet."
+            "There is not enough prior 5h-limit history in this reset window to estimate a burn-down rate yet."
             f"{reset_suffix}"
         )
 
@@ -191,7 +191,7 @@ def _burn_projection_text(
     delta_used = max(0.0, current_used - start_used)
     if elapsed_seconds <= 0 or delta_used <= 0:
         return (
-            "Your recent recorded session burn is flat, so you are not currently projected to run out before reset."
+            "Your recent recorded 5h-limit burn is flat, so you are not currently projected to run out before reset."
             f"{reset_suffix}"
         )
 
@@ -201,20 +201,20 @@ def _burn_projection_text(
     if hours_to_empty is None:
         projection = "I cannot project when it will run out yet."
     elif seconds_to_reset is None:
-        projection = f"At that pace, the remaining session limit would last about {_format_duration(hours_to_empty * 3600.0)}."
+        projection = f"At that pace, the remaining 5h limit would last about {_format_duration(hours_to_empty * 3600.0)}."
     elif hours_to_empty * 3600.0 <= seconds_to_reset:
         projection = (
             f"At that pace, it is expected to run out in about {_format_duration(hours_to_empty * 3600.0)}, "
-            "before the session resets."
+            "before the 5h limit resets."
         )
     else:
         projection = (
             f"At that pace, it should last about {_format_duration(hours_to_empty * 3600.0)}, "
-            "so it is not expected to run out before the session resets."
+            "so it is not expected to run out before the 5h limit resets."
         )
 
     return (
-        f"Recent burn-down is about {_format_percent(rate_per_hour)} of the session limit per hour, "
+        f"Recent burn-down is about {_format_percent(rate_per_hour)} of the 5h limit per hour, "
         f"based on a {_format_percent(delta_used)} increase over {_format_duration(elapsed_seconds)}."
         f"{reset_suffix} {projection}"
     )
@@ -243,7 +243,7 @@ def build_usage_reminder_text(
 
     threshold_clause = ""
     if threshold_percent:
-        threshold_clause = f" This crossed the {threshold_percent}% session-usage reminder."
+        threshold_clause = f" This crossed the {threshold_percent}% 5h-usage reminder."
 
     weekly_clause = "Weekly limit: not reported by the upstream response."
     weekly = current_windows.get("weekly") if isinstance(current_windows, dict) else None
@@ -265,7 +265,7 @@ def build_usage_reminder_text(
 
     burn_text = _burn_projection_text(current_windows, usage_events, now=now)
     return (
-        f"By the way, your session usage limit is currently at {_format_percent(session_remaining)} remaining "
+        f"By the way, your 5h usage limit is currently at {_format_percent(session_remaining)} remaining "
         f"({_format_percent(session_used)} used).{threshold_clause} {burn_text} {weekly_clause}"
     )
 
