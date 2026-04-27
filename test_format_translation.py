@@ -2891,7 +2891,7 @@ class ResponsesToAnthropicMessagesTests(unittest.TestCase):
             ],
         )
 
-    def test_sanitize_input_limits_old_encrypted_reasoning_ciphertext(self):
+    def test_sanitize_input_preserves_all_encrypted_reasoning_ciphertext(self):
         sanitized = format_translation.sanitize_input(
             [
                 {
@@ -2917,7 +2917,6 @@ class ResponsesToAnthropicMessagesTests(unittest.TestCase):
                     "content": [{"type": "input_text", "text": "continue"}],
                 },
             ],
-            max_encrypted_reasoning_items=1,
         )
 
         self.assertEqual(
@@ -2927,6 +2926,12 @@ class ResponsesToAnthropicMessagesTests(unittest.TestCase):
                     "type": "reasoning",
                     "id": "rs_1",
                     "summary": [{"type": "summary_text", "text": "summary 1"}],
+                    "encrypted_content": "ciphertext-1",
+                },
+                {
+                    "type": "reasoning",
+                    "id": "rs_2",
+                    "encrypted_content": "ciphertext-2",
                 },
                 {
                     "type": "reasoning",

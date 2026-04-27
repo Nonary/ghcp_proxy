@@ -254,30 +254,24 @@ class RemainingReasoningCompactionTests(unittest.TestCase):
             ],
         )
 
-    def test_encrypted_reasoning_indexes_ignore_empty_ciphertext(self):
+    def test_sanitize_input_preserves_all_reasoning_ciphertext(self):
         self.assertEqual(
-            format_translation._encrypted_reasoning_indexes_to_keep(
+            format_translation.sanitize_input(
                 [
                     {"type": "reasoning", "encrypted_content": ""},
                     "ignored scalar",
                     {"type": "message", "encrypted_content": "not reasoning"},
                     {"type": "reasoning", "encrypted_content": "ciphertext-1"},
-                    {"type": "compaction", "encrypted_content": "ciphertext-2"},
-                ],
-                2,
-            ),
-            {3, 4},
-        )
-        self.assertEqual(
-            format_translation._encrypted_reasoning_indexes_to_keep(
-                [
-                    "ignored scalar before ciphertext",
-                    {"type": "reasoning", "encrypted_content": "ciphertext-1"},
                     {"type": "reasoning", "encrypted_content": "ciphertext-2"},
-                ],
-                2,
+                ]
             ),
-            {1, 2},
+            [
+                {"type": "reasoning", "encrypted_content": ""},
+                "ignored scalar",
+                {"type": "message", "encrypted_content": "not reasoning"},
+                {"type": "reasoning", "encrypted_content": "ciphertext-1"},
+                {"type": "reasoning", "encrypted_content": "ciphertext-2"},
+            ],
         )
 
     def test_format_compaction_tool_call_uses_empty_json_for_blank_string_arguments(self):

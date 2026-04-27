@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta, timezone
 import unittest
+from unittest import mock
 
 import usage_reminder
 
@@ -99,6 +100,39 @@ class UsageReminderTests(unittest.TestCase):
         self.assertIn("70% session-usage reminder", text)
         self.assertIn("expected to run out", text)
         self.assertIn("before the session resets", text)
+
+    def test_friendly_limit_message_reports_session_and_weekly_reset_durations(self):
+        import httpx
+        import proxy
+
+        now = datetime(2026, 4, 25, 18, 0, tzinfo=timezone.utc)
+        upstream = httpx.Response(
+            429,
+            json={"error": {"message": "rate limited"}},
+            headers={
+                "x-usage-ratelimit-session": "rem=0&rst=2026-04-25T20%3A30%3A00Z",
+                "x-usage-ratelimit-weekly": "rem=0&rst=2026-04-27T00%3A00%3A00Z",
+            },
+        )
+
+        with mock.patch.object(proxy.util, "utc_now", return_value=now):
+            message = proxy._friendly_limit_message_from_upstream(upstream)
+
+        self.assertIn("session and weekly usage limits", message)
+        self.assertIn("Session resets in about 2 hours 30 minutes", message)
+        self.assertIn("Weekly resets in about 1 day 6 hours", message)
+
+    def test_friendly_limit_message_ignores_unexhausted_429(self):
+        import httpx
+        import proxy
+
+        upstream = httpx.Response(
+            429,
+            json={"error": {"message": "rate limited"}},
+            headers={"x-usage-ratelimit-session": "rem=12.5&rst=2026-04-25T20%3A30%3A00Z"},
+        )
+
+        self.assertIsNone(proxy._friendly_limit_message_from_upstream(upstream))
 
 
 if __name__ == "__main__":

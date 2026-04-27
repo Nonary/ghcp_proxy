@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import unittest
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest import mock
 
@@ -1273,7 +1274,7 @@ class ProxyRoutesTests(unittest.TestCase):
         self.assertEqual(sanitization["encrypted_content_items_dropped"], 0)
         self.assertFalse(sanitization["reasoning_items_dropped"])
 
-    def test_responses_route_traces_encrypted_reasoning_trim(self):
+    def test_responses_route_preserves_all_encrypted_reasoning_without_size_trim(self):
         request = SimpleNamespace(
             url=SimpleNamespace(path="/v1/responses"),
             method="POST",
@@ -1332,7 +1333,7 @@ class ProxyRoutesTests(unittest.TestCase):
 
         forwarded_input = post.await_args.kwargs["json"]["input"]
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(proxy._responses_input_encrypted_content_count(forwarded_input), 6)
+        self.assertEqual(proxy._responses_input_encrypted_content_count(forwarded_input), 10)
 
         request_started = next(
             call.args[0]
@@ -1343,10 +1344,111 @@ class ProxyRoutesTests(unittest.TestCase):
         self.assertEqual(sanitization["input_items_before"], 50)
         self.assertEqual(sanitization["input_items_after"], 50)
         self.assertEqual(sanitization["encrypted_content_items_before"], 10)
-        self.assertEqual(sanitization["encrypted_content_items_after"], 6)
-        self.assertEqual(sanitization["encrypted_content_items_dropped"], 4)
-        self.assertEqual(sanitization["encrypted_content_preservation"], "limited")
-        self.assertEqual(sanitization["encrypted_keep_last"], 6)
+        self.assertEqual(sanitization["encrypted_content_items_after"], 10)
+        self.assertEqual(sanitization["encrypted_content_items_dropped"], 0)
+        self.assertEqual(sanitization["encrypted_content_preservation"], "preserved")
+        self.assertIsNone(sanitization["encrypted_keep_last"])
+
+    def test_responses_route_does_not_trim_encrypted_reasoning_with_cache_lineage(self):
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/responses"),
+            method="POST",
+            headers={},
+        )
+        input_items = [
+            {
+                "type": "message",
+                "role": "developer",
+                "content": [{"type": "input_text", "text": "developer"}],
+            },
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "start"}],
+            },
+        ]
+        for index in range(8):
+            input_items.extend(
+                [
+                    {
+                        "type": "reasoning",
+                        "id": f"rs_{index}",
+                        "summary": [{"type": "summary_text", "text": f"summary {index}"}],
+                        "encrypted_content": f"ciphertext-{index}",
+                    },
+                    {
+                        "type": "function_call",
+                        "call_id": f"call_{index}",
+                        "name": "exec_command",
+                        "arguments": "{}",
+                    },
+                    {
+                        "type": "function_call_output",
+                        "call_id": f"call_{index}",
+                        "output": "ok",
+                    },
+                ]
+            )
+        for index in range(23):
+            input_items.append(
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": f"turn {index}"}],
+                }
+            )
+        self.assertGreaterEqual(len(input_items), 48)
+        body = {
+            "model": "gpt-5.5",
+            "stream": False,
+            "prompt_cache_key": "session-cache",
+            "input": input_items,
+        }
+        upstream = httpx.Response(
+            200,
+            json={
+                "id": "resp_123",
+                "model": "gpt-5.5",
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "done"}],
+                    }
+                ],
+            },
+            headers={"content-type": "application/json"},
+        )
+
+        with (
+            mock.patch.object(proxy, "parse_json_request", mock.AsyncMock(return_value=body)),
+            mock.patch.object(auth, "get_api_key", return_value="test-key"),
+            mock.patch.object(auth, "get_api_base", return_value="https://example.invalid"),
+            mock.patch.object(proxy.model_routing_config_service, "resolve_target_model", return_value="gpt-5.5"),
+            mock.patch.object(proxy.usage_tracker, "start_event", return_value=None),
+            mock.patch.object(proxy.usage_tracker, "finish_event"),
+            mock.patch.object(proxy, "_append_request_trace") as append_trace,
+            mock.patch.object(proxy, "throttled_client_post", mock.AsyncMock(return_value=upstream)) as post,
+        ):
+            response = proxy.asyncio.run(proxy.responses(request))
+
+        forwarded_input = post.await_args.kwargs["json"]["input"]
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(proxy._responses_input_encrypted_content_count(forwarded_input), 8)
+
+        request_started = next(
+            call.args[0]
+            for call in append_trace.call_args_list
+            if call.args and call.args[0].get("event") == "request_started"
+        )
+        sanitization = request_started["trace"]["responses_input_sanitization"]
+        self.assertEqual(sanitization["input_items_before"], len(input_items))
+        self.assertEqual(sanitization["input_items_after"], len(input_items))
+        self.assertEqual(sanitization["encrypted_content_items_before"], 8)
+        self.assertEqual(sanitization["encrypted_content_items_after"], 8)
+        self.assertEqual(sanitization["encrypted_content_items_dropped"], 0)
+        self.assertEqual(sanitization["encrypted_content_preservation"], "preserved")
+        self.assertIsNone(sanitization["encrypted_keep_last"])
 
     def test_responses_route_strips_unsupported_image_generation_tool(self):
         request = SimpleNamespace(
@@ -1742,6 +1844,157 @@ class AnthropicMessagesPassthroughRouteTests(unittest.TestCase):
             method="POST",
             headers={"x-client-request-id": "req-msg-1", "anthropic-beta": "context-management-2025-06-27"},
         )
+
+
+    def test_responses_route_returns_friendly_message_for_session_limit_429(self):
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/responses"),
+            method="POST",
+            headers={"x-client-request-id": "req-limit-1"},
+        )
+        body = {"model": "gpt-5.4", "input": "hi", "stream": False}
+        plan = _BridgeExecutionPlan_for_msgs(
+            strategy_name="responses_to_responses",
+            inbound_protocol="responses",
+            caller_protocol="responses",
+            upstream_protocol="responses",
+            header_kind="responses",
+            requested_model="gpt-5.4",
+            resolved_model="gpt-5.4",
+            upstream_body=body,
+            stream=False,
+            is_compact=False,
+        )
+        upstream = httpx.Response(
+            429,
+            json={"error": {"message": "rate limited"}},
+            headers={
+                "content-type": "application/json",
+                "x-usage-ratelimit-session": "rem=0&rst=2026-04-25T20%3A00%3A00Z",
+            },
+        )
+
+        async def fake_plan(*args, **kwargs):
+            return plan
+
+        with (
+            mock.patch.object(proxy, "parse_json_request", mock.AsyncMock(return_value=body)),
+            mock.patch.object(auth, "get_api_key", return_value="test-key"),
+            mock.patch.object(auth, "get_api_base", return_value="https://example.invalid"),
+            mock.patch.object(proxy.bridge_planner, "plan", side_effect=fake_plan),
+            mock.patch.object(proxy.util, "utc_now", return_value=datetime(2026, 4, 25, 18, 0, tzinfo=timezone.utc)),
+            mock.patch.object(usage_tracking, "log_proxy_request"),
+            mock.patch.object(proxy.usage_tracker, "start_event", return_value=None),
+            mock.patch.object(proxy.usage_tracker, "finish_event") as finish_usage,
+            mock.patch.object(proxy, "throttled_client_post", mock.AsyncMock(return_value=upstream)),
+        ):
+            response = proxy.asyncio.run(proxy.responses(request))
+
+        self.assertEqual(response.status_code, 200)
+        payload = json.loads(response.body)
+        self.assertEqual(payload["status"], "completed")
+        self.assertIn("session usage limit", payload["output_text"])
+        self.assertIn("2 hours", payload["output_text"])
+        finish_usage.assert_called_once()
+        self.assertEqual(finish_usage.call_args.args[1], 429)
+        self.assertEqual(finish_usage.call_args.kwargs["response_text"], payload["output_text"])
+
+    def test_responses_route_passes_through_unclassified_429(self):
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/responses"),
+            method="POST",
+            headers={"x-client-request-id": "req-limit-2"},
+        )
+        body = {"model": "gpt-5.4", "input": "hi", "stream": False}
+        plan = _BridgeExecutionPlan_for_msgs(
+            strategy_name="responses_to_responses",
+            inbound_protocol="responses",
+            caller_protocol="responses",
+            upstream_protocol="responses",
+            header_kind="responses",
+            requested_model="gpt-5.4",
+            resolved_model="gpt-5.4",
+            upstream_body=body,
+            stream=False,
+            is_compact=False,
+        )
+        upstream = httpx.Response(
+            429,
+            json={"error": {"message": "generic rate limited"}},
+            headers={"content-type": "application/json"},
+        )
+
+        async def fake_plan(*args, **kwargs):
+            return plan
+
+        with (
+            mock.patch.object(proxy, "parse_json_request", mock.AsyncMock(return_value=body)),
+            mock.patch.object(auth, "get_api_key", return_value="test-key"),
+            mock.patch.object(auth, "get_api_base", return_value="https://example.invalid"),
+            mock.patch.object(proxy.bridge_planner, "plan", side_effect=fake_plan),
+            mock.patch.object(usage_tracking, "log_proxy_request"),
+            mock.patch.object(proxy.usage_tracker, "start_event", return_value=None),
+            mock.patch.object(proxy.usage_tracker, "finish_event"),
+            mock.patch.object(proxy, "throttled_client_post", mock.AsyncMock(return_value=upstream)),
+        ):
+            response = proxy.asyncio.run(proxy.responses(request))
+
+        self.assertEqual(response.status_code, 429)
+        self.assertEqual(json.loads(response.body)["error"]["message"], "generic rate limited")
+
+    def test_chat_streaming_returns_friendly_message_for_weekly_limit_429(self):
+        upstream = httpx.Response(
+            429,
+            json={"error": {"message": "rate limited"}},
+            headers={
+                "content-type": "application/json",
+                "x-usage-ratelimit-weekly": "rem=0&rst=2026-04-27T00%3A00%3A00Z",
+            },
+        )
+
+        class FakeClient:
+            def build_request(self, *args, **kwargs):
+                return httpx.Request("POST", "https://example.invalid/chat/completions")
+
+            async def aclose(self):
+                return None
+
+        trace_plan = proxy.UpstreamRequestPlan(
+            request_id="req-chat-limit",
+            upstream_url="https://example.invalid/chat/completions",
+            headers={},
+            body={"stream": True},
+            usage_event=None,
+            requested_model="gpt-5.4",
+            resolved_model="gpt-5.4",
+        )
+
+        async def run_stream():
+            with (
+                mock.patch.object(proxy.httpx, "AsyncClient", return_value=FakeClient()),
+                mock.patch.object(proxy, "throttled_client_send", mock.AsyncMock(return_value=upstream)),
+                mock.patch.object(proxy.util, "utc_now", return_value=datetime(2026, 4, 25, 18, 0, tzinfo=timezone.utc)),
+                mock.patch.object(proxy.usage_tracker, "finish_event") as finish_usage,
+            ):
+                response = await proxy.proxy_streaming_response(
+                    "https://example.invalid/chat/completions",
+                    {},
+                    {"stream": True},
+                    stream_type="chat",
+                    trace_plan=trace_plan,
+                )
+                body_bytes = b""
+                async for chunk in response.body_iterator:
+                    body_bytes += chunk
+                return response, body_bytes.decode("utf-8"), finish_usage
+
+        response, body, finish_usage = proxy.asyncio.run(run_stream())
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("weekly usage limit", body)
+        self.assertIn("1 day 6 hours", body)
+        self.assertIn("[DONE]", body)
+        finish_usage.assert_called_once()
+        self.assertEqual(finish_usage.call_args.args[1], 429)
 
     def test_messages_route_forwards_claude_session_affinity_for_cache(self):
         request = SimpleNamespace(

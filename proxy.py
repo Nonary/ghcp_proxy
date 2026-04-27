@@ -61,6 +61,7 @@ import hashlib
 import messages_preprocess
 import migrate_runtime_paths
 import json
+import math
 import sqlite3
 import tempfile
 import time
@@ -139,8 +140,6 @@ _CLIENT_PROXY_STARTUP_RESTORE_LOCK = Lock()
 _CLIENT_PROXY_STARTUP_RESTORE_COMPLETE = False
 _CLIENT_PROXY_SHUTDOWN_REVERT_LOCK = Lock()
 _CLIENT_PROXY_SHUTDOWN_REVERT_COMPLETE = False
-_RESPONSES_REASONING_TRIM_INPUT_ITEM_THRESHOLD = 48
-_RESPONSES_REASONING_ENCRYPTED_KEEP_LAST = 6
 migrated_runtime_files = migrate_runtime_paths.migrate_legacy_runtime_files()
 if migrated_runtime_files:
     print(f"runtime migration: copied {len(migrated_runtime_files)} legacy file(s)", flush=True)
@@ -391,6 +390,304 @@ def _extract_upstream_text(upstream: httpx.Response) -> str | None:
     if not text:
         return None
     return text[:4096]
+
+
+def _format_limit_reset_duration(seconds: float | None) -> str:
+    if seconds is None:
+        return "an unknown amount of time"
+    seconds = max(0, int(math.ceil(float(seconds))))
+    if seconds < 60:
+        return "less than 1 minute"
+    minutes = int(math.ceil(seconds / 60.0))
+    days, minutes = divmod(minutes, 24 * 60)
+    hours, minutes = divmod(minutes, 60)
+    parts: list[str] = []
+    if days:
+        parts.append(f"{days} day{'s' if days != 1 else ''}")
+    if hours:
+        parts.append(f"{hours} hour{'s' if hours != 1 else ''}")
+    if minutes and len(parts) < 2:
+        parts.append(f"{minutes} minute{'s' if minutes != 1 else ''}")
+    return " ".join(parts[:2]) if parts else "less than 1 minute"
+
+
+def _limit_window_is_exhausted(window: dict | None) -> bool:
+    if not isinstance(window, dict):
+        return False
+    remaining = window.get("percent_remaining")
+    if isinstance(remaining, (int, float)):
+        return float(remaining) <= 0.0
+    used = window.get("percent_used")
+    if isinstance(used, (int, float)):
+        return float(used) >= 100.0
+    overage = window.get("overage")
+    overage_permitted = window.get("overage_permitted")
+    if isinstance(overage, (int, float)) and float(overage) > 0 and overage_permitted is False:
+        return True
+    return False
+
+
+def _window_reset_duration_text(window: dict | None) -> str:
+    reset_at = window.get("reset_at") if isinstance(window, dict) else None
+    reset_dt = util._parse_iso_datetime(reset_at if isinstance(reset_at, str) else None)
+    if reset_dt is None:
+        return "an unknown amount of time"
+    now = util.utc_now()
+    if reset_dt.tzinfo is None:
+        reset_dt = reset_dt.replace(tzinfo=now.tzinfo)
+    return _format_limit_reset_duration((reset_dt - now).total_seconds())
+
+
+def _friendly_limit_message_from_upstream(upstream: httpx.Response) -> str | None:
+    if upstream.status_code != 429:
+        return None
+    windows = usage_tracking.extract_usage_ratelimits_from_headers(upstream.headers)
+    exhausted: list[tuple[str, dict]] = []
+    for name in ("session", "weekly"):
+        window = windows.get(name)
+        if _limit_window_is_exhausted(window):
+            exhausted.append((name, window))
+    if not exhausted:
+        return None
+
+    if len(exhausted) == 1:
+        label = exhausted[0][0]
+        headline = f"Your Copilot {label} usage limit has been reached."
+    else:
+        headline = "Your Copilot session and weekly usage limits have been reached."
+
+    reset_parts = [
+        f"{name.capitalize()} resets in about {_window_reset_duration_text(window)}"
+        for name, window in exhausted
+    ]
+    return f"{headline} {'; '.join(reset_parts)}. Please try again later."
+
+
+def _empty_openai_usage() -> dict:
+    return {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+
+
+def _empty_anthropic_usage() -> dict:
+    return {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
+    }
+
+
+def _friendly_limit_chat_payload(message: str, model: str | None = None) -> dict:
+    return {
+        "id": f"chatcmpl_{uuid4().hex}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": message},
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+    }
+
+
+def _friendly_limit_responses_payload(message: str, model: str | None = None) -> dict:
+    return {
+        "id": f"resp_{uuid4().hex}",
+        "object": "response",
+        "created_at": int(time.time()),
+        "status": "completed",
+        "model": model,
+        "output": [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": message}],
+            }
+        ],
+        "output_text": message,
+        "usage": _empty_openai_usage(),
+    }
+
+
+def _friendly_limit_anthropic_payload(message: str, model: str | None = None) -> dict:
+    return {
+        "id": f"msg_{uuid4().hex}",
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        "content": [{"type": "text", "text": message}],
+        "stop_reason": "end_turn",
+        "stop_sequence": None,
+        "usage": _empty_anthropic_usage(),
+    }
+
+
+def _friendly_limit_payload_for_bridge(bridge_plan: BridgeExecutionPlan, message: str) -> dict:
+    model = bridge_plan.resolved_model or bridge_plan.requested_model
+    if bridge_plan.caller_protocol == "anthropic":
+        return _friendly_limit_anthropic_payload(message, model)
+    if bridge_plan.is_compact:
+        return format_translation.chat_completion_to_compaction_response(
+            _friendly_limit_chat_payload(message, model),
+            fallback_model=model,
+        )
+    return _friendly_limit_responses_payload(message, model)
+
+
+def _friendly_limit_non_streaming_response(
+    message: str,
+    *,
+    caller_protocol: str,
+    model: str | None = None,
+    is_compact: bool = False,
+) -> JSONResponse:
+    if caller_protocol == "anthropic":
+        payload = _friendly_limit_anthropic_payload(message, model)
+    elif caller_protocol == "chat":
+        payload = _friendly_limit_chat_payload(message, model)
+    elif is_compact:
+        payload = format_translation.chat_completion_to_compaction_response(
+            _friendly_limit_chat_payload(message, model),
+            fallback_model=model,
+        )
+    else:
+        payload = _friendly_limit_responses_payload(message, model)
+    return JSONResponse(content=payload, status_code=200)
+
+
+async def _friendly_limit_responses_stream(message: str, model: str | None):
+    response_payload = _friendly_limit_responses_payload(message, model)
+    response_started = {
+        "id": response_payload["id"],
+        "object": "response",
+        "created_at": response_payload["created_at"],
+        "status": "in_progress",
+        "model": response_payload.get("model"),
+        "output": [],
+    }
+    item = response_payload["output"][0]
+    yield format_translation.sse_encode(
+        "response.created",
+        {"type": "response.created", "response": response_started},
+    )
+    yield format_translation.sse_encode(
+        "response.output_item.added",
+        {"type": "response.output_item.added", "output_index": 0, "item": {**item, "content": []}},
+    )
+    yield format_translation.sse_encode(
+        "response.content_part.added",
+        {
+            "type": "response.content_part.added",
+            "output_index": 0,
+            "content_index": 0,
+            "part": {"type": "output_text", "text": ""},
+        },
+    )
+    yield format_translation.sse_encode(
+        "response.output_text.delta",
+        {"type": "response.output_text.delta", "output_index": 0, "content_index": 0, "delta": message},
+    )
+    yield format_translation.sse_encode(
+        "response.output_text.done",
+        {"type": "response.output_text.done", "output_index": 0, "content_index": 0, "text": message},
+    )
+    yield format_translation.sse_encode(
+        "response.content_part.done",
+        {
+            "type": "response.content_part.done",
+            "output_index": 0,
+            "content_index": 0,
+            "part": {"type": "output_text", "text": message},
+        },
+    )
+    yield format_translation.sse_encode(
+        "response.output_item.done",
+        {"type": "response.output_item.done", "output_index": 0, "item": item},
+    )
+    yield format_translation.sse_encode(
+        "response.completed",
+        {"type": "response.completed", "response": response_payload},
+    )
+    yield b"data: [DONE]\n\n"
+
+
+async def _friendly_limit_chat_stream(message: str, model: str | None):
+    payload = {
+        "id": f"chatcmpl_{uuid4().hex}",
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [{"index": 0, "delta": {"content": message}, "finish_reason": None}],
+    }
+    yield format_translation.sse_encode("message", payload)
+    done_payload = {
+        **payload,
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+    }
+    yield format_translation.sse_encode("message", done_payload)
+    yield b"data: [DONE]\n\n"
+
+
+async def _friendly_limit_anthropic_stream(message: str, model: str | None):
+    message_id = f"msg_{uuid4().hex}"
+    usage = _empty_anthropic_usage()
+    yield format_translation.sse_encode(
+        "message_start",
+        {
+            "type": "message_start",
+            "message": {
+                "id": message_id,
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+                "model": model,
+                "stop_reason": None,
+                "stop_sequence": None,
+                "usage": usage,
+            },
+        },
+    )
+    yield format_translation.sse_encode(
+        "content_block_start",
+        {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+    )
+    yield format_translation.sse_encode(
+        "content_block_delta",
+        {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": message}},
+    )
+    yield format_translation.sse_encode("content_block_stop", {"type": "content_block_stop", "index": 0})
+    yield format_translation.sse_encode(
+        "message_delta",
+        {
+            "type": "message_delta",
+            "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+            "usage": usage,
+        },
+    )
+    yield format_translation.sse_encode("message_stop", {"type": "message_stop"})
+
+
+def _friendly_limit_streaming_response(message: str, *, protocol: str, model: str | None = None) -> Response:
+    normalized = str(protocol or "").strip().lower()
+    if normalized == "anthropic":
+        iterator = _friendly_limit_anthropic_stream(message, model)
+    elif normalized == "chat":
+        iterator = _friendly_limit_chat_stream(message, model)
+    else:
+        iterator = _friendly_limit_responses_stream(message, model)
+    return GracefulStreamingResponse(
+        iterator,
+        status_code=200,
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "content-type": "text/event-stream; charset=utf-8",
+        },
+    )
 
 
 @dataclass
@@ -1520,6 +1817,25 @@ async def _post_non_streaming_request(plan: UpstreamRequestPlan, *, error_respon
                 headers=plan.headers,
                 json=plan.body,
             )
+        friendly_limit_message = _friendly_limit_message_from_upstream(upstream)
+        if friendly_limit_message is not None:
+            payload = _friendly_limit_chat_payload(
+                friendly_limit_message,
+                plan.resolved_model or plan.requested_model,
+            )
+            _finish_usage_and_trace(
+                plan,
+                upstream.status_code,
+                upstream=upstream,
+                response_payload=payload,
+                response_text=friendly_limit_message,
+                usage=_empty_openai_usage(),
+            )
+            return _friendly_limit_non_streaming_response(
+                friendly_limit_message,
+                caller_protocol="chat",
+                model=plan.resolved_model or plan.requested_model,
+            )
         _finish_usage_and_trace(
             plan,
             upstream.status_code,
@@ -1556,6 +1872,28 @@ async def _post_bridge_non_streaming_request(plan: UpstreamRequestPlan, bridge_p
         raise
 
     if upstream.status_code >= 400:
+        friendly_limit_message = _friendly_limit_message_from_upstream(upstream)
+        if friendly_limit_message is not None:
+            response_payload = _friendly_limit_payload_for_bridge(bridge_plan, friendly_limit_message)
+            _finish_usage_and_trace(
+                plan,
+                upstream.status_code,
+                upstream=upstream,
+                response_payload=response_payload,
+                response_text=friendly_limit_message,
+                usage=(
+                    _empty_anthropic_usage()
+                    if bridge_plan.caller_protocol == "anthropic"
+                    else _empty_openai_usage()
+                ),
+            )
+            return _friendly_limit_non_streaming_response(
+                friendly_limit_message,
+                caller_protocol=bridge_plan.caller_protocol,
+                model=bridge_plan.resolved_model or bridge_plan.requested_model,
+                is_compact=bridge_plan.is_compact,
+            )
+
         response_payload = _extract_upstream_json_payload(upstream)
         response_text = _extract_upstream_text(upstream)
         if bridge_plan.caller_protocol == "anthropic":
@@ -1675,6 +2013,27 @@ async def proxy_streaming_response(
     if upstream.status_code >= 400:
         try:
             await upstream.aread()
+            friendly_limit_message = _friendly_limit_message_from_upstream(upstream)
+            if friendly_limit_message is not None:
+                model = trace_plan.resolved_model if isinstance(trace_plan, UpstreamRequestPlan) else None
+                response_payload = (
+                    _friendly_limit_chat_payload(friendly_limit_message, model)
+                    if stream_type == "chat"
+                    else _friendly_limit_responses_payload(friendly_limit_message, model)
+                )
+                _finish_usage_and_trace(
+                    trace_plan,
+                    upstream.status_code,
+                    upstream=upstream,
+                    response_payload=response_payload,
+                    response_text=friendly_limit_message,
+                    usage=_empty_openai_usage(),
+                )
+                return _friendly_limit_streaming_response(
+                    friendly_limit_message,
+                    protocol=stream_type,
+                    model=model,
+                )
             _finish_usage_and_trace(
                 trace_plan,
                 upstream.status_code,
@@ -1748,6 +2107,22 @@ async def proxy_anthropic_streaming_response(
     if upstream.status_code >= 400:
         try:
             await upstream.aread()
+            friendly_limit_message = _friendly_limit_message_from_upstream(upstream)
+            if friendly_limit_message is not None:
+                response_payload = _friendly_limit_anthropic_payload(friendly_limit_message, fallback_model)
+                _finish_usage_and_trace(
+                    trace_plan,
+                    upstream.status_code,
+                    upstream=upstream,
+                    response_payload=response_payload,
+                    response_text=friendly_limit_message,
+                    usage=_empty_anthropic_usage(),
+                )
+                return _friendly_limit_streaming_response(
+                    friendly_limit_message,
+                    protocol="anthropic",
+                    model=fallback_model,
+                )
             fallback_message = _extract_upstream_text(upstream) or f"Upstream request failed with status {upstream.status_code}"
             error_payload = format_translation.anthropic_error_payload_from_openai(
                 _extract_upstream_json_payload(upstream),
@@ -1827,6 +2202,25 @@ async def proxy_responses_from_chat_streaming_response(
     if upstream.status_code >= 400:
         try:
             await upstream.aread()
+            friendly_limit_message = _friendly_limit_message_from_upstream(upstream)
+            if friendly_limit_message is not None:
+                response_payload = _friendly_limit_responses_payload(
+                    friendly_limit_message,
+                    trace_plan.resolved_model if isinstance(trace_plan, UpstreamRequestPlan) else None,
+                )
+                _finish_usage_and_trace(
+                    trace_plan,
+                    upstream.status_code,
+                    upstream=upstream,
+                    response_payload=response_payload,
+                    response_text=friendly_limit_message,
+                    usage=_empty_openai_usage(),
+                )
+                return _friendly_limit_streaming_response(
+                    friendly_limit_message,
+                    protocol="responses",
+                    model=trace_plan.resolved_model if isinstance(trace_plan, UpstreamRequestPlan) else None,
+                )
             _finish_usage_and_trace(
                 trace_plan,
                 upstream.status_code,
@@ -1901,6 +2295,22 @@ async def proxy_anthropic_from_responses_streaming_response(
     if upstream.status_code >= 400:
         try:
             await upstream.aread()
+            friendly_limit_message = _friendly_limit_message_from_upstream(upstream)
+            if friendly_limit_message is not None:
+                response_payload = _friendly_limit_anthropic_payload(friendly_limit_message, fallback_model)
+                _finish_usage_and_trace(
+                    trace_plan,
+                    upstream.status_code,
+                    upstream=upstream,
+                    response_payload=response_payload,
+                    response_text=friendly_limit_message,
+                    usage=_empty_anthropic_usage(),
+                )
+                return _friendly_limit_streaming_response(
+                    friendly_limit_message,
+                    protocol="anthropic",
+                    model=fallback_model,
+                )
             fallback_message = _extract_upstream_text(upstream) or f"Upstream request failed with status {upstream.status_code}"
             error_payload = format_translation.anthropic_error_payload_from_openai(
                 _extract_upstream_json_payload(upstream),
@@ -1974,7 +2384,7 @@ async def proxy_anthropic_passthrough_streaming_response(
     usage display. We still parse message_start / message_delta usage for the
     local dashboard.
     """
-    del fallback_model  # unused; kept for signature symmetry with siblings.
+    # Used for synthetic friendly limit responses when upstream rejects before streaming.
 
     client = httpx.AsyncClient(timeout=timeout)
     request = client.build_request("POST", upstream_url, headers=headers, json=body)
@@ -1993,6 +2403,22 @@ async def proxy_anthropic_passthrough_streaming_response(
     if upstream.status_code >= 400:
         try:
             await upstream.aread()
+            friendly_limit_message = _friendly_limit_message_from_upstream(upstream)
+            if friendly_limit_message is not None:
+                response_payload = _friendly_limit_anthropic_payload(friendly_limit_message, fallback_model)
+                _finish_usage_and_trace(
+                    trace_plan,
+                    upstream.status_code,
+                    upstream=upstream,
+                    response_payload=response_payload,
+                    response_text=friendly_limit_message,
+                    usage=_empty_anthropic_usage(),
+                )
+                return _friendly_limit_streaming_response(
+                    friendly_limit_message,
+                    protocol="anthropic",
+                    model=fallback_model,
+                )
             fallback_message = _extract_upstream_text(upstream) or f"Upstream request failed with status {upstream.status_code}"
             error_payload = format_translation.anthropic_error_payload_from_openai(
                 _extract_upstream_json_payload(upstream),
@@ -2170,6 +2596,25 @@ async def proxy_responses_from_anthropic_streaming_response(
     if upstream.status_code >= 400:
         try:
             await upstream.aread()
+            friendly_limit_message = _friendly_limit_message_from_upstream(upstream)
+            if friendly_limit_message is not None:
+                response_payload = _friendly_limit_responses_payload(
+                    friendly_limit_message,
+                    trace_plan.resolved_model if isinstance(trace_plan, UpstreamRequestPlan) else fallback_model,
+                )
+                _finish_usage_and_trace(
+                    trace_plan,
+                    upstream.status_code,
+                    upstream=upstream,
+                    response_payload=response_payload,
+                    response_text=friendly_limit_message,
+                    usage=_empty_openai_usage(),
+                )
+                return _friendly_limit_streaming_response(
+                    friendly_limit_message,
+                    protocol="responses",
+                    model=trace_plan.resolved_model if isinstance(trace_plan, UpstreamRequestPlan) else fallback_model,
+                )
             upstream_payload = _extract_upstream_json_payload(upstream)
             upstream_text = _extract_upstream_text(upstream) or f"Upstream request failed with status {upstream.status_code}"
             # Upstream is Anthropic-shaped; reshape to a Responses-shaped error
@@ -2721,14 +3166,6 @@ def _should_drop_reasoning_items_for_responses_context(strip_reason: str | None)
     return strip_reason is not None
 
 
-def _max_encrypted_reasoning_items_for_responses_input(input_value) -> int | None:
-    if not isinstance(input_value, list):
-        return None
-    if len(input_value) < _RESPONSES_REASONING_TRIM_INPUT_ITEM_THRESHOLD:
-        return None
-    return _RESPONSES_REASONING_ENCRYPTED_KEEP_LAST
-
-
 def _responses_input_encrypted_content_count(input_value) -> int:
     if not isinstance(input_value, list):
         return 0
@@ -2748,7 +3185,6 @@ def _responses_input_sanitization_trace(
     raw_input,
     sanitized_input,
     *,
-    max_encrypted_reasoning_items: int | None,
     encrypted_reasoning_strip_reason: str | None,
     dropped_reasoning_items: bool,
 ) -> dict | None:
@@ -2758,7 +3194,6 @@ def _responses_input_sanitization_trace(
     after_encrypted = _responses_input_encrypted_content_count(sanitized_input)
     if (
         not before_encrypted
-        and max_encrypted_reasoning_items is None
         and encrypted_reasoning_strip_reason is None
         and not dropped_reasoning_items
     ):
@@ -2766,8 +3201,6 @@ def _responses_input_sanitization_trace(
 
     if encrypted_reasoning_strip_reason is not None:
         preservation = "disabled"
-    elif max_encrypted_reasoning_items is not None:
-        preservation = "limited"
     else:
         preservation = "preserved"
 
@@ -2779,9 +3212,8 @@ def _responses_input_sanitization_trace(
         "encrypted_content_items_dropped": max(0, before_encrypted - after_encrypted),
         "encrypted_content_preservation": preservation,
         "encrypted_content_strip_reason": encrypted_reasoning_strip_reason,
-        "encrypted_keep_last": max_encrypted_reasoning_items,
+        "encrypted_keep_last": None,
         "reasoning_items_dropped": dropped_reasoning_items,
-        "trim_input_item_threshold": _RESPONSES_REASONING_TRIM_INPUT_ITEM_THRESHOLD,
     }
 
 # ─── Route: /v1/responses  (Codex / Responses API) ───────────────────────────
@@ -2872,19 +3304,16 @@ async def responses(request: Request):
     drop_reasoning_items = _should_drop_reasoning_items_for_responses_context(
         encrypted_reasoning_strip_reason
     )
-    max_encrypted_reasoning_items = _max_encrypted_reasoning_items_for_responses_input(raw_input)
     input_sanitization_trace = None
     if raw_input is not None:
         body["input"] = format_translation.sanitize_input(
             raw_input,
             preserve_encrypted_content=encrypted_reasoning_strip_reason is None,
-            max_encrypted_reasoning_items=max_encrypted_reasoning_items,
             drop_reasoning_items=drop_reasoning_items,
         )
         input_sanitization_trace = _responses_input_sanitization_trace(
             raw_input,
             body.get("input"),
-            max_encrypted_reasoning_items=max_encrypted_reasoning_items,
             encrypted_reasoning_strip_reason=encrypted_reasoning_strip_reason,
             dropped_reasoning_items=drop_reasoning_items,
         )

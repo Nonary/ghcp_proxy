@@ -1956,31 +1956,10 @@ def _reasoning_item_has_replay_value(item: dict) -> bool:
     return _reasoning_summary_has_text(item.get("summary"))
 
 
-def _encrypted_reasoning_indexes_to_keep(input_items, max_encrypted_reasoning_items: int | None) -> set[int] | None:
-    if max_encrypted_reasoning_items is None:
-        return None
-    if not isinstance(max_encrypted_reasoning_items, int) or max_encrypted_reasoning_items < 0:
-        return None
-
-    indexes: list[int] = []
-    for index, item in enumerate(input_items):
-        if not isinstance(item, dict):
-            continue
-        if item.get("type") not in {"reasoning", "compaction"}:
-            continue
-        encrypted_content = item.get("encrypted_content")
-        if isinstance(encrypted_content, str) and encrypted_content:
-            indexes.append(index)
-    if max_encrypted_reasoning_items == 0:
-        return set()
-    return set(indexes[-max_encrypted_reasoning_items:])
-
-
 def sanitize_input(
     input_items,
     *,
     preserve_encrypted_content: bool = True,
-    max_encrypted_reasoning_items: int | None = None,
     drop_reasoning_items: bool = False,
 ):
     """
@@ -1999,23 +1978,15 @@ def sanitize_input(
         return input_items  # plain string — pass through untouched
 
     window_items = _latest_compaction_window(input_items)
-    encrypted_indexes_to_keep = (
-        _encrypted_reasoning_indexes_to_keep(window_items, max_encrypted_reasoning_items)
-        if preserve_encrypted_content
-        else set()
-    )
 
     result = []
-    for index, item in enumerate(window_items):
+    for item in window_items:
         if not isinstance(item, dict):
             result.append(item)
             continue
 
         item_type = item.get("type")
-        preserve_item_encrypted_content = (
-            preserve_encrypted_content
-            and (encrypted_indexes_to_keep is None or index in encrypted_indexes_to_keep)
-        )
+        preserve_item_encrypted_content = preserve_encrypted_content
         if item_type == "compaction":
             encrypted_content = item.get("encrypted_content")
             summary_text = decode_fake_compaction(encrypted_content)
