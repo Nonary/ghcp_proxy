@@ -417,6 +417,85 @@ class InitiatorPolicyTests(unittest.TestCase):
         # bypass must not fire on the original (now-stale) user turn.
         self.assertEqual(candidate, "agent")
 
+    def test_responses_user_prompt_ending_with_subagent_notification_is_agent(self):
+        policy = initiator_policy.InitiatorPolicy()
+        input_items = [
+            {"type": "message", "role": "developer", "content": "developer instructions"},
+            {
+                "type": "message",
+                "role": "user",
+                "content": (
+                    "Fix classifier to mark requests that end with a subagent_notification.\n"
+                    "<subagent_notification>\n"
+                    "{\"agent_path\":\"agent-1\",\"status\":{\"completed\":\"analysis\"}}\n"
+                    "</subagent_notification>"
+                ),
+            },
+        ]
+
+        normalized_input, initiator = policy.resolve_responses_input(input_items, "gpt-5.4")
+
+        self.assertIs(normalized_input, input_items)
+        self.assertEqual(initiator, "agent")
+
+    def test_responses_plus_prefix_does_not_override_trailing_subagent_notification(self):
+        policy = initiator_policy.InitiatorPolicy()
+        input_items = [
+            {
+                "type": "message",
+                "role": "user",
+                "content": (
+                    "+ refix the interactions coverage\n"
+                    "<subagent_notification>\n"
+                    "{\"agent_path\":\"agent-1\",\"status\":{\"completed\":\"done\"}}\n"
+                    "</subagent_notification>"
+                ),
+            },
+        ]
+
+        normalized_input, initiator = policy.resolve_responses_input(input_items, "gpt-5.4")
+
+        self.assertIs(normalized_input, input_items)
+        self.assertEqual(initiator, "agent")
+
+    def test_responses_plain_input_ending_with_subagent_notification_is_agent(self):
+        policy = initiator_policy.InitiatorPolicy()
+        prompt = (
+            "Refix interactions are well-represented.\n"
+            "<subagent_notification>\n"
+            "{\"agent_path\":\"agent-1\",\"status\":{\"completed\":\"done\"}}\n"
+            "</subagent_notification>"
+        )
+
+        normalized_input, initiator = policy.resolve_responses_input(prompt, "gpt-5.4")
+
+        self.assertEqual(normalized_input, prompt)
+        self.assertEqual(initiator, "agent")
+
+    def test_anthropic_user_prompt_ending_with_subagent_notification_is_agent(self):
+        policy = initiator_policy.InitiatorPolicy()
+        messages = [
+            {"role": "assistant", "content": [{"type": "text", "text": "previous answer"}]},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            "Refix interactions are well-represented.\n"
+                            "<subagent_notification>\n"
+                            "{\"agent_path\":\"agent-1\",\"status\":{\"completed\":\"done\"}}\n"
+                            "</subagent_notification>"
+                        ),
+                    }
+                ],
+            },
+        ]
+
+        initiator = policy.resolve_anthropic_messages(messages, "claude-sonnet-4.6")
+
+        self.assertEqual(initiator, "agent")
+
     def test_plus_prefix_forces_user_for_chat_messages(self):
         policy = initiator_policy.InitiatorPolicy()
         messages = [

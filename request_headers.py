@@ -181,8 +181,9 @@ def _extract_responses_affinity_key(
         if normalized_client_request_id:
             affinity_key = normalized_client_request_id
 
-    body.pop("promptCacheKey", None)
-    body.pop("prompt_cache_key", None)
+    # NOTE: prompt_cache_key intentionally stays on the outbound body — it is
+    # the upstream Responses cache lineage hint, and dropping it would force
+    # the Copilot backend to recompute the prefix cache on every turn.
     return affinity_key
 
 

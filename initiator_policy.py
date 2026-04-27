@@ -23,6 +23,10 @@ _SKILL_PHRASE_INVOCATION_RE = re.compile(
     r"\b(?:apply|use|run|invoke|load|open)\s+(?:the\s+)?(?!this\b|that\b|the\b|a\b|an\b)[A-Za-z][A-Za-z0-9-]{1,63}\s+skill\b",
     re.IGNORECASE,
 )
+_SUBAGENT_NOTIFICATION_END_RE = re.compile(
+    r"</subagent[_-]notification>\s*\Z",
+    re.IGNORECASE,
+)
 
 
 def utc_now() -> datetime:
@@ -173,6 +177,8 @@ def _is_claude_meta_user_text(text: str) -> bool:
         "<local-command-caveat>",
         "<local-command-stdout>",
         "<local-command-stderr>",
+        "<subagent_notification>",
+        "<subagent-notification>",
         "<task-notification>",
         "<system-reminder>",
     )):
@@ -285,6 +291,8 @@ def _responses_item_candidate(item, *, explicit_initiators: dict[int, str] | Non
 def _determine_responses_candidate(input_param) -> tuple[object, str]:
     if isinstance(input_param, str):
         normalized_input, explicit_initiator = _strip_explicit_initiator_prefix(input_param)
+        if _ends_with_subagent_notification_text(normalized_input):
+            return normalized_input, AGENT_INITIATOR
         if explicit_initiator == _EXPLICIT_USER_INITIATOR:
             return normalized_input, explicit_initiator
         if _contains_skill_invocation_text(normalized_input):
@@ -293,6 +301,8 @@ def _determine_responses_candidate(input_param) -> tuple[object, str]:
 
     if isinstance(input_param, list):
         explicit_initiators = _explicit_initiators_for_responses_input(input_param)
+        if _trailing_user_message_ends_with_subagent_notification(input_param):
+            return input_param, AGENT_INITIATOR
         if _trailing_user_messages_include_explicit_user(input_param, explicit_initiators):
             return input_param, _EXPLICIT_USER_INITIATOR
         if _trailing_user_messages_contain_skill_invocation(input_param):
@@ -417,6 +427,38 @@ def _contains_skill_invocation_text(text: str) -> bool:
         or _SKILL_DOLLAR_INVOCATION_RE.search(text) is not None
         or _SKILL_PHRASE_INVOCATION_RE.search(text) is not None
     )
+
+
+def _ends_with_subagent_notification_text(text: str) -> bool:
+    if not isinstance(text, str):
+        return False
+    # Codex appends completed subagent reports as user-role content. When the
+    # latest prompt ends with one of these blocks it is a harness/agent refix
+    # continuation, even if real-looking user text appears before the block.
+    return _SUBAGENT_NOTIFICATION_END_RE.search(text) is not None
+
+
+def _trailing_user_message_ends_with_subagent_notification(messages) -> bool:
+    if not isinstance(messages, list):
+        return False
+
+    for message in reversed(messages):
+        if not isinstance(message, dict):
+            return False
+
+        role = str(message.get("role", "")).lower()
+        item_type = str(message.get("type", "")).lower()
+
+        if role == "user":
+            return _ends_with_subagent_notification_text(_responses_item_text(message))
+
+        if role in {"system", "developer"}:
+            continue
+        if item_type in {"reasoning", "item_reference", "compaction"}:
+            continue
+        return False
+
+    return False
 
 
 def _trailing_user_messages_contain_skill_invocation(messages) -> bool:
@@ -720,6 +762,8 @@ def _determine_chat_candidate(messages) -> str:
         if explicit_initiator is not None:
             explicit_initiators[id(message)] = explicit_initiator
 
+    if _trailing_user_message_ends_with_subagent_notification(messages):
+        return AGENT_INITIATOR
     if _trailing_user_messages_include_explicit_user(messages, explicit_initiators):
         return _EXPLICIT_USER_INITIATOR
     if _trailing_user_messages_contain_skill_invocation(messages):
@@ -860,6 +904,8 @@ def _determine_anthropic_candidate(messages, *, system=None) -> str:
         if saw_agent_meta and not saw_tool_result and not saw_real_user_content:
             ignorable_meta_messages.add(id(message))
 
+    if _trailing_user_message_ends_with_subagent_notification(messages):
+        return AGENT_INITIATOR
     if _trailing_user_messages_include_explicit_user(messages, explicit_initiators):
         return _EXPLICIT_USER_INITIATOR
     if _trailing_user_messages_contain_skill_invocation(messages):

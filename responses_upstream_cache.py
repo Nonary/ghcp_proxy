@@ -10,20 +10,28 @@ import util
 
 _COPILOT_UNSUPPORTED_RESPONSES_TOOL_TYPES = {"image_generation"}
 
-# Top-level native Responses fields observed in captured Copilot CLI
-# /responses requests. Unknown Codex-only fields are kept local so they cannot
-# perturb upstream cache keys.
+# Native Responses fields the upstream Copilot endpoint actually consumes —
+# either captured in CLI traffic or part of the documented Responses contract
+# that contributes to the upstream prompt-prefix cache key. Anything else is
+# treated as a Codex-only client field and stripped, since unknown keys
+# perturb the upstream cache hash with no behavioral upside.
 _COPILOT_RESPONSES_UPSTREAM_BODY_KEYS = {
     "include",
     "input",
     "instructions",
+    "metadata",
     "model",
     "parallel_tool_calls",
+    "previous_response_id",
+    "prompt_cache_key",
+    "promptCacheKey",
     "reasoning",
+    "safety_identifier",
     "store",
     "stream",
     "text",
     "tools",
+    "user",
 }
 
 _TOOL_SEARCH_TOOL_NAMES = {"tool_search", "tools.tool_search"}
@@ -54,10 +62,12 @@ def _append_sanitizer_diagnostic(diagnostics: list[dict] | None, diagnostic: dic
 def sanitize_responses_body_for_copilot(body: dict, *, diagnostics: list[dict] | None = None) -> dict:
     """Keep native Responses upstream payloads aligned with Copilot CLI.
 
-    Codex sends local/client fields such as ``client_metadata``,
-    ``prompt_cache_key``, and ``service_tier``. They are useful to this proxy
-    but are absent from captured Copilot CLI /responses traffic and can split
-    upstream cache keys, so only the captured upstream contract is forwarded.
+    Codex sends local/client fields such as ``client_metadata`` that aren't
+    part of the upstream Responses contract and would split the upstream
+    prompt cache hash for no behavioral gain. Drop those, but preserve the
+    documented cache-bearing fields (``prompt_cache_key``,
+    ``previous_response_id``, ``metadata``, ``user``, ``safety_identifier``)
+    so upstream can keep its prefix cache stable across turns.
     """
     if not isinstance(body, dict):
         return body

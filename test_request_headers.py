@@ -213,8 +213,8 @@ class RequestHeadersTests(unittest.TestCase):
                 "Copilot-Vision-Request": "true",
             },
         )
-        self.assertNotIn("prompt_cache_key", body)
-        self.assertNotIn("promptCacheKey", body)
+        self.assertEqual(body.get("prompt_cache_key"), " cache-key ")
+        self.assertEqual(body.get("promptCacheKey"), "other-key")
 
     def test_chat_header_contract_preserves_forwarded_ids_and_detects_image_url_key(self):
         class RecordingPolicy:
@@ -966,7 +966,7 @@ class RequestHeadersTests(unittest.TestCase):
             request_headers._extract_responses_affinity_key(body, " session-ignored ", " client-ignored "),
             "camel-cache",
         )
-        self.assertEqual(body, {})
+        self.assertEqual(body, {"prompt_cache_key": " ", "promptCacheKey": " camel-cache "})
         self.assertEqual(request_headers._extract_responses_affinity_key({}, " ", " client-2 "), "client-2")
         self.assertIsNone(request_headers._extract_responses_affinity_key({}, " ", " "))
 
@@ -1341,8 +1341,7 @@ class RequestHeadersTests(unittest.TestCase):
         self.assertIn("x-client-session-id", headers)
         self.assertIn("x-interaction-id", headers)
         self.assertIn("x-agent-task-id", headers)
-        self.assertNotIn("prompt_cache_key", body)
-        self.assertNotIn("promptCacheKey", body)
+        self.assertEqual(body.get("promptCacheKey"), "cache-123")
 
     def test_build_responses_headers_for_request_uses_incoming_client_request_id_for_affinity_only(self):
         request = SimpleNamespace(
@@ -1397,9 +1396,9 @@ class RequestHeadersTests(unittest.TestCase):
         self.assertNotEqual(first_headers["x-agent-task-id"], second_headers["x-agent-task-id"])
         self.assertEqual(first_headers["x-interaction-id"], third_headers["x-interaction-id"])
         self.assertEqual(first_headers["x-agent-task-id"], third_headers["x-agent-task-id"])
-        self.assertNotIn("prompt_cache_key", first_body)
-        self.assertNotIn("prompt_cache_key", second_body)
-        self.assertNotIn("prompt_cache_key", third_body)
+        self.assertEqual(first_body.get("prompt_cache_key"), "cache-a")
+        self.assertEqual(second_body.get("prompt_cache_key"), "cache-b")
+        self.assertEqual(third_body.get("prompt_cache_key"), "cache-a")
 
     def test_build_responses_headers_for_request_rotates_explicit_affinity_on_native_user_turns(self):
         first_request = SimpleNamespace(headers={}, url=SimpleNamespace(path="/v1/responses"))
@@ -1426,8 +1425,8 @@ class RequestHeadersTests(unittest.TestCase):
         self.assertEqual(second_headers["X-Initiator"], "user")
         self.assertNotEqual(first_headers["x-interaction-id"], second_headers["x-interaction-id"])
         self.assertNotEqual(first_headers["x-agent-task-id"], second_headers["x-agent-task-id"])
-        self.assertNotIn("prompt_cache_key", first_body)
-        self.assertNotIn("prompt_cache_key", second_body)
+        self.assertEqual(first_body.get("prompt_cache_key"), "cache-user-turns")
+        self.assertEqual(second_body.get("prompt_cache_key"), "cache-user-turns")
 
     def test_build_responses_headers_for_request_can_keep_claude_bridge_affinity_stable(self):
         first_request = SimpleNamespace(headers={}, url=SimpleNamespace(path="/v1/messages"))
@@ -1456,8 +1455,8 @@ class RequestHeadersTests(unittest.TestCase):
         self.assertEqual(second_headers["X-Initiator"], "user")
         self.assertEqual(first_headers["x-interaction-id"], second_headers["x-interaction-id"])
         self.assertEqual(first_headers["x-agent-task-id"], second_headers["x-agent-task-id"])
-        self.assertNotIn("prompt_cache_key", first_body)
-        self.assertNotIn("prompt_cache_key", second_body)
+        self.assertEqual(first_body.get("prompt_cache_key"), "cache-user-turns")
+        self.assertEqual(second_body.get("prompt_cache_key"), "cache-user-turns")
 
     def test_build_responses_headers_for_request_can_use_unsent_affinity_body(self):
         request = SimpleNamespace(headers={}, url=SimpleNamespace(path="/v1/messages"))
@@ -1581,8 +1580,7 @@ class RequestHeadersTests(unittest.TestCase):
         self.assertNotIn("session_id", compact_headers)
         self.assertNotIn("x-client-request-id", compact_headers)
         self.assertEqual(compact_body["sessionId"], "session-123")
-        self.assertNotIn("prompt_cache_key", compact_body)
-        self.assertNotIn("promptCacheKey", compact_body)
+        self.assertEqual(compact_body.get("promptCacheKey"), "cache-123")
         self.assertEqual(compact_body["previous_response_id"], "resp_prev")
         self.assertNotEqual(compact_headers["x-interaction-id"], user_headers["x-interaction-id"])
         self.assertNotEqual(compact_headers["x-agent-task-id"], user_headers["x-agent-task-id"])

@@ -1371,6 +1371,15 @@ def _build_bridge_headers(
     verdict_sink: dict | None = None,
 ) -> dict:
     if bridge_plan.header_kind == "responses":
+        # Stable affinity when the caller has supplied an explicit cache
+        # lineage hint (prompt_cache_key from Codex, or any caller using the
+        # Anthropic shape, which we anchor on session_id). Without that hint
+        # we fall back to the rotate-on-user behavior so unrelated requests
+        # don't silently merge into one bucket.
+        explicit_cache_lineage = isinstance(original_body, dict) and any(
+            isinstance(original_body.get(k), str) and original_body.get(k).strip()
+            for k in ("prompt_cache_key", "promptCacheKey")
+        )
         return format_translation.build_responses_headers_for_request(
             request,
             bridge_plan.upstream_body,
@@ -1381,7 +1390,9 @@ def _build_bridge_headers(
             session_id_resolver=usage_tracking.request_session_id,
             verdict_sink=verdict_sink,
             affinity_body=original_body,
-            stable_user_affinity=bridge_plan.caller_protocol == "anthropic",
+            stable_user_affinity=(
+                bridge_plan.caller_protocol == "anthropic" or explicit_cache_lineage
+            ),
         )
     if bridge_plan.header_kind == "chat":
         return format_translation.build_chat_headers_for_request(

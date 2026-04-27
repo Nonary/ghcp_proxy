@@ -1336,14 +1336,16 @@ class FormatTranslationTests(unittest.TestCase):
         )
 
         self.assertNotIn("client_metadata", sanitized)
-        self.assertNotIn("previous_response_id", sanitized)
-        self.assertNotIn("prompt_cache_key", sanitized)
         self.assertNotIn("service_tier", sanitized)
         self.assertNotIn("tool_choice", sanitized)
+        # Cache-lineage fields stay on the body — they're the upstream prefix
+        # cache hint and stripping them broke Codex's cache hit rate in prod.
+        self.assertEqual(sanitized["previous_response_id"], "resp_prev")
+        self.assertEqual(sanitized["prompt_cache_key"], "cache-local")
         self.assertEqual(diagnostics[0]["action"], "drop_non_copilot_cli_fields")
         self.assertEqual(
             diagnostics[0]["fields"],
-            ["client_metadata", "previous_response_id", "prompt_cache_key", "service_tier", "tool_choice"],
+            ["client_metadata", "service_tier", "tool_choice"],
         )
 
     def test_sanitize_responses_body_drops_explicit_tool_choice_for_cache_shape(self):

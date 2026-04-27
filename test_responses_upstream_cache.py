@@ -31,8 +31,6 @@ class ResponsesUpstreamCacheSanitizerTests(unittest.TestCase):
             "text": {"format": {"type": "text"}},
             "tools": [{"type": "function", "name": "Read"}],
             "client_metadata": {"local": True},
-            "prompt_cache_key": "cache-key",
-            "previous_response_id": "resp_prev",
             "service_tier": "priority",
         }
         with mock.patch("builtins.print") as print_mock:
@@ -61,8 +59,6 @@ class ResponsesUpstreamCacheSanitizerTests(unittest.TestCase):
                     "action": "drop_non_copilot_cli_fields",
                     "fields": [
                         "client_metadata",
-                        "previous_response_id",
-                        "prompt_cache_key",
                         "service_tier",
                     ],
                 }
@@ -70,9 +66,29 @@ class ResponsesUpstreamCacheSanitizerTests(unittest.TestCase):
         )
         print_mock.assert_called_once_with(
             "Responses proxy dropped non-Copilot-CLI fields: "
-            "client_metadata, previous_response_id, prompt_cache_key, service_tier",
+            "client_metadata, service_tier",
             flush=True,
         )
+
+    def test_body_sanitizer_preserves_cache_lineage_fields(self):
+        body = {
+            "model": "gpt-5.4",
+            "input": "hi",
+            "prompt_cache_key": "lineage-1",
+            "promptCacheKey": "lineage-1",
+            "previous_response_id": "resp_prev",
+            "metadata": {"k": "v"},
+            "user": "user-1",
+            "safety_identifier": "safe-1",
+        }
+        sanitized = ruc.sanitize_responses_body_for_copilot(body)
+        self.assertIs(sanitized, body)
+        self.assertEqual(sanitized["prompt_cache_key"], "lineage-1")
+        self.assertEqual(sanitized["promptCacheKey"], "lineage-1")
+        self.assertEqual(sanitized["previous_response_id"], "resp_prev")
+        self.assertEqual(sanitized["metadata"], {"k": "v"})
+        self.assertEqual(sanitized["user"], "user-1")
+        self.assertEqual(sanitized["safety_identifier"], "safe-1")
 
     def test_tool_choice_removed_detection_covers_type_and_function_names(self):
         self.assertFalse(ruc._responses_tool_choice_targets_removed_tool("auto", {"image_generation"}, set()))

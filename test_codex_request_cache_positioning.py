@@ -242,22 +242,17 @@ class CodexRequestCachePositioningTests(unittest.TestCase):
         self.assertEqual(plan.strategy_name, "responses_to_responses")
         self.assertEqual(plan.upstream_body["input"], input_items)
         self.assertEqual(body["input"], input_items)
-        for key in (
-            "prompt_cache_key",
-            "promptCacheKey",
-            "previous_response_id",
-            "service_tier",
-            "client_metadata",
-            "tool_choice",
-        ):
+        # Cache-lineage fields are now forwarded so upstream can reuse the
+        # prompt-prefix cache across turns.
+        for key in ("prompt_cache_key", "promptCacheKey", "previous_response_id"):
+            self.assertEqual(plan.upstream_body.get(key), body[key])
+        # Codex-only / unsupported fields are still stripped.
+        for key in ("service_tier", "client_metadata", "tool_choice"):
             self.assertNotIn(key, plan.upstream_body)
             self.assertIn(key, body)
 
         self.assertEqual(plan.diagnostics[0]["fields"], [
             "client_metadata",
-            "previous_response_id",
-            "promptCacheKey",
-            "prompt_cache_key",
             "service_tier",
             "tool_choice",
         ])
@@ -320,10 +315,10 @@ class CodexRequestCachePositioningTests(unittest.TestCase):
         self.assertEqual(first_headers["x-agent-task-id"], second_headers["x-agent-task-id"])
         self.assertNotEqual(first_headers["x-interaction-id"], third_headers["x-interaction-id"])
         self.assertNotEqual(first_headers["x-agent-task-id"], third_headers["x-agent-task-id"])
-        self.assertNotIn("prompt_cache_key", first_body)
-        self.assertNotIn("promptCacheKey", first_body)
-        self.assertNotIn("prompt_cache_key", second_body)
-        self.assertNotIn("promptCacheKey", third_body)
+        self.assertEqual(first_body.get("prompt_cache_key"), " primary-cache ")
+        self.assertEqual(first_body.get("promptCacheKey"), "secondary-cache")
+        self.assertEqual(second_body.get("prompt_cache_key"), "primary-cache")
+        self.assertEqual(third_body.get("promptCacheKey"), "secondary-cache")
         self.assertNotIn("x-client-request-id", first_headers)
         self.assertNotIn("x-openai-subagent", first_headers)
 
@@ -402,8 +397,8 @@ class CodexRequestCachePositioningTests(unittest.TestCase):
 
         self.assertEqual(first_headers["x-interaction-id"], second_headers["x-interaction-id"])
         self.assertEqual(first_headers["x-agent-task-id"], second_headers["x-agent-task-id"])
-        self.assertNotIn("promptCacheKey", first_body)
-        self.assertNotIn("promptCacheKey", second_body)
+        self.assertEqual(first_body.get("promptCacheKey"), "camel-cache")
+        self.assertEqual(second_body.get("promptCacheKey"), " camel-cache ")
 
 
 class ResponsesToAnthropicMessagesUpstreamFormattingTests(unittest.TestCase):
