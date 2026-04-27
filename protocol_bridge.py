@@ -142,7 +142,7 @@ class ProtocolBridgeStrategy(ABC):
         resolved_model: str | None,
         api_base: str,
         api_key: str,
-        is_compact: bool = False,
+        is_compact: bool,
     ) -> BridgeExecutionPlan:
         raise NotImplementedError
 
@@ -155,7 +155,7 @@ class ResponsesToResponsesStrategy(ProtocolBridgeStrategy):
     header_kind = "responses"
     caller_protocol = "responses"
 
-    async def build_plan(self, body: dict, *, requested_model, resolved_model, api_base, api_key, is_compact=False) -> BridgeExecutionPlan:
+    async def build_plan(self, body: dict, *, requested_model, resolved_model, api_base, api_key, is_compact) -> BridgeExecutionPlan:
         del api_base, api_key
         diagnostics: list[dict] = []
         upstream_body = dict(body)
@@ -198,7 +198,7 @@ class ResponsesToChatStrategy(ProtocolBridgeStrategy):
     header_kind = "chat"
     caller_protocol = "responses"
 
-    async def build_plan(self, body: dict, *, requested_model, resolved_model, api_base, api_key, is_compact=False) -> BridgeExecutionPlan:
+    async def build_plan(self, body: dict, *, requested_model, resolved_model, api_base, api_key, is_compact) -> BridgeExecutionPlan:
         del api_base, api_key
         upstream_body = dict(body)
         upstream_body["model"] = resolved_model
@@ -225,7 +225,7 @@ class MessagesToChatStrategy(ProtocolBridgeStrategy):
     header_kind = "anthropic"
     caller_protocol = "anthropic"
 
-    async def build_plan(self, body: dict, *, requested_model, resolved_model, api_base, api_key, is_compact=False) -> BridgeExecutionPlan:
+    async def build_plan(self, body: dict, *, requested_model, resolved_model, api_base, api_key, is_compact) -> BridgeExecutionPlan:
         upstream_body = dict(body)
         upstream_body["model"] = resolved_model
         translated = await format_translation.anthropic_request_to_chat(upstream_body, api_base, api_key)
@@ -251,7 +251,7 @@ class MessagesToResponsesStrategy(ProtocolBridgeStrategy):
     header_kind = "responses"
     caller_protocol = "anthropic"
 
-    async def build_plan(self, body: dict, *, requested_model, resolved_model, api_base, api_key, is_compact=False) -> BridgeExecutionPlan:
+    async def build_plan(self, body: dict, *, requested_model, resolved_model, api_base, api_key, is_compact) -> BridgeExecutionPlan:
         del api_base, api_key
         upstream_body = dict(body)
         upstream_body["model"] = resolved_model
@@ -304,7 +304,7 @@ class MessagesToMessagesStrategy(ProtocolBridgeStrategy):
         resolver = capability_resolver or _default_capability_resolver
         return bool(resolver(model))
 
-    async def build_plan(self, body: dict, *, requested_model, resolved_model, api_base, api_key, is_compact=False) -> BridgeExecutionPlan:
+    async def build_plan(self, body: dict, *, requested_model, resolved_model, api_base, api_key, is_compact) -> BridgeExecutionPlan:
         del api_base, api_key
         import messages_preprocess  # local to avoid hard import cycle
         upstream_body = dict(body)
@@ -313,6 +313,7 @@ class MessagesToMessagesStrategy(ProtocolBridgeStrategy):
             upstream_body,
             model_supports_adaptive=_default_adaptive_thinking_resolver(resolved_model),
         )
+        stream_value = upstream_body["stream"] if "stream" in upstream_body else False
         return BridgeExecutionPlan(
             strategy_name=self.strategy_name,
             inbound_protocol=self.inbound_protocol,
@@ -322,7 +323,7 @@ class MessagesToMessagesStrategy(ProtocolBridgeStrategy):
             requested_model=requested_model,
             resolved_model=resolved_model,
             upstream_body=upstream_body,
-            stream=bool(upstream_body.get("stream", False)),
+            stream=bool(stream_value),
             is_compact=is_compact,
         )
 
@@ -352,7 +353,7 @@ class ResponsesToMessagesStrategy(ProtocolBridgeStrategy):
         resolver = capability_resolver or _default_capability_resolver
         return bool(resolver(model))
 
-    async def build_plan(self, body: dict, *, requested_model, resolved_model, api_base, api_key, is_compact=False) -> BridgeExecutionPlan:
+    async def build_plan(self, body: dict, *, requested_model, resolved_model, api_base, api_key, is_compact) -> BridgeExecutionPlan:
         del api_base, api_key
         import messages_preprocess  # local to avoid hard import cycle
         upstream_body = dict(body)

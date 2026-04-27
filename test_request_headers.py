@@ -17,6 +17,394 @@ class RequestHeadersTests(unittest.TestCase):
         request_headers._RESPONSES_AFFINITY_BY_SESSION.clear()
         request_headers._RESPONSES_DEFAULT_AFFINITY = None
 
+    def test_base_copilot_header_contract_is_exact(self):
+        self.assertEqual(
+            request_headers.build_copilot_headers("test-key"),
+            {
+                "Authorization": "Bearer test-key",
+                "content-type": "application/json",
+                "accept": "application/json",
+                "User-Agent": "opencode/1.3.13",
+                "Openai-Intent": "conversation-agent",
+                "Copilot-Integration-Id": "vscode-chat",
+                "x-github-api-version": "2026-01-09",
+                "x-client-session-id": request_headers._CLIENT_SESSION_ID,
+            },
+        )
+
+    def test_has_vision_input_depth_and_type_contract(self):
+        self.assertFalse(request_headers.has_vision_input(None))
+        self.assertFalse(request_headers.has_vision_input({"type": "text"}))
+        self.assertFalse(request_headers.has_vision_input({"type": None, "content": []}))
+        self.assertTrue(request_headers.has_vision_input({"type": "input_image"}, max_depth=0))
+        self.assertFalse(request_headers.has_vision_input([{"type": "input_image"}], max_depth=0))
+        self.assertTrue(request_headers.has_vision_input([{"type": "INPUT_IMAGE"}], max_depth=1))
+
+        depth_10 = {"type": "input_image"}
+        for _ in range(10):
+            depth_10 = {"content": [depth_10]}
+        self.assertTrue(request_headers.has_vision_input(depth_10))
+
+        depth_11 = {"type": "input_image"}
+        for _ in range(11):
+            depth_11 = {"content": [depth_11]}
+        self.assertFalse(request_headers.has_vision_input(depth_11))
+        self.assertFalse(request_headers.has_vision_input({"content": [{"content": [{"type": "input_image"}]}]}, max_depth=1))
+
+    def test_responses_affinity_reuses_agent_session_until_reset_or_user(self):
+        with mock.patch.object(
+            request_headers,
+            "_new_responses_affinity",
+            side_effect=[
+                {"x-interaction-id": "first", "x-agent-task-id": "first-task"},
+                {"x-interaction-id": "second", "x-agent-task-id": "second-task"},
+                {"x-interaction-id": "third", "x-agent-task-id": "third-task"},
+            ],
+        ):
+            first = request_headers._responses_affinity_headers("agent", " session ")
+            second = request_headers._responses_affinity_headers("agent", "session")
+            reset = request_headers._responses_affinity_headers("agent", "session", reset=True)
+
+        self.assertIs(second, first)
+        self.assertEqual(reset, {"x-interaction-id": "second", "x-agent-task-id": "second-task"})
+
+    def test_chat_vision_scan_stops_after_first_image_message(self):
+        class RecordingPolicy:
+            def resolve_chat_messages(self, *args, **kwargs):
+                return "agent"
+
+        class ExplodingDict(dict):
+            def __contains__(self, key):
+                raise AssertionError("vision scan should stop after image is found")
+
+        request = SimpleNamespace(url=SimpleNamespace(path="/v1/chat/completions"), headers={})
+        messages = [
+            {"role": "user", "content": [{"type": "image_url", "image_url": {"url": "https://example.invalid/a.png"}}]},
+            {"role": "user", "content": [ExplodingDict()]},
+        ]
+
+        with mock.patch.object(request_headers.uuid, "uuid4", return_value="agent-task-id"):
+            headers = request_headers.build_chat_headers_for_request(
+                request,
+                messages,
+                "gpt-4.1",
+                "test-key",
+                initiator_policy=RecordingPolicy(),
+                session_id_resolver=lambda req, body_arg=None: "session-id",
+            )
+
+        self.assertEqual(headers["Copilot-Vision-Request"], "true")
+        self.assertEqual(
+            request_headers.build_responses_copilot_headers("test-key"),
+            {
+                "Authorization": "Bearer test-key",
+                "content-type": "application/json",
+                "accept": "application/json",
+                "User-Agent": "copilot/1.0.36 (client/github/cli win32 v25.6.0) term/unknown",
+                "Openai-Intent": "conversation-agent",
+                "Copilot-Integration-Id": "copilot-developer-cli",
+                "x-github-api-version": "2026-01-09",
+                "x-client-session-id": request_headers._CLIENT_SESSION_ID,
+            },
+        )
+
+    def test_responses_header_contract_is_exact_and_uses_cache_affinity_locally(self):
+        class RecordingPolicy:
+            def __init__(self):
+                self.calls = []
+
+            def resolve_responses_input(
+                self,
+                input_value,
+                model_name,
+                *,
+                subagent=None,
+                force_initiator=None,
+                request_id=None,
+                verdict_sink=None,
+            ):
+                self.calls.append(
+                    {
+                        "input_value": input_value,
+                        "model_name": model_name,
+                        "subagent": subagent,
+                        "force_initiator": force_initiator,
+                        "request_id": request_id,
+                        "verdict_sink": verdict_sink,
+                    }
+                )
+                return input_value, "user"
+
+        policy = RecordingPolicy()
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/responses"),
+            headers={
+                "x-client-request-id": "client-request",
+                "x-openai-subagent": "worker",
+            },
+        )
+        body = {
+            "model": "gpt-5.4-mini",
+            "prompt_cache_key": " cache-key ",
+            "promptCacheKey": "other-key",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_image", "image_url": "data:image/png;base64,AAAA"}],
+                }
+            ],
+        }
+        verdict_sink = {}
+
+        with mock.patch.object(
+            request_headers,
+            "_new_responses_affinity",
+            return_value={
+                "x-interaction-id": "interaction-id",
+                "x-agent-task-id": "agent-task-id",
+            },
+        ):
+            headers = request_headers.build_responses_headers_for_request(
+                request,
+                body,
+                "test-key",
+                force_initiator="user",
+                request_id="req-1",
+                initiator_policy=policy,
+                session_id_resolver=lambda req, body_arg: "session-id",
+                verdict_sink=verdict_sink,
+            )
+
+        self.assertEqual(
+            policy.calls,
+            [
+                {
+                    "input_value": [
+                        {
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_image", "image_url": "data:image/png;base64,AAAA"}],
+                        }
+                    ],
+                    "model_name": "gpt-5.4-mini",
+                    "subagent": "worker",
+                    "force_initiator": "user",
+                    "request_id": "req-1",
+                    "verdict_sink": verdict_sink,
+                }
+            ],
+        )
+        self.assertEqual(
+            headers,
+            {
+                "Authorization": "Bearer test-key",
+                "content-type": "application/json",
+                "accept": "application/json",
+                "User-Agent": "copilot/1.0.36 (client/github/cli win32 v25.6.0) term/unknown",
+                "Openai-Intent": "conversation-agent",
+                "Copilot-Integration-Id": "copilot-developer-cli",
+                "x-github-api-version": "2026-01-09",
+                "x-client-session-id": request_headers._CLIENT_SESSION_ID,
+                "X-Initiator": "user",
+                "x-interaction-type": "conversation-user",
+                "x-interaction-id": "interaction-id",
+                "x-agent-task-id": "agent-task-id",
+                "Copilot-Vision-Request": "true",
+            },
+        )
+        self.assertNotIn("prompt_cache_key", body)
+        self.assertNotIn("promptCacheKey", body)
+
+    def test_chat_header_contract_preserves_forwarded_ids_and_detects_image_url_key(self):
+        class RecordingPolicy:
+            def __init__(self):
+                self.calls = []
+
+            def resolve_chat_messages(
+                self,
+                messages,
+                model_name,
+                *,
+                subagent=None,
+                request_id=None,
+                verdict_sink=None,
+            ):
+                self.calls.append(
+                    {
+                        "messages": messages,
+                        "model_name": model_name,
+                        "subagent": subagent,
+                        "request_id": request_id,
+                        "verdict_sink": verdict_sink,
+                    }
+                )
+                return "agent"
+
+        policy = RecordingPolicy()
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/chat/completions"),
+            headers={
+                "x-client-request-id": "client-request",
+                "x-openai-subagent": "worker",
+            },
+        )
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "look"},
+                    {"image_url": {"url": "https://example.invalid/a.png"}},
+                ],
+            }
+        ]
+        verdict_sink = {}
+
+        with mock.patch.object(request_headers.uuid, "uuid4", return_value="agent-task-id"):
+            headers = request_headers.build_chat_headers_for_request(
+                request,
+                messages,
+                "gpt-4.1",
+                "test-key",
+                request_id="req-1",
+                initiator_policy=policy,
+                session_id_resolver=lambda req, body_arg=None: "session-id",
+                verdict_sink=verdict_sink,
+            )
+
+        self.assertEqual(
+            policy.calls,
+            [
+                {
+                    "messages": messages,
+                    "model_name": "gpt-4.1",
+                    "subagent": "worker",
+                    "request_id": "req-1",
+                    "verdict_sink": verdict_sink,
+                }
+            ],
+        )
+        self.assertEqual(
+            headers,
+            {
+                "Authorization": "Bearer test-key",
+                "content-type": "application/json",
+                "accept": "application/json",
+                "User-Agent": "opencode/1.3.13",
+                "Openai-Intent": "conversation-agent",
+                "Copilot-Integration-Id": "vscode-chat",
+                "x-github-api-version": "2026-01-09",
+                "x-client-session-id": request_headers._CLIENT_SESSION_ID,
+                "session_id": "session-id",
+                "x-client-request-id": "client-request",
+                "x-openai-subagent": "worker",
+                "X-Initiator": "agent",
+                "x-interaction-type": "conversation-agent",
+                "x-interaction-id": "session-id",
+                "x-agent-task-id": "agent-task-id",
+                "Copilot-Vision-Request": "true",
+            },
+        )
+
+    def test_anthropic_header_contract_preserves_forwarded_ids_and_detects_nested_vision(self):
+        class RecordingPolicy:
+            def __init__(self):
+                self.calls = []
+
+            def resolve_anthropic_messages(
+                self,
+                messages,
+                model_name,
+                *,
+                system=None,
+                subagent=None,
+                request_id=None,
+                verdict_sink=None,
+            ):
+                self.calls.append(
+                    {
+                        "messages": messages,
+                        "model_name": model_name,
+                        "system": system,
+                        "subagent": subagent,
+                        "request_id": request_id,
+                        "verdict_sink": verdict_sink,
+                    }
+                )
+                return "user"
+
+        policy = RecordingPolicy()
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/messages"),
+            headers={
+                "x-client-request-id": "client-request",
+                "x-openai-subagent": "worker",
+            },
+        )
+        body = {
+            "model": "claude-sonnet-4.6",
+            "system": "sys",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_1",
+                            "content": [{"type": "image", "source": {"type": "url", "url": "https://example.invalid/a.png"}}],
+                        }
+                    ],
+                }
+            ],
+        }
+        verdict_sink = {}
+
+        with mock.patch.object(request_headers.uuid, "uuid4", return_value="agent-task-id"):
+            headers = request_headers.build_anthropic_headers_for_request(
+                request,
+                body,
+                "test-key",
+                request_id="req-1",
+                initiator_policy=policy,
+                session_id_resolver=lambda req, body_arg=None: "session-id",
+                verdict_sink=verdict_sink,
+            )
+
+        self.assertEqual(
+            policy.calls,
+            [
+                {
+                    "messages": body["messages"],
+                    "model_name": "claude-sonnet-4.6",
+                    "system": "sys",
+                    "subagent": "worker",
+                    "request_id": "req-1",
+                    "verdict_sink": verdict_sink,
+                }
+            ],
+        )
+        self.assertEqual(
+            headers,
+            {
+                "Authorization": "Bearer test-key",
+                "content-type": "application/json",
+                "accept": "application/json",
+                "User-Agent": "opencode/1.3.13",
+                "Openai-Intent": "conversation-agent",
+                "Copilot-Integration-Id": "vscode-chat",
+                "x-github-api-version": "2026-01-09",
+                "x-client-session-id": request_headers._CLIENT_SESSION_ID,
+                "session_id": "session-id",
+                "x-client-request-id": "client-request",
+                "x-openai-subagent": "worker",
+                "X-Initiator": "user",
+                "x-interaction-type": "conversation-user",
+                "x-interaction-id": "session-id",
+                "x-agent-task-id": "agent-task-id",
+                "Copilot-Vision-Request": "true",
+            },
+        )
+
     def test_responses_requests_default_to_user(self):
         request = SimpleNamespace(url=SimpleNamespace(path="/v1/responses"), headers={})
         body = {
@@ -546,6 +934,242 @@ class RequestHeadersTests(unittest.TestCase):
 
         self.assertEqual(headers["X-Initiator"], "agent")
 
+    def test_has_vision_input_handles_none_scalars_depth_and_nested_images(self):
+        self.assertFalse(request_headers.has_vision_input(None))
+        self.assertFalse(request_headers.has_vision_input("text"))
+        self.assertFalse(request_headers.has_vision_input({"content": []}, depth=11, max_depth=10))
+        self.assertTrue(
+            request_headers.has_vision_input(
+                {
+                    "type": "message",
+                    "content": [
+                        {"type": "input_text", "text": "look"},
+                        {"type": "input_image", "image_url": "https://example.invalid/a.png"},
+                    ],
+                }
+            )
+        )
+
+    def test_extract_responses_affinity_key_handles_non_dict_fallback_order(self):
+        self.assertEqual(
+            request_headers._extract_responses_affinity_key(None, " session-1 ", " client-1 "),
+            "session-1",
+        )
+        self.assertEqual(
+            request_headers._extract_responses_affinity_key(None, " ", " client-1 "),
+            "client-1",
+        )
+        self.assertIsNone(request_headers._extract_responses_affinity_key(None, " ", " "))
+
+        body = {"prompt_cache_key": " ", "promptCacheKey": " camel-cache "}
+        self.assertEqual(
+            request_headers._extract_responses_affinity_key(body, " session-ignored ", " client-ignored "),
+            "camel-cache",
+        )
+        self.assertEqual(body, {})
+        self.assertEqual(request_headers._extract_responses_affinity_key({}, " ", " client-2 "), "client-2")
+        self.assertIsNone(request_headers._extract_responses_affinity_key({}, " ", " "))
+
+    def test_responses_affinity_headers_reset_default_and_session_affinities(self):
+        with mock.patch.object(
+            request_headers,
+            "_new_responses_affinity",
+            side_effect=[
+                {"x-interaction-id": "default-first", "x-agent-task-id": "default-first-task"},
+                {"x-interaction-id": "default-reset", "x-agent-task-id": "default-reset-task"},
+            ],
+        ) as new_affinity:
+            first_default = request_headers._responses_affinity_headers("agent", None)
+            reused_default = request_headers._responses_affinity_headers("agent", None)
+            reset_default = request_headers._responses_affinity_headers("agent", None, reset=True)
+            reused_after_reset = request_headers._responses_affinity_headers("agent", None)
+
+        self.assertEqual(first_default, {"x-interaction-id": "default-first", "x-agent-task-id": "default-first-task"})
+        self.assertIs(reused_default, first_default)
+        self.assertEqual(reset_default, {"x-interaction-id": "default-reset", "x-agent-task-id": "default-reset-task"})
+        self.assertIsNot(reset_default, first_default)
+        self.assertIs(reused_after_reset, reset_default)
+        self.assertEqual(new_affinity.call_count, 2)
+
+        self.assertIsNot(reset_default, request_headers._responses_affinity_headers("user", None))
+        self.assertIsNot(first_default, request_headers._responses_affinity_headers("user", " "))
+
+        first_session = request_headers._responses_affinity_headers("agent", "session-a")
+        self.assertIs(first_session, request_headers._responses_affinity_headers("agent", " session-a "))
+        self.assertIsNot(first_session, request_headers._responses_affinity_headers("user", "session-a"))
+
+    def test_interaction_id_for_blank_session_generates_new_id(self):
+        generated = request_headers._interaction_id_for_session(" ")
+
+        self.assertIsInstance(generated, str)
+        self.assertNotEqual(generated, "")
+
+    def test_apply_forwarded_request_headers_synthesizes_client_request_id_from_session(self):
+        request = SimpleNamespace(
+            headers={"x-openai-subagent": "worker"},
+            url=SimpleNamespace(path="/v1/messages"),
+        )
+        headers = {}
+
+        session_id = request_headers._apply_forwarded_request_headers(
+            headers,
+            request,
+            {"sessionId": "session-123"},
+            session_id_resolver=usage_tracking.request_session_id,
+        )
+
+        self.assertEqual(session_id, "session-123")
+        self.assertEqual(headers["session_id"], "session-123")
+        self.assertEqual(headers["x-client-request-id"], "session-123")
+        self.assertEqual(headers["x-openai-subagent"], "worker")
+
+    def test_apply_forwarded_request_headers_preserves_forwarded_client_request_id(self):
+        request = SimpleNamespace(
+            headers={"x-client-request-id": "client-request"},
+            url=SimpleNamespace(path="/v1/messages"),
+        )
+        headers = {}
+
+        session_id = request_headers._apply_forwarded_request_headers(
+            headers,
+            request,
+            {"sessionId": "session-123"},
+            session_id_resolver=usage_tracking.request_session_id,
+        )
+
+        self.assertEqual(session_id, "session-123")
+        self.assertEqual(headers["session_id"], "session-123")
+        self.assertEqual(headers["x-client-request-id"], "client-request")
+
+    def test_apply_forwarded_request_headers_ignores_blank_session_for_client_request_id(self):
+        request = SimpleNamespace(headers={}, url=SimpleNamespace(path="/v1/messages"))
+        headers = {}
+
+        session_id = request_headers._apply_forwarded_request_headers(
+            headers,
+            request,
+            {"sessionId": " "},
+            session_id_resolver=lambda _request, _body: " ",
+        )
+
+        self.assertEqual(session_id, " ")
+        self.assertEqual(headers["session_id"], " ")
+        self.assertNotIn("x-client-request-id", headers)
+
+    def test_build_chat_headers_detects_image_url_content_and_skips_non_dict_items(self):
+        request = SimpleNamespace(headers={}, url=SimpleNamespace(path="/v1/chat/completions"))
+        messages = [
+            "not-a-message",
+            {"role": "user", "content": ["not-a-dict", {"type": "image_url", "image_url": {"url": "x"}}]},
+            {"role": "user", "content": [{"type": "text", "text": "after image"}]},
+        ]
+
+        headers = format_translation.build_chat_headers_for_request(
+            request,
+            messages,
+            "gpt-4.1",
+            "test-key",
+            initiator_policy=proxy._initiator_policy,
+            session_id_resolver=usage_tracking.request_session_id,
+        )
+
+        self.assertEqual(headers["Copilot-Vision-Request"], "true")
+
+    def test_build_chat_headers_without_list_or_image_content_omits_vision_header(self):
+        request = SimpleNamespace(headers={}, url=SimpleNamespace(path="/v1/chat/completions"))
+
+        for messages in (
+            None,
+            [{"role": "user", "content": "plain text"}],
+            [{"role": "user", "content": [{"type": "text"}]}],
+        ):
+            with self.subTest(messages=messages):
+                headers = format_translation.build_chat_headers_for_request(
+                    request,
+                    messages,
+                    "gpt-4.1",
+                    "test-key",
+                    initiator_policy=proxy._initiator_policy,
+                    session_id_resolver=usage_tracking.request_session_id,
+                )
+                self.assertNotIn("Copilot-Vision-Request", headers)
+
+    def test_anthropic_headers_detect_direct_and_nested_image_blocks(self):
+        request = SimpleNamespace(headers={}, url=SimpleNamespace(path="/v1/messages"))
+        direct_body = {
+            "model": "claude-sonnet-4.6",
+            "messages": [{"role": "user", "content": [{"type": "image", "source": {"type": "url", "url": "x"}}]}],
+        }
+        nested_body = {
+            "model": "claude-sonnet-4.6",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_1",
+                            "content": [{"type": "image", "source": {"type": "url", "url": "x"}}],
+                        }
+                    ],
+                }
+            ],
+        }
+
+        for body in (direct_body, nested_body):
+            with self.subTest(body=body):
+                headers = format_translation.build_anthropic_headers_for_request(
+                    request,
+                    body,
+                    "test-key",
+                    initiator_policy=proxy._initiator_policy,
+                    session_id_resolver=usage_tracking.request_session_id,
+                )
+                self.assertEqual(headers["Copilot-Vision-Request"], "true")
+
+    def test_anthropic_vision_detector_false_for_malformed_or_text_only_messages(self):
+        self.assertFalse(request_headers._anthropic_messages_has_vision(None))
+        self.assertFalse(request_headers._anthropic_messages_has_vision(["not-a-message"]))
+        self.assertFalse(request_headers._anthropic_messages_has_vision([{"content": "text"}]))
+        self.assertFalse(request_headers._anthropic_messages_has_vision([{"content": ["not-a-part"]}]))
+        self.assertFalse(
+            request_headers._anthropic_messages_has_vision(
+                [{"content": [{"type": "tool_result", "content": [{"type": "text", "text": "no image"}]}]}]
+            )
+        )
+
+    def test_build_responses_headers_for_request_without_input_leaves_body_without_input(self):
+        request = SimpleNamespace(headers={}, url=SimpleNamespace(path="/v1/responses"))
+        body = {"model": "gpt-5.4"}
+
+        headers = format_translation.build_responses_headers_for_request(
+            request,
+            body,
+            "test-key",
+            initiator_policy=proxy._initiator_policy,
+            session_id_resolver=usage_tracking.request_session_id,
+        )
+
+        self.assertEqual(headers["X-Initiator"], "agent")
+        self.assertNotIn("input", body)
+
+    def test_build_responses_headers_marks_vision_input(self):
+        request = SimpleNamespace(headers={}, url=SimpleNamespace(path="/v1/responses"))
+        body = {
+            "model": "gpt-5.4",
+            "input": [{"type": "message", "content": [{"type": "input_image", "image_url": "x"}]}],
+        }
+
+        headers = format_translation.build_responses_headers_for_request(
+            request,
+            body,
+            "test-key",
+            initiator_policy=proxy._initiator_policy,
+            session_id_resolver=usage_tracking.request_session_id,
+        )
+
+        self.assertEqual(headers["Copilot-Vision-Request"], "true")
+
     def test_anthropic_user_text_after_tool_result_is_user(self):
         request = SimpleNamespace(url=SimpleNamespace(path="/v1/messages"), headers={})
         body = {
@@ -651,6 +1275,39 @@ class RequestHeadersTests(unittest.TestCase):
         self.assertEqual(body["sessionId"], "session-123")
         self.assertNotIn("prompt_cache_key", body)
 
+    def test_build_responses_headers_for_request_disables_session_forwarding(self):
+        class RecordingPolicy:
+            def resolve_responses_input(self, input_value, model_name, **kwargs):
+                del model_name, kwargs
+                return input_value, "agent"
+
+        request = SimpleNamespace(headers={}, url=SimpleNamespace(path="/v1/responses"))
+        body = {"model": "gpt-5.4", "input": "hello", "sessionId": "session-123"}
+
+        with mock.patch.object(
+            request_headers,
+            "_apply_forwarded_request_headers",
+            wraps=request_headers._apply_forwarded_request_headers,
+        ) as apply_forwarded:
+            headers = request_headers.build_responses_headers_for_request(
+                request,
+                body,
+                "test-key",
+                initiator_policy=RecordingPolicy(),
+                session_id_resolver=usage_tracking.request_session_id,
+            )
+
+        self.assertNotIn("session_id", headers)
+        self.assertNotIn("x-client-request-id", headers)
+        apply_forwarded.assert_called_once_with(
+            mock.ANY,
+            request,
+            body,
+            session_id_resolver=usage_tracking.request_session_id,
+            forward_session_header=False,
+            synthesize_client_request_id=False,
+        )
+
     def test_build_responses_headers_for_request_uses_conversation_agent_intent(self):
         request = SimpleNamespace(
             headers={},
@@ -744,7 +1401,7 @@ class RequestHeadersTests(unittest.TestCase):
         self.assertNotIn("prompt_cache_key", second_body)
         self.assertNotIn("prompt_cache_key", third_body)
 
-    def test_build_responses_headers_for_request_rotates_explicit_affinity_across_user_turns(self):
+    def test_build_responses_headers_for_request_rotates_explicit_affinity_on_native_user_turns(self):
         first_request = SimpleNamespace(headers={}, url=SimpleNamespace(path="/v1/responses"))
         first_body = {"model": "gpt-5.4", "input": "first", "prompt_cache_key": "cache-user-turns"}
         first_headers = format_translation.build_responses_headers_for_request(
@@ -772,7 +1429,7 @@ class RequestHeadersTests(unittest.TestCase):
         self.assertNotIn("prompt_cache_key", first_body)
         self.assertNotIn("prompt_cache_key", second_body)
 
-    def test_build_responses_headers_for_request_can_stabilize_user_affinity_for_bridge(self):
+    def test_build_responses_headers_for_request_can_keep_claude_bridge_affinity_stable(self):
         first_request = SimpleNamespace(headers={}, url=SimpleNamespace(path="/v1/messages"))
         first_body = {"model": "gpt-5.4", "input": "first", "prompt_cache_key": "cache-user-turns"}
         first_headers = format_translation.build_responses_headers_for_request(
@@ -960,6 +1617,7 @@ import request_headers as _rh
 
 class DeriveAnthropicBetasTests(unittest.TestCase):
     def test_filters_to_allowlist(self):
+        self.assertEqual(_rh._normalize_model_for_betas(None), "")
         out = _rh.derive_anthropic_betas(
             client_betas=[
                 "interleaved-thinking-2025-05-14",
@@ -981,6 +1639,28 @@ class DeriveAnthropicBetasTests(unittest.TestCase):
         )
         self.assertIn("interleaved-thinking-2025-05-14", out)
 
+    def test_interleaved_thinking_requires_enabled_positive_integer_budget(self):
+        for thinking in (
+            {"type": "enabled", "budget_tokens": 0},
+            {"type": "enabled", "budget_tokens": -1},
+            {"type": "adaptive", "budget_tokens": 4096},
+            {"type": "enabled", "budget_tokens": "4096"},
+        ):
+            with self.subTest(thinking=thinking):
+                out = _rh.derive_anthropic_betas(
+                    client_betas=None,
+                    body={"thinking": thinking},
+                    model="claude-haiku-4.5",
+                )
+                self.assertNotIn("interleaved-thinking-2025-05-14", out)
+
+        out = _rh.derive_anthropic_betas(
+            client_betas=None,
+            body={"thinking": {"type": "enabled", "budget_tokens": 1}},
+            model="claude-haiku-4.5",
+        )
+        self.assertIn("interleaved-thinking-2025-05-14", out)
+
     def test_does_not_inject_thinking_for_adaptive(self):
         out = _rh.derive_anthropic_betas(
             client_betas=None,
@@ -995,6 +1675,15 @@ class DeriveAnthropicBetasTests(unittest.TestCase):
             body={},
             model="claude-sonnet-4.6",
         )
+        self.assertIn("advanced-tool-use-2025-11-20", out)
+
+    def test_auto_injects_advanced_tool_use_for_anthropic_prefixed_opus_46(self):
+        out = _rh.derive_anthropic_betas(
+            client_betas=None,
+            body={},
+            model="anthropic/claude-opus-4.6",
+        )
+
         self.assertIn("advanced-tool-use-2025-11-20", out)
 
     def test_no_advanced_tool_use_for_sonnet_4(self):
@@ -1018,6 +1707,26 @@ class DeriveAnthropicBetasTests(unittest.TestCase):
             sorted(out),
             sorted({"interleaved-thinking-2025-05-14", "context-management-2025-06-27"}),
         )
+
+    def test_client_beta_values_are_split_only_on_commas(self):
+        out = _rh.derive_anthropic_betas(
+            client_betas=[
+                "interleaved-thinking-2025-05-14 context-management-2025-06-27",
+            ],
+            body={},
+            model="claude-haiku-4.5",
+        )
+
+        self.assertEqual(out, [])
+
+    def test_ignores_non_string_client_beta_entries(self):
+        out = _rh.derive_anthropic_betas(
+            client_betas=[123, None, " , context-management-2025-06-27 , "],
+            body={},
+            model="claude-haiku-4.5",
+        )
+
+        self.assertEqual(out, ["context-management-2025-06-27"])
 
 
 class BuildAnthropicMessagesPassthroughHeadersTests(unittest.TestCase):
@@ -1132,3 +1841,62 @@ class BuildAnthropicMessagesPassthroughHeadersTests(unittest.TestCase):
         self.assertEqual(first["x-agent-task-id"], "req-a")
         self.assertEqual(second["x-interaction-id"], "req-b")
         self.assertEqual(second["x-agent-task-id"], "req-b")
+
+    def test_non_dict_base_headers_empty_initiator_and_non_list_betas_are_omitted(self):
+        headers = _rh.build_anthropic_messages_passthrough_headers(
+            request_id="r",
+            initiator="",
+            interaction_id="",
+            interaction_type="ignored",
+            anthropic_betas=None,
+            base_headers=None,
+        )
+
+        self.assertEqual(headers["x-agent-task-id"], "r")
+        self.assertEqual(headers["x-request-id"], "r")
+        self.assertEqual(headers["x-interaction-type"], "messages-proxy")
+        self.assertEqual(headers["openai-intent"], "messages-proxy")
+        self.assertNotIn("x-initiator", headers)
+        self.assertEqual(headers["x-interaction-id"], "r")
+        self.assertNotIn("anthropic-beta", headers)
+
+    def test_managed_headers_are_removed_case_insensitively_before_replacement(self):
+        headers = _rh.build_anthropic_messages_passthrough_headers(
+            request_id="new-request",
+            initiator="agent",
+            interaction_id="new-interaction",
+            interaction_type=None,
+            anthropic_betas=["context-management-2025-06-27"],
+            base_headers={
+                "User-Agent": "stale",
+                "Openai-Intent": "stale",
+                "X-Interaction-Type": "stale",
+                "X-Interaction-Id": "stale",
+                "X-Agent-Task-Id": "stale",
+                "X-Request-Id": "stale",
+                "X-Initiator": "stale",
+                "Anthropic-Version": "stale",
+                "Anthropic-Beta": "stale",
+                "Authorization": "Bearer keep",
+            },
+        )
+
+        self.assertNotIn("User-Agent", headers)
+        self.assertNotIn("Openai-Intent", headers)
+        self.assertNotIn("X-Interaction-Type", headers)
+        self.assertNotIn("X-Interaction-Id", headers)
+        self.assertNotIn("X-Agent-Task-Id", headers)
+        self.assertNotIn("X-Request-Id", headers)
+        self.assertNotIn("X-Initiator", headers)
+        self.assertNotIn("Anthropic-Version", headers)
+        self.assertNotIn("Anthropic-Beta", headers)
+        self.assertEqual(headers["Authorization"], "Bearer keep")
+        self.assertEqual(headers["user-agent"], _rh.CLAUDE_AGENT_USER_AGENT)
+        self.assertEqual(headers["openai-intent"], "messages-proxy")
+        self.assertEqual(headers["x-interaction-type"], "messages-proxy")
+        self.assertEqual(headers["x-interaction-id"], "new-interaction")
+        self.assertEqual(headers["x-agent-task-id"], "new-request")
+        self.assertEqual(headers["x-request-id"], "new-request")
+        self.assertEqual(headers["x-initiator"], "agent")
+        self.assertEqual(headers["anthropic-version"], "2023-06-01")
+        self.assertEqual(headers["anthropic-beta"], "context-management-2025-06-27")

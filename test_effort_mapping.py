@@ -1,4 +1,5 @@
 import unittest
+from unittest import mock
 
 import effort_mapping
 
@@ -16,6 +17,17 @@ class EffortMappingTests(unittest.TestCase):
             effort_mapping.map_effort_for_model("gpt-5.4", "max"),
             "xhigh",
         )
+
+    def test_openai_prefixed_gpt_models_use_gpt_effort_mapping(self):
+        self.assertEqual(
+            effort_mapping.map_effort_for_model("openai/gpt-5.4", "max"),
+            "xhigh",
+        )
+
+    def test_model_normalization_contract(self):
+        self.assertEqual(effort_mapping._normalize_model(None), "")
+        self.assertEqual(effort_mapping._normalize_model("  OpenAI/GPT-5.4/preview  "), "gpt-5.4/preview")
+        self.assertEqual(effort_mapping._normalize_model("  anthropic/Claude-Sonnet-4.6/beta  "), "claude-sonnet-4.6/beta")
 
     def test_xhigh_is_preserved_for_gpt_models(self):
         self.assertEqual(
@@ -82,6 +94,35 @@ class EffortMappingTests(unittest.TestCase):
         self.assertIsNone(effort_mapping.map_effort_for_model("gpt-5.4", ""))
         self.assertIsNone(effort_mapping.map_effort_for_model("gpt-5.4", "bogus"))
         self.assertIsNone(effort_mapping.map_effort_for_model("claude-opus-4.7", "bogus"))
+
+    def test_base_strategy_methods_are_abstract_sentinels(self):
+        class Concrete(effort_mapping.ModelEffortStrategy):
+            def matches(self, normalized_model):
+                return super().matches(normalized_model)
+
+            def map(self, canonical_effort):
+                return super().map(canonical_effort)
+
+        strategy = Concrete()
+        with self.assertRaises(NotImplementedError):
+            strategy.matches("gpt-5.4")
+        with self.assertRaises(NotImplementedError):
+            strategy.map("high")
+
+    def test_strategy_for_falls_back_to_last_strategy_if_none_match(self):
+        class NoMatch(effort_mapping.ModelEffortStrategy):
+            def matches(self, normalized_model):
+                return False
+
+            def map(self, canonical_effort):
+                return f"mapped:{canonical_effort}"
+
+        fallback = NoMatch()
+        with mock.patch.object(effort_mapping, "_STRATEGIES", [fallback]):
+            self.assertIs(effort_mapping._strategy_for("gpt-5.4"), fallback)
+
+    def test_passthrough_strategy_matches_any_model(self):
+        self.assertTrue(effort_mapping.PassthroughStrategy().matches("unknown-model"))
 
 
 if __name__ == "__main__":

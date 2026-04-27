@@ -1,7 +1,9 @@
 import unittest
+from unittest import mock
 
+import protocol_bridge
 import proxy
-from protocol_bridge import ProtocolBridgePlanner
+from protocol_bridge import BridgeExecutionPlan, ProtocolBridgePlanner, ProtocolBridgeStrategy
 
 
 class _RoutingConfigStub:
@@ -45,6 +47,454 @@ class ProtocolBridgePlannerTests(unittest.TestCase):
         self.assertEqual(plan.header_kind, "responses")
         self.assertEqual(plan.resolved_model, "gpt-5.4")
 
+    def test_default_capability_resolver_requires_explicit_models_cache_support(self):
+        cache = getattr(proxy, "_COPILOT_MODEL_CAPS_CACHE", None)
+        self.assertIsInstance(cache, dict)
+
+        self.assertFalse(protocol_bridge._default_capability_resolver(None))
+        self.assertFalse(protocol_bridge._default_capability_resolver("claude-sonnet-4.6"))
+
+        cache.update(
+            {
+                "data": {
+                    "claude-sonnet-4.6": {"messages_endpoint_supported": True},
+                    "claude-opus-4.6": {"messages_endpoint_supported": False},
+                    "claude-haiku-4.5": "not-a-record",
+                }
+            }
+        )
+
+        self.assertTrue(protocol_bridge._default_capability_resolver("claude-sonnet-4.6"))
+        self.assertFalse(protocol_bridge._default_capability_resolver("claude-opus-4.6"))
+        self.assertFalse(protocol_bridge._default_capability_resolver("claude-haiku-4.5"))
+
+    def test_default_cache_resolvers_treat_proxy_import_failure_as_unknown(self):
+        real_import = __import__
+
+        def fail_proxy_import(name, *args, **kwargs):
+            if name == "proxy":
+                raise ImportError("proxy unavailable")
+            return real_import(name, *args, **kwargs)
+
+        with mock.patch("builtins.__import__", side_effect=fail_proxy_import):
+            self.assertFalse(protocol_bridge._default_capability_resolver("claude-sonnet-4.6"))
+            self.assertIsNone(protocol_bridge._resolve_reasoning_efforts("gpt-5.4"))
+            self.assertFalse(protocol_bridge._default_adaptive_thinking_resolver("claude-sonnet-4.6"))
+
+    def test_resolve_reasoning_efforts_reads_only_string_entries_from_cache(self):
+        cache = getattr(proxy, "_COPILOT_MODEL_CAPS_CACHE", None)
+        self.assertIsInstance(cache, dict)
+
+        self.assertIsNone(protocol_bridge._resolve_reasoning_efforts(None))
+        self.assertIsNone(protocol_bridge._resolve_reasoning_efforts("gpt-5.4"))
+
+        cache.update(
+            {
+                "data": {
+                    "gpt-5.4": {"reasoning_efforts": ["low", "xhigh", 7]},
+                    "gpt-5.4-mini": {"reasoning_efforts": []},
+                    "gpt-5.3-codex": "not-a-record",
+                }
+            }
+        )
+
+        self.assertEqual(protocol_bridge._resolve_reasoning_efforts("gpt-5.4"), ["low", "xhigh"])
+        self.assertIsNone(protocol_bridge._resolve_reasoning_efforts("gpt-5.4-mini"))
+        self.assertIsNone(protocol_bridge._resolve_reasoning_efforts("gpt-5.3-codex"))
+
+        cache.clear()
+        cache.update({"data": ["not-a-dict"]})
+        self.assertIsNone(protocol_bridge._resolve_reasoning_efforts("gpt-5.4"))
+
+    def test_default_adaptive_thinking_resolver_handles_cache_and_offline_allowlist(self):
+        cache = getattr(proxy, "_COPILOT_MODEL_CAPS_CACHE", None)
+        self.assertIsInstance(cache, dict)
+
+        self.assertFalse(protocol_bridge._default_adaptive_thinking_resolver(None))
+        self.assertTrue(protocol_bridge._default_adaptive_thinking_resolver("anthropic/claude-sonnet-4.6"))
+        self.assertTrue(protocol_bridge._default_adaptive_thinking_resolver("claude-opus-4.6"))
+        self.assertFalse(protocol_bridge._default_adaptive_thinking_resolver("gpt-5.4"))
+
+        cache.update(
+            {
+                "data": {
+                    "claude-sonnet-4.6": {"adaptive_thinking_supported": True},
+                    "claude-opus-4.6": {"adaptive_thinking_supported": False},
+                    "claude-haiku-4.5": "not-a-record",
+                }
+            }
+        )
+
+        self.assertTrue(protocol_bridge._default_adaptive_thinking_resolver("claude-sonnet-4.6"))
+        self.assertFalse(protocol_bridge._default_adaptive_thinking_resolver("claude-opus-4.6"))
+        self.assertFalse(protocol_bridge._default_adaptive_thinking_resolver("claude-haiku-4.5"))
+
+        cache.clear()
+        cache.update({"data": ["not-a-dict"]})
+        self.assertTrue(protocol_bridge._default_adaptive_thinking_resolver("claude-sonnet-4.6"))
+
+    def test_bridge_execution_plan_upstream_path_defaults_to_chat(self):
+        plan = BridgeExecutionPlan(
+            strategy_name="dummy",
+            inbound_protocol="responses",
+            caller_protocol="responses",
+            upstream_protocol="chat",
+            header_kind="chat",
+            requested_model="gpt-5.4",
+            resolved_model="claude-sonnet-4.6",
+            upstream_body={},
+            stream=False,
+        )
+
+        self.assertEqual(plan.upstream_path, "/chat/completions")
+
+    def test_planner_pins_exact_execution_plan_metadata_for_each_route(self):
+        cases = [
+            {
+                "name": "responses_to_responses",
+                "planner": ProtocolBridgePlanner(_RoutingConfigStub()),
+                "protocol": "responses",
+                "body": {"model": "gpt-5.4", "input": "hello", "stream": True},
+                "expected": {
+                    "strategy_name": "responses_to_responses",
+                    "inbound_protocol": "responses",
+                    "caller_protocol": "responses",
+                    "upstream_protocol": "responses",
+                    "header_kind": "responses",
+                    "requested_model": "gpt-5.4",
+                    "resolved_model": "gpt-5.4",
+                    "stream": True,
+                    "is_compact": False,
+                    "upstream_path": "/responses",
+                    "diagnostics": (),
+                },
+            },
+            {
+                "name": "responses_to_chat",
+                "planner": ProtocolBridgePlanner(_RoutingConfigStub("claude-opus-4.6"), capability_resolver=lambda _model: False),
+                "protocol": "responses",
+                "body": {"model": "gpt-5.4", "input": "hello", "stream": False},
+                "expected": {
+                    "strategy_name": "responses_to_chat",
+                    "inbound_protocol": "responses",
+                    "caller_protocol": "responses",
+                    "upstream_protocol": "chat",
+                    "header_kind": "chat",
+                    "requested_model": "gpt-5.4",
+                    "resolved_model": "claude-opus-4.6",
+                    "stream": False,
+                    "is_compact": False,
+                    "upstream_path": "/chat/completions",
+                    "diagnostics": (),
+                },
+            },
+            {
+                "name": "responses_to_messages",
+                "planner": ProtocolBridgePlanner(_RoutingConfigStub("claude-sonnet-4.6"), capability_resolver=lambda _model: True),
+                "protocol": "responses",
+                "body": {"model": "gpt-5.4", "input": "hello", "stream": False},
+                "expected": {
+                    "strategy_name": "responses_to_messages",
+                    "inbound_protocol": "responses",
+                    "caller_protocol": "responses",
+                    "upstream_protocol": "messages",
+                    "header_kind": "messages",
+                    "requested_model": "gpt-5.4",
+                    "resolved_model": "claude-sonnet-4.6",
+                    "stream": False,
+                    "is_compact": False,
+                    "upstream_path": "/v1/messages",
+                    "diagnostics": (),
+                },
+            },
+            {
+                "name": "messages_to_messages",
+                "planner": ProtocolBridgePlanner(_RoutingConfigStub("claude-sonnet-4.6"), capability_resolver=lambda _model: True),
+                "protocol": "messages",
+                "body": {
+                    "model": "claude-opus-4.6",
+                    "messages": [{"role": "user", "content": [{"type": "text", "text": "hello"}]}],
+                    "stream": True,
+                },
+                "expected": {
+                    "strategy_name": "messages_to_messages",
+                    "inbound_protocol": "messages",
+                    "caller_protocol": "anthropic",
+                    "upstream_protocol": "messages",
+                    "header_kind": "messages",
+                    "requested_model": "claude-opus-4.6",
+                    "resolved_model": "claude-sonnet-4.6",
+                    "stream": True,
+                    "is_compact": False,
+                    "upstream_path": "/v1/messages",
+                    "diagnostics": (),
+                },
+            },
+            {
+                "name": "messages_to_chat",
+                "planner": ProtocolBridgePlanner(_RoutingConfigStub("claude-sonnet-4.6"), capability_resolver=lambda _model: False),
+                "protocol": "messages",
+                "body": {
+                    "model": "claude-opus-4.6",
+                    "messages": [{"role": "user", "content": [{"type": "text", "text": "hello"}]}],
+                    "stream": False,
+                },
+                "expected": {
+                    "strategy_name": "messages_to_chat",
+                    "inbound_protocol": "messages",
+                    "caller_protocol": "anthropic",
+                    "upstream_protocol": "chat",
+                    "header_kind": "anthropic",
+                    "requested_model": "claude-opus-4.6",
+                    "resolved_model": "claude-sonnet-4.6",
+                    "stream": False,
+                    "is_compact": False,
+                    "upstream_path": "/chat/completions",
+                    "diagnostics": (),
+                },
+            },
+            {
+                "name": "messages_to_responses",
+                "planner": ProtocolBridgePlanner(_RoutingConfigStub("gpt-5.4")),
+                "protocol": "messages",
+                "body": {
+                    "model": "claude-opus-4.6",
+                    "messages": [{"role": "user", "content": [{"type": "text", "text": "hello"}]}],
+                    "stream": True,
+                },
+                "expected": {
+                    "strategy_name": "messages_to_responses",
+                    "inbound_protocol": "messages",
+                    "caller_protocol": "anthropic",
+                    "upstream_protocol": "responses",
+                    "header_kind": "responses",
+                    "requested_model": "claude-opus-4.6",
+                    "resolved_model": "gpt-5.4",
+                    "stream": True,
+                    "is_compact": False,
+                    "upstream_path": "/responses",
+                    "diagnostics": (),
+                },
+            },
+        ]
+
+        for case in cases:
+            with self.subTest(case=case["name"]):
+                plan = proxy.asyncio.run(
+                    case["planner"].plan(
+                        case["protocol"],
+                        case["body"],
+                        api_base="https://example.invalid",
+                        api_key="test-key",
+                    )
+                )
+                self.assertEqual(
+                    {
+                        "strategy_name": plan.strategy_name,
+                        "inbound_protocol": plan.inbound_protocol,
+                        "caller_protocol": plan.caller_protocol,
+                        "upstream_protocol": plan.upstream_protocol,
+                        "header_kind": plan.header_kind,
+                        "requested_model": plan.requested_model,
+                        "resolved_model": plan.resolved_model,
+                        "stream": plan.stream,
+                        "is_compact": plan.is_compact,
+                        "upstream_path": plan.upstream_path,
+                        "diagnostics": plan.diagnostics,
+                    },
+                    case["expected"],
+                )
+
+    def test_base_strategy_matches_tuple_and_scalar_families(self):
+        class DummyStrategy(ProtocolBridgeStrategy):
+            strategy_name = "dummy"
+            inbound_protocol = "responses"
+            target_family = ("claude", "gemini")
+            upstream_protocol = "chat"
+            header_kind = "chat"
+            caller_protocol = "responses"
+
+            async def build_plan(self, body, *, requested_model, resolved_model, api_base, api_key, is_compact=False):
+                del body, requested_model, resolved_model, api_base, api_key, is_compact
+                raise NotImplementedError
+
+        strategy = DummyStrategy()
+
+        self.assertTrue(strategy.matches("responses", "claude"))
+        self.assertTrue(strategy.matches("responses", "gemini"))
+        self.assertFalse(strategy.matches("messages", "claude"))
+        self.assertFalse(strategy.matches("responses", "codex"))
+
+    def test_native_responses_strategy_maps_reasoning_effort_before_upstream(self):
+        planner = ProtocolBridgePlanner(_RoutingConfigStub())
+        body = {
+            "model": "gpt-5.4",
+            "input": "hello",
+            "stream": True,
+            "reasoning": {"effort": "max", "summary": "auto"},
+        }
+
+        plan = proxy.asyncio.run(
+            planner.plan("responses", body, api_base="https://example.invalid", api_key="test-key")
+        )
+
+        self.assertEqual(plan.strategy_name, "responses_to_responses")
+        self.assertTrue(plan.stream)
+        self.assertEqual(plan.upstream_body["reasoning"], {"effort": "xhigh", "summary": "auto"})
+
+    def test_native_responses_strategy_leaves_unmapped_reasoning_effort_unchanged(self):
+        planner = ProtocolBridgePlanner(_RoutingConfigStub())
+        body = {
+            "model": "gpt-5.4",
+            "input": "hello",
+            "reasoning": {"effort": "unrecognized", "summary": "auto"},
+        }
+
+        plan = proxy.asyncio.run(
+            planner.plan("responses", body, api_base="https://example.invalid", api_key="test-key")
+        )
+
+        self.assertEqual(plan.upstream_body["reasoning"], {"effort": "unrecognized", "summary": "auto"})
+
+    def test_abstract_strategy_build_plan_raises_when_called_directly(self):
+        async def call_base_build_plan():
+            return await ProtocolBridgeStrategy.build_plan(
+                object(),
+                {},
+                requested_model=None,
+                resolved_model=None,
+                api_base="https://example.invalid",
+                api_key="test-key",
+                is_compact=False,
+            )
+
+        with self.assertRaises(NotImplementedError):
+            proxy.asyncio.run(call_base_build_plan())
+
+    def test_planner_rejects_unknown_mapped_model_family(self):
+        planner = ProtocolBridgePlanner(_RoutingConfigStub("unknown-family-model"))
+
+        with self.assertRaisesRegex(ValueError, "Unsupported mapped model family"):
+            proxy.asyncio.run(
+                planner.plan(
+                    "responses",
+                    {"model": "gpt-5.4", "input": "hello"},
+                    api_base="https://example.invalid",
+                    api_key="test-key",
+                )
+            )
+
+    def test_strategy_for_rejects_unsupported_protocol_family_pair(self):
+        planner = ProtocolBridgePlanner(_RoutingConfigStub())
+
+        with self.assertRaisesRegex(ValueError, "No bridge strategy for messages -> unsupported"):
+            planner._strategy_for("messages", "unsupported", "gpt-5.4")
+
+    def test_translation_strategies_inject_resolved_model_before_translation(self):
+        responses_body = {"model": "gpt-5.3-codex", "input": "hello"}
+        messages_body = {
+            "model": "claude-opus-4.6",
+            "messages": [{"role": "user", "content": "hello"}],
+        }
+
+        with mock.patch.object(
+            protocol_bridge.format_translation,
+            "responses_request_to_chat",
+            side_effect=lambda body: {"model": body.get("model"), "stream": body.get("stream", False)},
+        ) as responses_to_chat:
+            plan = proxy.asyncio.run(
+                protocol_bridge.ResponsesToChatStrategy().build_plan(
+                    responses_body,
+                    requested_model="gpt-5.3-codex",
+                    resolved_model="claude-sonnet-4.6",
+                    api_base="https://example.invalid",
+                    api_key="test-key",
+                    is_compact=False,
+                )
+            )
+
+        self.assertEqual(responses_to_chat.call_args.args[0]["model"], "claude-sonnet-4.6")
+        self.assertEqual(plan.upstream_body["model"], "claude-sonnet-4.6")
+        self.assertFalse(plan.is_compact)
+
+        with mock.patch.object(
+            protocol_bridge.format_translation,
+            "anthropic_request_to_chat",
+            new=mock.AsyncMock(return_value={"model": "claude-sonnet-4.6", "stream": False}),
+        ) as messages_to_chat:
+            plan = proxy.asyncio.run(
+                protocol_bridge.MessagesToChatStrategy().build_plan(
+                    messages_body,
+                    requested_model="claude-opus-4.6",
+                    resolved_model="claude-sonnet-4.6",
+                    api_base="https://api-base.invalid",
+                    api_key="api-key",
+                    is_compact=True,
+                )
+            )
+
+        call_body, call_api_base, call_api_key = messages_to_chat.call_args.args
+        self.assertEqual(call_body["model"], "claude-sonnet-4.6")
+        self.assertEqual(call_api_base, "https://api-base.invalid")
+        self.assertEqual(call_api_key, "api-key")
+        self.assertTrue(plan.is_compact)
+
+        with mock.patch.object(
+            protocol_bridge.format_translation,
+            "responses_request_to_anthropic_messages",
+            side_effect=lambda body: {
+                "model": body.get("model"),
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+        ) as responses_to_messages:
+            plan = proxy.asyncio.run(
+                protocol_bridge.ResponsesToMessagesStrategy().build_plan(
+                    responses_body,
+                    requested_model="gpt-5.3-codex",
+                    resolved_model="claude-sonnet-4.6",
+                    api_base="https://example.invalid",
+                    api_key="test-key",
+                    is_compact=False,
+                )
+            )
+
+        self.assertEqual(responses_to_messages.call_args.args[0]["model"], "claude-sonnet-4.6")
+        self.assertEqual(plan.upstream_body["model"], "claude-sonnet-4.6")
+        self.assertFalse(plan.is_compact)
+
+    def test_messages_to_messages_defaults_absent_stream_to_false(self):
+        body = {
+            "model": "claude-opus-4.6",
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hello"}]}],
+        }
+
+        plan = proxy.asyncio.run(
+            protocol_bridge.MessagesToMessagesStrategy().build_plan(
+                body,
+                requested_model="claude-opus-4.6",
+                resolved_model="claude-sonnet-4.6",
+                api_base="https://example.invalid",
+                api_key="test-key",
+                is_compact=False,
+            )
+        )
+
+        self.assertFalse(plan.stream)
+        self.assertFalse(plan.is_compact)
+
+        compact_plan = proxy.asyncio.run(
+            protocol_bridge.MessagesToMessagesStrategy().build_plan(
+                body,
+                requested_model="claude-opus-4.6",
+                resolved_model="claude-sonnet-4.6",
+                api_base="https://example.invalid",
+                api_key="test-key",
+                is_compact=True,
+            )
+        )
+
+        self.assertTrue(compact_plan.is_compact)
+
     def test_planner_strips_unsupported_image_generation_tools_for_native_responses(self):
         planner = ProtocolBridgePlanner(_RoutingConfigStub())
         body = {
@@ -65,7 +515,7 @@ class ProtocolBridgePlannerTests(unittest.TestCase):
         self.assertNotIn("tool_choice", plan.upstream_body)
         self.assertNotIn("parallel_tool_calls", plan.upstream_body)
 
-    def test_planner_strips_service_tier_but_preserves_cache_affinity_for_native_responses(self):
+    def test_planner_uses_cache_affinity_fields_locally_for_native_responses(self):
         planner = ProtocolBridgePlanner(_RoutingConfigStub())
         body = {
             "model": "gpt-5.4",
@@ -86,6 +536,11 @@ class ProtocolBridgePlannerTests(unittest.TestCase):
         self.assertNotIn("sessionId", plan.upstream_body)
         self.assertNotIn("prompt_cache_key", plan.upstream_body)
         self.assertNotIn("previous_response_id", plan.upstream_body)
+        self.assertEqual(plan.upstream_body["input"], "hello")
+        self.assertEqual(
+            plan.diagnostics[0]["fields"],
+            ["previous_response_id", "prompt_cache_key", "service_tier", "sessionId"],
+        )
 
     def test_planner_strips_invalid_deferred_tools_for_native_responses(self):
         planner = ProtocolBridgePlanner(_RoutingConfigStub())

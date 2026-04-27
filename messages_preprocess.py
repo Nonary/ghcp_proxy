@@ -60,6 +60,9 @@ _COMPACT_AUTO_CONTINUE_PROMPT_STARTS = (
     # OpenCode
     "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed.",
 )
+_MERGE_TOOL_RESULT_SKIP_LAST_DEFAULT = False
+_PASSTHROUGH_IS_COMPACT_DEFAULT = False
+_NO_INCOMING_EFFORT = object()
 
 
 # ---------------------------------------------------------------------------
@@ -71,7 +74,7 @@ def _strip_scope_from_block(block: Any) -> None:
         return
     cc = block.get("cache_control")
     if isinstance(cc, dict) and "scope" in cc:
-        cc.pop("scope", None)
+        del cc["scope"]
     # Recurse into nested content arrays (tool_result blocks etc.)
     nested = block.get("content")
     if isinstance(nested, list):
@@ -506,8 +509,8 @@ def _merge_user_message_content(content: list) -> list | None:
         remaining = attachments
         count_indices = list(mergeable)
 
-        if documents and pdf_indices:
-            pair_count = min(len(pdf_indices), len(documents))
+        pair_count = min(len(pdf_indices), len(documents))
+        if pair_count:
             matched_docs = documents[:pair_count]
             matched_doc_orders = {o for (o, _) in matched_docs}
             matched_pdf_indices = pdf_indices[:pair_count]
@@ -537,7 +540,11 @@ def _merge_user_message_content(content: list) -> list | None:
     return list(tool_results)
 
 
-def merge_tool_result_with_reminder(body: dict, *, skip_last_message: bool = False) -> dict:
+def merge_tool_result_with_reminder(
+    body: dict,
+    *,
+    skip_last_message: bool = _MERGE_TOOL_RESULT_SKIP_LAST_DEFAULT,
+) -> dict:
     """Port of copilot-api's ``mergeToolResultForClaude``.
 
     For every user turn whose content is a list of tool_result / text /
@@ -552,10 +559,8 @@ def merge_tool_result_with_reminder(body: dict, *, skip_last_message: bool = Fal
     if not isinstance(messages, list) or not messages:
         return body
 
-    last_idx = len(messages) - 1
-    for idx, msg in enumerate(messages):
-        if skip_last_message and idx == last_idx:
-            continue
+    messages_to_process = messages[:-1] if skip_last_message else messages
+    for msg in messages_to_process:
         if not isinstance(msg, dict) or msg.get("role") != "user":
             continue
         content = msg.get("content")
@@ -644,13 +649,12 @@ def sanitize_ide_tools(body: dict) -> dict:
 
 def budget_tokens_to_effort(budget_tokens: int | None) -> str:
     """Map an Anthropic ``thinking.budget_tokens`` value to a Copilot effort."""
-    if not isinstance(budget_tokens, int) or budget_tokens <= 0:
-        return "low"
-    if budget_tokens <= 1024:
-        return "low"
-    if budget_tokens <= 8192:
-        return "medium"
-    return "high"
+    if isinstance(budget_tokens, int):
+        if budget_tokens > 8192:
+            return "high"
+        if budget_tokens > 1024:
+            return "medium"
+    return "low"
 
 
 def _tool_choice_blocks_thinking(tool_choice: Any) -> bool:
@@ -711,11 +715,11 @@ def apply_adaptive_thinking(
     # translator (e.g. responses_request_to_anthropic_messages maps
     # reasoning.effort to output_config.effort BEFORE preprocess runs).
     output_config = body.get("output_config")
-    incoming_effort: str | None = None
+    incoming_effort: str | object = _NO_INCOMING_EFFORT
     if isinstance(output_config, dict):
         oc_effort = output_config.get("effort")
         if isinstance(oc_effort, str) and oc_effort:
-            incoming_effort = oc_effort.strip().lower() or None
+            incoming_effort = oc_effort.strip().lower() or _NO_INCOMING_EFFORT
 
     new_thinking: dict = {"type": "adaptive"}
     if not had_thinking:
@@ -729,7 +733,7 @@ def apply_adaptive_thinking(
     # Effort resolution: budget -> existing output_config -> default "high"
     if budget is not None:
         effort = budget_tokens_to_effort(budget)
-    elif incoming_effort:
+    elif incoming_effort is not _NO_INCOMING_EFFORT:
         effort = incoming_effort
     else:
         effort = "high"
@@ -835,7 +839,7 @@ def prepare_messages_passthrough_payload(
     body: dict,
     *,
     model_supports_adaptive: bool,
-    is_compact: bool = False,
+    is_compact: bool = _PASSTHROUGH_IS_COMPACT_DEFAULT,
     reasoning_efforts: Iterable[str] | None = None,
 ) -> dict:
     """Run the full passthrough preprocessing pipeline on a deep copy.
@@ -867,7 +871,4 @@ def clamp_temperature_for_claude(body: dict) -> None:
         return
     temp = body.get("temperature")
     if isinstance(temp, (int, float)):
-        if temp < 0:
-            body["temperature"] = 0
-        elif temp > 1:
-            body["temperature"] = 1
+        body["temperature"] = max(0, min(1, temp))

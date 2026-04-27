@@ -14,9 +14,17 @@ from constants import (
 _CLIENT_SESSION_ID = str(uuid.uuid4())
 _RESPONSES_AFFINITY_BY_SESSION: dict[str, dict[str, str]] = {}
 _RESPONSES_DEFAULT_AFFINITY: dict[str, str] | None = None
+_RESPONSES_AFFINITY_RESET_DEFAULT = False
+_FORWARD_SESSION_HEADER_DEFAULT = True
+_VISION_INPUT_INITIAL_DEPTH = 0
+_VISION_INPUT_MAX_DEPTH = 10
 
 
-def has_vision_input(value, depth=0, max_depth=10) -> bool:
+def has_vision_input(
+    value,
+    depth: int = _VISION_INPUT_INITIAL_DEPTH,
+    max_depth: int = _VISION_INPUT_MAX_DEPTH,
+) -> bool:
     """Recursively find type='input_image' anywhere in the input tree."""
     if depth > max_depth or value is None:
         return False
@@ -24,7 +32,8 @@ def has_vision_input(value, depth=0, max_depth=10) -> bool:
         return any(has_vision_input(i, depth + 1, max_depth) for i in value)
     if not isinstance(value, dict):
         return False
-    if str(value.get("type", "")).lower() == "input_image":
+    value_type = value.get("type")
+    if isinstance(value_type, str) and value_type.lower() == "input_image":
         return True
     content = value.get("content")
     if isinstance(content, list):
@@ -57,7 +66,7 @@ def _responses_affinity_headers(
     initiator: str,
     session_id: str | None,
     *,
-    reset: bool = False,
+    reset: bool = _RESPONSES_AFFINITY_RESET_DEFAULT,
     stable_user_affinity: bool = False,
 ) -> dict[str, str]:
     global _RESPONSES_DEFAULT_AFFINITY
@@ -122,7 +131,7 @@ def _apply_forwarded_request_headers(
     request_body: dict | None = None,
     *,
     session_id_resolver=None,
-    forward_session_header: bool = True,
+    forward_session_header: bool = _FORWARD_SESSION_HEADER_DEFAULT,
     synthesize_client_request_id: bool = True,
 ):
     session_id = session_id_resolver(request, request_body) if session_id_resolver else None
@@ -221,11 +230,13 @@ def build_responses_headers_for_request(
         body["input"] = effective_input
     headers["X-Initiator"] = initiator
     headers["x-interaction-type"] = _interaction_type_for_initiator(initiator)
-    headers.update(_responses_affinity_headers(
-        initiator,
-        affinity_key,
-        stable_user_affinity=stable_user_affinity,
-    ))
+    headers.update(
+        _responses_affinity_headers(
+            initiator,
+            affinity_key,
+            stable_user_affinity=stable_user_affinity,
+        )
+    )
 
     if has_vision_input(effective_input):
         headers["Copilot-Vision-Request"] = "true"
@@ -432,7 +443,7 @@ def build_anthropic_messages_passthrough_headers(
         "anthropic-beta",
     )
     for key in [k for k in list(headers.keys()) if k.lower() in _drop_keys]:
-        headers.pop(key, None)
+        del headers[key]
 
     headers["x-agent-task-id"] = request_id
     headers["x-request-id"] = request_id

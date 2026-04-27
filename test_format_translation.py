@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 import gzip
+import json
 
 import format_translation
 import proxy
@@ -36,6 +37,147 @@ class FormatTranslationTests(unittest.TestCase):
 
         self.assertEqual(parsed["model"], "gpt-5")
         self.assertEqual(parsed["input"], "hello")
+
+    def test_chat_usage_to_response_exact_contract(self):
+        self.assertEqual(
+            format_translation.chat_usage_to_response(None),
+            {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+        )
+        self.assertEqual(
+            format_translation.chat_usage_to_response(
+                {
+                    "prompt_tokens": 20,
+                    "completion_tokens": 4,
+                    "prompt_tokens_details": {"cached_tokens": 6},
+                    "completion_tokens_details": {"reasoning_tokens": 3},
+                }
+            ),
+            {
+                "input_tokens": 20,
+                "output_tokens": 4,
+                "total_tokens": 24,
+                "input_tokens_details": {"cached_tokens": 6},
+                "output_tokens_details": {"reasoning_tokens": 3},
+            },
+        )
+
+    def test_chat_completion_to_response_exact_contract(self):
+        self.assertEqual(
+            format_translation.chat_completion_to_response(
+                {"id": "chat-empty", "created": 123, "model": "gpt-5.4", "choices": []}
+            ),
+            {
+                "id": "chat-empty",
+                "object": "response",
+                "created_at": 123,
+                "status": "completed",
+                "model": "gpt-5.4",
+                "output": [],
+                "output_text": "",
+                "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+            },
+        )
+
+        translated = format_translation.chat_completion_to_response(
+            {
+                "id": "chat-1",
+                "created": 456,
+                "model": "gpt-5.4",
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "hello",
+                            "tool_calls": [
+                                {
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {"name": "Read", "arguments": '{"file":"main.py"}'},
+                                }
+                            ],
+                        }
+                    }
+                ],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 2},
+            },
+            fallback_model="resolved-model",
+        )
+
+        self.assertEqual(translated["id"], "chat-1")
+        self.assertEqual(translated["object"], "response")
+        self.assertEqual(translated["created_at"], 456)
+        self.assertEqual(translated["status"], "completed")
+        self.assertEqual(translated["model"], "resolved-model")
+        self.assertEqual(
+            translated["output"],
+            [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "hello"}],
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "Read",
+                    "arguments": '{"file":"main.py"}',
+                },
+            ],
+        )
+        self.assertEqual(translated["output_text"], "hello")
+        self.assertEqual(translated["usage"], {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5})
+
+    def test_tool_choice_helpers_exact_contracts(self):
+        self.assertIsNone(format_translation.responses_tool_choice_to_chat(None))
+        self.assertEqual(format_translation.responses_tool_choice_to_chat("required"), "required")
+        self.assertEqual(format_translation.responses_tool_choice_to_chat({"type": "required"}), "required")
+        self.assertEqual(
+            format_translation.responses_tool_choice_to_chat({"type": "function", "name": "Read"}),
+            {"type": "function", "function": {"name": "Read"}},
+        )
+        self.assertEqual(
+            format_translation.responses_tool_choice_to_chat(
+                {"type": "function", "function": {"name": "Read"}}
+            ),
+            {"type": "function", "function": {"name": "Read"}},
+        )
+        self.assertIsNone(
+            format_translation.responses_tool_choice_to_chat(
+                {"type": "function", "name": "mcp__ide__executeCode"}
+            )
+        )
+        with self.assertRaisesRegex(ValueError, "Unsupported Responses tool_choice value"):
+            format_translation.responses_tool_choice_to_chat({})
+
+        self.assertIsNone(format_translation.chat_tool_choice_to_responses(None))
+        self.assertEqual(format_translation.chat_tool_choice_to_responses("auto"), "auto")
+        self.assertEqual(format_translation.chat_tool_choice_to_responses({"type": "required"}), "required")
+        self.assertEqual(
+            format_translation.chat_tool_choice_to_responses({"type": "function", "function": {"name": "Read"}}),
+            {"type": "function", "name": "Read"},
+        )
+        self.assertIsNone(
+            format_translation.chat_tool_choice_to_responses(
+                {"type": "function", "function": {"name": "mcp__ide__executeCode"}}
+            )
+        )
+        with self.assertRaisesRegex(ValueError, "Unsupported chat tool_choice value"):
+            format_translation.chat_tool_choice_to_responses({})
+
+        self.assertIsNone(format_translation.anthropic_tool_choice_to_chat(None))
+        self.assertEqual(format_translation.anthropic_tool_choice_to_chat("auto"), "auto")
+        self.assertEqual(format_translation.anthropic_tool_choice_to_chat({"type": "any"}), "required")
+        self.assertEqual(
+            format_translation.anthropic_tool_choice_to_chat({"type": "tool", "name": "Read"}),
+            {"type": "function", "function": {"name": "Read"}},
+        )
+        self.assertIsNone(
+            format_translation.anthropic_tool_choice_to_chat(
+                {"type": "tool", "name": "mcp__ide__executeCode"}
+            )
+        )
+        with self.assertRaisesRegex(ValueError, "Unsupported Anthropic tool_choice value"):
+            format_translation.anthropic_tool_choice_to_chat({})
 
     def test_anthropic_request_to_chat_translates_cache_control_to_copilot_cache_control(self):
         body = {
@@ -351,6 +493,563 @@ class FormatTranslationTests(unittest.TestCase):
         body = {"model": "openai/gpt-5.4", "input": "hi"}
         translated = format_translation.responses_request_to_chat(body)
         self.assertNotIn("reasoning_effort", translated)
+
+    def test_model_resolution_helpers_are_exact_for_upstream_cache_keys(self):
+        cases = [
+            (None, None, None),
+            (123, 123, 123),
+            (" anthropic/Claude-Sonnet-Latest ", "claude-sonnet-latest", "claude-sonnet-4.6"),
+            ("anthropic/claude-opus-4.6", "claude-opus-4.6", "claude-opus-4.6"),
+            ("claude-opus-experimental", "claude-opus-experimental", "claude-opus-4.7"),
+            ("claude-haiku-next", "claude-haiku-next", "claude-haiku-4.5"),
+            ("openai/gpt-5.4", "gpt-5.4", "gpt-5.4"),
+        ]
+
+        for source, normalized, resolved in cases:
+            with self.subTest(source=source):
+                self.assertEqual(format_translation.normalize_upstream_model_name(source), normalized)
+                self.assertEqual(format_translation.resolve_copilot_model_name(source), resolved)
+
+    def test_anthropic_to_chat_full_upstream_payload_shape_is_stable(self):
+        body = {
+            "model": "anthropic/claude-sonnet-latest",
+            "system": [
+                {"type": "text", "text": "sys-a"},
+                {"type": "text", "text": "sys-b", "cache_control": {"ephemeral": {"scope": "conversation"}}},
+            ],
+            "thinking": {"type": "enabled", "budget_tokens": 10000},
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "look", "cache_control": {"type": "ephemeral"}},
+                        {"type": "image", "source": {"type": "url", "url": "https://example.invalid/a.png"}},
+                    ],
+                },
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": "calling"},
+                        {"type": "tool_use", "id": "tool_1", "name": "Read", "input": {"path": "a.py"}},
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "tool_1",
+                            "content": [{"type": "text", "text": "file"}],
+                            "cache_control": {"type": "ephemeral"},
+                        },
+                        {"type": "text", "text": "done"},
+                    ],
+                },
+            ],
+            "tools": [
+                {
+                    "name": "Read",
+                    "description": "Read files",
+                    "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}},
+                    "cache_control": {"type": "ephemeral"},
+                },
+                {"name": "mcp__ide__executeCode", "description": "Execute code", "input_schema": {"type": "object"}},
+            ],
+            "tool_choice": {"type": "tool", "name": "Read"},
+            "stream": True,
+            "max_tokens": 123,
+            "temperature": 0.2,
+            "top_p": 0.8,
+            "stop_sequences": ["STOP"],
+        }
+
+        outbound = proxy.asyncio.run(format_translation.anthropic_request_to_chat(body, "https://example.invalid", "test-key"))
+
+        self.assertEqual(
+            outbound,
+            {
+                "model": "claude-sonnet-4.6",
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": [
+                            {"type": "text", "text": "sys-a"},
+                            {"type": "text", "text": "sys-b", "copilot_cache_control": {"type": "ephemeral"}},
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "look", "copilot_cache_control": {"type": "ephemeral"}},
+                            {"type": "image_url", "image_url": {"url": "https://example.invalid/a.png"}},
+                        ],
+                    },
+                    {
+                        "role": "assistant",
+                        "content": "calling",
+                        "tool_calls": [
+                            {
+                                "id": "tool_1",
+                                "type": "function",
+                                "function": {"name": "Read", "arguments": '{"path":"a.py"}'},
+                            }
+                        ],
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": "tool_1",
+                        "content": "file",
+                        "copilot_cache_control": {"type": "ephemeral"},
+                    },
+                    {"role": "user", "content": "done"},
+                ],
+                "stream": True,
+                "stream_options": {"include_usage": True},
+                "max_tokens": 123,
+                "temperature": 0.2,
+                "top_p": 0.8,
+                "stop": ["STOP"],
+                "reasoning_effort": "high",
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "Read",
+                            "description": "Read files",
+                            "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+                        },
+                        "copilot_cache_control": {"type": "ephemeral"},
+                    }
+                ],
+                "tool_choice": {"type": "function", "function": {"name": "Read"}},
+            },
+        )
+
+    def test_responses_to_chat_full_upstream_payload_shape_is_stable(self):
+        body = {
+            "model": "anthropic/claude-sonnet-4.6",
+            "instructions": "global",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "developer",
+                    "content": [{"type": "input_text", "text": "dev", "copilot_cache_control": {"type": "ephemeral"}}],
+                },
+                {"type": "message", "role": "system", "content": "sys"},
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "hello", "copilot_cache_control": {"type": "ephemeral"}},
+                        {"type": "input_file", "filename": "doc.pdf", "file_data": "data:application/pdf;base64,PDF"},
+                        {"type": "input_image", "image_url": {"url": "https://example.invalid/i.png"}},
+                    ],
+                },
+                {"type": "function_call", "call_id": "call_1", "name": "Read", "arguments": {"path": "a.py"}},
+                {"type": "message", "role": "user", "content": "defer until tool done"},
+                {"type": "function_call_output", "call_id": "call_1", "output": [{"type": "output_text", "text": "contents"}]},
+                {"type": "custom_tool_call", "call_id": "ct_1", "name": "apply_patch", "input": {"patch": "x"}},
+                {"type": "custom_tool_call_output", "call_id": "ct_1", "output": {"ok": True}},
+            ],
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "Read",
+                    "description": "Read files",
+                    "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+                    "cache_control": {"type": "ephemeral"},
+                },
+                {"type": "function", "name": "mcp__ide__executeCode"},
+            ],
+            "tool_choice": {"type": "function", "name": "Read"},
+            "stream": True,
+            "max_output_tokens": 55,
+            "temperature": 0.3,
+            "top_p": 0.7,
+            "reasoning": {"effort": "max"},
+        }
+
+        translated = format_translation.responses_request_to_chat(body)
+
+        self.assertEqual(
+            translated,
+            {
+                "model": "claude-sonnet-4.6",
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": [
+                            {"type": "text", "text": "global"},
+                            {"type": "text", "text": "\n\n"},
+                            {"type": "text", "text": "dev", "copilot_cache_control": {"type": "ephemeral"}},
+                            {"type": "text", "text": "\n\n"},
+                            {"type": "text", "text": "sys"},
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "hello", "copilot_cache_control": {"type": "ephemeral"}},
+                            {
+                                "type": "document",
+                                "source": {"type": "base64", "media_type": "application/pdf", "data": "PDF"},
+                                "title": "doc.pdf",
+                            },
+                            {"type": "image_url", "image_url": {"url": "https://example.invalid/i.png"}},
+                        ],
+                    },
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {"name": "Read", "arguments": '{"path":"a.py"}'},
+                            }
+                        ],
+                    },
+                    {"role": "tool", "tool_call_id": "call_1", "content": "contents"},
+                    {"role": "user", "content": "defer until tool done"},
+                    {"role": "assistant", "content": '[Custom tool call (ct_1)] apply_patch\n{"patch":"x"}'},
+                    {"role": "user", "content": '[Custom tool result (ct_1)]\n{"ok":true}'},
+                ],
+                "stream": True,
+                "stream_options": {"include_usage": True},
+                "max_tokens": 55,
+                "temperature": 0.3,
+                "top_p": 0.7,
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "Read",
+                            "description": "Read files",
+                            "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+                        },
+                        "copilot_cache_control": {"type": "ephemeral"},
+                    }
+                ],
+                "tool_choice": {"type": "function", "function": {"name": "Read"}},
+                "reasoning_effort": "max",
+            },
+        )
+
+    def test_anthropic_to_responses_full_upstream_payload_shape_is_stable(self):
+        body = {
+            "model": "anthropic/claude-sonnet-4.6",
+            "system": [{"type": "text", "text": "sys", "cache_control": {"type": "ephemeral"}}],
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "hello", "cache_control": {"type": "ephemeral"}},
+                        {"type": "image", "source": {"type": "url", "url": "https://example.invalid/i.png"}},
+                    ],
+                },
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": "answer"},
+                        {"type": "tool_use", "id": "tool_1", "name": "Read", "input": {"path": "a.py"}},
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "tool_result", "tool_use_id": "tool_1", "content": "contents"},
+                        {"type": "text", "text": "continue"},
+                    ],
+                },
+            ],
+            "tools": [
+                {
+                    "name": "Read",
+                    "description": "Read files",
+                    "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}},
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
+            "tool_choice": {"type": "tool", "name": "Read"},
+            "stream": True,
+            "max_tokens": 99,
+            "temperature": 0.4,
+            "top_p": 0.9,
+            "metadata": {"m": "v"},
+            "output_config": {"effort": "high"},
+        }
+
+        translated = format_translation.anthropic_request_to_responses(body)
+
+        self.assertEqual(
+            translated,
+            {
+                "model": "claude-sonnet-4.6",
+                "input": [
+                    {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "sys"}]},
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [
+                            {"type": "input_text", "text": "hello"},
+                            {"type": "input_image", "image_url": "https://example.invalid/i.png"},
+                        ],
+                    },
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "answer", "annotations": []}],
+                    },
+                    {"type": "function_call", "call_id": "tool_1", "name": "Read", "arguments": '{"path":"a.py"}'},
+                    {"type": "function_call_output", "call_id": "tool_1", "output": "contents"},
+                    {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "continue"}]},
+                ],
+                "stream": True,
+                "store": False,
+                "parallel_tool_calls": True,
+                "include": ["reasoning.encrypted_content"],
+                "text": {"format": {"type": "text"}, "verbosity": "low"},
+                "max_output_tokens": 99,
+                "temperature": 0.4,
+                "top_p": 0.9,
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "Read",
+                        "description": "Read files",
+                        "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+                    }
+                ],
+                "tool_choice": {"type": "function", "name": "Read"},
+                "reasoning": {"effort": "high"},
+            },
+        )
+
+    def test_anthropic_image_and_cache_helpers_are_exact(self):
+        self.assertEqual(
+            format_translation._normalize_anthropic_cache_control(
+                {"ephemeral": {"scope": "conversation"}}
+            ),
+            {"type": "ephemeral"},
+        )
+        self.assertEqual(
+            format_translation._normalize_anthropic_cache_control(
+                {"ttl": "5m", "scope": "conversation"}
+            ),
+            {"ttl": "5m", "scope": "conversation"},
+        )
+        self.assertIsNone(format_translation._normalize_anthropic_cache_control("bad"))
+
+        self.assertEqual(
+            format_translation._anthropic_image_block_to_chat(
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": "AAAA",
+                    },
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ),
+            {
+                "type": "image_url",
+                "image_url": {"url": "data:image/png;base64,AAAA"},
+                "copilot_cache_control": {"type": "ephemeral"},
+            },
+        )
+        with self.assertRaisesRegex(ValueError, "missing a valid source object"):
+            format_translation._anthropic_image_block_to_chat({"type": "image"})
+        with self.assertRaisesRegex(ValueError, "must include media_type and data strings"):
+            format_translation._anthropic_image_block_to_chat(
+                {"type": "image", "source": {"type": "base64", "data": "AAAA"}}
+            )
+        with self.assertRaisesRegex(ValueError, "must include a url string"):
+            format_translation._anthropic_image_block_to_chat(
+                {"type": "image", "source": {"type": "url", "url": 123}}
+            )
+        with self.assertRaisesRegex(ValueError, "Unsupported Anthropic image source type: file"):
+            format_translation._anthropic_image_block_to_chat(
+                {"type": "image", "source": {"type": "file"}}
+            )
+
+    def test_anthropic_system_content_and_tools_helpers_are_exact(self):
+        self.assertEqual(
+            format_translation._normalize_anthropic_cache_control(
+                {"type": "", "ephemeral": {"scope": "conversation"}}
+            ),
+            {"type": "ephemeral"},
+        )
+        self.assertEqual(
+            format_translation._anthropic_system_to_chat_content(
+                [
+                    "skip this",
+                    {"type": "text", "text": "a"},
+                    {"type": "text", "text": 123},
+                    {"type": "text", "text": "b"},
+                ]
+            ),
+            "ab",
+        )
+        self.assertEqual(format_translation._anthropic_system_to_chat_content([]), "")
+        self.assertEqual(format_translation._anthropic_system_to_chat_content(123), "")
+        with self.assertRaisesRegex(ValueError, "supports text blocks only"):
+            format_translation._anthropic_system_to_chat_content([{"type": "image"}])
+
+        self.assertEqual(format_translation._anthropic_blocks_to_chat_content([]), "")
+        self.assertEqual(
+            format_translation._anthropic_blocks_to_chat_content(
+                [
+                    {"type": "text", "text": "a"},
+                    {"type": "text", "text": "b", "cache_control": {"type": "ephemeral"}},
+                ]
+            ),
+            [
+                {"type": "text", "text": "a"},
+                {
+                    "type": "text",
+                    "text": "b",
+                    "copilot_cache_control": {"type": "ephemeral"},
+                },
+            ],
+        )
+        with self.assertRaisesRegex(ValueError, "tool_use cannot be converted"):
+            format_translation._anthropic_blocks_to_chat_content(
+                [{"type": "tool_use", "id": "tool_1", "name": "Read"}]
+            )
+
+        with self.assertRaisesRegex(ValueError, "Anthropic tools must be a list"):
+            format_translation.anthropic_tools_to_chat({"name": "Read"})
+        with self.assertRaisesRegex(ValueError, "Anthropic tools must include a string name"):
+            format_translation.anthropic_tools_to_chat([{"description": "missing"}])
+        self.assertEqual(
+            format_translation.anthropic_tools_to_chat(
+                [
+                    "skip",
+                    {
+                        "name": "NoDescription",
+                        "description": "",
+                        "input_schema": "bad",
+                    },
+                    {
+                        "name": "Cached",
+                        "description": "cached tool",
+                        "input_schema": {"type": "object", "properties": {"x": {"type": "string"}}},
+                        "cache_control": {"type": "ephemeral"},
+                    },
+                ]
+            ),
+            [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "NoDescription",
+                        "description": " ",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "Cached",
+                        "description": "cached tool",
+                        "parameters": {"type": "object", "properties": {"x": {"type": "string"}}},
+                    },
+                    "copilot_cache_control": {"type": "ephemeral"},
+                },
+            ],
+        )
+
+    def test_tool_choice_and_responses_chat_helpers_are_exact(self):
+        self.assertIsNone(format_translation.anthropic_tool_choice_to_chat(None))
+        self.assertEqual(format_translation.anthropic_tool_choice_to_chat({"type": "auto"}), "auto")
+        self.assertEqual(format_translation.anthropic_tool_choice_to_chat({"type": "any"}), "required")
+        self.assertEqual(format_translation.anthropic_tool_choice_to_chat({"type": "none"}), "none")
+        self.assertEqual(format_translation.anthropic_tool_choice_to_chat("any"), "required")
+        self.assertIsNone(
+            format_translation.anthropic_tool_choice_to_chat(
+                {"type": "tool", "name": "mcp__ide__executeCode"}
+            )
+        )
+        with self.assertRaisesRegex(ValueError, "type=tool must include name"):
+            format_translation.anthropic_tool_choice_to_chat({"type": "tool"})
+        with self.assertRaisesRegex(ValueError, "Unsupported Anthropic tool_choice value"):
+            format_translation.anthropic_tool_choice_to_chat({"type": "bogus"})
+        with self.assertRaisesRegex(ValueError, "Unsupported Anthropic tool_choice value"):
+            format_translation.anthropic_tool_choice_to_chat("required")
+
+        self.assertEqual(
+            format_translation._response_content_item_to_chat(
+                {"type": "input_text", "input_text": "input fallback"}
+            ),
+            {"type": "text", "text": "input fallback"},
+        )
+        self.assertEqual(
+            format_translation._response_content_item_to_chat(
+                {"type": "output_text", "output_text": "output fallback", "copilot_cache_control": {"type": "ephemeral"}}
+            ),
+            {
+                "type": "text",
+                "text": "output fallback",
+                "copilot_cache_control": {"type": "ephemeral"},
+            },
+        )
+        self.assertIsNone(format_translation._response_content_item_to_chat({"type": "text", "text": 123}))
+        self.assertIsNone(format_translation._response_content_item_to_chat({"type": "input_file", "file_data": "data:bad"}))
+        with self.assertRaisesRegex(ValueError, "must include image_url or image_base64/media_type"):
+            format_translation._response_content_item_to_chat({"type": "input_image"})
+        self.assertEqual(
+            format_translation._response_content_item_to_chat(
+                {"type": "input_image", "image_base64": "AAAA", "media_type": "image/png"}
+            ),
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+        )
+        self.assertEqual(format_translation._response_message_content_to_chat("plain"), "plain")
+        self.assertEqual(format_translation._response_message_content_to_chat(123), "")
+        self.assertEqual(
+            format_translation._response_message_content_to_chat(
+                [{"type": "output_text", "output_text": "only text"}]
+            ),
+            "only text",
+        )
+
+        with self.assertRaisesRegex(ValueError, "Responses function tools must include a name"):
+            format_translation._responses_tool_to_chat({"type": "function"})
+        self.assertEqual(
+            format_translation._responses_tool_to_chat(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "Nested",
+                        "description": "nested desc",
+                        "parameters": {"type": "object", "properties": {"x": {"type": "number"}}},
+                        "cache_control": {"type": "ephemeral"},
+                    },
+                }
+            ),
+            {
+                "type": "function",
+                "function": {
+                    "name": "Nested",
+                    "description": "nested desc",
+                    "parameters": {"type": "object", "properties": {"x": {"type": "number"}}},
+                },
+                "copilot_cache_control": {"type": "ephemeral"},
+            },
+        )
+        self.assertEqual(
+            format_translation._responses_tool_to_chat(
+                {"type": "function", "name": "Flat", "description": "", "parameters": "bad"}
+            ),
+            {
+                "type": "function",
+                "function": {
+                    "name": "Flat",
+                    "description": " ",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            },
+        )
 
     def test_anthropic_request_to_chat_preserves_cache_control_on_tool_results(self):
         body = {
@@ -763,6 +1462,16 @@ class FormatTranslationTests(unittest.TestCase):
                     "call_id": "call_1",
                     "output": "file contents",
                 },
+                {
+                    "type": "function_call_output",
+                    "call_id": 123,
+                    "output": "numeric id should not appear in label",
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "",
+                    "output": None,
+                },
             ],
         }
 
@@ -798,6 +1507,26 @@ class FormatTranslationTests(unittest.TestCase):
                         {
                             "type": "input_text",
                             "text": "[Tool result (call_1)]\nfile contents",
+                        }
+                    ],
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": "[Tool result]\nnumeric id should not appear in label",
+                        }
+                    ],
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": "[Tool result]",
                         }
                     ],
                 },
@@ -1669,6 +2398,11 @@ class FormatTranslationTests(unittest.TestCase):
         self.assertEqual(translated["usage"]["cache_creation_input_tokens"], 0)
 
     def test_anthropic_stream_refreshes_message_start_usage_when_openai_usage_arrives_late(self):
+        self.assertEqual(
+            format_translation.extract_reasoning_from_chat_delta({"thinking": {"text": "direct text"}}),
+            "direct text",
+        )
+
         chunks = [
             (
                 'event: message\n'
