@@ -720,7 +720,9 @@ class ProxyRoutesTests(unittest.TestCase):
         self.assertEqual(start_event.call_args.args[1], "claude-opus-4.6")
         self.assertEqual(start_event.call_args.args[2], "gpt-5.4")
         self.assertEqual(post.await_args.args[1], "https://example.invalid/responses")
-        self.assertEqual(post.await_args.kwargs["headers"], {"X-Initiator": "user"})
+        sent_headers = post.await_args.kwargs["headers"]
+        self.assertEqual(sent_headers["X-Initiator"], "user")
+        self.assertIn("x-request-id", sent_headers)
         self.assertEqual(
             response.body,
             b'{"id":"resp_123","type":"message","role":"assistant","model":"gpt-5.4","content":[{"type":"text","text":"hello from codex"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":12,"output_tokens":3,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}',
@@ -791,8 +793,9 @@ class ProxyRoutesTests(unittest.TestCase):
         self.assertEqual(second_headers["X-Initiator"], "user")
         self.assertEqual(first_headers["x-interaction-id"], second_headers["x-interaction-id"])
         self.assertEqual(first_headers["x-agent-task-id"], second_headers["x-agent-task-id"])
-        self.assertEqual(first_headers["x-request-id"], first_headers["x-agent-task-id"])
-        self.assertEqual(second_headers["x-request-id"], second_headers["x-agent-task-id"])
+        self.assertNotEqual(first_headers["x-request-id"], first_headers["x-agent-task-id"])
+        self.assertNotEqual(second_headers["x-request-id"], second_headers["x-agent-task-id"])
+        self.assertNotEqual(first_headers["x-request-id"], second_headers["x-request-id"])
         first_body = post.await_args_list[0].kwargs["json"]
         second_body = post.await_args_list[1].kwargs["json"]
         self.assertEqual(first_body["prompt_cache_key"], "claude-meta-cache-session")
@@ -941,7 +944,7 @@ class ProxyRoutesTests(unittest.TestCase):
         self.assertIn("x-interaction-id", forwarded_headers)
         self.assertIn("x-agent-task-id", forwarded_headers)
         self.assertIn("x-request-id", forwarded_headers)
-        self.assertEqual(forwarded_headers["x-request-id"], forwarded_headers["x-agent-task-id"])
+        self.assertNotEqual(forwarded_headers["x-request-id"], forwarded_headers["x-agent-task-id"])
         self.assertNotIn("session_id", forwarded_headers)
         self.assertNotIn("x-client-request-id", forwarded_headers)
         self.assertEqual(forwarded_body["sessionId"], "session-123")
@@ -1063,7 +1066,8 @@ class ProxyRoutesTests(unittest.TestCase):
 
         self.assertEqual(forwarded_headers[0]["x-interaction-id"], forwarded_headers[1]["x-interaction-id"])
         self.assertEqual(forwarded_headers[0]["x-agent-task-id"], forwarded_headers[1]["x-agent-task-id"])
-        self.assertEqual(forwarded_headers[0]["x-request-id"], forwarded_headers[0]["x-agent-task-id"])
+        self.assertNotEqual(forwarded_headers[0]["x-request-id"], forwarded_headers[0]["x-agent-task-id"])
+        self.assertNotEqual(forwarded_headers[0]["x-request-id"], forwarded_headers[1]["x-request-id"])
 
     def test_responses_route_returns_encrypted_reasoning_to_codex(self):
         request = SimpleNamespace(
@@ -2095,7 +2099,7 @@ class ProxyRoutesTests(unittest.TestCase):
         self.assertIn("x-interaction-id", forwarded_headers)
         self.assertIn("x-agent-task-id", forwarded_headers)
         self.assertIn("x-request-id", forwarded_headers)
-        self.assertEqual(forwarded_headers["x-request-id"], forwarded_headers["x-agent-task-id"])
+        self.assertNotEqual(forwarded_headers["x-request-id"], forwarded_headers["x-agent-task-id"])
         self.assertNotIn("session_id", forwarded_headers)
         self.assertNotIn("x-client-request-id", forwarded_headers)
         self.assertEqual(forwarded_body["sessionId"], "session-123")

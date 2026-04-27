@@ -1415,7 +1415,7 @@ def _prepare_upstream_request(
         initiator_verdict=initiator_verdict if isinstance(initiator_verdict, dict) else None,
     )
     if usage_tracking._is_responses_api_path(upstream_path):
-        _pair_responses_request_id(headers)
+        _ensure_responses_request_id(headers)
     auto_update_runtime_controller.note_request_started(request_id)
     trace_context = {
         "request_id": request_id,
@@ -1554,10 +1554,12 @@ def _build_anthropic_messages_passthrough_headers(
     return headers
 
 
-def _pair_responses_request_id(headers: dict) -> dict:
-    agent_task_id = headers.get("x-agent-task-id")
-    if isinstance(agent_task_id, str) and agent_task_id.strip():
-        headers["x-request-id"] = agent_task_id.strip()
+def _ensure_responses_request_id(headers: dict) -> dict:
+    request_id = headers.get("x-request-id")
+    if isinstance(request_id, str) and request_id.strip():
+        headers["x-request-id"] = request_id.strip()
+        return headers
+    headers["x-request-id"] = str(uuid4())
     return headers
 
 
@@ -1593,7 +1595,7 @@ def _build_bridge_headers(
                 bridge_plan.caller_protocol == "anthropic" or stable_affinity_hint
             ),
         )
-        return _pair_responses_request_id(headers)
+        return _ensure_responses_request_id(headers)
     if bridge_plan.header_kind == "chat":
         return format_translation.build_chat_headers_for_request(
             request,

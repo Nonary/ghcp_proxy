@@ -151,17 +151,22 @@ def _responses_affinity_value(payload, session_id: str | None = None) -> str | N
 def _responses_copilot_identity_headers(
     payload,
     session_id: str | None = None,
+    request_id: str | None = None,
     *,
     stable_affinity: bool = False,
 ) -> dict[str, str]:
+    scoped_request_id = _responses_scoped_request_id(
+        request_id,
+        generate_if_missing=stable_affinity,
+    )
     if stable_affinity:
         affinity_value = _responses_affinity_value(payload, session_id)
         if affinity_value:
             interaction_id = _copilot_uuid(f"responses-interaction:{affinity_value}")
-            request_id = _copilot_uuid(f"responses-task:{affinity_value}")
+            agent_task_id = _copilot_uuid(f"responses-task:{affinity_value}")
             return {
-                "x-agent-task-id": request_id,
-                "x-request-id": request_id,
+                "x-agent-task-id": agent_task_id,
+                "x-request-id": scoped_request_id,
                 "x-interaction-id": interaction_id,
             }
 
@@ -170,20 +175,34 @@ def _responses_copilot_identity_headers(
     if is_anthropic_messages_payload and isinstance(session_id, str) and session_id.strip():
         root_session_id = _copilot_uuid(session_id.strip())
 
-    request_id = _generate_request_id_from_payload(
+    agent_task_id = _generate_request_id_from_payload(
         payload,
         session_id=root_session_id if is_anthropic_messages_payload else None,
     )
     headers = {
-        "x-agent-task-id": request_id,
-        "x-request-id": request_id,
+        "x-agent-task-id": agent_task_id,
+        "x-request-id": scoped_request_id if scoped_request_id else agent_task_id,
     }
     if is_anthropic_messages_payload:
         if root_session_id:
             headers["x-interaction-id"] = root_session_id
     else:
-        headers["x-interaction-id"] = _copilot_uuid(request_id)
+        headers["x-interaction-id"] = _copilot_uuid(agent_task_id)
     return headers
+
+
+def _responses_scoped_request_id(
+    request_id: str | None = None,
+    *,
+    generate_if_missing: bool = False,
+) -> str | None:
+    if isinstance(request_id, str):
+        normalized = request_id.strip()
+        if normalized:
+            return _copilot_uuid(f"responses-request:{normalized}")
+    if generate_if_missing:
+        return str(uuid.uuid4())
+    return None
 
 
 def _messages_affinity_headers(initiator: str, interaction_id: str | None, request_id: str) -> dict[str, str]:
@@ -298,6 +317,7 @@ def build_responses_headers_for_request(
         _responses_copilot_identity_headers(
             identity_source,
             session_id,
+            request_id=request_id,
             stable_affinity=stable_user_affinity,
         )
     )

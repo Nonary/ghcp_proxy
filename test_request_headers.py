@@ -206,7 +206,8 @@ class RequestHeadersTests(unittest.TestCase):
         request_id_header = headers.pop("x-request-id")
         agent_task_id = headers.pop("x-agent-task-id")
         interaction_id = headers.pop("x-interaction-id")
-        self.assertEqual(request_id_header, agent_task_id)
+        self.assertEqual(request_id_header, request_headers._copilot_uuid("responses-request:req-1"))
+        self.assertNotEqual(request_id_header, agent_task_id)
         self.assertEqual(interaction_id, request_headers._copilot_uuid(agent_task_id))
         self.assertEqual(
             headers,
@@ -1448,7 +1449,8 @@ class RequestHeadersTests(unittest.TestCase):
         self.assertEqual(second_headers["X-Initiator"], "user")
         self.assertEqual(first_headers["x-interaction-id"], second_headers["x-interaction-id"])
         self.assertEqual(first_headers["x-agent-task-id"], second_headers["x-agent-task-id"])
-        self.assertEqual(first_headers["x-request-id"], first_headers["x-agent-task-id"])
+        self.assertNotEqual(first_headers["x-request-id"], first_headers["x-agent-task-id"])
+        self.assertNotEqual(first_headers["x-request-id"], second_headers["x-request-id"])
         self.assertEqual(first_body.get("prompt_cache_key"), "cache-user-turns")
         self.assertEqual(second_body.get("prompt_cache_key"), "cache-user-turns")
 

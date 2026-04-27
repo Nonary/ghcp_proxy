@@ -284,13 +284,14 @@ def _outbound_header_value(headers: dict, header_name: str) -> str | None:
 
 def _prepare_responses_affinity_headers(outbound_headers: dict) -> None:
     agent_task_id = _outbound_header_value(outbound_headers, "x-agent-task-id")
+    request_id = _outbound_header_value(outbound_headers, "x-request-id")
     _drop_outbound_headers(
         outbound_headers,
         ("request-id", "x-github-request-id", "session_id", "session-id"),
     )
     _drop_outbound_headers(outbound_headers, ("x-request-id",))
     if agent_task_id:
-        outbound_headers["x-request-id"] = agent_task_id
+        outbound_headers["x-request-id"] = request_id or agent_task_id
 
 
 def _display_model_name(model_name: str | None) -> str | None:
