@@ -53,15 +53,22 @@ def _new_responses_affinity() -> dict[str, str]:
     }
 
 
-def _responses_affinity_headers(initiator: str, session_id: str | None, *, reset: bool = False) -> dict[str, str]:
+def _responses_affinity_headers(
+    initiator: str,
+    session_id: str | None,
+    *,
+    reset: bool = False,
+    stable_user_affinity: bool = False,
+) -> dict[str, str]:
     global _RESPONSES_DEFAULT_AFFINITY
+    should_rotate_user_affinity = initiator == "user" and not stable_user_affinity
     if isinstance(session_id, str):
         normalized = session_id.strip()
         if normalized:
-            if reset or normalized not in _RESPONSES_AFFINITY_BY_SESSION:
+            if reset or should_rotate_user_affinity or normalized not in _RESPONSES_AFFINITY_BY_SESSION:
                 _RESPONSES_AFFINITY_BY_SESSION[normalized] = _new_responses_affinity()
             return _RESPONSES_AFFINITY_BY_SESSION[normalized]
-    if reset or _RESPONSES_DEFAULT_AFFINITY is None:
+    if reset or should_rotate_user_affinity or _RESPONSES_DEFAULT_AFFINITY is None:
         _RESPONSES_DEFAULT_AFFINITY = _new_responses_affinity()
     return _RESPONSES_DEFAULT_AFFINITY
 
@@ -181,6 +188,7 @@ def build_responses_headers_for_request(
     session_id_resolver=None,
     verdict_sink: dict | None = None,
     affinity_body: dict | None = None,
+    stable_user_affinity: bool = False,
 ) -> dict:
     headers = build_responses_copilot_headers(api_key)
     affinity_source = affinity_body if isinstance(affinity_body, dict) else body
@@ -213,7 +221,11 @@ def build_responses_headers_for_request(
         body["input"] = effective_input
     headers["X-Initiator"] = initiator
     headers["x-interaction-type"] = _interaction_type_for_initiator(initiator)
-    headers.update(_responses_affinity_headers(initiator, affinity_key))
+    headers.update(_responses_affinity_headers(
+        initiator,
+        affinity_key,
+        stable_user_affinity=stable_user_affinity,
+    ))
 
     if has_vision_input(effective_input):
         headers["Copilot-Vision-Request"] = "true"

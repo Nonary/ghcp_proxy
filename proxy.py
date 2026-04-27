@@ -1381,6 +1381,7 @@ def _build_bridge_headers(
             session_id_resolver=usage_tracking.request_session_id,
             verdict_sink=verdict_sink,
             affinity_body=original_body,
+            stable_user_affinity=bridge_plan.caller_protocol == "anthropic",
         )
     if bridge_plan.header_kind == "chat":
         return format_translation.build_chat_headers_for_request(

@@ -6,6 +6,7 @@ from unittest import mock
 import format_translation
 import initiator_policy
 import proxy
+import request_headers
 import usage_tracking
 
 
@@ -13,6 +14,8 @@ class RequestHeadersTests(unittest.TestCase):
     def setUp(self):
         proxy.set_initiator_policy(initiator_policy.InitiatorPolicy())
         proxy.usage_tracker.clear_state()
+        request_headers._RESPONSES_AFFINITY_BY_SESSION.clear()
+        request_headers._RESPONSES_DEFAULT_AFFINITY = None
 
     def test_responses_requests_default_to_user(self):
         request = SimpleNamespace(url=SimpleNamespace(path="/v1/responses"), headers={})
@@ -741,7 +744,7 @@ class RequestHeadersTests(unittest.TestCase):
         self.assertNotIn("prompt_cache_key", second_body)
         self.assertNotIn("prompt_cache_key", third_body)
 
-    def test_build_responses_headers_for_request_reuses_explicit_affinity_across_user_turns(self):
+    def test_build_responses_headers_for_request_rotates_explicit_affinity_across_user_turns(self):
         first_request = SimpleNamespace(headers={}, url=SimpleNamespace(path="/v1/responses"))
         first_body = {"model": "gpt-5.4", "input": "first", "prompt_cache_key": "cache-user-turns"}
         first_headers = format_translation.build_responses_headers_for_request(
@@ -760,6 +763,36 @@ class RequestHeadersTests(unittest.TestCase):
             "test-key",
             initiator_policy=proxy._initiator_policy,
             session_id_resolver=usage_tracking.request_session_id,
+        )
+
+        self.assertEqual(first_headers["X-Initiator"], "user")
+        self.assertEqual(second_headers["X-Initiator"], "user")
+        self.assertNotEqual(first_headers["x-interaction-id"], second_headers["x-interaction-id"])
+        self.assertNotEqual(first_headers["x-agent-task-id"], second_headers["x-agent-task-id"])
+        self.assertNotIn("prompt_cache_key", first_body)
+        self.assertNotIn("prompt_cache_key", second_body)
+
+    def test_build_responses_headers_for_request_can_stabilize_user_affinity_for_bridge(self):
+        first_request = SimpleNamespace(headers={}, url=SimpleNamespace(path="/v1/messages"))
+        first_body = {"model": "gpt-5.4", "input": "first", "prompt_cache_key": "cache-user-turns"}
+        first_headers = format_translation.build_responses_headers_for_request(
+            first_request,
+            first_body,
+            "test-key",
+            initiator_policy=proxy._initiator_policy,
+            session_id_resolver=usage_tracking.request_session_id,
+            stable_user_affinity=True,
+        )
+
+        second_request = SimpleNamespace(headers={}, url=SimpleNamespace(path="/v1/messages"))
+        second_body = {"model": "gpt-5.4", "input": "follow up", "prompt_cache_key": "cache-user-turns"}
+        second_headers = format_translation.build_responses_headers_for_request(
+            second_request,
+            second_body,
+            "test-key",
+            initiator_policy=proxy._initiator_policy,
+            session_id_resolver=usage_tracking.request_session_id,
+            stable_user_affinity=True,
         )
 
         self.assertEqual(first_headers["X-Initiator"], "user")
@@ -785,6 +818,7 @@ class RequestHeadersTests(unittest.TestCase):
             initiator_policy=proxy._initiator_policy,
             session_id_resolver=usage_tracking.request_session_id,
             affinity_body=original_body,
+            stable_user_affinity=True,
         )
         second_headers = format_translation.build_responses_headers_for_request(
             request,
@@ -793,6 +827,7 @@ class RequestHeadersTests(unittest.TestCase):
             initiator_policy=proxy._initiator_policy,
             session_id_resolver=usage_tracking.request_session_id,
             affinity_body=original_body,
+            stable_user_affinity=True,
         )
 
         self.assertEqual(first_headers["X-Initiator"], "user")
@@ -800,7 +835,7 @@ class RequestHeadersTests(unittest.TestCase):
         self.assertEqual(first_headers["x-agent-task-id"], second_headers["x-agent-task-id"])
         self.assertNotIn("metadata", upstream_body)
 
-    def test_build_responses_headers_for_request_reuses_default_affinity_without_session(self):
+    def test_build_responses_headers_for_request_rotates_default_affinity_without_session(self):
         request = SimpleNamespace(headers={}, url=SimpleNamespace(path="/v1/messages"))
 
         first_headers = format_translation.build_responses_headers_for_request(
@@ -820,8 +855,8 @@ class RequestHeadersTests(unittest.TestCase):
 
         self.assertEqual(first_headers["X-Initiator"], "user")
         self.assertEqual(second_headers["X-Initiator"], "user")
-        self.assertEqual(first_headers["x-interaction-id"], second_headers["x-interaction-id"])
-        self.assertEqual(first_headers["x-agent-task-id"], second_headers["x-agent-task-id"])
+        self.assertNotEqual(first_headers["x-interaction-id"], second_headers["x-interaction-id"])
+        self.assertNotEqual(first_headers["x-agent-task-id"], second_headers["x-agent-task-id"])
 
     def test_build_responses_headers_for_request_ignores_plain_metadata_user_id_as_affinity(self):
         request = SimpleNamespace(headers={}, url=SimpleNamespace(path="/v1/messages"))
@@ -842,6 +877,7 @@ class RequestHeadersTests(unittest.TestCase):
             initiator_policy=proxy._initiator_policy,
             session_id_resolver=usage_tracking.request_session_id,
             affinity_body=original_body,
+            stable_user_affinity=True,
         )
         second_headers = format_translation.build_responses_headers_for_request(
             request,
@@ -850,6 +886,7 @@ class RequestHeadersTests(unittest.TestCase):
             initiator_policy=proxy._initiator_policy,
             session_id_resolver=usage_tracking.request_session_id,
             affinity_body=original_body,
+            stable_user_affinity=True,
         )
 
         self.assertNotEqual(first_headers["x-interaction-id"], "plain-claude-session")
