@@ -19,6 +19,7 @@ class ProxyRoutesTests(unittest.TestCase):
     def setUp(self):
         proxy.set_initiator_policy(initiator_policy.InitiatorPolicy())
         proxy.usage_tracker.clear_state()
+        proxy._reset_cache_tripwire_consecutive_hits()
         proxy._COPILOT_MODEL_CAPS_CACHE.update({"key": None, "ts": 0.0, "data": {}})
         with proxy._PROMPT_CACHE_SETTLE_LOCK:
             proxy._PROMPT_CACHE_LAST_FINISH_BY_LINEAGE.clear()
@@ -1495,7 +1496,7 @@ class ProxyRoutesTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(json.loads(response.body), upstream_payload)
 
-    def test_responses_route_returns_tripwire_message_for_large_uncached_request(self):
+    def test_responses_route_appends_tripwire_message_for_three_consecutive_large_uncached_requests(self):
         request = SimpleNamespace(
             url=SimpleNamespace(path="/v1/responses"),
             method="POST",
@@ -1542,10 +1543,20 @@ class ProxyRoutesTests(unittest.TestCase):
             mock.patch.object(proxy.usage_tracker, "finish_event") as finish_usage,
             mock.patch.object(proxy, "throttled_client_post", mock.AsyncMock(return_value=upstream)),
         ):
+            first_response = proxy.asyncio.run(proxy.responses(request))
+            second_response = proxy.asyncio.run(proxy.responses(request))
             response = proxy.asyncio.run(proxy.responses(request))
 
+        self.assertEqual(first_response.status_code, 200)
+        first_payload = json.loads(first_response.body)
+        self.assertEqual(first_payload["output_text"], "expensive answer")
+        self.assertEqual(second_response.status_code, 200)
+        second_payload = json.loads(second_response.body)
+        self.assertEqual(second_payload["output_text"], "expensive answer")
+        self.assertNotIn("Safety tripwire activated", second_payload["output_text"])
         self.assertEqual(response.status_code, 200)
         payload = json.loads(response.body)
+        self.assertTrue(payload["output_text"].startswith("expensive answer\n\nSafety tripwire activated"))
         self.assertIn("Safety tripwire activated", payload["output_text"])
         self.assertIn("could burn through your Copilot session limit", payload["output_text"])
         self.assertIn("0 cached tokens", payload["output_text"])
@@ -1554,8 +1565,8 @@ class ProxyRoutesTests(unittest.TestCase):
         self.assertIn("50000 token fresh/cache gap limit", payload["output_text"])
         self.assertIn("disable the tripwire in Settings", payload["output_text"])
         self.assertIn("debug the cache lineage", payload["output_text"])
-        self.assertNotIn("expensive answer", payload["output_text"])
-        finish_usage.assert_called_once()
+        self.assertIn("expensive answer", payload["output_text"])
+        self.assertEqual(finish_usage.call_count, 3)
         self.assertEqual(finish_usage.call_args.kwargs["usage"]["input_tokens"], 60000)
         self.assertEqual(finish_usage.call_args.kwargs["usage"]["cached_input_tokens"], 0)
 
@@ -1613,6 +1624,90 @@ class ProxyRoutesTests(unittest.TestCase):
         self.assertEqual(payload["output_text"], "cache acceptable")
         self.assertNotIn("Safety tripwire activated", payload["output_text"])
         finish_usage.assert_called_once()
+
+    def test_responses_route_resets_tripwire_streak_after_fine_request(self):
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/responses"),
+            method="POST",
+            headers={},
+        )
+        body = {
+            "model": "gpt-5.5",
+            "stream": False,
+            "input": "hello",
+        }
+        bad_payload = {
+            "id": "resp_bad",
+            "object": "response",
+            "created_at": 123,
+            "model": "gpt-5.5",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "bad cache answer"}],
+                }
+            ],
+            "output_text": "bad cache answer",
+            "usage": {
+                "input_tokens": 60000,
+                "input_tokens_details": {"cached_tokens": 0},
+                "output_tokens": 5,
+                "total_tokens": 60005,
+            },
+        }
+        fine_payload = {
+            "id": "resp_fine",
+            "object": "response",
+            "created_at": 124,
+            "model": "gpt-5.5",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "fine cache answer"}],
+                }
+            ],
+            "output_text": "fine cache answer",
+            "usage": {
+                "input_tokens": 60000,
+                "input_tokens_details": {"cached_tokens": 45000},
+                "output_tokens": 5,
+                "total_tokens": 60005,
+            },
+        }
+        responses = [
+            httpx.Response(200, json=bad_payload, headers={"content-type": "application/json"}),
+            httpx.Response(200, json=bad_payload, headers={"content-type": "application/json"}),
+            httpx.Response(200, json=fine_payload, headers={"content-type": "application/json"}),
+            httpx.Response(200, json=bad_payload, headers={"content-type": "application/json"}),
+        ]
+
+        with (
+            mock.patch.object(proxy, "parse_json_request", mock.AsyncMock(return_value=body)),
+            mock.patch.object(auth, "get_api_key", return_value="test-key"),
+            mock.patch.object(auth, "get_api_base", return_value="https://example.invalid"),
+            mock.patch.object(proxy.model_routing_config_service, "resolve_target_model", return_value="gpt-5.5"),
+            mock.patch.object(proxy.usage_tracker, "start_event", return_value=None),
+            mock.patch.object(proxy.usage_tracker, "finish_event") as finish_usage,
+            mock.patch.object(proxy, "throttled_client_post", mock.AsyncMock(side_effect=responses)),
+        ):
+            first = proxy.asyncio.run(proxy.responses(request))
+            second = proxy.asyncio.run(proxy.responses(request))
+            third = proxy.asyncio.run(proxy.responses(request))
+            fourth = proxy.asyncio.run(proxy.responses(request))
+
+        self.assertEqual(json.loads(first.body)["output_text"], "bad cache answer")
+        self.assertEqual(json.loads(second.body)["output_text"], "bad cache answer")
+        third_payload = json.loads(third.body)
+        self.assertEqual(third_payload["output_text"], "fine cache answer")
+        self.assertNotIn("Safety tripwire activated", third_payload["output_text"])
+        fourth_payload = json.loads(fourth.body)
+        self.assertEqual(fourth_payload["output_text"], "bad cache answer")
+        self.assertNotIn("Safety tripwire activated", fourth_payload["output_text"])
+        self.assertEqual(finish_usage.call_count, 4)
 
     def test_responses_route_does_not_tripwire_when_low_cache_gap_is_below_threshold(self):
         request = SimpleNamespace(
@@ -2782,6 +2877,7 @@ class AnthropicMessagesPassthroughRouteTests(unittest.TestCase):
     def setUp(self):
         proxy.set_initiator_policy(initiator_policy.InitiatorPolicy())
         proxy.usage_tracker.clear_state()
+        proxy._reset_cache_tripwire_consecutive_hits()
 
     def _messages_request(self):
         return SimpleNamespace(
@@ -3002,7 +3098,7 @@ class AnthropicMessagesPassthroughRouteTests(unittest.TestCase):
         finish_usage.assert_called_once()
         self.assertEqual(finish_usage.call_args.args[1], 429)
 
-    def test_responses_streaming_returns_tripwire_message_for_large_uncached_request(self):
+    def test_responses_streaming_appends_tripwire_message_for_three_consecutive_large_uncached_requests(self):
         chunks = [
             (
                 'event: response.created\n'
@@ -3069,13 +3165,26 @@ class AnthropicMessagesPassthroughRouteTests(unittest.TestCase):
                     body_bytes += chunk
                 return response, body_bytes.decode("utf-8"), finish_usage
 
+        first_response, first_body, first_finish_usage = proxy.asyncio.run(run_stream())
+        self.assertEqual(first_response.status_code, 200)
+        self.assertIn("expensive answer", first_body)
+        self.assertNotIn("Safety tripwire activated", first_body)
+        first_finish_usage.assert_called_once()
+
+        second_response, second_body, second_finish_usage = proxy.asyncio.run(run_stream())
+        self.assertEqual(second_response.status_code, 200)
+        self.assertIn("expensive answer", second_body)
+        self.assertNotIn("Safety tripwire activated", second_body)
+        second_finish_usage.assert_called_once()
+
         response, body, finish_usage = proxy.asyncio.run(run_stream())
         self.assertEqual(response.status_code, 200)
+        self.assertIn("expensive answer", body)
         self.assertIn("Safety tripwire activated", body)
         self.assertIn("could burn through your Copilot session limit", body)
         self.assertIn("disable the tripwire in Settings", body)
         self.assertIn("[DONE]", body)
-        self.assertNotIn("expensive answer", body)
+        self.assertEqual(body.count("event: response.created"), 1)
         finish_usage.assert_called_once()
         usage = finish_usage.call_args.kwargs["usage"]
         self.assertEqual(usage["input_tokens"], 60000)

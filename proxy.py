@@ -187,10 +187,13 @@ INVALID_BRIDGE_REQUEST_MESSAGE = "Invalid request"
 CACHE_TRIPWIRE_INPUT_TOKEN_THRESHOLD = 30_000
 CACHE_TRIPWIRE_CACHED_INPUT_TOKEN_THRESHOLD = 30_000
 CACHE_TRIPWIRE_FRESH_CACHED_GAP_THRESHOLD = 50_000
+CACHE_TRIPWIRE_CONSECUTIVE_HIT_THRESHOLD = 3
 CACHE_TRIPWIRE_REASON = "token_tripwire"
 CACHE_SETTLE_DELAY_SECONDS = 5.0
 
 safeguard_event_store = dashboard_module.create_safeguard_event_store()
+_CACHE_TRIPWIRE_LOCK = threading.Lock()
+_CACHE_TRIPWIRE_CONSECUTIVE_HITS = 0
 _PROMPT_CACHE_SETTLE_LOCK = threading.Lock()
 _PROMPT_CACHE_LAST_FINISH_BY_LINEAGE: dict[tuple[str, str], float] = {}
 _PROMPT_CACHE_TRACE_LOCK = threading.Lock()
@@ -506,9 +509,13 @@ def _synthetic_reply_for_message(message: str) -> upstream_errors.SyntheticReply
     )
 
 
-def _cache_tripwire_usage(usage: dict | None) -> dict | None:
-    if not _cache_tripwire_enabled():
-        return None
+def _reset_cache_tripwire_consecutive_hits() -> None:
+    global _CACHE_TRIPWIRE_CONSECUTIVE_HITS
+    with _CACHE_TRIPWIRE_LOCK:
+        _CACHE_TRIPWIRE_CONSECUTIVE_HITS = 0
+
+
+def _cache_tripwire_candidate_usage(usage: dict | None) -> dict | None:
     normalized = util.normalize_usage_payload(usage)
     if not isinstance(normalized, dict):
         return None
@@ -523,6 +530,22 @@ def _cache_tripwire_usage(usage: dict | None) -> dict | None:
     ):
         return normalized
     return None
+
+
+def _cache_tripwire_usage(usage: dict | None) -> dict | None:
+    global _CACHE_TRIPWIRE_CONSECUTIVE_HITS
+    if not _cache_tripwire_enabled():
+        _reset_cache_tripwire_consecutive_hits()
+        return None
+    normalized = _cache_tripwire_candidate_usage(usage)
+    with _CACHE_TRIPWIRE_LOCK:
+        if not isinstance(normalized, dict):
+            _CACHE_TRIPWIRE_CONSECUTIVE_HITS = 0
+            return None
+        _CACHE_TRIPWIRE_CONSECUTIVE_HITS += 1
+        if _CACHE_TRIPWIRE_CONSECUTIVE_HITS < CACHE_TRIPWIRE_CONSECUTIVE_HIT_THRESHOLD:
+            return None
+        return normalized
 
 
 def _cache_tripwire_enabled() -> bool:
@@ -907,9 +930,10 @@ def _cache_tripwire_reply(usage: dict) -> upstream_errors.SyntheticReply:
     fresh_tokens = max(0, input_tokens - cached_tokens)
     fresh_cached_gap = max(0, fresh_tokens - cached_tokens)
     message = (
-        "Safety tripwire activated. The proxy stopped this request because it "
-        "looked like the prompt cache was not being reused correctly, which "
-        "could burn through your Copilot session limit. "
+        "Safety tripwire activated. The proxy stopped the request chain after this response "
+        "because it looked like the prompt cache was not being reused correctly, which "
+        "could burn through your Copilot session limit; this warning was appended so the "
+        "upstream message is still preserved. "
         f"This request had {input_tokens} input tokens, {cached_tokens} cached "
         f"tokens, and {fresh_tokens} fresh input tokens. "
         f"The safety floor is {CACHE_TRIPWIRE_CACHED_INPUT_TOKEN_THRESHOLD} "
@@ -955,6 +979,169 @@ def _cache_tripwire_response_payload(
         model=model,
         is_compact=is_compact,
     )
+
+
+def _cache_tripwire_appended_message(reply: upstream_errors.SyntheticReply) -> str:
+    return f"\n\n{reply.message}"
+
+
+def _append_to_responses_payload(payload: dict, suffix: str) -> bool:
+    appended = False
+    output_text = payload.get("output_text")
+    if isinstance(output_text, str):
+        payload["output_text"] = f"{output_text}{suffix}"
+        appended = True
+
+    output = payload.get("output")
+    if not isinstance(output, list):
+        return appended
+    for item in output:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") != "message" or str(item.get("role", "")).lower() != "assistant":
+            continue
+        content = item.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") == "output_text" and isinstance(part.get("text"), str):
+                part["text"] = f"{part['text']}{suffix}"
+                return True
+    return appended
+
+
+def _append_to_chat_payload(payload: dict, suffix: str) -> bool:
+    choices = payload.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return False
+    first = choices[0]
+    if not isinstance(first, dict):
+        return False
+    message = first.get("message")
+    if not isinstance(message, dict) or not isinstance(message.get("content"), str):
+        return False
+    message["content"] = f"{message['content']}{suffix}"
+    return True
+
+
+def _append_to_anthropic_payload(payload: dict, suffix: str) -> bool:
+    content = payload.get("content")
+    if not isinstance(content, list):
+        return False
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "text" and isinstance(block.get("text"), str):
+            block["text"] = f"{block['text']}{suffix}"
+            return True
+    return False
+
+
+def _append_cache_tripwire_reply_to_payload(
+    payload: dict,
+    reply: upstream_errors.SyntheticReply,
+    *,
+    protocol: str,
+    model: str | None,
+    is_compact: bool = False,
+) -> dict:
+    suffix = _cache_tripwire_appended_message(reply)
+    normalized = protocol_replies._normalize_protocol(protocol)
+    appended = False
+    if normalized == "anthropic":
+        appended = _append_to_anthropic_payload(payload, suffix)
+    elif normalized == "chat":
+        appended = _append_to_chat_payload(payload, suffix)
+    elif is_compact:
+        appended = _append_to_chat_payload(payload, suffix)
+    else:
+        appended = _append_to_responses_payload(payload, suffix)
+    if appended:
+        return payload
+    return _cache_tripwire_response_payload(reply, protocol=protocol, model=model, is_compact=is_compact)
+
+
+def _cache_tripwire_warning_delta(
+    reply: upstream_errors.SyntheticReply,
+    *,
+    output_index: int,
+    content_index: int,
+) -> bytes:
+    return format_translation.sse_encode(
+        "response.output_text.delta",
+        {
+            "type": "response.output_text.delta",
+            "output_index": output_index,
+            "content_index": content_index,
+            "delta": _cache_tripwire_appended_message(reply),
+        },
+    )
+
+
+def _is_response_completed_event(event_name: str | None, data: str | None) -> bool:
+    if str(event_name or "").strip().lower() == "response.completed":
+        return True
+    if not data or data == "[DONE]":
+        return False
+    try:
+        payload = json.loads(data)
+    except json.JSONDecodeError:
+        return False
+    return isinstance(payload, dict) and str(payload.get("type") or "").strip().lower() == "response.completed"
+
+
+def _cache_tripwire_appended_stream_chunks(
+    buffered_chunks: list[bytes],
+    reply: upstream_errors.SyntheticReply,
+) -> list[bytes]:
+    text = b"".join(buffered_chunks).decode("utf-8", errors="replace").replace("\r\n", "\n")
+    raw_blocks = text.split("\n\n")
+    output: list[bytes] = []
+    output_index = 0
+    content_index = 0
+    inserted = False
+
+    for raw_block in raw_blocks:
+        if not raw_block.strip():
+            continue
+        event_name, data = format_translation.parse_sse_block(raw_block)
+        if data == "[DONE]":
+            continue
+        if data:
+            try:
+                payload = json.loads(data)
+            except json.JSONDecodeError:
+                payload = None
+            if isinstance(payload, dict):
+                event_type = str(payload.get("type") or event_name or "").strip().lower()
+                if event_type == "response.output_text.delta":
+                    if isinstance(payload.get("output_index"), int):
+                        output_index = payload["output_index"]
+                    if isinstance(payload.get("content_index"), int):
+                        content_index = payload["content_index"]
+
+        if not inserted and _is_response_completed_event(event_name, data):
+            output.append(
+                _cache_tripwire_warning_delta(
+                    reply,
+                    output_index=output_index,
+                    content_index=content_index,
+                )
+            )
+            inserted = True
+
+        output.append(f"{raw_block}\n\n".encode("utf-8"))
+
+    if not inserted:
+        output.append(
+            _cache_tripwire_warning_delta(
+                reply,
+                output_index=output_index,
+                content_index=content_index,
+            )
+        )
+    output.append(b"data: [DONE]\n\n")
+    return output
 
 
 def _friendly_limit_chat_payload(message: str, model: str | None = None) -> dict:
@@ -2572,7 +2759,8 @@ async def _post_bridge_non_streaming_request(plan: UpstreamRequestPlan, bridge_p
     )
     if isinstance(tripwire_usage, dict):
         reply = _cache_tripwire_reply(tripwire_usage)
-        response_payload = _cache_tripwire_response_payload(
+        response_payload = _append_cache_tripwire_reply_to_payload(
+            translated_payload,
             reply,
             protocol=bridge_plan.caller_protocol,
             model=bridge_plan.resolved_model or bridge_plan.requested_model,
@@ -2583,7 +2771,14 @@ async def _post_bridge_non_streaming_request(plan: UpstreamRequestPlan, bridge_p
             reply.status_for_trace,
             upstream=upstream,
             response_payload=response_payload,
-            response_text=reply.message,
+            response_text=(
+                format_translation.extract_response_output_text(response_payload)
+                if bridge_plan.caller_protocol == "responses"
+                else util.extract_item_text(response_payload.get("content", [{}])[0])
+                if isinstance(response_payload.get("content"), list)
+                else None
+            )
+            or reply.message,
             usage=tracking_usage if isinstance(tracking_usage, dict) else tripwire_usage,
         )
         _publish_synthetic_reply_event(reply, plan)
@@ -2888,16 +3083,9 @@ async def proxy_streaming_response(
                 )
                 finish_called = True
                 _publish_synthetic_reply_event(reply, trace_plan)
-                synthetic_response = protocol_replies.render_synthetic_reply(
-                    reply,
-                    protocol=stream_type,
-                    stream=True,
-                    model=model,
-                    streaming_response_class=GracefulStreamingResponse,
-                )
                 usage_tracker.mark_first_output(usage_event)
-                async for synthetic_chunk in synthetic_response.body_iterator:
-                    yield synthetic_chunk
+                for appended_chunk in _cache_tripwire_appended_stream_chunks(buffered_chunks, reply):
+                    yield appended_chunk
                 return
             _finish_usage_and_trace(
                 trace_plan,
