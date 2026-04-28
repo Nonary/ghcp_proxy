@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 
 import effort_mapping
 import util
@@ -613,6 +614,31 @@ def _responses_body_requests_prompt_cache(body: dict) -> bool:
     return False
 
 
+def _configured_responses_prompt_cache_retention() -> str | None:
+    raw = str(os.environ.get("GHCP_PROXY_RESPONSES_PROMPT_CACHE_RETENTION", "24h")).strip()
+    if not raw:
+        return "24h"
+    if raw.lower() in {"0", "false", "no", "off"}:
+        return None
+    return raw
+
+
+def apply_responses_prompt_cache_retention(body: dict) -> dict:
+    """Request extended prompt-cache retention for cache-keyed Responses turns."""
+    if not isinstance(body, dict):
+        return body
+    if "prompt_cache_retention" in body:
+        return body
+    if not _responses_body_requests_prompt_cache(body):
+        return body
+    retention = _configured_responses_prompt_cache_retention()
+    if not retention:
+        return body
+    updated = dict(body)
+    updated["prompt_cache_retention"] = retention
+    return updated
+
+
 def _add_anthropic_cache_control(block: dict) -> None:
     if not isinstance(block.get("cache_control"), dict):
         block["cache_control"] = {"type": "ephemeral"}
@@ -835,6 +861,7 @@ __all__ = [
     "_format_custom_tool_call_for_chat",
     "_format_custom_tool_output_for_chat",
     "_last_cacheable_anthropic_content_block",
+    "apply_responses_prompt_cache_retention",
     "_responses_body_requests_prompt_cache",
     "_responses_function_call_output_to_anthropic_block",
     "_responses_function_call_to_anthropic_block",

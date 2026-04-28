@@ -24,6 +24,24 @@ def _stable_uuid(value: str) -> str:
 _CLIENT_SESSION_ID = _stable_uuid(
     f"client-session:{os.path.expanduser('~')}:{uuid.getnode():012x}"
 )
+
+
+def _subagent_isolated_session_id(prompt_cache_key) -> str | None:
+    """Derive a stable per-cache-key client-session id for subagent traffic.
+
+    Parent and subagents currently share ``_CLIENT_SESSION_ID`` upstream, so
+    their prefix writes compete for the same cache shard. When Codex marks a
+    request as a subagent, route it under a session id derived from the
+    subagent's own ``prompt_cache_key`` so upstream can shard it off the
+    parent's cache pool.
+    """
+    if not isinstance(prompt_cache_key, str):
+        return None
+    normalized = prompt_cache_key.strip()
+    if not normalized:
+        return None
+    return _stable_uuid(f"client-session:subagent:{normalized}")
+
 _COPILOT_MACHINE_ID = hashlib.sha256(f"{uuid.getnode():012x}".encode("utf-8")).hexdigest()
 _FORWARD_SESSION_HEADER_DEFAULT = True
 _VISION_INPUT_INITIAL_DEPTH = 0
@@ -146,6 +164,22 @@ def _responses_affinity_value(payload, session_id: str | None = None) -> str | N
         if normalized:
             return normalized
     return None
+
+
+def _responses_body_has_affinity_hint(payload) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    for key in ("prompt_cache_key", "promptCacheKey", "session_id", "sessionId"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return True
+    metadata = payload.get("metadata")
+    if isinstance(metadata, dict):
+        for key in ("session_id", "sessionId"):
+            value = metadata.get(key)
+            if isinstance(value, str) and value.strip():
+                return True
+    return False
 
 
 def _responses_copilot_identity_headers(
@@ -298,7 +332,16 @@ def build_responses_headers_for_request(
         synthesize_client_request_id=False,
     )
     headers.pop("x-client-request-id", None)
+    inbound_subagent = request.headers.get("x-openai-subagent") if hasattr(request, "headers") else None
     headers.pop("x-openai-subagent", None)
+    if isinstance(inbound_subagent, str) and inbound_subagent.strip():
+        isolated = _subagent_isolated_session_id(
+            identity_source.get("prompt_cache_key") or identity_source.get("promptCacheKey")
+            if isinstance(identity_source, dict)
+            else None
+        )
+        if isolated:
+            headers["x-client-session-id"] = isolated
 
     had_input = "input" in body
     effective_input, initiator = initiator_policy.resolve_responses_input(
@@ -313,12 +356,13 @@ def build_responses_headers_for_request(
         body["input"] = effective_input
     headers["X-Initiator"] = initiator
     headers["x-interaction-type"] = _interaction_type_for_initiator(initiator)
+    stable_affinity = stable_user_affinity or _responses_body_has_affinity_hint(identity_source)
     headers.update(
         _responses_copilot_identity_headers(
             identity_source,
             session_id,
             request_id=request_id,
-            stable_affinity=stable_user_affinity,
+            stable_affinity=stable_affinity,
         )
     )
 

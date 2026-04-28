@@ -537,6 +537,7 @@ class ProtocolBridgePlannerTests(unittest.TestCase):
         # Cache lineage stays on the upstream body so the Copilot prefix cache
         # can match across turns.
         self.assertEqual(plan.upstream_body["prompt_cache_key"], "cache-123")
+        self.assertEqual(plan.upstream_body["prompt_cache_retention"], "24h")
         self.assertEqual(plan.upstream_body["previous_response_id"], "resp_prev")
         self.assertEqual(plan.upstream_body["input"], "hello")
         self.assertEqual(

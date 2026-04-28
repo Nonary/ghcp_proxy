@@ -950,7 +950,7 @@ class ProxyClientConfigService:
                 "default_verbosity": "low" if supports_verbosity else None,
                 "apply_patch_tool_type": "freeform",
                 "web_search_tool_type": "text",
-                "truncation_policy": {"mode": "tokens", "limit": 10000},
+                "truncation_policy": {"mode": "bytes", "limit": 10000},
                 "supports_parallel_tool_calls": supports_parallel_tool_calls,
                 "supports_image_detail_original": False,
                 "context_window": context_window,

@@ -24,6 +24,8 @@ class ProxyRoutesTests(unittest.TestCase):
             proxy._PROMPT_CACHE_LAST_FINISH_BY_LINEAGE.clear()
         with proxy._PROMPT_CACHE_TRACE_LOCK:
             proxy._PROMPT_CACHE_LAST_INPUT_BY_LINEAGE.clear()
+        with proxy._PROMPT_CACHE_AFFINITY_TRACE_LOCK:
+            proxy._PROMPT_CACHE_LAST_AFFINITY_BY_LINEAGE.clear()
         proxy._CLIENT_PROXY_STARTUP_RESTORE_COMPLETE = False
         proxy._CLIENT_PROXY_SHUTDOWN_REVERT_COMPLETE = False
 
@@ -142,6 +144,210 @@ class ProxyRoutesTests(unittest.TestCase):
             proxy.asyncio.run(proxy._wait_for_responses_cache_settle(other_model_plan))
 
         sleep.assert_not_awaited()
+
+    def _build_responses_plan(
+        self,
+        *,
+        request_id: str = "req-1",
+        cs_id: str | None,
+        prompt_cache_key: str = "019dd22d-34be-7da0-aaaa-aaaaaaaaaaaa",
+        upstream_url: str = "https://example.invalid/responses",
+    ):
+        headers = {}
+        if cs_id is not None:
+            headers["x-client-session-id"] = cs_id
+        return proxy.UpstreamRequestPlan(
+            request_id=request_id,
+            upstream_url=upstream_url,
+            headers=headers,
+            body={
+                "model": "gpt-5.5",
+                "prompt_cache_key": prompt_cache_key,
+                "input": [{"type": "message", "role": "user", "content": "hi"}],
+            },
+            usage_event=None,
+            requested_model="gpt-5.5",
+            resolved_model="gpt-5.5",
+        )
+
+    def test_responses_plan_role_classifies_parent_and_subagent(self):
+        import request_headers as request_headers_module
+        parent = self._build_responses_plan(cs_id=request_headers_module._CLIENT_SESSION_ID)
+        subagent = self._build_responses_plan(cs_id="some-derived-uuid", request_id="req-2")
+        chat_plan = proxy.UpstreamRequestPlan(
+            request_id="req-3",
+            upstream_url="https://example.invalid/chat/completions",
+            headers={"x-client-session-id": request_headers_module._CLIENT_SESSION_ID},
+            body={"model": "gpt-5.5", "prompt_cache_key": "019dd22d-34be-7da0-aaaa-aaaaaaaaaaaa"},
+            usage_event=None,
+            requested_model="gpt-5.5",
+            resolved_model="gpt-5.5",
+        )
+        wrong_model = self._build_responses_plan(cs_id=request_headers_module._CLIENT_SESSION_ID, request_id="req-4")
+        wrong_model.resolved_model = "gpt-5.4"
+        wrong_model.requested_model = "gpt-5.4"
+        wrong_model.body["model"] = "gpt-5.4"
+        self.assertEqual(proxy._responses_plan_role(parent), "parent")
+        self.assertEqual(proxy._responses_plan_role(subagent), "subagent")
+        self.assertIsNone(proxy._responses_plan_role(chat_plan))
+        self.assertIsNone(proxy._responses_plan_role(wrong_model))
+
+    def test_responses_plan_task_prefix_extracts_uuid_prefix(self):
+        plan = self._build_responses_plan(cs_id="x", prompt_cache_key="019dd22d-34be-7da0-aaaa-aaaaaaaaaaaa")
+        self.assertEqual(proxy._responses_plan_task_prefix(plan), "019dd22d")
+        plan_short = self._build_responses_plan(cs_id="x", prompt_cache_key="short-key")
+        self.assertIsNone(proxy._responses_plan_task_prefix(plan_short))
+        plan_none = self._build_responses_plan(cs_id="x")
+        plan_none.body.pop("prompt_cache_key", None)
+        self.assertIsNone(proxy._responses_plan_task_prefix(plan_none))
+
+    def test_parent_keepalive_snapshot_stored_on_parent_finish(self):
+        import request_headers as request_headers_module
+        proxy._PARENT_KEEPALIVE_SNAPSHOTS.clear()
+        parent = self._build_responses_plan(cs_id=request_headers_module._CLIENT_SESSION_ID)
+        parent.body["previous_response_id"] = "should-be-stripped"
+        with mock.patch.dict(proxy.os.environ, {"GHCP_PROXY_PARENT_KEEPALIVE_ENABLED": "1"}, clear=False):
+            proxy._remember_parent_for_keepalive(parent, 200)
+        snap = proxy._PARENT_KEEPALIVE_SNAPSHOTS.get("019dd22d")
+        self.assertIsNotNone(snap)
+        self.assertEqual(snap["upstream_url"], "https://example.invalid/responses")
+        self.assertNotIn("previous_response_id", snap["body"])
+        self.assertFalse(snap["warmer_in_flight"])
+
+    def test_parent_keepalive_snapshot_not_stored_for_subagent(self):
+        proxy._PARENT_KEEPALIVE_SNAPSHOTS.clear()
+        sub = self._build_responses_plan(cs_id="derived-uuid")
+        with mock.patch.dict(proxy.os.environ, {"GHCP_PROXY_PARENT_KEEPALIVE_ENABLED": "1"}, clear=False):
+            proxy._remember_parent_for_keepalive(sub, 200)
+        self.assertNotIn("019dd22d", proxy._PARENT_KEEPALIVE_SNAPSHOTS)
+
+    def test_parent_keepalive_skips_when_parent_recent(self):
+        import request_headers as request_headers_module
+        proxy._PARENT_KEEPALIVE_SNAPSHOTS.clear()
+        parent = self._build_responses_plan(cs_id=request_headers_module._CLIENT_SESSION_ID)
+        sub = self._build_responses_plan(cs_id="derived-uuid", request_id="req-2")
+        env = {
+            "GHCP_PROXY_PARENT_KEEPALIVE_ENABLED": "1",
+            "GHCP_PROXY_PARENT_KEEPALIVE_MIN_IDLE_SECONDS": "6",
+        }
+        with mock.patch.dict(proxy.os.environ, env, clear=False):
+            proxy._remember_parent_for_keepalive(parent, 200)
+            with mock.patch.object(proxy.asyncio, "get_running_loop") as get_loop:
+                proxy._maybe_fire_parent_keepalive(sub, 200)
+                self.assertFalse(get_loop.called)
+        self.assertFalse(proxy._PARENT_KEEPALIVE_SNAPSHOTS["019dd22d"]["warmer_in_flight"])
+
+    def test_parent_keepalive_fires_when_idle_threshold_exceeded(self):
+        import request_headers as request_headers_module
+        proxy._PARENT_KEEPALIVE_SNAPSHOTS.clear()
+        parent = self._build_responses_plan(cs_id=request_headers_module._CLIENT_SESSION_ID)
+        sub = self._build_responses_plan(cs_id="derived-uuid", request_id="req-2")
+        env = {
+            "GHCP_PROXY_PARENT_KEEPALIVE_ENABLED": "1",
+            "GHCP_PROXY_PARENT_KEEPALIVE_MIN_IDLE_SECONDS": "0",
+            "GHCP_PROXY_PARENT_KEEPALIVE_MIN_INTERVAL_SECONDS": "0",
+        }
+        scheduled: list = []
+
+        class FakeLoop:
+            def create_task(self, coro):
+                scheduled.append(coro)
+                coro.close()
+                return mock.Mock()
+
+        with mock.patch.dict(proxy.os.environ, env, clear=False):
+            proxy._remember_parent_for_keepalive(parent, 200)
+            with mock.patch.object(proxy.asyncio, "get_running_loop", return_value=FakeLoop()):
+                proxy._maybe_fire_parent_keepalive(sub, 200)
+        self.assertEqual(len(scheduled), 1)
+
+    def test_parent_keepalive_skips_when_disabled(self):
+        import request_headers as request_headers_module
+        proxy._PARENT_KEEPALIVE_SNAPSHOTS.clear()
+        parent = self._build_responses_plan(cs_id=request_headers_module._CLIENT_SESSION_ID)
+        sub = self._build_responses_plan(cs_id="derived-uuid", request_id="req-2")
+        with mock.patch.dict(proxy.os.environ, {"GHCP_PROXY_PARENT_KEEPALIVE_ENABLED": "0"}, clear=False):
+            proxy._remember_parent_for_keepalive(parent, 200)
+            self.assertNotIn("019dd22d", proxy._PARENT_KEEPALIVE_SNAPSHOTS)
+            with mock.patch.object(proxy.asyncio, "get_running_loop") as get_loop:
+                proxy._maybe_fire_parent_keepalive(sub, 200)
+                self.assertFalse(get_loop.called)
+
+    def test_parent_keepalive_skips_when_already_in_flight(self):
+        import request_headers as request_headers_module
+        proxy._PARENT_KEEPALIVE_SNAPSHOTS.clear()
+        parent = self._build_responses_plan(cs_id=request_headers_module._CLIENT_SESSION_ID)
+        sub = self._build_responses_plan(cs_id="derived-uuid", request_id="req-2")
+        env = {
+            "GHCP_PROXY_PARENT_KEEPALIVE_ENABLED": "1",
+            "GHCP_PROXY_PARENT_KEEPALIVE_MIN_IDLE_SECONDS": "0",
+            "GHCP_PROXY_PARENT_KEEPALIVE_MIN_INTERVAL_SECONDS": "0",
+        }
+        with mock.patch.dict(proxy.os.environ, env, clear=False):
+            proxy._remember_parent_for_keepalive(parent, 200)
+            proxy._PARENT_KEEPALIVE_SNAPSHOTS["019dd22d"]["warmer_in_flight"] = True
+            with mock.patch.object(proxy.asyncio, "get_running_loop") as get_loop:
+                proxy._maybe_fire_parent_keepalive(sub, 200)
+                self.assertFalse(get_loop.called)
+
+    def test_parent_keepalive_drops_stale_snapshot_past_ttl(self):
+        import request_headers as request_headers_module
+        proxy._PARENT_KEEPALIVE_SNAPSHOTS.clear()
+        parent = self._build_responses_plan(cs_id=request_headers_module._CLIENT_SESSION_ID)
+        sub = self._build_responses_plan(cs_id="derived-uuid", request_id="req-2")
+        env = {
+            "GHCP_PROXY_PARENT_KEEPALIVE_ENABLED": "1",
+            "GHCP_PROXY_PARENT_KEEPALIVE_MIN_IDLE_SECONDS": "0",
+            "GHCP_PROXY_PARENT_KEEPALIVE_MIN_INTERVAL_SECONDS": "0",
+            "GHCP_PROXY_PARENT_KEEPALIVE_SNAPSHOT_TTL_SECONDS": "1",
+        }
+        with mock.patch.dict(proxy.os.environ, env, clear=False):
+            with mock.patch.object(proxy.time, "monotonic", return_value=100.0):
+                proxy._remember_parent_for_keepalive(parent, 200)
+            with mock.patch.object(proxy.time, "monotonic", return_value=200.0):
+                with mock.patch.object(proxy.asyncio, "get_running_loop") as get_loop:
+                    proxy._maybe_fire_parent_keepalive(sub, 200)
+                    self.assertFalse(get_loop.called)
+        self.assertNotIn("019dd22d", proxy._PARENT_KEEPALIVE_SNAPSHOTS)
+
+    def test_fire_parent_keepalive_posts_with_capped_max_output_tokens(self):
+        proxy._PARENT_KEEPALIVE_SNAPSHOTS.clear()
+        proxy._PARENT_KEEPALIVE_SNAPSHOTS["019dd22d"] = {
+            "upstream_url": "https://example.invalid/responses",
+            "headers": {"x-client-session-id": "sess-A"},
+            "body": {"model": "gpt-5.5", "prompt_cache_key": "019dd22d-34be-7da0", "input": [], "previous_response_id": "old"},
+            "finished_at": proxy.time.monotonic(),
+            "last_warmer_at": 0.0,
+            "warmer_in_flight": True,
+        }
+        captured: dict = {}
+
+        class FakePost:
+            def __init__(self, status: int):
+                self.status_code = status
+
+        class FakeClient:
+            def __init__(self, *args, **kwargs):
+                pass
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *args):
+                return False
+            async def post(self, url, headers=None, json=None):
+                captured["url"] = url
+                captured["headers"] = headers
+                captured["body"] = json
+                return FakePost(200)
+
+        env = {"GHCP_PROXY_PARENT_KEEPALIVE_MAX_OUTPUT_TOKENS": "8"}
+        with mock.patch.dict(proxy.os.environ, env, clear=False):
+            with mock.patch.object(proxy.httpx, "AsyncClient", FakeClient):
+                proxy.asyncio.run(proxy._fire_parent_keepalive("019dd22d"))
+        self.assertEqual(captured["url"], "https://example.invalid/responses")
+        self.assertEqual(captured["body"]["max_output_tokens"], 8)
+        self.assertFalse(captured["body"]["stream"])
+        self.assertNotIn("previous_response_id", captured["body"])
+        self.assertFalse(proxy._PARENT_KEEPALIVE_SNAPSHOTS["019dd22d"]["warmer_in_flight"])
 
     def test_proxy_registers_copilot_native_root_aliases(self):
         paths = {route.path for route in proxy.app.routes}
@@ -2423,6 +2629,88 @@ class ProxyRoutesTests(unittest.TestCase):
             b'{"error":{"message":"Upstream connection failed","type":"server_error","param":null,"code":null}}',
         )
 
+    def test_proxy_streaming_response_retries_without_prompt_cache_retention_when_rejected(self):
+        class RecordingClient:
+            def __init__(self):
+                self.bodies = []
+                self.aclose = mock.AsyncMock()
+
+            def build_request(self, method, url, headers=None, json=None):
+                self.bodies.append(json)
+                return httpx.Request(method, url, headers=headers, json=json)
+
+        first_client = RecordingClient()
+        retry_client = RecordingClient()
+        rejected = httpx.Response(
+            400,
+            json={
+                "error": {
+                    "message": "Unknown parameter: prompt_cache_retention",
+                    "param": "prompt_cache_retention",
+                }
+            },
+            headers={"content-type": "application/json"},
+        )
+        accepted = httpx.Response(
+            200,
+            content=b"data: [DONE]\n\n",
+            headers={"content-type": "text/event-stream"},
+        )
+        trace_plan = proxy.UpstreamRequestPlan(
+            request_id="req-retention-stream-retry",
+            upstream_url="https://example.invalid/responses",
+            headers={"Authorization": "Bearer test"},
+            body={
+                "model": "gpt-5.4",
+                "input": "hi",
+                "stream": True,
+                "prompt_cache_key": "cache-123",
+                "prompt_cache_retention": "24h",
+            },
+            usage_event=None,
+            requested_model="gpt-5.4",
+            resolved_model="gpt-5.4",
+            trace_context={},
+        )
+
+        async def run_stream():
+            with (
+                mock.patch.object(proxy.httpx, "AsyncClient", side_effect=[first_client, retry_client]),
+                mock.patch.object(
+                    proxy,
+                    "throttled_client_send",
+                    mock.AsyncMock(side_effect=[rejected, accepted]),
+                ) as send,
+                mock.patch.object(proxy.usage_tracker, "finish_event") as finish_usage,
+            ):
+                response = await proxy.proxy_streaming_response(
+                    "https://example.invalid/responses",
+                    {"Authorization": "Bearer test"},
+                    trace_plan.body,
+                    stream_type="responses",
+                    trace_plan=trace_plan,
+                )
+                body_bytes = b""
+                async for chunk in response.body_iterator:
+                    body_bytes += chunk
+                return response, body_bytes, send, finish_usage
+
+        response, body, send, finish_usage = proxy.asyncio.run(run_stream())
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(b"[DONE]", body)
+        self.assertEqual(send.await_count, 2)
+        self.assertEqual(first_client.bodies[0]["prompt_cache_retention"], "24h")
+        self.assertNotIn("prompt_cache_retention", retry_client.bodies[0])
+        self.assertEqual(retry_client.bodies[0]["prompt_cache_key"], "cache-123")
+        self.assertEqual(
+            trace_plan.trace_context["prompt_cache_retention_retry"],
+            {"action": "drop_unsupported_field", "field": "prompt_cache_retention"},
+        )
+        first_client.aclose.assert_awaited_once()
+        retry_client.aclose.assert_awaited_once()
+        finish_usage.assert_called_once()
+
     def test_graceful_streaming_response_swallows_cancelled_error(self):
         response = proxy.GracefulStreamingResponse(iter(()))
         receive = mock.AsyncMock()
@@ -2564,6 +2852,66 @@ class AnthropicMessagesPassthroughRouteTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 429)
         self.assertEqual(json.loads(response.body)["error"]["message"], "generic rate limited")
+
+    def test_non_streaming_request_retries_without_prompt_cache_retention_when_rejected(self):
+        rejected = httpx.Response(
+            400,
+            json={
+                "error": {
+                    "message": "Unknown parameter: prompt_cache_retention",
+                    "param": "prompt_cache_retention",
+                }
+            },
+            headers={"content-type": "application/json"},
+        )
+        accepted = httpx.Response(
+            200,
+            json={"id": "resp_123", "output": [], "usage": {"input_tokens": 10, "output_tokens": 1}},
+            headers={"content-type": "application/json"},
+        )
+        plan = proxy.UpstreamRequestPlan(
+            request_id="req-retention-retry",
+            upstream_url="https://example.invalid/responses",
+            headers={"Authorization": "Bearer test"},
+            body={
+                "model": "gpt-5.4",
+                "input": "hi",
+                "prompt_cache_key": "cache-123",
+                "prompt_cache_retention": "24h",
+            },
+            usage_event=None,
+            requested_model="gpt-5.4",
+            resolved_model="gpt-5.4",
+            trace_context={},
+        )
+
+        with (
+            mock.patch.object(
+                proxy,
+                "throttled_client_post",
+                mock.AsyncMock(side_effect=[rejected, accepted]),
+            ) as post,
+            mock.patch.object(proxy.usage_tracker, "finish_event") as finish_usage,
+        ):
+            response = proxy.asyncio.run(
+                proxy._post_non_streaming_request(
+                    plan,
+                    error_response=format_translation.openai_error_response,
+                )
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(post.await_count, 2)
+        first_body = post.await_args_list[0].kwargs["json"]
+        retry_body = post.await_args_list[1].kwargs["json"]
+        self.assertEqual(first_body["prompt_cache_retention"], "24h")
+        self.assertNotIn("prompt_cache_retention", retry_body)
+        self.assertEqual(retry_body["prompt_cache_key"], "cache-123")
+        self.assertEqual(
+            plan.trace_context["prompt_cache_retention_retry"],
+            {"action": "drop_unsupported_field", "field": "prompt_cache_retention"},
+        )
+        finish_usage.assert_called_once()
 
     def test_chat_streaming_returns_friendly_message_for_weekly_limit_429(self):
         upstream = httpx.Response(

@@ -121,6 +121,49 @@ class ProxyTracingTests(unittest.TestCase):
             },
         )
 
+    def test_prompt_cache_affinity_diagnostics_reports_header_drift(self):
+        body = {"model": "gpt-5.5", "input": "hi", "prompt_cache_key": "cache-123"}
+        with proxy._PROMPT_CACHE_AFFINITY_TRACE_LOCK:
+            proxy._PROMPT_CACHE_LAST_AFFINITY_BY_LINEAGE.clear()
+
+        first = proxy._prompt_cache_affinity_diagnostics(
+            request_id="req_1",
+            upstream_body=body,
+            resolved_model="gpt-5.5",
+            outbound_headers={
+                "x-agent-task-id": "task-a",
+                "x-interaction-id": "interaction-a",
+                "x-client-session-id": "client-a",
+            },
+        )
+        second = proxy._prompt_cache_affinity_diagnostics(
+            request_id="req_2",
+            upstream_body=body,
+            resolved_model="gpt-5.5",
+            outbound_headers={
+                "x-agent-task-id": "task-a",
+                "x-interaction-id": "interaction-a",
+                "x-client-session-id": "client-a",
+            },
+        )
+        drift = proxy._prompt_cache_affinity_diagnostics(
+            request_id="req_3",
+            upstream_body=body,
+            resolved_model="gpt-5.5",
+            outbound_headers={
+                "x-agent-task-id": "task-b",
+                "x-interaction-id": "interaction-b",
+                "x-client-session-id": "client-a",
+            },
+        )
+
+        self.assertIsNone(first)
+        self.assertIsNone(second)
+        self.assertEqual(drift["previous_request_id"], "req_2")
+        self.assertEqual(drift["changed_fields"], ["x_agent_task_id", "x_interaction_id"])
+        self.assertEqual(drift["previous"]["x_agent_task_id"], "task-a")
+        self.assertEqual(drift["current"]["x_agent_task_id"], "task-b")
+
     def test_finish_usage_and_trace_emits_failure_diagnostic_for_bridge_request(self):
         plan = proxy.UpstreamRequestPlan(
             request_id="req_123",

@@ -35,6 +35,7 @@ from responses_upstream_cache import (  # noqa: F401
     _format_custom_tool_call_for_chat,
     _format_custom_tool_output_for_chat,
     _last_cacheable_anthropic_content_block,
+    apply_responses_prompt_cache_retention,
     _responses_body_requests_prompt_cache,
     _responses_function_call_output_to_anthropic_block,
     _responses_function_call_to_anthropic_block,

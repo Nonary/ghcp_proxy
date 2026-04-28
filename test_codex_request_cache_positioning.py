@@ -251,7 +251,7 @@ class CodexRequestCachePositioningTests(unittest.TestCase):
 
         self.assertEqual(plan.diagnostics[0]["fields"], ["service_tier"])
 
-    def test_responses_header_identity_ignores_prompt_cache_key_and_strips_aliases(self):
+    def test_responses_header_identity_uses_prompt_cache_key_and_strips_aliases(self):
         first_request = SimpleNamespace(
             headers={"x-openai-subagent": "worker", "x-client-request-id": "client-fallback"},
             url=SimpleNamespace(path="/v1/responses"),
@@ -305,10 +305,10 @@ class CodexRequestCachePositioningTests(unittest.TestCase):
             session_id_resolver=usage_tracking.request_session_id,
         )
 
-        self.assertNotEqual(first_headers["x-interaction-id"], second_headers["x-interaction-id"])
-        self.assertNotEqual(first_headers["x-agent-task-id"], second_headers["x-agent-task-id"])
-        self.assertEqual(second_headers["x-interaction-id"], third_headers["x-interaction-id"])
-        self.assertEqual(second_headers["x-agent-task-id"], third_headers["x-agent-task-id"])
+        self.assertEqual(first_headers["x-interaction-id"], second_headers["x-interaction-id"])
+        self.assertEqual(first_headers["x-agent-task-id"], second_headers["x-agent-task-id"])
+        self.assertNotEqual(second_headers["x-interaction-id"], third_headers["x-interaction-id"])
+        self.assertNotEqual(second_headers["x-agent-task-id"], third_headers["x-agent-task-id"])
         self.assertEqual(first_body.get("prompt_cache_key"), " primary-cache ")
         self.assertEqual(first_body.get("promptCacheKey"), "secondary-cache")
         self.assertEqual(second_body.get("prompt_cache_key"), "primary-cache")
@@ -316,7 +316,7 @@ class CodexRequestCachePositioningTests(unittest.TestCase):
         self.assertNotIn("x-client-request-id", first_headers)
         self.assertNotIn("x-openai-subagent", first_headers)
 
-    def test_responses_header_identity_ignores_session_and_client_request_id_for_native_responses(self):
+    def test_responses_header_identity_uses_session_and_ignores_client_request_id_for_native_responses(self):
         first_request = SimpleNamespace(
             headers={"x-openai-subagent": "worker", "x-client-request-id": "client-a"},
             url=SimpleNamespace(path="/v1/responses"),
@@ -356,14 +356,14 @@ class CodexRequestCachePositioningTests(unittest.TestCase):
             session_id_resolver=usage_tracking.request_session_id,
         )
 
-        self.assertNotEqual(first_headers["x-interaction-id"], second_headers["x-interaction-id"])
-        self.assertNotEqual(first_headers["x-agent-task-id"], second_headers["x-agent-task-id"])
-        self.assertEqual(second_headers["x-interaction-id"], third_headers["x-interaction-id"])
-        self.assertEqual(second_headers["x-agent-task-id"], third_headers["x-agent-task-id"])
+        self.assertEqual(first_headers["x-interaction-id"], second_headers["x-interaction-id"])
+        self.assertEqual(first_headers["x-agent-task-id"], second_headers["x-agent-task-id"])
+        self.assertNotEqual(second_headers["x-interaction-id"], third_headers["x-interaction-id"])
+        self.assertNotEqual(second_headers["x-agent-task-id"], third_headers["x-agent-task-id"])
         self.assertNotIn("session_id", first_headers)
         self.assertNotIn("x-client-request-id", first_headers)
 
-    def test_responses_header_identity_ignores_camel_prompt_cache_key_alias(self):
+    def test_responses_header_identity_uses_camel_prompt_cache_key_alias(self):
         first_request = SimpleNamespace(
             headers={"x-openai-subagent": "worker", "x-client-request-id": "client-a"},
             url=SimpleNamespace(path="/v1/responses"),
@@ -390,8 +390,8 @@ class CodexRequestCachePositioningTests(unittest.TestCase):
             session_id_resolver=usage_tracking.request_session_id,
         )
 
-        self.assertNotEqual(first_headers["x-interaction-id"], second_headers["x-interaction-id"])
-        self.assertNotEqual(first_headers["x-agent-task-id"], second_headers["x-agent-task-id"])
+        self.assertEqual(first_headers["x-interaction-id"], second_headers["x-interaction-id"])
+        self.assertEqual(first_headers["x-agent-task-id"], second_headers["x-agent-task-id"])
         self.assertEqual(first_body.get("promptCacheKey"), "camel-cache")
         self.assertEqual(second_body.get("promptCacheKey"), " camel-cache ")
 

@@ -177,6 +177,8 @@ _PROMPT_CACHE_SETTLE_LOCK = threading.Lock()
 _PROMPT_CACHE_LAST_FINISH_BY_LINEAGE: dict[tuple[str, str], float] = {}
 _PROMPT_CACHE_TRACE_LOCK = threading.Lock()
 _PROMPT_CACHE_LAST_INPUT_BY_LINEAGE: dict[tuple[str, str], dict] = {}
+_PROMPT_CACHE_AFFINITY_TRACE_LOCK = threading.Lock()
+_PROMPT_CACHE_LAST_AFFINITY_BY_LINEAGE: dict[tuple[str, str], dict] = {}
 
 
 def _stream_with_update_notice(byte_iter, protocol: str, upstream_headers=None):
@@ -499,6 +501,266 @@ def _remember_responses_cache_settle_finish(plan: "UpstreamRequestPlan | None", 
         return
     with _PROMPT_CACHE_SETTLE_LOCK:
         _PROMPT_CACHE_LAST_FINISH_BY_LINEAGE[lineage] = time.monotonic()
+
+
+# ─── Parent prompt-cache LRU keepalive ───────────────────────────────────────
+# Subagent activity on the same Codex task evicts the parent's idle prefix from
+# upstream cache after ~10s of cumulative writes. Snapshot the parent's last
+# successful upstream body per task prefix; when a subagent finishes for the
+# same task and the parent has been idle past a small threshold, fire a small
+# warmer POST on the parent's lineage so upstream's LRU keeps the prefix hot.
+_PARENT_KEEPALIVE_LOCK = threading.Lock()
+_PARENT_KEEPALIVE_SNAPSHOTS: dict[str, dict] = {}
+_PARENT_KEEPALIVE_MAX_SNAPSHOTS = 64
+
+
+def _parent_keepalive_enabled() -> bool:
+    raw = str(os.environ.get("GHCP_PROXY_PARENT_KEEPALIVE_ENABLED", "1")).strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
+def _parent_keepalive_min_idle_seconds() -> float:
+    raw = os.environ.get("GHCP_PROXY_PARENT_KEEPALIVE_MIN_IDLE_SECONDS")
+    if raw is None:
+        return 6.0
+    try:
+        return max(0.0, float(str(raw).strip()))
+    except (TypeError, ValueError):
+        return 6.0
+
+
+def _parent_keepalive_min_interval_seconds() -> float:
+    raw = os.environ.get("GHCP_PROXY_PARENT_KEEPALIVE_MIN_INTERVAL_SECONDS")
+    if raw is None:
+        return 5.0
+    try:
+        return max(0.0, float(str(raw).strip()))
+    except (TypeError, ValueError):
+        return 5.0
+
+
+def _parent_keepalive_max_output_tokens() -> int:
+    raw = os.environ.get("GHCP_PROXY_PARENT_KEEPALIVE_MAX_OUTPUT_TOKENS")
+    if raw is None:
+        return 16
+    try:
+        return max(1, int(str(raw).strip()))
+    except (TypeError, ValueError):
+        return 16
+
+
+def _parent_keepalive_snapshot_ttl_seconds() -> float:
+    raw = os.environ.get("GHCP_PROXY_PARENT_KEEPALIVE_SNAPSHOT_TTL_SECONDS")
+    if raw is None:
+        return 300.0
+    try:
+        return max(0.0, float(str(raw).strip()))
+    except (TypeError, ValueError):
+        return 300.0
+
+
+def _responses_plan_task_prefix(plan: "UpstreamRequestPlan | None") -> str | None:
+    """First eight chars of ``prompt_cache_key`` (UUIDv7 task prefix), if any."""
+    if not isinstance(plan, UpstreamRequestPlan):
+        return None
+    body = plan.body if isinstance(plan.body, dict) else None
+    if not isinstance(body, dict):
+        return None
+    pck = body.get("prompt_cache_key") or body.get("promptCacheKey")
+    if not isinstance(pck, str):
+        return None
+    normalized = pck.strip()
+    if len(normalized) >= 36 and normalized[8:9] == "-":
+        return normalized[:8]
+    return None
+
+
+def _responses_plan_outbound_session_id(plan: "UpstreamRequestPlan | None") -> str | None:
+    if not isinstance(plan, UpstreamRequestPlan):
+        return None
+    headers = plan.headers if isinstance(plan.headers, dict) else None
+    if not headers:
+        return None
+    for key, value in headers.items():
+        if isinstance(key, str) and key.lower() == "x-client-session-id":
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return None
+
+
+def _responses_plan_role(plan: "UpstreamRequestPlan | None") -> str | None:
+    """Classify a /responses gpt-5.5 plan as ``parent`` or ``subagent``.
+
+    Subagent isolation routes subagent traffic to a derived
+    ``x-client-session-id``; parent traffic keeps the proxy default.
+    """
+    import request_headers as _request_headers_module
+    if not isinstance(plan, UpstreamRequestPlan):
+        return None
+    if "/responses" not in (plan.upstream_url or ""):
+        return None
+    model = str(plan.resolved_model or plan.requested_model or "").strip().lower()
+    if model != "gpt-5.5":
+        return None
+    cs_id = _responses_plan_outbound_session_id(plan)
+    if not cs_id:
+        return None
+    if cs_id == _request_headers_module._CLIENT_SESSION_ID:
+        return "parent"
+    return "subagent"
+
+
+def _evict_oldest_parent_keepalive_snapshot_locked() -> None:
+    """Caller must hold ``_PARENT_KEEPALIVE_LOCK``."""
+    if len(_PARENT_KEEPALIVE_SNAPSHOTS) <= _PARENT_KEEPALIVE_MAX_SNAPSHOTS:
+        return
+    oldest_key = None
+    oldest_at = float("inf")
+    for key, snap in _PARENT_KEEPALIVE_SNAPSHOTS.items():
+        ts = snap.get("finished_at", 0.0)
+        if ts < oldest_at:
+            oldest_at = ts
+            oldest_key = key
+    if oldest_key is not None:
+        _PARENT_KEEPALIVE_SNAPSHOTS.pop(oldest_key, None)
+
+
+def _remember_parent_for_keepalive(
+    plan: "UpstreamRequestPlan | None",
+    status_code: int,
+) -> None:
+    if status_code >= 400:
+        return
+    if not _parent_keepalive_enabled():
+        return
+    if _responses_plan_role(plan) != "parent":
+        return
+    task_prefix = _responses_plan_task_prefix(plan)
+    if not task_prefix:
+        return
+    if not isinstance(plan.body, dict) or not plan.upstream_url:
+        return
+    snapshot_body = dict(plan.body)
+    # Drop fields that are not safe to replay verbatim.
+    snapshot_body.pop("previous_response_id", None)
+    snapshot = {
+        "upstream_url": plan.upstream_url,
+        "headers": dict(plan.headers) if isinstance(plan.headers, dict) else {},
+        "body": snapshot_body,
+        "finished_at": time.monotonic(),
+    }
+    with _PARENT_KEEPALIVE_LOCK:
+        existing = _PARENT_KEEPALIVE_SNAPSHOTS.get(task_prefix)
+        if existing is not None:
+            snapshot["last_warmer_at"] = existing.get("last_warmer_at", 0.0)
+            snapshot["warmer_in_flight"] = existing.get("warmer_in_flight", False)
+        else:
+            snapshot["last_warmer_at"] = 0.0
+            snapshot["warmer_in_flight"] = False
+        _PARENT_KEEPALIVE_SNAPSHOTS[task_prefix] = snapshot
+        _evict_oldest_parent_keepalive_snapshot_locked()
+
+
+def _maybe_fire_parent_keepalive(
+    plan: "UpstreamRequestPlan | None",
+    status_code: int,
+) -> None:
+    if status_code >= 400:
+        return
+    if not _parent_keepalive_enabled():
+        return
+    if _responses_plan_role(plan) != "subagent":
+        return
+    task_prefix = _responses_plan_task_prefix(plan)
+    if not task_prefix:
+        return
+    now = time.monotonic()
+    fire = False
+    with _PARENT_KEEPALIVE_LOCK:
+        snap = _PARENT_KEEPALIVE_SNAPSHOTS.get(task_prefix)
+        if snap is None:
+            return
+        ttl = _parent_keepalive_snapshot_ttl_seconds()
+        if ttl > 0 and now - snap.get("finished_at", 0.0) > ttl:
+            _PARENT_KEEPALIVE_SNAPSHOTS.pop(task_prefix, None)
+            return
+        if snap.get("warmer_in_flight"):
+            return
+        if now - snap.get("finished_at", 0.0) < _parent_keepalive_min_idle_seconds():
+            return
+        if now - snap.get("last_warmer_at", 0.0) < _parent_keepalive_min_interval_seconds():
+            return
+        snap["warmer_in_flight"] = True
+        snap["last_warmer_at"] = now
+        fire = True
+    if not fire:
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        with _PARENT_KEEPALIVE_LOCK:
+            s = _PARENT_KEEPALIVE_SNAPSHOTS.get(task_prefix)
+            if s:
+                s["warmer_in_flight"] = False
+        return
+    loop.create_task(_fire_parent_keepalive(task_prefix))
+
+
+async def _fire_parent_keepalive(task_prefix: str) -> None:
+    with _PARENT_KEEPALIVE_LOCK:
+        snap = _PARENT_KEEPALIVE_SNAPSHOTS.get(task_prefix)
+        if snap is None:
+            return
+        upstream_url = snap.get("upstream_url")
+        headers = dict(snap.get("headers") or {})
+        body = dict(snap.get("body") or {})
+    if not isinstance(upstream_url, str) or not upstream_url:
+        with _PARENT_KEEPALIVE_LOCK:
+            s = _PARENT_KEEPALIVE_SNAPSHOTS.get(task_prefix)
+            if s:
+                s["warmer_in_flight"] = False
+        return
+    body["max_output_tokens"] = _parent_keepalive_max_output_tokens()
+    body["stream"] = False
+    body.pop("previous_response_id", None)
+    keepalive_id = uuid4().hex
+    started_at = util.utc_now_iso()
+    if request_tracing_enabled():
+        _append_request_trace(
+            {
+                "event": "parent_keepalive_started",
+                "time": started_at,
+                "request_id": keepalive_id,
+                "task_prefix": task_prefix,
+                "upstream_url": upstream_url,
+            }
+        )
+    status_code: int | None = None
+    error_message: str | None = None
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.post(upstream_url, headers=headers, json=body)
+            status_code = response.status_code
+    except httpx.RequestError as exc:
+        error_message = format_translation.upstream_request_error_status_and_message(exc)[1]
+    except Exception as exc:  # noqa: BLE001 - keepalive must never raise
+        error_message = str(exc)
+    finally:
+        with _PARENT_KEEPALIVE_LOCK:
+            s = _PARENT_KEEPALIVE_SNAPSHOTS.get(task_prefix)
+            if s:
+                s["warmer_in_flight"] = False
+        if request_tracing_enabled():
+            payload = {
+                "event": "parent_keepalive_finished",
+                "time": util.utc_now_iso(),
+                "request_id": keepalive_id,
+                "task_prefix": task_prefix,
+                "status_code": status_code,
+            }
+            if error_message:
+                payload["error"] = error_message
+            _append_request_trace(payload)
 
 
 def _cache_tripwire_reply(usage: dict) -> upstream_errors.SyntheticReply:
@@ -1060,6 +1322,57 @@ def _prompt_cache_prefix_diagnostics(
     return diagnostics
 
 
+def _prompt_cache_affinity_diagnostics(
+    *,
+    request_id: str,
+    upstream_body: dict | None,
+    resolved_model: str | None,
+    outbound_headers: dict | None,
+) -> dict | None:
+    lineage = _prompt_cache_trace_lineage(upstream_body, resolved_model)
+    if lineage is None or not isinstance(outbound_headers, dict):
+        return None
+
+    def header_value(name: str) -> str | None:
+        value = outbound_headers.get(name)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        target = name.lower()
+        for key, candidate in outbound_headers.items():
+            if isinstance(key, str) and key.lower() == target and isinstance(candidate, str) and candidate.strip():
+                return candidate.strip()
+        return None
+
+    snapshot = {
+        "request_id": request_id,
+        "x_agent_task_id": header_value("x-agent-task-id"),
+        "x_interaction_id": header_value("x-interaction-id"),
+        "x_client_session_id": header_value("x-client-session-id"),
+    }
+    with _PROMPT_CACHE_AFFINITY_TRACE_LOCK:
+        previous = _PROMPT_CACHE_LAST_AFFINITY_BY_LINEAGE.get(lineage)
+        _PROMPT_CACHE_LAST_AFFINITY_BY_LINEAGE[lineage] = snapshot
+
+    if not isinstance(previous, dict):
+        return None
+
+    changed_fields = []
+    for field in ("x_agent_task_id", "x_interaction_id", "x_client_session_id"):
+        if previous.get(field) != snapshot.get(field):
+            changed_fields.append(field)
+
+    if not changed_fields:
+        return None
+
+    return {
+        "lineage_model": lineage[0],
+        "previous_request_id": previous.get("request_id"),
+        "changed_fields": changed_fields,
+        "previous": {field: previous.get(field) for field in changed_fields},
+        "current": {field: snapshot.get(field) for field in changed_fields},
+    }
+
+
 def _trace_response_summary(
     upstream: httpx.Response | None = None,
     response_payload: dict | None = None,
@@ -1408,6 +1721,15 @@ def _emit_request_trace_start(
     if cache_prefix_diagnostics is not None:
         trace_details = dict(trace_details)
         trace_details["prompt_cache_prefix"] = cache_prefix_diagnostics
+    cache_affinity_diagnostics = _prompt_cache_affinity_diagnostics(
+        request_id=request_id,
+        upstream_body=upstream_body,
+        resolved_model=resolved_model,
+        outbound_headers=outbound_headers,
+    )
+    if cache_affinity_diagnostics is not None:
+        trace_details = dict(trace_details)
+        trace_details["prompt_cache_affinity_drift"] = cache_affinity_diagnostics
     payload = {
         "event": "request_started",
         "time": util.utc_now_iso(),
@@ -1489,6 +1811,8 @@ def _finish_usage_and_trace(
                 _append_request_trace(trace_payload, force=force_trace)
         finally:
             _remember_responses_cache_settle_finish(plan, status_code)
+            _remember_parent_for_keepalive(plan, status_code)
+            _maybe_fire_parent_keepalive(plan, status_code)
             if plan.auto_update_request_tracked:
                 auto_update_runtime_controller.note_request_finished(plan.request_id)
         return
@@ -1869,6 +2193,14 @@ async def _post_non_streaming_request(plan: UpstreamRequestPlan, *, error_respon
                 headers=plan.headers,
                 json=plan.body,
             )
+            if _should_retry_without_prompt_cache_retention(upstream, plan):
+                _drop_prompt_cache_retention_for_retry(plan)
+                upstream = await throttled_client_post(
+                    client,
+                    plan.upstream_url,
+                    headers=plan.headers,
+                    json=plan.body,
+                )
         if upstream.status_code >= 400:
             return _handle_upstream_error(
                 upstream,
@@ -1906,6 +2238,14 @@ async def _post_bridge_non_streaming_request(plan: UpstreamRequestPlan, bridge_p
                 headers=plan.headers,
                 json=plan.body,
             )
+            if _should_retry_without_prompt_cache_retention(upstream, plan):
+                _drop_prompt_cache_retention_for_retry(plan)
+                upstream = await throttled_client_post(
+                    client,
+                    plan.upstream_url,
+                    headers=plan.headers,
+                    json=plan.body,
+                )
     except httpx.RequestError as exc:
         status_code, message = format_translation.upstream_request_error_status_and_message(exc)
         _finish_usage_and_trace(plan, status_code, response_text=message)
@@ -2075,6 +2415,54 @@ def _openai_error_response_from_anthropic(upstream: httpx.Response) -> Response:
     )
 
 
+def _plan_uses_prompt_cache_retention(plan: UpstreamRequestPlan | None) -> bool:
+    return (
+        isinstance(plan, UpstreamRequestPlan)
+        and isinstance(plan.body, dict)
+        and "prompt_cache_retention" in plan.body
+    )
+
+
+def _upstream_rejected_prompt_cache_retention(upstream: httpx.Response) -> bool:
+    if upstream.status_code not in {400, 422}:
+        return False
+    payload = _extract_upstream_json_payload(upstream)
+    if isinstance(payload, dict):
+        error = payload.get("error")
+        if isinstance(error, dict):
+            param = error.get("param")
+            if isinstance(param, str) and param == "prompt_cache_retention":
+                return True
+            message = error.get("message")
+            if isinstance(message, str) and "prompt_cache_retention" in message:
+                return True
+        message = payload.get("message")
+        if isinstance(message, str) and "prompt_cache_retention" in message:
+            return True
+    text = _extract_upstream_text(upstream)
+    return isinstance(text, str) and "prompt_cache_retention" in text
+
+
+def _drop_prompt_cache_retention_for_retry(plan: UpstreamRequestPlan) -> None:
+    if not isinstance(plan.body, dict):
+        return
+    if "prompt_cache_retention" not in plan.body:
+        return
+    plan.body = {key: value for key, value in plan.body.items() if key != "prompt_cache_retention"}
+    if isinstance(plan.trace_context, dict):
+        plan.trace_context["prompt_cache_retention_retry"] = {
+            "action": "drop_unsupported_field",
+            "field": "prompt_cache_retention",
+        }
+
+
+def _should_retry_without_prompt_cache_retention(
+    upstream: httpx.Response,
+    plan: UpstreamRequestPlan | None,
+) -> bool:
+    return _plan_uses_prompt_cache_retention(plan) and _upstream_rejected_prompt_cache_retention(upstream)
+
+
 def _handle_upstream_error(
     upstream: httpx.Response,
     *,
@@ -2160,19 +2548,35 @@ async def proxy_streaming_response(
         raise
 
     if upstream.status_code >= 400:
-        try:
-            await upstream.aread()
-            return _handle_upstream_error(
-                upstream,
-                trace_plan=trace_plan,
-                caller_protocol=stream_type,
-                stream=True,
-                model=trace_plan.resolved_model if isinstance(trace_plan, UpstreamRequestPlan) else None,
-                fallback_error_response=proxy_non_streaming_response,
-            )
-        finally:
+        await upstream.aread()
+        if _should_retry_without_prompt_cache_retention(upstream, trace_plan):
             await upstream.aclose()
             await client.aclose()
+            _drop_prompt_cache_retention_for_retry(trace_plan)
+            client = httpx.AsyncClient(timeout=timeout)
+            retry_body = trace_plan.body if isinstance(trace_plan, UpstreamRequestPlan) else body
+            request = client.build_request("POST", upstream_url, headers=headers, json=retry_body)
+            try:
+                upstream = await throttled_client_send(client, request, stream=True)
+            except httpx.RequestError as exc:
+                status_code, message = format_translation.upstream_request_error_status_and_message(exc)
+                _finish_usage_and_trace(trace_plan, status_code, response_text=message)
+                await client.aclose()
+                return format_translation.openai_error_response(status_code, message)
+        if upstream.status_code >= 400:
+            try:
+                await upstream.aread()
+                return _handle_upstream_error(
+                    upstream,
+                    trace_plan=trace_plan,
+                    caller_protocol=stream_type,
+                    stream=True,
+                    model=trace_plan.resolved_model if isinstance(trace_plan, UpstreamRequestPlan) else None,
+                    fallback_error_response=proxy_non_streaming_response,
+                )
+            finally:
+                await upstream.aclose()
+                await client.aclose()
 
     response_headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
     content_type = upstream.headers.get("content-type")

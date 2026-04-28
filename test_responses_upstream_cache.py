@@ -91,6 +91,29 @@ class ResponsesUpstreamCacheSanitizerTests(unittest.TestCase):
         self.assertEqual(sanitized["user"], "user-1")
         self.assertEqual(sanitized["safety_identifier"], "safe-1")
 
+    def test_apply_prompt_cache_retention_for_cache_keyed_requests(self):
+        body = {"model": "gpt-5.4", "input": "hi", "prompt_cache_key": "lineage-1"}
+
+        retained = ruc.apply_responses_prompt_cache_retention(body)
+
+        self.assertIsNot(retained, body)
+        self.assertEqual(retained["prompt_cache_key"], "lineage-1")
+        self.assertEqual(retained["prompt_cache_retention"], "24h")
+        self.assertNotIn("prompt_cache_retention", body)
+
+    def test_apply_prompt_cache_retention_respects_existing_value_and_opt_out(self):
+        body = {
+            "model": "gpt-5.4",
+            "input": "hi",
+            "promptCacheKey": "lineage-1",
+            "prompt_cache_retention": "5m",
+        }
+        self.assertIs(ruc.apply_responses_prompt_cache_retention(body), body)
+
+        with mock.patch.dict("os.environ", {"GHCP_PROXY_RESPONSES_PROMPT_CACHE_RETENTION": "off"}):
+            disabled = {"model": "gpt-5.4", "input": "hi", "prompt_cache_key": "lineage-1"}
+            self.assertIs(ruc.apply_responses_prompt_cache_retention(disabled), disabled)
+
     def test_tool_choice_removed_detection_covers_type_and_function_names(self):
         self.assertFalse(ruc._responses_tool_choice_targets_removed_tool("auto", {"image_generation"}, set()))
         self.assertTrue(

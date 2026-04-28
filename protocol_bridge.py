@@ -171,6 +171,7 @@ class ResponsesToResponsesStrategy(ProtocolBridgeStrategy):
             upstream_body,
             diagnostics=diagnostics,
         )
+        upstream_body = format_translation.apply_responses_prompt_cache_retention(upstream_body)
         upstream_body = format_translation.sanitize_responses_body_for_copilot(
             upstream_body,
             diagnostics=diagnostics,
