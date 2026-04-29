@@ -71,7 +71,7 @@ class ResponsesUpstreamCacheSanitizerTests(unittest.TestCase):
             flush=True,
         )
 
-    def test_body_sanitizer_preserves_cache_lineage_fields(self):
+    def test_body_sanitizer_drops_local_cache_lineage_fields(self):
         body = {
             "model": "gpt-5.4",
             "input": "hi",
@@ -83,22 +83,21 @@ class ResponsesUpstreamCacheSanitizerTests(unittest.TestCase):
             "safety_identifier": "safe-1",
         }
         sanitized = ruc.sanitize_responses_body_for_copilot(body)
-        self.assertIs(sanitized, body)
-        self.assertEqual(sanitized["prompt_cache_key"], "lineage-1")
-        self.assertEqual(sanitized["promptCacheKey"], "lineage-1")
-        self.assertEqual(sanitized["previous_response_id"], "resp_prev")
+        self.assertIsNot(sanitized, body)
+        self.assertNotIn("prompt_cache_key", sanitized)
+        self.assertNotIn("promptCacheKey", sanitized)
+        self.assertNotIn("previous_response_id", sanitized)
         self.assertEqual(sanitized["metadata"], {"k": "v"})
         self.assertEqual(sanitized["user"], "user-1")
         self.assertEqual(sanitized["safety_identifier"], "safe-1")
 
-    def test_apply_prompt_cache_retention_for_cache_keyed_requests(self):
+    def test_apply_prompt_cache_retention_is_noop_for_copilot_cli_shape(self):
         body = {"model": "gpt-5.4", "input": "hi", "prompt_cache_key": "lineage-1"}
 
         retained = ruc.apply_responses_prompt_cache_retention(body)
 
-        self.assertIsNot(retained, body)
+        self.assertIs(retained, body)
         self.assertEqual(retained["prompt_cache_key"], "lineage-1")
-        self.assertEqual(retained["prompt_cache_retention"], "24h")
         self.assertNotIn("prompt_cache_retention", body)
 
     def test_apply_prompt_cache_retention_respects_existing_value_and_opt_out(self):

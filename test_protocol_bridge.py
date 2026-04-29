@@ -533,16 +533,14 @@ class ProtocolBridgePlannerTests(unittest.TestCase):
 
         self.assertEqual(plan.strategy_name, "responses_to_responses")
         self.assertNotIn("service_tier", plan.upstream_body)
-        self.assertEqual(plan.upstream_body["sessionId"], "session-123")
-        # Cache lineage stays on the upstream body so the Copilot prefix cache
-        # can match across turns.
-        self.assertEqual(plan.upstream_body["prompt_cache_key"], "cache-123")
-        self.assertEqual(plan.upstream_body["prompt_cache_retention"], "24h")
-        self.assertEqual(plan.upstream_body["previous_response_id"], "resp_prev")
+        self.assertNotIn("sessionId", plan.upstream_body)
+        self.assertNotIn("prompt_cache_key", plan.upstream_body)
+        self.assertNotIn("prompt_cache_retention", plan.upstream_body)
+        self.assertNotIn("previous_response_id", plan.upstream_body)
         self.assertEqual(plan.upstream_body["input"], "hello")
         self.assertEqual(
             plan.diagnostics[0]["fields"],
-            ["service_tier"],
+            ["previous_response_id", "prompt_cache_key", "service_tier", "sessionId"],
         )
 
     def test_planner_preserves_deferred_tools_for_native_responses(self):
@@ -652,7 +650,7 @@ class ProtocolBridgePlannerTests(unittest.TestCase):
         )
 
         self.assertEqual(plan.strategy_name, "messages_to_responses")
-        self.assertEqual(plan.upstream_body["prompt_cache_key"], "claude-cache-session")
+        self.assertNotIn("prompt_cache_key", plan.upstream_body)
         self.assertNotIn("instructions", plan.upstream_body)
         self.assertEqual(plan.upstream_body["text"], {"format": {"type": "text"}, "verbosity": "low"})
         self.assertEqual(plan.upstream_body["input"][0]["role"], "developer")

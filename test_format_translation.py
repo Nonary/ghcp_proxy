@@ -873,7 +873,7 @@ class FormatTranslationTests(unittest.TestCase):
                 {"type": "image", "source": {"type": "file"}}
             )
 
-    def test_anthropic_request_to_responses_uses_metadata_session_as_prompt_cache_key(self):
+    def test_anthropic_request_to_responses_keeps_metadata_session_out_of_body(self):
         translated = format_translation.anthropic_request_to_responses(
             {
                 "model": "claude-opus-4.6",
@@ -882,7 +882,7 @@ class FormatTranslationTests(unittest.TestCase):
             }
         )
 
-        self.assertEqual(translated["prompt_cache_key"], "session-1")
+        self.assertNotIn("prompt_cache_key", translated)
 
     def test_anthropic_request_to_responses_ignores_plain_metadata_user_id_for_prompt_cache(self):
         translated = format_translation.anthropic_request_to_responses(
@@ -1342,14 +1342,12 @@ class FormatTranslationTests(unittest.TestCase):
         self.assertEqual(sanitized["client_metadata"], {"session_id": "local-only"})
         self.assertEqual(sanitized["tool_choice"], "auto")
         self.assertEqual(sanitized["context_management"], [{"type": "compaction", "compact_threshold": 100000}])
-        # Cache-lineage fields stay on the body — they're the upstream prefix
-        # cache hint and stripping them broke Codex's cache hit rate in prod.
-        self.assertEqual(sanitized["previous_response_id"], "resp_prev")
-        self.assertEqual(sanitized["prompt_cache_key"], "cache-local")
+        self.assertNotIn("previous_response_id", sanitized)
+        self.assertNotIn("prompt_cache_key", sanitized)
         self.assertEqual(diagnostics[0]["action"], "drop_unsupported_copilot_fields")
         self.assertEqual(
             diagnostics[0]["fields"],
-            ["service_tier"],
+            ["previous_response_id", "prompt_cache_key", "service_tier"],
         )
 
     def test_sanitize_responses_body_preserves_explicit_tool_choice(self):

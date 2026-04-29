@@ -96,7 +96,7 @@ class ProxyRoutesTests(unittest.TestCase):
         plan = proxy.UpstreamRequestPlan(
             request_id="req-1",
             upstream_url="https://example.invalid/responses",
-            headers={},
+            headers={"x-agent-task-id": "cache-task"},
             body={"model": "gpt-5.5", "prompt_cache_key": "cache-key", "input": "hello"},
             usage_event=None,
             requested_model="gpt-5.5",
@@ -120,7 +120,7 @@ class ProxyRoutesTests(unittest.TestCase):
         finished_plan = proxy.UpstreamRequestPlan(
             request_id="req-1",
             upstream_url="https://example.invalid/responses",
-            headers={},
+            headers={"x-agent-task-id": "cache-task"},
             body={"model": "gpt-5.5", "prompt_cache_key": "cache-key", "input": "hello"},
             usage_event=None,
             requested_model="gpt-5.5",
@@ -129,7 +129,7 @@ class ProxyRoutesTests(unittest.TestCase):
         other_model_plan = proxy.UpstreamRequestPlan(
             request_id="req-2",
             upstream_url="https://example.invalid/responses",
-            headers={},
+            headers={"x-agent-task-id": "cache-task"},
             body={"model": "gpt-5.4", "prompt_cache_key": "cache-key", "input": "hello"},
             usage_event=None,
             requested_model="gpt-5.4",
@@ -150,12 +150,19 @@ class ProxyRoutesTests(unittest.TestCase):
         *,
         request_id: str = "req-1",
         cs_id: str | None,
+        subagent: bool = False,
         prompt_cache_key: str = "019dd22d-34be-7da0-aaaa-aaaaaaaaaaaa",
         upstream_url: str = "https://example.invalid/responses",
     ):
         headers = {}
         if cs_id is not None:
             headers["x-client-session-id"] = cs_id
+        if subagent:
+            headers["x-interaction-type"] = "conversation-subagent"
+            headers["x-parent-agent-id"] = "parent-task"
+            headers["x-agent-task-id"] = "child-task"
+        else:
+            headers["x-agent-task-id"] = "parent-task"
         return proxy.UpstreamRequestPlan(
             request_id=request_id,
             upstream_url=upstream_url,
@@ -173,7 +180,11 @@ class ProxyRoutesTests(unittest.TestCase):
     def test_responses_plan_role_classifies_parent_and_subagent(self):
         import request_headers as request_headers_module
         parent = self._build_responses_plan(cs_id=request_headers_module._CLIENT_SESSION_ID)
-        subagent = self._build_responses_plan(cs_id="some-derived-uuid", request_id="req-2")
+        subagent = self._build_responses_plan(
+            cs_id=request_headers_module._CLIENT_SESSION_ID,
+            subagent=True,
+            request_id="req-2",
+        )
         chat_plan = proxy.UpstreamRequestPlan(
             request_id="req-3",
             upstream_url="https://example.invalid/chat/completions",
@@ -194,11 +205,13 @@ class ProxyRoutesTests(unittest.TestCase):
 
     def test_responses_plan_task_prefix_extracts_uuid_prefix(self):
         plan = self._build_responses_plan(cs_id="x", prompt_cache_key="019dd22d-34be-7da0-aaaa-aaaaaaaaaaaa")
-        self.assertEqual(proxy._responses_plan_task_prefix(plan), "019dd22d")
+        self.assertEqual(proxy._responses_plan_task_prefix(plan), "parent-task")
         plan_short = self._build_responses_plan(cs_id="x", prompt_cache_key="short-key")
+        plan_short.headers.pop("x-agent-task-id", None)
         self.assertIsNone(proxy._responses_plan_task_prefix(plan_short))
         plan_none = self._build_responses_plan(cs_id="x")
         plan_none.body.pop("prompt_cache_key", None)
+        plan_none.headers.pop("x-agent-task-id", None)
         self.assertIsNone(proxy._responses_plan_task_prefix(plan_none))
 
     def test_parent_keepalive_snapshot_stored_on_parent_finish(self):
@@ -208,24 +221,29 @@ class ProxyRoutesTests(unittest.TestCase):
         parent.body["previous_response_id"] = "should-be-stripped"
         with mock.patch.dict(proxy.os.environ, {"GHCP_PROXY_PARENT_KEEPALIVE_ENABLED": "1"}, clear=False):
             proxy._remember_parent_for_keepalive(parent, 200)
-        snap = proxy._PARENT_KEEPALIVE_SNAPSHOTS.get("019dd22d")
+        snap = proxy._PARENT_KEEPALIVE_SNAPSHOTS.get("parent-task")
         self.assertIsNotNone(snap)
         self.assertEqual(snap["upstream_url"], "https://example.invalid/responses")
         self.assertNotIn("previous_response_id", snap["body"])
         self.assertFalse(snap["warmer_in_flight"])
 
     def test_parent_keepalive_snapshot_not_stored_for_subagent(self):
+        import request_headers as request_headers_module
         proxy._PARENT_KEEPALIVE_SNAPSHOTS.clear()
-        sub = self._build_responses_plan(cs_id="derived-uuid")
+        sub = self._build_responses_plan(cs_id=request_headers_module._CLIENT_SESSION_ID, subagent=True)
         with mock.patch.dict(proxy.os.environ, {"GHCP_PROXY_PARENT_KEEPALIVE_ENABLED": "1"}, clear=False):
             proxy._remember_parent_for_keepalive(sub, 200)
-        self.assertNotIn("019dd22d", proxy._PARENT_KEEPALIVE_SNAPSHOTS)
+        self.assertNotIn("parent-task", proxy._PARENT_KEEPALIVE_SNAPSHOTS)
 
     def test_parent_keepalive_skips_when_parent_recent(self):
         import request_headers as request_headers_module
         proxy._PARENT_KEEPALIVE_SNAPSHOTS.clear()
         parent = self._build_responses_plan(cs_id=request_headers_module._CLIENT_SESSION_ID)
-        sub = self._build_responses_plan(cs_id="derived-uuid", request_id="req-2")
+        sub = self._build_responses_plan(
+            cs_id=request_headers_module._CLIENT_SESSION_ID,
+            subagent=True,
+            request_id="req-2",
+        )
         env = {
             "GHCP_PROXY_PARENT_KEEPALIVE_ENABLED": "1",
             "GHCP_PROXY_PARENT_KEEPALIVE_MIN_IDLE_SECONDS": "6",
@@ -235,13 +253,17 @@ class ProxyRoutesTests(unittest.TestCase):
             with mock.patch.object(proxy.asyncio, "get_running_loop") as get_loop:
                 proxy._maybe_fire_parent_keepalive(sub, 200)
                 self.assertFalse(get_loop.called)
-        self.assertFalse(proxy._PARENT_KEEPALIVE_SNAPSHOTS["019dd22d"]["warmer_in_flight"])
+        self.assertFalse(proxy._PARENT_KEEPALIVE_SNAPSHOTS["parent-task"]["warmer_in_flight"])
 
     def test_parent_keepalive_fires_when_idle_threshold_exceeded(self):
         import request_headers as request_headers_module
         proxy._PARENT_KEEPALIVE_SNAPSHOTS.clear()
         parent = self._build_responses_plan(cs_id=request_headers_module._CLIENT_SESSION_ID)
-        sub = self._build_responses_plan(cs_id="derived-uuid", request_id="req-2")
+        sub = self._build_responses_plan(
+            cs_id=request_headers_module._CLIENT_SESSION_ID,
+            subagent=True,
+            request_id="req-2",
+        )
         env = {
             "GHCP_PROXY_PARENT_KEEPALIVE_ENABLED": "1",
             "GHCP_PROXY_PARENT_KEEPALIVE_MIN_IDLE_SECONDS": "0",
@@ -265,10 +287,14 @@ class ProxyRoutesTests(unittest.TestCase):
         import request_headers as request_headers_module
         proxy._PARENT_KEEPALIVE_SNAPSHOTS.clear()
         parent = self._build_responses_plan(cs_id=request_headers_module._CLIENT_SESSION_ID)
-        sub = self._build_responses_plan(cs_id="derived-uuid", request_id="req-2")
+        sub = self._build_responses_plan(
+            cs_id=request_headers_module._CLIENT_SESSION_ID,
+            subagent=True,
+            request_id="req-2",
+        )
         with mock.patch.dict(proxy.os.environ, {"GHCP_PROXY_PARENT_KEEPALIVE_ENABLED": "0"}, clear=False):
             proxy._remember_parent_for_keepalive(parent, 200)
-            self.assertNotIn("019dd22d", proxy._PARENT_KEEPALIVE_SNAPSHOTS)
+            self.assertNotIn("parent-task", proxy._PARENT_KEEPALIVE_SNAPSHOTS)
             with mock.patch.object(proxy.asyncio, "get_running_loop") as get_loop:
                 proxy._maybe_fire_parent_keepalive(sub, 200)
                 self.assertFalse(get_loop.called)
@@ -277,7 +303,11 @@ class ProxyRoutesTests(unittest.TestCase):
         import request_headers as request_headers_module
         proxy._PARENT_KEEPALIVE_SNAPSHOTS.clear()
         parent = self._build_responses_plan(cs_id=request_headers_module._CLIENT_SESSION_ID)
-        sub = self._build_responses_plan(cs_id="derived-uuid", request_id="req-2")
+        sub = self._build_responses_plan(
+            cs_id=request_headers_module._CLIENT_SESSION_ID,
+            subagent=True,
+            request_id="req-2",
+        )
         env = {
             "GHCP_PROXY_PARENT_KEEPALIVE_ENABLED": "1",
             "GHCP_PROXY_PARENT_KEEPALIVE_MIN_IDLE_SECONDS": "0",
@@ -285,7 +315,7 @@ class ProxyRoutesTests(unittest.TestCase):
         }
         with mock.patch.dict(proxy.os.environ, env, clear=False):
             proxy._remember_parent_for_keepalive(parent, 200)
-            proxy._PARENT_KEEPALIVE_SNAPSHOTS["019dd22d"]["warmer_in_flight"] = True
+            proxy._PARENT_KEEPALIVE_SNAPSHOTS["parent-task"]["warmer_in_flight"] = True
             with mock.patch.object(proxy.asyncio, "get_running_loop") as get_loop:
                 proxy._maybe_fire_parent_keepalive(sub, 200)
                 self.assertFalse(get_loop.called)
@@ -294,7 +324,11 @@ class ProxyRoutesTests(unittest.TestCase):
         import request_headers as request_headers_module
         proxy._PARENT_KEEPALIVE_SNAPSHOTS.clear()
         parent = self._build_responses_plan(cs_id=request_headers_module._CLIENT_SESSION_ID)
-        sub = self._build_responses_plan(cs_id="derived-uuid", request_id="req-2")
+        sub = self._build_responses_plan(
+            cs_id=request_headers_module._CLIENT_SESSION_ID,
+            subagent=True,
+            request_id="req-2",
+        )
         env = {
             "GHCP_PROXY_PARENT_KEEPALIVE_ENABLED": "1",
             "GHCP_PROXY_PARENT_KEEPALIVE_MIN_IDLE_SECONDS": "0",
@@ -308,7 +342,7 @@ class ProxyRoutesTests(unittest.TestCase):
                 with mock.patch.object(proxy.asyncio, "get_running_loop") as get_loop:
                     proxy._maybe_fire_parent_keepalive(sub, 200)
                     self.assertFalse(get_loop.called)
-        self.assertNotIn("019dd22d", proxy._PARENT_KEEPALIVE_SNAPSHOTS)
+        self.assertNotIn("parent-task", proxy._PARENT_KEEPALIVE_SNAPSHOTS)
 
     def test_fire_parent_keepalive_posts_with_capped_max_output_tokens(self):
         proxy._PARENT_KEEPALIVE_SNAPSHOTS.clear()
@@ -1124,8 +1158,8 @@ class ProxyRoutesTests(unittest.TestCase):
         self.assertNotEqual(first_headers["x-request-id"], second_headers["x-request-id"])
         first_body = post.await_args_list[0].kwargs["json"]
         second_body = post.await_args_list[1].kwargs["json"]
-        self.assertEqual(first_body["prompt_cache_key"], "claude-meta-cache-session")
-        self.assertEqual(second_body["prompt_cache_key"], "claude-meta-cache-session")
+        self.assertNotIn("prompt_cache_key", first_body)
+        self.assertNotIn("prompt_cache_key", second_body)
         self.assertNotIn("metadata", first_body)
 
     def test_responses_route_treats_local_compaction_as_handoff_boundary(self):
@@ -1273,9 +1307,9 @@ class ProxyRoutesTests(unittest.TestCase):
         self.assertNotEqual(forwarded_headers["x-request-id"], forwarded_headers["x-agent-task-id"])
         self.assertNotIn("session_id", forwarded_headers)
         self.assertNotIn("x-client-request-id", forwarded_headers)
-        self.assertEqual(forwarded_body["sessionId"], "session-123")
-        self.assertEqual(forwarded_body.get("prompt_cache_key"), "cache-123")
-        self.assertEqual(forwarded_body.get("previous_response_id"), "resp_prev")
+        self.assertNotIn("sessionId", forwarded_body)
+        self.assertNotIn("prompt_cache_key", forwarded_body)
+        self.assertNotIn("previous_response_id", forwarded_body)
         self.assertEqual(forwarded_body["tools"], body["tools"])
         self.assertEqual(forwarded_body["include"], body["include"])
         self.assertTrue(forwarded_body["parallel_tool_calls"])
@@ -1983,7 +2017,7 @@ class ProxyRoutesTests(unittest.TestCase):
         forwarded = post.await_args.kwargs["json"]
         forwarded_input = forwarded["input"]
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(forwarded["prompt_cache_key"], "session-cache")
+        self.assertNotIn("prompt_cache_key", forwarded)
         self.assertEqual(proxy._responses_input_encrypted_content_count(forwarded_input), 2)
         self.assertEqual([item.get("type") for item in forwarded_input], [
             "message",
@@ -2428,9 +2462,9 @@ class ProxyRoutesTests(unittest.TestCase):
         self.assertNotEqual(forwarded_headers["x-request-id"], forwarded_headers["x-agent-task-id"])
         self.assertNotIn("session_id", forwarded_headers)
         self.assertNotIn("x-client-request-id", forwarded_headers)
-        self.assertEqual(forwarded_body["sessionId"], "session-123")
-        self.assertEqual(forwarded_body.get("prompt_cache_key"), "cache-123")
-        self.assertEqual(forwarded_body.get("previous_response_id"), "resp_prev")
+        self.assertNotIn("sessionId", forwarded_body)
+        self.assertNotIn("prompt_cache_key", forwarded_body)
+        self.assertNotIn("previous_response_id", forwarded_body)
         self.assertEqual(forwarded_body["tools"], body["tools"])
         self.assertEqual(forwarded_body["include"], body["include"])
         self.assertTrue(forwarded_body["parallel_tool_calls"])

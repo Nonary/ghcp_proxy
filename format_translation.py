@@ -54,6 +54,13 @@ from responses_upstream_cache import (  # noqa: F401
 
 _COMPACT_JSON_SEPARATORS = (",", ":")
 _JSON_ENSURE_ASCII_DISABLED = not True
+_SUBAGENT_NOTIFICATION_ONLY_RE = re.compile(
+    r"\A\s*(?:(?:"
+    r"<subagent[_-]notification>\s*.*?\s*</subagent[_-]notification>"
+    r"|<task-notification>\s*.*?\s*</task-notification>"
+    r")\s*)+\Z",
+    re.DOTALL,
+)
 
 
 def _compact_json_dumps(value) -> str:
@@ -1151,10 +1158,6 @@ def anthropic_request_to_responses(body: dict) -> dict:
         "include": ["reasoning.encrypted_content"],
         "text": {"format": {"type": "text"}, "verbosity": "low"},
     }
-    prompt_cache_key = _anthropic_metadata_session_id(body.get("metadata"))
-    if prompt_cache_key:
-        payload["prompt_cache_key"] = prompt_cache_key
-
     for source_key, target_key in (
         ("max_tokens", "max_output_tokens"),
         ("temperature", "temperature"),
@@ -1957,6 +1960,183 @@ def _reasoning_item_has_replay_value(item: dict) -> bool:
     return _reasoning_summary_has_text(item.get("summary"))
 
 
+def _message_text(item: dict) -> str:
+    content = item.get("content")
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    parts = []
+    for part in content:
+        if isinstance(part, str):
+            parts.append(part)
+            continue
+        if not isinstance(part, dict):
+            continue
+        for key in ("text", "input_text", "output_text"):
+            text = part.get(key)
+            if isinstance(text, str):
+                parts.append(text)
+                break
+    return "".join(parts)
+
+
+def _is_instruction_input_message(item: dict) -> bool:
+    if not isinstance(item, dict):
+        return False
+    item_type = str(item.get("type", "")).lower()
+    role = str(item.get("role", "")).lower()
+    return item_type in {"", "message"} and role in {"system", "developer"}
+
+
+def _is_user_input_message(item: dict) -> bool:
+    if not isinstance(item, dict):
+        return False
+    item_type = str(item.get("type", "")).lower()
+    role = str(item.get("role", "")).lower()
+    return item_type in {"", "message"} and role == "user"
+
+
+def _message_content_is_text_only(item: dict) -> bool:
+    content = item.get("content")
+    if isinstance(content, str):
+        return True
+    if not isinstance(content, list):
+        return False
+    for part in content:
+        if isinstance(part, str):
+            continue
+        if not isinstance(part, dict):
+            return False
+        part_type = str(part.get("type", "")).lower()
+        if part_type not in {"", "text", "input_text", "output_text"}:
+            return False
+        if not any(isinstance(part.get(key), str) for key in ("text", "input_text", "output_text")):
+            return False
+    return True
+
+
+def _message_with_merged_text(item: dict, text: str) -> dict:
+    merged = dict(item)
+    content = item.get("content")
+    if isinstance(content, str):
+        merged["content"] = text
+        return merged
+    part_type = "input_text" if str(item.get("role", "")).lower() == "user" else "text"
+    if isinstance(content, list):
+        for part in content:
+            if isinstance(part, dict):
+                candidate_type = str(part.get("type", "")).lower()
+                if candidate_type in {"text", "input_text", "output_text"}:
+                    part_type = candidate_type
+                    break
+    merged["content"] = [{"type": part_type, "text": text}]
+    return merged
+
+
+def normalize_responses_instructions_for_copilot(body: dict, *, diagnostics: list[dict] | None = None) -> dict:
+    if not isinstance(body, dict):
+        return body
+    input_items = body.get("input")
+    if not isinstance(input_items, list):
+        return body
+
+    instruction_parts: list[str] = []
+    existing_instructions = body.get("instructions")
+    if isinstance(existing_instructions, str) and existing_instructions.strip():
+        instruction_parts.append(existing_instructions.strip())
+
+    retained_items = []
+    removed_roles: list[str] = []
+    for item in input_items:
+        if _is_instruction_input_message(item):
+            text = _message_text(item).strip()
+            if text:
+                instruction_parts.append(text)
+            role = str(item.get("role", "")).lower()
+            if role:
+                removed_roles.append(role)
+            continue
+        retained_items.append(item)
+
+    if not removed_roles:
+        return body
+
+    deduped_parts = []
+    seen_parts = set()
+    for part in instruction_parts:
+        if part in seen_parts:
+            continue
+        seen_parts.add(part)
+        deduped_parts.append(part)
+
+    normalized = dict(body)
+    normalized["input"] = retained_items
+    if deduped_parts:
+        normalized["instructions"] = "\n\n".join(deduped_parts)
+
+    if isinstance(diagnostics, list):
+        diagnostics.append(
+            {
+                "kind": "responses_input",
+                "action": "fold_instruction_messages_into_instructions",
+                "roles": sorted(set(removed_roles)),
+                "input_items_before": len(input_items),
+                "input_items_after": len(retained_items),
+            }
+        )
+    return normalized
+
+
+def normalize_responses_input_for_copilot(body: dict, *, diagnostics: list[dict] | None = None) -> dict:
+    if not isinstance(body, dict):
+        return body
+    input_items = body.get("input")
+    if not isinstance(input_items, list):
+        return body
+
+    leading_users = []
+    for item in input_items:
+        if not _is_user_input_message(item):
+            break
+        if not _message_content_is_text_only(item):
+            return body
+        leading_users.append(item)
+
+    if len(leading_users) <= 1:
+        return body
+
+    merged_text_parts = []
+    for item in leading_users:
+        text = _message_text(item).strip()
+        if text:
+            merged_text_parts.append(text)
+    if not merged_text_parts:
+        return body
+
+    normalized = dict(body)
+    merged_user = _message_with_merged_text(leading_users[0], "\n\n".join(merged_text_parts))
+    normalized["input"] = [merged_user, *input_items[len(leading_users):]]
+
+    if isinstance(diagnostics, list):
+        diagnostics.append(
+            {
+                "kind": "responses_input",
+                "action": "merge_leading_user_messages",
+                "merged_messages": len(leading_users),
+                "input_items_before": len(input_items),
+                "input_items_after": len(normalized["input"]),
+            }
+        )
+    return normalized
+
+
+def _is_subagent_notification_message(item: dict) -> bool:
+    if item.get("type") != "message" or item.get("role") != "user":
+        return False
+    return _SUBAGENT_NOTIFICATION_ONLY_RE.match(_message_text(item)) is not None
+
+
 def sanitize_input(
     input_items,
     *,
@@ -1985,6 +2165,9 @@ def sanitize_input(
     for item in window_items:
         if not isinstance(item, dict):
             result.append(item)
+            continue
+
+        if _is_subagent_notification_message(item):
             continue
 
         item_type = item.get("type")

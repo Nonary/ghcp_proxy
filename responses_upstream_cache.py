@@ -11,9 +11,23 @@ import util
 
 _COPILOT_UNSUPPORTED_RESPONSES_TOOL_TYPES = {"image_generation"}
 
-# Native Responses fields are preserved by default. Only fields with a concrete
-# Copilot rejection are removed here.
-_COPILOT_UNSUPPORTED_RESPONSES_BODY_KEYS = {"service_tier"}
+# Native Responses fields are preserved by default. Fields that Copilot CLI
+# does not send for native /responses cache lineage stay local to the proxy and
+# are expressed upstream through Copilot affinity headers instead.
+_COPILOT_LOCAL_ONLY_RESPONSES_BODY_KEYS = {
+    "prompt_cache_key",
+    "promptCacheKey",
+    "prompt_cache_retention",
+    "previous_response_id",
+    "session_id",
+    "sessionId",
+}
+_COPILOT_UNSUPPORTED_RESPONSES_BODY_KEYS = {
+    "client_metadata",
+    "service_tier",
+    "tool_choice",
+    *_COPILOT_LOCAL_ONLY_RESPONSES_BODY_KEYS,
+}
 
 _TOOL_SEARCH_TOOL_NAMES = {"tool_search", "tools.tool_search"}
 _DANGEROUS_CODE_EXECUTION_TOOL_NAMES = {"mcp__ide__executecode"}
@@ -624,19 +638,8 @@ def _configured_responses_prompt_cache_retention() -> str | None:
 
 
 def apply_responses_prompt_cache_retention(body: dict) -> dict:
-    """Request extended prompt-cache retention for cache-keyed Responses turns."""
-    if not isinstance(body, dict):
-        return body
-    if "prompt_cache_retention" in body:
-        return body
-    if not _responses_body_requests_prompt_cache(body):
-        return body
-    retention = _configured_responses_prompt_cache_retention()
-    if not retention:
-        return body
-    updated = dict(body)
-    updated["prompt_cache_retention"] = retention
-    return updated
+    """Compatibility no-op: Copilot CLI does not send this Responses field."""
+    return body
 
 
 def _add_anthropic_cache_control(block: dict) -> None:

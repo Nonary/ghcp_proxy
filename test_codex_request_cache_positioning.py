@@ -239,17 +239,16 @@ class CodexRequestCachePositioningTests(unittest.TestCase):
         self.assertEqual(plan.strategy_name, "responses_to_responses")
         self.assertEqual(plan.upstream_body["input"], input_items)
         self.assertEqual(body["input"], input_items)
-        # Cache-lineage fields are now forwarded so upstream can reuse the
-        # prompt-prefix cache across turns.
         for key in ("prompt_cache_key", "promptCacheKey", "previous_response_id"):
-            self.assertEqual(plan.upstream_body.get(key), body[key])
-        # Only fields known to be rejected by Copilot are stripped; other
-        # request fields stay byte-stable for cache-sensitive follow-ups.
+            self.assertNotIn(key, plan.upstream_body)
         self.assertNotIn("service_tier", plan.upstream_body)
         self.assertEqual(plan.upstream_body["client_metadata"], {"session_id": "local-only"})
         self.assertEqual(plan.upstream_body["tool_choice"], "auto")
 
-        self.assertEqual(plan.diagnostics[0]["fields"], ["service_tier"])
+        self.assertEqual(
+            plan.diagnostics[0]["fields"],
+            ["previous_response_id", "promptCacheKey", "prompt_cache_key", "service_tier"],
+        )
 
     def test_responses_header_identity_uses_prompt_cache_key_and_strips_aliases(self):
         first_request = SimpleNamespace(

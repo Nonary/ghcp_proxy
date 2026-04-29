@@ -206,12 +206,15 @@ class RequestHeadersTests(unittest.TestCase):
         request_id_header = headers.pop("x-request-id")
         agent_task_id = headers.pop("x-agent-task-id")
         interaction_id = headers.pop("x-interaction-id")
+        parent_agent_id = headers.pop("x-parent-agent-id")
         self.assertEqual(request_id_header, request_headers._copilot_uuid("responses-request:req-1"))
         self.assertNotEqual(request_id_header, agent_task_id)
-        self.assertEqual(agent_task_id, request_headers._copilot_uuid("responses-task:cache-key"))
+        self.assertEqual(parent_agent_id, request_headers._copilot_uuid("responses-task:cache-key"))
+        self.assertEqual(
+            agent_task_id,
+            request_headers._copilot_uuid("responses-subagent-task:cache-key:worker:cache-key"),
+        )
         self.assertEqual(interaction_id, request_headers._copilot_uuid("responses-interaction:cache-key"))
-        expected_session_id = request_headers._subagent_isolated_session_id(" cache-key ")
-        self.assertNotEqual(expected_session_id, request_headers._CLIENT_SESSION_ID)
         self.assertEqual(
             headers,
             {
@@ -222,9 +225,9 @@ class RequestHeadersTests(unittest.TestCase):
                 "Openai-Intent": "conversation-agent",
                 "Copilot-Integration-Id": "copilot-developer-cli",
                 "x-github-api-version": "2026-01-09",
-                "x-client-session-id": expected_session_id,
-                "X-Initiator": "user",
-                "x-interaction-type": "conversation-user",
+                "x-client-session-id": request_headers._CLIENT_SESSION_ID,
+                "X-Initiator": "agent",
+                "x-interaction-type": "conversation-subagent",
                 "Copilot-Vision-Request": "true",
             },
         )
@@ -254,16 +257,34 @@ class RequestHeadersTests(unittest.TestCase):
         )
         self.assertEqual(headers["x-client-session-id"], request_headers._CLIENT_SESSION_ID)
 
-    def test_subagent_isolated_session_id_is_stable_and_distinct(self):
-        first = request_headers._subagent_isolated_session_id("019dd1ff-526a-7293")
-        second = request_headers._subagent_isolated_session_id("019dd1ff-526a-7293")
-        third = request_headers._subagent_isolated_session_id("019dd1ff-528e-7000")
+    def test_responses_subagent_task_id_is_stable_and_parent_scoped(self):
+        self.assertEqual(
+            request_headers._responses_task_affinity_scope("019dd1ff-526a-7293-aaaa-aaaaaaaaaaaa"),
+            "019dd1ff",
+        )
+        self.assertEqual(request_headers._responses_task_affinity_scope(" cache-key "), "cache-key")
+        first = request_headers._responses_subagent_task_id(
+            "019dd1ff",
+            "worker",
+            "019dd1ff-526a-7293-aaaa-aaaaaaaaaaaa",
+        )
+        second = request_headers._responses_subagent_task_id(
+            "019dd1ff",
+            "worker",
+            "019dd1ff-526a-7293-aaaa-aaaaaaaaaaaa",
+        )
+        third = request_headers._responses_subagent_task_id(
+            "019dd1ff",
+            "reviewer",
+            "019dd1ff-526a-7293-aaaa-aaaaaaaaaaaa",
+        )
         self.assertEqual(first, second)
         self.assertNotEqual(first, third)
-        self.assertNotEqual(first, request_headers._CLIENT_SESSION_ID)
-        self.assertIsNone(request_headers._subagent_isolated_session_id(None))
-        self.assertIsNone(request_headers._subagent_isolated_session_id(""))
-        self.assertIsNone(request_headers._subagent_isolated_session_id("   "))
+        self.assertIsNone(request_headers._responses_task_affinity_scope(None))
+        self.assertIsNone(request_headers._responses_task_affinity_scope(""))
+        self.assertIsNone(request_headers._responses_task_affinity_scope("   "))
+        self.assertIsNone(request_headers._responses_subagent_task_id(None, "worker"))
+        self.assertIsNone(request_headers._responses_subagent_task_id("019dd1ff", ""))
 
     def test_chat_header_contract_preserves_forwarded_ids_and_detects_image_url_key(self):
         class RecordingPolicy:
@@ -815,6 +836,7 @@ class RequestHeadersTests(unittest.TestCase):
         )
 
         self.assertEqual(headers["X-Initiator"], "agent")
+        self.assertEqual(headers["x-interaction-type"], "conversation-subagent")
         self.assertNotIn("x-openai-subagent", headers)
 
     def test_chat_tool_message_follow_up_stays_agent(self):
@@ -1629,7 +1651,7 @@ class RequestHeadersTests(unittest.TestCase):
 
         self.assertEqual(first_headers["X-Initiator"], "user")
         self.assertEqual(second_headers["X-Initiator"], "user")
-        self.assertNotEqual(first_headers["x-interaction-id"], second_headers["x-interaction-id"])
+        self.assertEqual(first_headers["x-interaction-id"], second_headers["x-interaction-id"])
         self.assertNotEqual(first_headers["x-agent-task-id"], second_headers["x-agent-task-id"])
 
     def test_build_responses_headers_for_request_ignores_plain_metadata_user_id_as_affinity(self):
@@ -1664,8 +1686,7 @@ class RequestHeadersTests(unittest.TestCase):
         )
 
         self.assertNotEqual(first_headers["x-agent-task-id"], "plain-claude-session")
-        self.assertNotIn("x-interaction-id", first_headers)
-        self.assertNotIn("x-interaction-id", second_headers)
+        self.assertEqual(first_headers["x-interaction-id"], second_headers["x-interaction-id"])
         self.assertEqual(first_headers["x-agent-task-id"], second_headers["x-agent-task-id"])
 
     def test_build_responses_headers_for_compact_preserves_cache_affinity_fields(self):

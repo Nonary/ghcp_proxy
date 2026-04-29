@@ -160,7 +160,20 @@ _TRACE_HEADER_ALLOWLIST = {
     "x-interaction-id",
     "x-interaction-type",
     "x-agent-task-id",
+    "x-parent-agent-id",
     "x-client-session-id",
+    "x-client-machine-id",
+    "x-copilot-client-exp-assignment-context",
+    "x-github-api-version",
+    "x-stainless-retry-count",
+    "x-stainless-lang",
+    "x-stainless-package-version",
+    "x-stainless-os",
+    "x-stainless-arch",
+    "x-stainless-runtime",
+    "x-stainless-runtime-version",
+    "accept-language",
+    "sec-fetch-mode",
     "x-request-id",
     "x-github-request-id",
 }
@@ -170,7 +183,7 @@ CACHE_TRIPWIRE_INPUT_TOKEN_THRESHOLD = 30_000
 CACHE_TRIPWIRE_CACHED_INPUT_TOKEN_THRESHOLD = 30_000
 CACHE_TRIPWIRE_FRESH_CACHED_GAP_THRESHOLD = 50_000
 CACHE_TRIPWIRE_REASON = "token_tripwire"
-CACHE_SETTLE_DELAY_SECONDS = 2.0
+CACHE_SETTLE_DELAY_SECONDS = 5.0
 
 safeguard_event_store = dashboard_module.create_safeguard_event_store()
 _PROMPT_CACHE_SETTLE_LOCK = threading.Lock()
@@ -319,6 +332,68 @@ def configured_upstream_timeout_seconds() -> int:
         )
         return DEFAULT_UPSTREAM_TIMEOUT_SECONDS
     return value
+
+
+# ---------------------------------------------------------------------------
+# Shared upstream HTTP client.
+#
+# Copilot's /responses backend pins its KV (prompt) cache to the connection:
+# each new TCP connection lands on a randomly-chosen pod whose cache may be
+# cold for the prefix, while a long-lived HTTP/2 connection multiplexes every
+# request onto the same pod and lets the cache grow monotonically — the same
+# behavior the official Copilot CLI gets out of the box. Constructing an
+# httpx.AsyncClient per request fragments the cache and produces wildly
+# oscillating cached_input_tokens values for byte-identical payloads. Use a
+# single process-wide client for all upstream Copilot calls instead.
+# ---------------------------------------------------------------------------
+_UPSTREAM_CLIENT: "httpx.AsyncClient | None" = None
+_UPSTREAM_CLIENT_LOCK = threading.Lock()
+
+
+def _get_upstream_client() -> "httpx.AsyncClient":
+    global _UPSTREAM_CLIENT
+    if _UPSTREAM_CLIENT is not None:
+        return _UPSTREAM_CLIENT
+    with _UPSTREAM_CLIENT_LOCK:
+        if _UPSTREAM_CLIENT is not None:
+            return _UPSTREAM_CLIENT
+        timeout = httpx.Timeout(configured_upstream_timeout_seconds())
+        limits = httpx.Limits(
+            max_connections=8,
+            max_keepalive_connections=4,
+            keepalive_expiry=300.0,
+        )
+        try:
+            _UPSTREAM_CLIENT = httpx.AsyncClient(
+                http2=True,
+                timeout=timeout,
+                limits=limits,
+            )
+        except (ImportError, RuntimeError):
+            # h2 package not installed; fall back to HTTP/1.1 with persistent
+            # keep-alive. Still better than per-request clients.
+            _UPSTREAM_CLIENT = httpx.AsyncClient(
+                timeout=timeout,
+                limits=limits,
+            )
+        atexit.register(_shutdown_upstream_client)
+    return _UPSTREAM_CLIENT
+
+
+def _shutdown_upstream_client() -> None:
+    global _UPSTREAM_CLIENT
+    client = _UPSTREAM_CLIENT
+    _UPSTREAM_CLIENT = None
+    if client is None:
+        return
+    try:
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(client.aclose())
+        finally:
+            loop.close()
+    except Exception:
+        pass
 
 
 def _write_proxy_pid_file() -> None:
@@ -471,10 +546,12 @@ def _responses_cache_settle_lineage(plan: "UpstreamRequestPlan | None") -> tuple
     model = str(plan.resolved_model or plan.requested_model or plan.body.get("model") or "").strip().lower()
     if model != "gpt-5.5":
         return None
-    prompt_cache_key = plan.body.get("prompt_cache_key") or plan.body.get("promptCacheKey")
-    if not isinstance(prompt_cache_key, str) or not prompt_cache_key.strip():
+    task_key = _responses_plan_header_value(plan, "x-agent-task-id")
+    if not task_key:
+        task_key = _responses_plan_task_prefix(plan)
+    if not task_key:
         return None
-    return model, prompt_cache_key.strip()
+    return model, task_key
 
 
 async def _wait_for_responses_cache_settle(plan: "UpstreamRequestPlan | None") -> None:
@@ -515,7 +592,7 @@ _PARENT_KEEPALIVE_MAX_SNAPSHOTS = 64
 
 
 def _parent_keepalive_enabled() -> bool:
-    raw = str(os.environ.get("GHCP_PROXY_PARENT_KEEPALIVE_ENABLED", "1")).strip().lower()
+    raw = str(os.environ.get("GHCP_PROXY_PARENT_KEEPALIVE_ENABLED", "0")).strip().lower()
     return raw not in {"0", "false", "no", "off"}
 
 
@@ -560,9 +637,15 @@ def _parent_keepalive_snapshot_ttl_seconds() -> float:
 
 
 def _responses_plan_task_prefix(plan: "UpstreamRequestPlan | None") -> str | None:
-    """First eight chars of ``prompt_cache_key`` (UUIDv7 task prefix), if any."""
+    """Copilot parent task key, with prompt-cache-key fallback for old plans."""
     if not isinstance(plan, UpstreamRequestPlan):
         return None
+    parent_agent_id = _responses_plan_header_value(plan, "x-parent-agent-id")
+    if parent_agent_id:
+        return parent_agent_id
+    agent_task_id = _responses_plan_header_value(plan, "x-agent-task-id")
+    if agent_task_id:
+        return agent_task_id
     body = plan.body if isinstance(plan.body, dict) else None
     if not isinstance(body, dict):
         return None
@@ -575,14 +658,18 @@ def _responses_plan_task_prefix(plan: "UpstreamRequestPlan | None") -> str | Non
     return None
 
 
-def _responses_plan_outbound_session_id(plan: "UpstreamRequestPlan | None") -> str | None:
+def _responses_plan_header_value(
+    plan: "UpstreamRequestPlan | None",
+    header_name: str,
+) -> str | None:
     if not isinstance(plan, UpstreamRequestPlan):
         return None
     headers = plan.headers if isinstance(plan.headers, dict) else None
     if not headers:
         return None
+    wanted = header_name.lower()
     for key, value in headers.items():
-        if isinstance(key, str) and key.lower() == "x-client-session-id":
+        if isinstance(key, str) and key.lower() == wanted:
             if isinstance(value, str) and value.strip():
                 return value.strip()
     return None
@@ -591,10 +678,9 @@ def _responses_plan_outbound_session_id(plan: "UpstreamRequestPlan | None") -> s
 def _responses_plan_role(plan: "UpstreamRequestPlan | None") -> str | None:
     """Classify a /responses gpt-5.5 plan as ``parent`` or ``subagent``.
 
-    Subagent isolation routes subagent traffic to a derived
-    ``x-client-session-id``; parent traffic keeps the proxy default.
+    Copilot keeps parent and subagents on one client session and separates
+    subagent lineage with ``conversation-subagent`` plus ``x-parent-agent-id``.
     """
-    import request_headers as _request_headers_module
     if not isinstance(plan, UpstreamRequestPlan):
         return None
     if "/responses" not in (plan.upstream_url or ""):
@@ -602,12 +688,14 @@ def _responses_plan_role(plan: "UpstreamRequestPlan | None") -> str | None:
     model = str(plan.resolved_model or plan.requested_model or "").strip().lower()
     if model != "gpt-5.5":
         return None
-    cs_id = _responses_plan_outbound_session_id(plan)
+    interaction_type = _responses_plan_header_value(plan, "x-interaction-type")
+    parent_agent_id = _responses_plan_header_value(plan, "x-parent-agent-id")
+    if parent_agent_id or interaction_type == "conversation-subagent":
+        return "subagent"
+    cs_id = _responses_plan_header_value(plan, "x-client-session-id")
     if not cs_id:
         return None
-    if cs_id == _request_headers_module._CLIENT_SESSION_ID:
-        return "parent"
-    return "subagent"
+    return "parent"
 
 
 def _evict_oldest_parent_keepalive_snapshot_locked() -> None:
@@ -641,8 +729,15 @@ def _remember_parent_for_keepalive(
     if not isinstance(plan.body, dict) or not plan.upstream_url:
         return
     snapshot_body = dict(plan.body)
-    # Drop fields that are not safe to replay verbatim.
-    snapshot_body.pop("previous_response_id", None)
+    for key in (
+        "prompt_cache_key",
+        "promptCacheKey",
+        "prompt_cache_retention",
+        "previous_response_id",
+        "session_id",
+        "sessionId",
+    ):
+        snapshot_body.pop(key, None)
     snapshot = {
         "upstream_url": plan.upstream_url,
         "headers": dict(plan.headers) if isinstance(plan.headers, dict) else {},
@@ -722,7 +817,15 @@ async def _fire_parent_keepalive(task_prefix: str) -> None:
         return
     body["max_output_tokens"] = _parent_keepalive_max_output_tokens()
     body["stream"] = False
-    body.pop("previous_response_id", None)
+    for key in (
+        "prompt_cache_key",
+        "promptCacheKey",
+        "prompt_cache_retention",
+        "previous_response_id",
+        "session_id",
+        "sessionId",
+    ):
+        body.pop(key, None)
     keepalive_id = uuid4().hex
     started_at = util.utc_now_iso()
     if request_tracing_enabled():
@@ -738,9 +841,9 @@ async def _fire_parent_keepalive(task_prefix: str) -> None:
     status_code: int | None = None
     error_message: str | None = None
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            response = await client.post(upstream_url, headers=headers, json=body)
-            status_code = response.status_code
+        client = _get_upstream_client()
+        response = await client.post(upstream_url, headers=headers, json=body, timeout=30)
+        status_code = response.status_code
     except httpx.RequestError as exc:
         error_message = format_translation.upstream_request_error_status_and_message(exc)[1]
     except Exception as exc:  # noqa: BLE001 - keepalive must never raise
@@ -1245,16 +1348,25 @@ def _trace_body_summary(body: dict | None) -> dict | None:
     return summary
 
 
-def _prompt_cache_trace_lineage(body: dict | None, model: str | None) -> tuple[str, str] | None:
+def _prompt_cache_trace_lineage(
+    body: dict | None,
+    model: str | None,
+    outbound_headers: dict | None = None,
+) -> tuple[str, str] | None:
     if not isinstance(body, dict):
         return None
     model_name = str(model or body.get("model") or "").strip().lower()
     if not model_name:
         return None
     prompt_cache_key = body.get("prompt_cache_key") or body.get("promptCacheKey")
-    if not isinstance(prompt_cache_key, str) or not prompt_cache_key.strip():
-        return None
-    return model_name, prompt_cache_key.strip()
+    if isinstance(prompt_cache_key, str) and prompt_cache_key.strip():
+        return model_name, prompt_cache_key.strip()
+    if isinstance(outbound_headers, dict):
+        for header_name in ("x-agent-task-id", "x-parent-agent-id"):
+            header_value = outbound_headers.get(header_name)
+            if isinstance(header_value, str) and header_value.strip():
+                return model_name, f"{header_name}:{header_value.strip()}"
+    return None
 
 
 def _prompt_cache_prefix_diagnostics(
@@ -1262,8 +1374,9 @@ def _prompt_cache_prefix_diagnostics(
     request_id: str,
     upstream_body: dict | None,
     resolved_model: str | None,
+    outbound_headers: dict | None,
 ) -> dict | None:
-    lineage = _prompt_cache_trace_lineage(upstream_body, resolved_model)
+    lineage = _prompt_cache_trace_lineage(upstream_body, resolved_model, outbound_headers)
     if lineage is None or not isinstance(upstream_body, dict):
         return None
     item_hashes = _trace_input_item_hashes(upstream_body.get("input"))
@@ -1329,7 +1442,7 @@ def _prompt_cache_affinity_diagnostics(
     resolved_model: str | None,
     outbound_headers: dict | None,
 ) -> dict | None:
-    lineage = _prompt_cache_trace_lineage(upstream_body, resolved_model)
+    lineage = _prompt_cache_trace_lineage(upstream_body, resolved_model, outbound_headers)
     if lineage is None or not isinstance(outbound_headers, dict):
         return None
 
@@ -1717,6 +1830,7 @@ def _emit_request_trace_start(
         request_id=request_id,
         upstream_body=upstream_body,
         resolved_model=resolved_model,
+        outbound_headers=outbound_headers,
     )
     if cache_prefix_diagnostics is not None:
         trace_details = dict(trace_details)
@@ -1885,8 +1999,6 @@ def _prepare_upstream_request(
         prompt_preview=prompt_preview,
         initiator_verdict=initiator_verdict if isinstance(initiator_verdict, dict) else None,
     )
-    if usage_tracking._is_responses_api_path(upstream_path):
-        _ensure_responses_request_id(headers)
     auto_update_runtime_controller.note_request_started(request_id)
     trace_context = {
         "request_id": request_id,
@@ -2025,15 +2137,6 @@ def _build_anthropic_messages_passthrough_headers(
     return headers
 
 
-def _ensure_responses_request_id(headers: dict) -> dict:
-    request_id = headers.get("x-request-id")
-    if isinstance(request_id, str) and request_id.strip():
-        headers["x-request-id"] = request_id.strip()
-        return headers
-    headers["x-request-id"] = str(uuid4())
-    return headers
-
-
 def _build_bridge_headers(
     request: Request,
     original_body: dict,
@@ -2066,7 +2169,7 @@ def _build_bridge_headers(
                 bridge_plan.caller_protocol == "anthropic" or stable_affinity_hint
             ),
         )
-        return _ensure_responses_request_id(headers)
+        return headers
     if bridge_plan.header_kind == "chat":
         return format_translation.build_chat_headers_for_request(
             request,
@@ -2186,21 +2289,21 @@ def _bridge_error_response_from_upstream(bridge_plan: BridgeExecutionPlan, upstr
 async def _post_non_streaming_request(plan: UpstreamRequestPlan, *, error_response) -> Response:
     try:
         await _wait_for_responses_cache_settle(plan)
-        async with httpx.AsyncClient(timeout=configured_upstream_timeout_seconds()) as client:
+        client = _get_upstream_client()
+        upstream = await throttled_client_post(
+            client,
+            plan.upstream_url,
+            headers=plan.headers,
+            json=plan.body,
+        )
+        if _should_retry_without_prompt_cache_retention(upstream, plan):
+            _drop_prompt_cache_retention_for_retry(plan)
             upstream = await throttled_client_post(
                 client,
                 plan.upstream_url,
                 headers=plan.headers,
                 json=plan.body,
             )
-            if _should_retry_without_prompt_cache_retention(upstream, plan):
-                _drop_prompt_cache_retention_for_retry(plan)
-                upstream = await throttled_client_post(
-                    client,
-                    plan.upstream_url,
-                    headers=plan.headers,
-                    json=plan.body,
-                )
         if upstream.status_code >= 400:
             return _handle_upstream_error(
                 upstream,
@@ -2231,21 +2334,21 @@ async def _post_bridge_non_streaming_request(plan: UpstreamRequestPlan, bridge_p
     error_response = _bridge_error_response(bridge_plan)
     try:
         await _wait_for_responses_cache_settle(plan)
-        async with httpx.AsyncClient(timeout=configured_upstream_timeout_seconds()) as client:
+        client = _get_upstream_client()
+        upstream = await throttled_client_post(
+            client,
+            plan.upstream_url,
+            headers=plan.headers,
+            json=plan.body,
+        )
+        if _should_retry_without_prompt_cache_retention(upstream, plan):
+            _drop_prompt_cache_retention_for_retry(plan)
             upstream = await throttled_client_post(
                 client,
                 plan.upstream_url,
                 headers=plan.headers,
                 json=plan.body,
             )
-            if _should_retry_without_prompt_cache_retention(upstream, plan):
-                _drop_prompt_cache_retention_for_retry(plan)
-                upstream = await throttled_client_post(
-                    client,
-                    plan.upstream_url,
-                    headers=plan.headers,
-                    json=plan.body,
-                )
     except httpx.RequestError as exc:
         status_code, message = format_translation.upstream_request_error_status_and_message(exc)
         _finish_usage_and_trace(plan, status_code, response_text=message)
@@ -2532,7 +2635,7 @@ async def proxy_streaming_response(
     If the upstream request fails before the stream starts, return the upstream
     error body as a normal HTTP response instead of masking it as 200 SSE.
     """
-    client = httpx.AsyncClient(timeout=timeout)
+    client = _get_upstream_client()
     request = client.build_request("POST", upstream_url, headers=headers, json=body)
     try:
         await _wait_for_responses_cache_settle(trace_plan)
@@ -2540,20 +2643,17 @@ async def proxy_streaming_response(
     except httpx.RequestError as exc:
         status_code, message = format_translation.upstream_request_error_status_and_message(exc)
         _finish_usage_and_trace(trace_plan, status_code, response_text=message)
-        await client.aclose()
         return format_translation.openai_error_response(status_code, message)
     except Exception:
         _finish_usage_and_trace(trace_plan, 599)
-        await client.aclose()
         raise
 
     if upstream.status_code >= 400:
         await upstream.aread()
         if _should_retry_without_prompt_cache_retention(upstream, trace_plan):
             await upstream.aclose()
-            await client.aclose()
             _drop_prompt_cache_retention_for_retry(trace_plan)
-            client = httpx.AsyncClient(timeout=timeout)
+            client = _get_upstream_client()
             retry_body = trace_plan.body if isinstance(trace_plan, UpstreamRequestPlan) else body
             request = client.build_request("POST", upstream_url, headers=headers, json=retry_body)
             try:
@@ -2561,7 +2661,6 @@ async def proxy_streaming_response(
             except httpx.RequestError as exc:
                 status_code, message = format_translation.upstream_request_error_status_and_message(exc)
                 _finish_usage_and_trace(trace_plan, status_code, response_text=message)
-                await client.aclose()
                 return format_translation.openai_error_response(status_code, message)
         if upstream.status_code >= 400:
             try:
@@ -2576,7 +2675,6 @@ async def proxy_streaming_response(
                 )
             finally:
                 await upstream.aclose()
-                await client.aclose()
 
     response_headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
     content_type = upstream.headers.get("content-type")
@@ -2647,7 +2745,6 @@ async def proxy_streaming_response(
                     usage=capture.usage if isinstance(capture.usage, dict) else None,
                 )
             await upstream.aclose()
-            await client.aclose()
 
     return GracefulStreamingResponse(
         stream_upstream(),
@@ -2668,18 +2765,16 @@ async def proxy_anthropic_streaming_response(
     """
     Translate upstream chat-completions SSE into Anthropic Messages SSE.
     """
-    client = httpx.AsyncClient(timeout=timeout)
+    client = _get_upstream_client()
     request = client.build_request("POST", upstream_url, headers=headers, json=body)
     try:
         upstream = await throttled_client_send(client, request, stream=True)
     except httpx.RequestError as exc:
         status_code, message = format_translation.upstream_request_error_status_and_message(exc)
         _finish_usage_and_trace(trace_plan, status_code, response_text=message)
-        await client.aclose()
         return format_translation.anthropic_error_response(status_code, message)
     except Exception:
         _finish_usage_and_trace(trace_plan, 599)
-        await client.aclose()
         raise
 
     if upstream.status_code >= 400:
@@ -2696,7 +2791,6 @@ async def proxy_anthropic_streaming_response(
             )
         finally:
             await upstream.aclose()
-            await client.aclose()
 
     response_headers = {
         "Cache-Control": "no-cache",
@@ -2724,7 +2818,6 @@ async def proxy_anthropic_streaming_response(
                 usage=response_payload["usage"],
             )
             await upstream.aclose()
-            await client.aclose()
 
     return GracefulStreamingResponse(
         stream_translated(),
@@ -2742,18 +2835,16 @@ async def proxy_responses_from_chat_streaming_response(
     usage_event: dict | None = None,
     trace_plan: UpstreamRequestPlan | None = None,
 ) -> Response:
-    client = httpx.AsyncClient(timeout=timeout)
+    client = _get_upstream_client()
     request = client.build_request("POST", upstream_url, headers=headers, json=body)
     try:
         upstream = await throttled_client_send(client, request, stream=True)
     except httpx.RequestError as exc:
         status_code, message = format_translation.upstream_request_error_status_and_message(exc)
         _finish_usage_and_trace(trace_plan, status_code, response_text=message)
-        await client.aclose()
         return format_translation.openai_error_response(status_code, message)
     except Exception:
         _finish_usage_and_trace(trace_plan, 599)
-        await client.aclose()
         raise
 
     if upstream.status_code >= 400:
@@ -2769,7 +2860,6 @@ async def proxy_responses_from_chat_streaming_response(
             )
         finally:
             await upstream.aclose()
-            await client.aclose()
 
     response_headers = {
         "Cache-Control": "no-cache",
@@ -2798,7 +2888,6 @@ async def proxy_responses_from_chat_streaming_response(
                 usage=response_payload["usage"],
             )
             await upstream.aclose()
-            await client.aclose()
 
     return GracefulStreamingResponse(
         stream_translated(),
@@ -2816,18 +2905,16 @@ async def proxy_anthropic_from_responses_streaming_response(
     usage_event: dict | None = None,
     trace_plan: UpstreamRequestPlan | None = None,
 ) -> Response:
-    client = httpx.AsyncClient(timeout=timeout)
+    client = _get_upstream_client()
     request = client.build_request("POST", upstream_url, headers=headers, json=body)
     try:
         upstream = await throttled_client_send(client, request, stream=True)
     except httpx.RequestError as exc:
         status_code, message = format_translation.upstream_request_error_status_and_message(exc)
         _finish_usage_and_trace(trace_plan, status_code, response_text=message)
-        await client.aclose()
         return format_translation.anthropic_error_response(status_code, message)
     except Exception:
         _finish_usage_and_trace(trace_plan, 599)
-        await client.aclose()
         raise
 
     if upstream.status_code >= 400:
@@ -2844,7 +2931,6 @@ async def proxy_anthropic_from_responses_streaming_response(
             )
         finally:
             await upstream.aclose()
-            await client.aclose()
 
     response_headers = {
         "Cache-Control": "no-cache",
@@ -2872,7 +2958,6 @@ async def proxy_anthropic_from_responses_streaming_response(
                 usage=response_payload["usage"],
             )
             await upstream.aclose()
-            await client.aclose()
 
     return GracefulStreamingResponse(
         stream_translated(),
@@ -2901,18 +2986,16 @@ async def proxy_anthropic_passthrough_streaming_response(
     usage display. We still parse message_start / message_delta usage for the
     local dashboard.
     """
-    client = httpx.AsyncClient(timeout=timeout)
+    client = _get_upstream_client()
     request = client.build_request("POST", upstream_url, headers=headers, json=body)
     try:
         upstream = await throttled_client_send(client, request, stream=True)
     except httpx.RequestError as exc:
         status_code, message = format_translation.upstream_request_error_status_and_message(exc)
         _finish_usage_and_trace(trace_plan, status_code, response_text=message)
-        await client.aclose()
         return format_translation.anthropic_error_response(status_code, message)
     except Exception:
         _finish_usage_and_trace(trace_plan, 599)
-        await client.aclose()
         raise
 
     if upstream.status_code >= 400:
@@ -2929,7 +3012,6 @@ async def proxy_anthropic_passthrough_streaming_response(
             )
         finally:
             await upstream.aclose()
-            await client.aclose()
 
     response_headers = {
         "Cache-Control": "no-cache",
@@ -3054,7 +3136,6 @@ async def proxy_anthropic_passthrough_streaming_response(
                 usage=usage_state,
             )
             await upstream.aclose()
-            await client.aclose()
 
     return GracefulStreamingResponse(
         stream_passthrough(),
@@ -3073,18 +3154,16 @@ async def proxy_responses_from_anthropic_streaming_response(
     trace_plan: UpstreamRequestPlan | None = None,
 ) -> Response:
     """Translate upstream Anthropic Messages SSE into Responses SSE."""
-    client = httpx.AsyncClient(timeout=timeout)
+    client = _get_upstream_client()
     request = client.build_request("POST", upstream_url, headers=headers, json=body)
     try:
         upstream = await throttled_client_send(client, request, stream=True)
     except httpx.RequestError as exc:
         status_code, message = format_translation.upstream_request_error_status_and_message(exc)
         _finish_usage_and_trace(trace_plan, status_code, response_text=message)
-        await client.aclose()
         return format_translation.openai_error_response(status_code, message)
     except Exception:
         _finish_usage_and_trace(trace_plan, 599)
-        await client.aclose()
         raise
 
     if upstream.status_code >= 400:
@@ -3101,7 +3180,6 @@ async def proxy_responses_from_anthropic_streaming_response(
             )
         finally:
             await upstream.aclose()
-            await client.aclose()
 
     response_headers = {
         "Cache-Control": "no-cache",
@@ -3139,7 +3217,6 @@ async def proxy_responses_from_anthropic_streaming_response(
                 usage=tracking_usage,
             )
             await upstream.aclose()
-            await client.aclose()
 
     return GracefulStreamingResponse(
         stream_translated(),
@@ -3361,9 +3438,9 @@ async def _proxy_models_request() -> Response:
     headers = format_translation.build_copilot_headers(api_key)
 
     try:
-        async with httpx.AsyncClient(timeout=configured_upstream_timeout_seconds()) as client:
-            request = client.build_request("GET", upstream_url, headers=headers)
-            upstream = await throttled_client_send(client, request)
+        client = _get_upstream_client()
+        request = client.build_request("GET", upstream_url, headers=headers)
+        upstream = await throttled_client_send(client, request)
     except httpx.RequestError as exc:
         status_code, message = format_translation.upstream_request_error_status_and_message(exc)
         return format_translation.openai_error_response(status_code, message)
@@ -3610,17 +3687,17 @@ def _encrypted_reasoning_strip_reason_for_responses_context(
     Codex subagent/fork starts can replay the parent transcript, including
     encrypted reasoning blobs, under a fresh prompt-cache key. Copilot/OpenAI
     validates those blobs against the active lineage and rejects foreign ones
-    with ``invalid_request_body``. Keep normal same-thread replay intact when
-    the request carries an explicit lineage hint. Without that hint, strip
-    ciphertext when we have an explicit subagent marker or the input has a fork
-    shape Codex has emitted before. Summaries remain available, so the visible
-    transcript is preserved.
+    with ``invalid_request_body``. Copilot CLI keeps encrypted reasoning when
+    the request carries an explicit cache lineage hint, including subagent
+    turns. Without that hint, strip ciphertext when we have an explicit
+    subagent marker or the input has a fork shape Codex has emitted before.
+    Summaries remain available, so the visible transcript is preserved.
     """
+    if _responses_body_has_cache_lineage(request_body):
+        return None
     subagent = request.headers.get("x-openai-subagent") if hasattr(request, "headers") else None
     if isinstance(subagent, str) and subagent.strip():
         return "subagent_header"
-    if _responses_body_has_cache_lineage(request_body):
-        return None
     if _responses_input_developer_message_count(input_value) > 1:
         return "multiple_developer_messages_without_cache_lineage"
     if (
