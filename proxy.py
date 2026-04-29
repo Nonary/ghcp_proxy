@@ -546,29 +546,57 @@ def _prompt_cache_settle_delay_seconds() -> float:
 
 
 def _responses_cache_settle_lineage(plan: "UpstreamRequestPlan | None") -> tuple[str, str] | None:
+    """Per-(agent-task) settle key. Kept for callers that only need the own-lineage key."""
+    keys = _responses_cache_settle_keys(plan)
+    return keys[0] if keys else None
+
+
+def _responses_cache_settle_keys(plan: "UpstreamRequestPlan | None") -> list[tuple[str, str]]:
+    """All settle keys a plan should wait/remember under.
+
+    Always includes a per-agent-task key. Also includes a per-family key
+    derived from x-parent-agent-id (subagents) or x-agent-task-id (parents)
+    so that subagent + parent activity in the same parent-task family
+    settle each other. Empirically the upstream prompt cache evicts a
+    cached prefix when a sibling (parent or sister subagent) writes to the
+    same family namespace, so back-to-back cross-family turns regress to
+    near-zero cache hits even though our own outbound prefix is byte-stable.
+    """
     if not isinstance(plan, UpstreamRequestPlan) or not isinstance(plan.body, dict):
-        return None
+        return []
     model = str(plan.resolved_model or plan.requested_model or plan.body.get("model") or "").strip().lower()
     if model != "gpt-5.5":
-        return None
-    task_key = _responses_plan_header_value(plan, "x-agent-task-id")
-    if not task_key:
-        task_key = _responses_plan_task_prefix(plan)
-    if not task_key:
-        return None
-    return model, task_key
+        return []
+    keys: list[tuple[str, str]] = []
+    own_task = _responses_plan_header_value(plan, "x-agent-task-id") or _responses_plan_task_prefix(plan)
+    if own_task:
+        keys.append((model, own_task))
+    parent_task = _responses_plan_header_value(plan, "x-parent-agent-id")
+    family_root = parent_task or own_task
+    if family_root:
+        family_key = (model, f"family:{family_root}")
+        if family_key not in keys:
+            keys.append(family_key)
+    return keys
 
 
 async def _wait_for_responses_cache_settle(plan: "UpstreamRequestPlan | None") -> None:
-    lineage = _responses_cache_settle_lineage(plan)
-    if lineage is None:
+    keys = _responses_cache_settle_keys(plan)
+    if not keys:
         return
     delay_seconds = _prompt_cache_settle_delay_seconds()
     if delay_seconds <= 0:
         return
     with _PROMPT_CACHE_SETTLE_LOCK:
-        last_finished_at = _PROMPT_CACHE_LAST_FINISH_BY_LINEAGE.get(lineage)
-    if not isinstance(last_finished_at, (int, float)):
+        last_finished_at = max(
+            (
+                t
+                for t in (_PROMPT_CACHE_LAST_FINISH_BY_LINEAGE.get(k) for k in keys)
+                if isinstance(t, (int, float))
+            ),
+            default=None,
+        )
+    if last_finished_at is None:
         return
     wait_seconds = delay_seconds - (time.monotonic() - float(last_finished_at))
     if wait_seconds > 0:
@@ -578,11 +606,13 @@ async def _wait_for_responses_cache_settle(plan: "UpstreamRequestPlan | None") -
 def _remember_responses_cache_settle_finish(plan: "UpstreamRequestPlan | None", status_code: int) -> None:
     if status_code >= 400:
         return
-    lineage = _responses_cache_settle_lineage(plan)
-    if lineage is None:
+    keys = _responses_cache_settle_keys(plan)
+    if not keys:
         return
+    now = time.monotonic()
     with _PROMPT_CACHE_SETTLE_LOCK:
-        _PROMPT_CACHE_LAST_FINISH_BY_LINEAGE[lineage] = time.monotonic()
+        for key in keys:
+            _PROMPT_CACHE_LAST_FINISH_BY_LINEAGE[key] = now
 
 
 # ─── Parent prompt-cache LRU keepalive ───────────────────────────────────────
