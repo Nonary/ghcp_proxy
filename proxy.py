@@ -176,6 +176,11 @@ _TRACE_HEADER_ALLOWLIST = {
     "sec-fetch-mode",
     "x-request-id",
     "x-github-request-id",
+    "accept",
+    "accept-encoding",
+    "host",
+    "connection",
+    "content-length",
 }
 AUTH_FAILURE_MESSAGE = "GitHub Copilot authorization required. Open /ui to sign in."
 INVALID_BRIDGE_REQUEST_MESSAGE = "Invalid request"
@@ -1031,6 +1036,19 @@ def request_trace_log_path() -> str:
     return os.path.expanduser(configured or REQUEST_TRACE_LOG_FILE)
 
 
+def request_body_dump_enabled() -> bool:
+    # Default-on so cache-bust diagnosis has full outbound bytes for byte-diffing
+    # paired requests. Opt out with GHCP_DUMP_REQUEST_BODIES=0.
+    return _env_flag_default("GHCP_DUMP_REQUEST_BODIES", default=True)
+
+
+def request_body_dump_dir() -> str:
+    configured = str(os.environ.get("GHCP_REQUEST_BODY_DUMP_DIR", "")).strip()
+    if configured:
+        return os.path.expanduser(configured)
+    return os.path.join(os.path.dirname(request_trace_log_path()), "request-bodies")
+
+
 def restore_client_proxy_configs_on_startup() -> dict[str, object]:
     global _CLIENT_PROXY_STARTUP_RESTORE_COMPLETE
     with _CLIENT_PROXY_STARTUP_RESTORE_LOCK:
@@ -1328,22 +1346,12 @@ def _trace_body_summary(body: dict | None) -> dict | None:
     metadata = body.get("metadata")
     if isinstance(metadata, dict):
         summary["metadata_keys"] = sorted(metadata.keys())
-    for key in (
-        "client_metadata",
-        "context_management",
-        "include",
-        "instructions",
-        "metadata",
-        "parallel_tool_calls",
-        "reasoning",
-        "text",
-        "tool_choice",
-        "tools",
-    ):
-        if key in body:
-            fingerprint = _trace_hash(body.get(key))
-            if fingerprint:
-                summary[f"{key}_fingerprint"] = fingerprint
+    for key in sorted(body.keys()):
+        if key in ("input", "messages"):
+            continue
+        fingerprint = _trace_hash(body.get(key))
+        if fingerprint:
+            summary[f"{key}_fingerprint"] = fingerprint
 
     return summary
 
@@ -1548,6 +1556,96 @@ def _append_request_trace(payload: dict, *, force: bool = False) -> None:
             _enforce_trace_retention_locked(trace_path)
     except OSError as exc:
         print(f"Warning: failed to write request trace log: {exc}", file=sys.stderr, flush=True)
+
+
+_REQUEST_BODY_DUMP_LOCK = threading.Lock()
+
+
+def _dump_outbound_request_body(
+    *,
+    request_id: str,
+    context: dict,
+    request: Request,
+    requested_model: str | None,
+    resolved_model: str | None,
+    request_body: dict | None,
+    upstream_body: dict | None,
+    outbound_headers: dict | None,
+) -> None:
+    """Persist the exact outbound body and full headers for a request.
+
+    Default-on so that paired hit/bust analysis can byte-diff what we sent
+    upstream — which fingerprints in the trace cannot expose. Opt out with
+    GHCP_DUMP_REQUEST_BODIES=0. Files are bounded by trace retention.
+    """
+    if not request_body_dump_enabled():
+        return
+    dump_dir = request_body_dump_dir()
+    # httpx uses json.dumps(body) with default kwargs to encode json= bodies,
+    # so capture the same wire form for byte-level diffing.
+    try:
+        wire_bytes = json.dumps(upstream_body, default=util._json_default).encode("utf-8")
+    except (TypeError, ValueError):
+        wire_bytes = None
+    payload: dict = {
+        "request_id": request_id,
+        "time": util.utc_now_iso(),
+        "method": request.method,
+        "client_path": context.get("client_path"),
+        "upstream_host": context.get("upstream_host"),
+        "upstream_path": context.get("upstream_path"),
+        "requested_model": requested_model,
+        "resolved_model": resolved_model,
+        "outbound_headers": dict(outbound_headers) if isinstance(outbound_headers, dict) else None,
+        "request_body": request_body,
+        "upstream_body": upstream_body,
+    }
+    if wire_bytes is not None:
+        payload["upstream_body_wire"] = wire_bytes.decode("utf-8", errors="replace")
+        payload["upstream_body_wire_size"] = len(wire_bytes)
+        payload["upstream_body_wire_sha256"] = hashlib.sha256(wire_bytes).hexdigest()
+    safe_rid = "".join(ch for ch in str(request_id) if ch.isalnum() or ch in ("-", "_")) or "request"
+    out_path = os.path.join(dump_dir, f"{safe_rid}.json")
+    try:
+        with _REQUEST_BODY_DUMP_LOCK:
+            os.makedirs(dump_dir, exist_ok=True)
+            with open(out_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, default=util._json_default)
+            _enforce_body_dump_retention_locked(dump_dir)
+    except OSError as exc:
+        print(f"Warning: failed to write request body dump: {exc}", file=sys.stderr, flush=True)
+
+
+def _enforce_body_dump_retention_locked(dump_dir: str) -> None:
+    """Cap body-dump directory at REQUEST_TRACE_HISTORY_LIMIT files.
+
+    Caller must hold ``_REQUEST_BODY_DUMP_LOCK``. Bodies can be 10-100KB
+    each; without retention the directory grows unbounded.
+    """
+    limit = REQUEST_TRACE_HISTORY_LIMIT
+    if limit <= 0:
+        return
+    try:
+        entries = os.listdir(dump_dir)
+    except OSError:
+        return
+    if len(entries) <= limit + max(REQUEST_TRACE_RETENTION_SLACK, 0):
+        return
+    paths = []
+    for name in entries:
+        full = os.path.join(dump_dir, name)
+        try:
+            mtime = os.path.getmtime(full)
+        except OSError:
+            continue
+        paths.append((mtime, full))
+    paths.sort()
+    drop = len(paths) - limit
+    for _, path in paths[:drop]:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
 
 
 def _anthropic_messages_usage_for_tracking(usage: dict | None) -> dict | None:
@@ -1867,6 +1965,16 @@ def _emit_request_trace_start(
         payload["initiator_verdict"] = initiator_verdict
         context["initiator_verdict"] = initiator_verdict
     _append_request_trace(payload)
+    _dump_outbound_request_body(
+        request_id=request_id,
+        context=context,
+        request=request,
+        requested_model=requested_model,
+        resolved_model=resolved_model,
+        request_body=request_body,
+        upstream_body=upstream_body,
+        outbound_headers=outbound_headers,
+    )
     return context
 
 
