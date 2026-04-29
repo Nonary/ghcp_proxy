@@ -1559,6 +1559,21 @@ def _append_request_trace(payload: dict, *, force: bool = False) -> None:
 
 
 _REQUEST_BODY_DUMP_LOCK = threading.Lock()
+_REQUEST_BODY_DUMP_EXECUTOR: "concurrent.futures.ThreadPoolExecutor | None" = None
+_REQUEST_BODY_DUMP_EXECUTOR_LOCK = threading.Lock()
+
+
+def _get_request_body_dump_executor() -> "concurrent.futures.ThreadPoolExecutor":
+    global _REQUEST_BODY_DUMP_EXECUTOR
+    if _REQUEST_BODY_DUMP_EXECUTOR is not None:
+        return _REQUEST_BODY_DUMP_EXECUTOR
+    with _REQUEST_BODY_DUMP_EXECUTOR_LOCK:
+        if _REQUEST_BODY_DUMP_EXECUTOR is None:
+            import concurrent.futures
+            _REQUEST_BODY_DUMP_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+                max_workers=2, thread_name_prefix="ghcp-body-dump"
+            )
+    return _REQUEST_BODY_DUMP_EXECUTOR
 
 
 def _dump_outbound_request_body(
@@ -1574,45 +1589,64 @@ def _dump_outbound_request_body(
 ) -> None:
     """Persist the exact outbound body and full headers for a request.
 
-    Default-on so that paired hit/bust analysis can byte-diff what we sent
-    upstream — which fingerprints in the trace cannot expose. Opt out with
-    GHCP_DUMP_REQUEST_BODIES=0. Files are bounded by trace retention.
+    Default-on so paired hit/bust analysis can byte-diff what we sent upstream
+    — which fingerprints in the trace cannot expose. Opt out with
+    GHCP_DUMP_REQUEST_BODIES=0. The actual file write runs on a background
+    thread so it never blocks the event loop, and any failure is swallowed
+    so a serialization issue cannot fail the upstream request itself. Files
+    are bounded by REQUEST_TRACE_HISTORY_LIMIT.
     """
     if not request_body_dump_enabled():
         return
-    dump_dir = request_body_dump_dir()
-    # httpx uses json.dumps(body) with default kwargs to encode json= bodies,
-    # so capture the same wire form for byte-level diffing.
     try:
-        wire_bytes = json.dumps(upstream_body, default=util._json_default).encode("utf-8")
-    except (TypeError, ValueError):
-        wire_bytes = None
-    payload: dict = {
-        "request_id": request_id,
-        "time": util.utc_now_iso(),
-        "method": request.method,
-        "client_path": context.get("client_path"),
-        "upstream_host": context.get("upstream_host"),
-        "upstream_path": context.get("upstream_path"),
-        "requested_model": requested_model,
-        "resolved_model": resolved_model,
-        "outbound_headers": dict(outbound_headers) if isinstance(outbound_headers, dict) else None,
-        "request_body": request_body,
-        "upstream_body": upstream_body,
-    }
-    if wire_bytes is not None:
-        payload["upstream_body_wire"] = wire_bytes.decode("utf-8", errors="replace")
-        payload["upstream_body_wire_size"] = len(wire_bytes)
-        payload["upstream_body_wire_sha256"] = hashlib.sha256(wire_bytes).hexdigest()
-    safe_rid = "".join(ch for ch in str(request_id) if ch.isalnum() or ch in ("-", "_")) or "request"
-    out_path = os.path.join(dump_dir, f"{safe_rid}.json")
+        dump_dir = request_body_dump_dir()
+        # Build a snapshot on the caller's thread so we don't race the request
+        # handler mutating the body after we hand off; serialization happens
+        # in the background thread.
+        snapshot = {
+            "request_id": request_id,
+            "time": util.utc_now_iso(),
+            "method": request.method,
+            "client_path": context.get("client_path"),
+            "upstream_host": context.get("upstream_host"),
+            "upstream_path": context.get("upstream_path"),
+            "requested_model": requested_model,
+            "resolved_model": resolved_model,
+            "outbound_headers": dict(outbound_headers) if isinstance(outbound_headers, dict) else None,
+            "request_body": request_body,
+            "upstream_body": upstream_body,
+        }
+        safe_rid = "".join(ch for ch in str(request_id) if ch.isalnum() or ch in ("-", "_")) or "request"
+        out_path = os.path.join(dump_dir, f"{safe_rid}.json")
+        executor = _get_request_body_dump_executor()
+        executor.submit(_write_request_body_dump, out_path, dump_dir, snapshot)
+    except Exception as exc:  # pragma: no cover - never let dump errors fail upstream
+        print(f"Warning: failed to schedule request body dump: {exc}", file=sys.stderr, flush=True)
+
+
+def _write_request_body_dump(out_path: str, dump_dir: str, snapshot: dict) -> None:
+    """Background worker: serialize the snapshot and persist it.
+
+    Runs on the body-dump executor so the event loop is never blocked by
+    disk I/O. Catches every exception so a malformed payload cannot leak
+    out of the worker.
+    """
     try:
+        upstream_body = snapshot.get("upstream_body")
+        try:
+            wire_bytes = json.dumps(upstream_body, default=util._json_default).encode("utf-8")
+        except (TypeError, ValueError):
+            wire_bytes = None
+        if wire_bytes is not None:
+            snapshot["upstream_body_wire"] = wire_bytes.decode("utf-8", errors="replace")
+            snapshot["upstream_body_wire_size"] = len(wire_bytes)
+            snapshot["upstream_body_wire_sha256"] = hashlib.sha256(wire_bytes).hexdigest()
         with _REQUEST_BODY_DUMP_LOCK:
             os.makedirs(dump_dir, exist_ok=True)
             with open(out_path, "w", encoding="utf-8") as f:
-                json.dump(payload, f, default=util._json_default)
+                json.dump(snapshot, f, default=util._json_default)
             _enforce_body_dump_retention_locked(dump_dir)
-    except OSError as exc:
+    except Exception as exc:  # pragma: no cover - dump must never raise
         print(f"Warning: failed to write request body dump: {exc}", file=sys.stderr, flush=True)
 
 
