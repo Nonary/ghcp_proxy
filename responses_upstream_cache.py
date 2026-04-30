@@ -691,6 +691,145 @@ def _apply_responses_prompt_cache_to_anthropic_messages(payload: dict) -> None:
             mark(_last_cacheable_anthropic_content_block(message.get("content")))
 
 
+def _anthropic_tool_use_as_text(block: dict) -> dict:
+    """Represent an unmatched Anthropic tool_use block as plain transcript text."""
+    call_id = block.get("id")
+    name = block.get("name")
+    call_suffix = f" ({call_id})" if isinstance(call_id, str) and call_id else ""
+    tool_name = name if isinstance(name, str) and name else "tool"
+    raw_input = block.get("input")
+    if isinstance(raw_input, str):
+        input_text = raw_input
+    elif raw_input is None:
+        input_text = "{}"
+    else:
+        input_text = json.dumps(raw_input, separators=(",", ":"), ensure_ascii=False)
+    return {"type": "text", "text": f"[Tool call{call_suffix}] {tool_name}\n{input_text}"}
+
+
+def _repair_anthropic_tool_result_adjacency(messages: list[dict]) -> None:
+    """Make translated Responses history obey Anthropic tool_use adjacency.
+
+    Anthropic requires every assistant ``tool_use`` block to have its
+    corresponding ``tool_result`` block(s) at the start of the immediately next
+    user message.  Responses histories can contain ordinary user/assistant
+    messages between a ``function_call`` item and its later
+    ``function_call_output`` item.  Move those delayed results next to the tool
+    use.  If a replayed tool call has no matching result anywhere in the
+    history, downgrade that specific tool call to transcript text so the
+    request remains valid instead of being rejected upstream.
+    """
+
+    def content_blocks(message: dict) -> list[dict]:
+        content = message.get("content")
+        return content if isinstance(content, list) else []
+
+    def tool_result_id(block: dict) -> str | None:
+        if not isinstance(block, dict) or block.get("type") != "tool_result":
+            return None
+        value = block.get("tool_use_id")
+        return value if isinstance(value, str) and value else None
+
+    index = 0
+    while index < len(messages):
+        message = messages[index]
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            index += 1
+            continue
+
+        content = content_blocks(message)
+        tool_uses = [
+            block
+            for block in content
+            if isinstance(block, dict) and block.get("type") == "tool_use"
+        ]
+        if not tool_uses:
+            index += 1
+            continue
+
+        required_ids = [
+            block.get("id")
+            for block in tool_uses
+            if isinstance(block.get("id"), str) and block.get("id")
+        ]
+        if not required_ids:
+            message["content"] = [
+                _anthropic_tool_use_as_text(block)
+                if isinstance(block, dict) and block.get("type") == "tool_use"
+                else block
+                for block in content
+            ]
+            index += 1
+            continue
+
+        collected_by_id: dict[str, dict] = {}
+        collected_object_ids: set[int] = set()
+        needed = set(required_ids)
+        for later in messages[index + 1 :]:
+            if not isinstance(later, dict) or later.get("role") != "user":
+                continue
+            for block in content_blocks(later):
+                result_id = tool_result_id(block)
+                if result_id in needed and result_id not in collected_by_id:
+                    collected_by_id[result_id] = block
+                    collected_object_ids.add(id(block))
+            if needed.issubset(collected_by_id):
+                break
+
+        matched_ids = set(collected_by_id)
+        rebuilt_other: list[dict] = []
+        rebuilt_tool_uses: list[dict] = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "tool_use":
+                block_id = block.get("id")
+                if isinstance(block_id, str) and block_id in matched_ids:
+                    rebuilt_tool_uses.append(block)
+                else:
+                    rebuilt_other.append(_anthropic_tool_use_as_text(block))
+            else:
+                rebuilt_other.append(block)
+        message["content"] = rebuilt_other + rebuilt_tool_uses
+
+        if not matched_ids:
+            index += 1
+            continue
+
+        for later in messages[index + 1 :]:
+            if not isinstance(later, dict) or later.get("role") != "user":
+                continue
+            later["content"] = [
+                block
+                for block in content_blocks(later)
+                if id(block) not in collected_object_ids
+            ]
+
+        ordered_results = [
+            collected_by_id[required_id]
+            for required_id in required_ids
+            if required_id in collected_by_id
+        ]
+        next_index = index + 1
+        if (
+            next_index < len(messages)
+            and isinstance(messages[next_index], dict)
+            and messages[next_index].get("role") == "user"
+        ):
+            messages[next_index]["content"] = ordered_results + content_blocks(messages[next_index])
+        else:
+            messages.insert(next_index, {"role": "user", "content": ordered_results})
+
+        messages[:] = [
+            item
+            for item in messages
+            if not (
+                isinstance(item, dict)
+                and isinstance(item.get("content"), list)
+                and len(item["content"]) == 0
+            )
+        ]
+        index += 1
+
+
 def responses_request_to_anthropic_messages(body: dict) -> dict:  # pragma: no mutate
     """Translate an OpenAI Responses request body into Anthropic Messages shape."""
     if not isinstance(body, dict):
@@ -772,6 +911,8 @@ def responses_request_to_anthropic_messages(body: dict) -> dict:  # pragma: no m
                 continue
 
             raise ValueError(f"Unsupported Responses input item type: {item_type}")
+
+    _repair_anthropic_tool_result_adjacency(messages)
 
     payload: dict = {
         "model": body.get("model"),

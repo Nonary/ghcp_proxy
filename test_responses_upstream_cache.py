@@ -800,6 +800,71 @@ class ResponsesToAnthropicMessagesRequestTests(unittest.TestCase):
         self.assertEqual(out["tools"], [{"name": "Read", "description": "", "input_schema": {"type": "object", "properties": {}}}])
         self.assertNotIn("tool_choice", out)
 
+    def test_request_translation_moves_delayed_tool_result_next_to_tool_use(self):
+        out = ruc.responses_request_to_anthropic_messages(
+            {
+                "model": "claude-opus-4.7",
+                "input": [
+                    {
+                        "type": "function_call",
+                        "call_id": "toolu_1",
+                        "name": "Bash",
+                        "arguments": '{"cmd":"pwd"}',
+                    },
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "continue after that"}],
+                    },
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "I can continue."}],
+                    },
+                    {
+                        "type": "function_call_output",
+                        "call_id": "toolu_1",
+                        "output": "/tmp/project",
+                    },
+                ],
+            }
+        )
+
+        self.assertEqual([message["role"] for message in out["messages"]], ["assistant", "user", "assistant"])
+        self.assertEqual(out["messages"][0]["content"][0]["type"], "tool_use")
+        self.assertEqual(
+            [block["type"] for block in out["messages"][1]["content"]],
+            ["tool_result", "text"],
+        )
+        self.assertEqual(out["messages"][1]["content"][0]["tool_use_id"], "toolu_1")
+        self.assertEqual(out["messages"][1]["content"][1]["text"], "continue after that")
+        self.assertEqual(out["messages"][2]["content"][0]["text"], "I can continue.")
+
+    def test_request_translation_textifies_unanswered_tool_use_before_later_messages(self):
+        out = ruc.responses_request_to_anthropic_messages(
+            {
+                "model": "claude-opus-4.7",
+                "input": [
+                    {
+                        "type": "function_call",
+                        "call_id": "toolu_missing",
+                        "name": "Bash",
+                        "arguments": '{"cmd":"pwd"}',
+                    },
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "continue without the result"}],
+                    },
+                ],
+            }
+        )
+
+        self.assertEqual([message["role"] for message in out["messages"]], ["assistant", "user"])
+        self.assertEqual(out["messages"][0]["content"][0]["type"], "text")
+        self.assertIn("[Tool call (toolu_missing)] Bash", out["messages"][0]["content"][0]["text"])
+        self.assertEqual(out["messages"][1]["content"][0]["text"], "continue without the result")
+
     def test_request_translation_raises_for_missing_custom_tool_name(self):
         with self.assertRaisesRegex(ValueError, "custom_tool_call items must include a name"):
             ruc.responses_request_to_anthropic_messages(
