@@ -50,6 +50,38 @@ def _responses_task_affinity_scope(affinity_value) -> str | None:
     return normalized
 
 
+def _responses_client_session_id_for_affinity(affinity_value, model=None) -> str | None:
+    """Return the Copilot client-session bucket for a Responses cache lineage.
+
+    The proxy process can multiplex multiple Codex conversations.  A single
+    process-wide ``x-client-session-id`` lets unrelated ``prompt_cache_key``
+    lineages fight over the same upstream prompt-cache/LRU namespace; in live
+    traces, switching from one large prompt_cache_key to another for ~100s made
+    the first key come back with only the tiny initial prefix cached despite an
+    append-only body.  Copilot CLI normally gets a fresh client session per CLI
+    process/conversation, so mirror that by deriving the client session from the
+    full explicit affinity key.
+
+    Also include the model in the derivation: same Codex conversation can fan
+    out to multiple models (e.g. gpt-5.5 main + gpt-5.4 memory_consolidation +
+    gpt-5.4-mini routing) and they have non-overlapping cache prefixes. Sharing
+    one upstream client_session across them lets each model's write evict
+    sister-model cache slots — observed live as 50% bust rate on gpt-5.5 main
+    when gpt-5.4 traffic shared the same affinity bucket.
+    """
+    if os.environ.get("GHCP_COPILOT_CLIENT_SESSION_ID"):
+        return None
+    if not isinstance(affinity_value, str):
+        return None
+    normalized = affinity_value.strip()
+    if not normalized:
+        return None
+    model_key = ""
+    if isinstance(model, str) and model.strip():
+        model_key = model.strip().lower()
+    return _copilot_uuid(f"responses-client-session:{normalized}:{model_key}")
+
+
 def _responses_subagent_task_id(parent_scope, subagent, affinity_value=None) -> str | None:
     if not isinstance(parent_scope, str) or not parent_scope.strip():
         return None
@@ -486,6 +518,12 @@ def build_responses_headers_for_request(
         else _interaction_type_for_initiator(initiator)
     )
     stable_affinity = stable_user_affinity or _responses_body_has_affinity_hint(identity_source)
+    affinity_value = _responses_affinity_value(identity_source, session_id) if stable_affinity else None
+    affinity_client_session_id = _responses_client_session_id_for_affinity(
+        affinity_value, model=body.get("model")
+    )
+    if affinity_client_session_id:
+        headers["x-client-session-id"] = affinity_client_session_id
     headers.update(
         _responses_copilot_identity_headers(
             identity_source,
