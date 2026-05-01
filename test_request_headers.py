@@ -1,3 +1,4 @@
+import json
 import unittest
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -1511,6 +1512,86 @@ class RequestHeadersTests(unittest.TestCase):
         self.assertEqual(second_headers["X-Initiator"], "user")
         self.assertEqual(first_headers["x-interaction-id"], second_headers["x-interaction-id"])
         self.assertEqual(first_headers["x-agent-task-id"], second_headers["x-agent-task-id"])
+        self.assertEqual(first_body.get("prompt_cache_key"), "cache-user-turns")
+        self.assertEqual(second_body.get("prompt_cache_key"), "cache-user-turns")
+
+    def test_build_responses_headers_for_request_isolates_codex_rollout_memory_affinity(self):
+        request = SimpleNamespace(headers={}, url=SimpleNamespace(path="/v1/responses"))
+        first_body = {
+            "model": "gpt-5.4-mini",
+            "prompt_cache_key": "cache-user-turns",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": (
+                                "Analyze this rollout and produce JSON with `raw_memory`, "
+                                "`rollout_summary`, and `rollout_slug`.\n\n"
+                                "rollout_context:\n"
+                                "- rollout_path: C:\\rollout-a.jsonl\n\n"
+                                "rendered conversation (pre-rendered from rollout `.jsonl`):\n"
+                                "[{\"type\":\"message\",\"role\":\"user\",\"content\":\"a\"}]"
+                            ),
+                        }
+                    ],
+                }
+            ],
+        }
+        second_body = {
+            **first_body,
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": (
+                                "Analyze this rollout and produce JSON with `raw_memory`, "
+                                "`rollout_summary`, and `rollout_slug`.\n\n"
+                                "rollout_context:\n"
+                                "- rollout_path: C:\\rollout-b.jsonl\n\n"
+                                "rendered conversation (pre-rendered from rollout `.jsonl`):\n"
+                                "[{\"type\":\"message\",\"role\":\"user\",\"content\":\"b\"}]"
+                            ),
+                        }
+                    ],
+                }
+            ],
+        }
+        repeat_first_body = json.loads(json.dumps(first_body))
+
+        first_headers = format_translation.build_responses_headers_for_request(
+            request,
+            first_body,
+            "test-key",
+            initiator_policy=proxy._initiator_policy,
+            session_id_resolver=usage_tracking.request_session_id,
+        )
+        second_headers = format_translation.build_responses_headers_for_request(
+            request,
+            second_body,
+            "test-key",
+            initiator_policy=proxy._initiator_policy,
+            session_id_resolver=usage_tracking.request_session_id,
+        )
+        repeat_first_headers = format_translation.build_responses_headers_for_request(
+            request,
+            repeat_first_body,
+            "test-key",
+            initiator_policy=proxy._initiator_policy,
+            session_id_resolver=usage_tracking.request_session_id,
+        )
+
+        self.assertNotEqual(first_headers["x-client-session-id"], second_headers["x-client-session-id"])
+        self.assertNotEqual(first_headers["x-interaction-id"], second_headers["x-interaction-id"])
+        self.assertNotEqual(first_headers["x-agent-task-id"], second_headers["x-agent-task-id"])
+        self.assertEqual(first_headers["x-client-session-id"], repeat_first_headers["x-client-session-id"])
+        self.assertEqual(first_headers["x-interaction-id"], repeat_first_headers["x-interaction-id"])
+        self.assertEqual(first_headers["x-agent-task-id"], repeat_first_headers["x-agent-task-id"])
         self.assertEqual(first_body.get("prompt_cache_key"), "cache-user-turns")
         self.assertEqual(second_body.get("prompt_cache_key"), "cache-user-turns")
 

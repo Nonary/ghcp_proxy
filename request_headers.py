@@ -264,6 +264,60 @@ def _responses_request_id_payload_messages(payload):
     return payload.get("input")
 
 
+def _responses_input_text(value) -> str | None:
+    if isinstance(value, str):
+        return value
+    if not isinstance(value, list):
+        return None
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        content = item.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: list[str] = []
+            for entry in content:
+                if not isinstance(entry, dict):
+                    continue
+                for key in ("text", "input_text", "output_text"):
+                    text = entry.get(key)
+                    if isinstance(text, str):
+                        parts.append(text)
+                        break
+            if parts:
+                return "".join(parts)
+        for key in ("text", "input_text", "output_text"):
+            text = item.get(key)
+            if isinstance(text, str):
+                return text
+    return None
+
+
+def _codex_rollout_memory_affinity_value(payload, base_affinity: str) -> str | None:
+    """Return an isolated affinity for Codex rollout-memory writer requests.
+
+    Codex's background memory writer sends prompts like "Analyze this rollout..."
+    using the active conversation's prompt_cache_key even though each rollout is
+    unrelated to the interactive turn. If those requests reuse the interactive
+    affinity, a post-interrupt rollout summary with <turn_aborted> content can
+    look like a cache bust and can also churn the upstream prompt-cache bucket.
+    Keep them stable for the same rollout, but isolate them from the main turn
+    and from other rollout summaries.
+    """
+    if not isinstance(payload, dict) or not isinstance(base_affinity, str):
+        return None
+    text = _responses_input_text(payload.get("input"))
+    if not isinstance(text, str):
+        return None
+    if not text.startswith("Analyze this rollout and produce JSON"):
+        return None
+    if "rollout_context:" not in text or "rendered conversation" not in text:
+        return None
+    digest = hashlib.sha256(f"{base_affinity}\n{text}".encode("utf-8")).hexdigest()[:32]
+    return f"codex-rollout-memory:{digest}"
+
+
 def _generate_request_id_from_payload(payload, session_id: str | None = None) -> str:
     messages = _responses_request_id_payload_messages(payload)
     if isinstance(messages, str) and messages:
@@ -284,6 +338,9 @@ def _responses_affinity_value(payload, session_id: str | None = None) -> str | N
             if isinstance(value, str):
                 normalized = value.strip()
                 if normalized:
+                    isolated = _codex_rollout_memory_affinity_value(payload, normalized)
+                    if isolated:
+                        return isolated
                     return normalized
         metadata = payload.get("metadata")
         if isinstance(metadata, dict):
@@ -292,6 +349,9 @@ def _responses_affinity_value(payload, session_id: str | None = None) -> str | N
                 if isinstance(value, str):
                     normalized = value.strip()
                     if normalized:
+                        isolated = _codex_rollout_memory_affinity_value(payload, normalized)
+                        if isolated:
+                            return isolated
                         return normalized
     if isinstance(session_id, str):
         normalized = session_id.strip()
