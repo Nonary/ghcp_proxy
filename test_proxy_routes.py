@@ -3644,9 +3644,9 @@ class AnthropicMessagesPassthroughRouteTests(unittest.TestCase):
         # input includes cache reads, while cached input is separately reported
         # in input_tokens_details. This is the inverse of copilot-api's
         # Responses->Anthropic subtraction.
-        self.assertEqual(payload["usage"]["input_tokens"], 126200)
+        self.assertEqual(payload["usage"]["input_tokens"], 126242)
         self.assertEqual(payload["usage"]["output_tokens"], 321)
-        self.assertEqual(payload["usage"]["total_tokens"], 126521)
+        self.assertEqual(payload["usage"]["total_tokens"], 126563)
         self.assertEqual(
             payload["usage"]["input_tokens_details"],
             {"cached_tokens": 125000, "cache_creation_input_tokens": 42},
@@ -3737,7 +3737,7 @@ class AnthropicMessagesPassthroughRouteTests(unittest.TestCase):
 
         body, finish_usage = proxy.asyncio.run(run_stream())
 
-        self.assertIn(b'"input_tokens":126200', body)
+        self.assertIn(b'"input_tokens":126242', body)
         self.assertIn(b'"cached_tokens":125000', body)
         self.assertIn(b'"cache_creation_input_tokens":42', body)
         finish_usage.assert_called_once()

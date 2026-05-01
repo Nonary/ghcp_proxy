@@ -534,13 +534,73 @@ class AnthropicToResponsesStreamTranslatorTests(unittest.TestCase):
 
         body, payload = proxy.asyncio.run(collect())
 
-        self.assertIn('"input_tokens":11', body)
-        self.assertEqual(payload["usage"]["input_tokens"], 11)
+        self.assertIn('"input_tokens":13', body)
+        self.assertEqual(payload["usage"]["input_tokens"], 13)
         self.assertEqual(payload["usage"]["output_tokens"], 3)
-        self.assertEqual(payload["usage"]["total_tokens"], 14)
+        self.assertEqual(payload["usage"]["total_tokens"], 16)
         self.assertEqual(
             payload["usage"]["input_tokens_details"],
             {"cached_tokens": 4, "cache_creation_input_tokens": 2},
+        )
+
+    def test_anthropic_to_responses_stream_delta_reuses_start_cache_for_input(self):
+        events = [
+            (
+                "message_start",
+                {
+                    "type": "message_start",
+                    "message": {
+                        "id": "msg_cache",
+                        "type": "message",
+                        "role": "assistant",
+                        "model": "claude-sonnet-4.6",
+                        "content": [],
+                        "usage": {
+                            "input_tokens": 1200,
+                            "output_tokens": 0,
+                            "cache_read_input_tokens": 125000,
+                            "cache_creation_input_tokens": 42,
+                        },
+                    },
+                },
+            ),
+            (
+                "message_delta",
+                {
+                    "type": "message_delta",
+                    "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                    # Some Messages streams repeat Anthropic's fresh-only
+                    # input_tokens on the final delta without repeating
+                    # cache_read_input_tokens. The Responses/Codex-facing
+                    # usage must still stay gross (fresh + cached), otherwise
+                    # Codex subtracts cached_tokens and displays 0 input.
+                    "usage": {"input_tokens": 1200, "output_tokens": 321},
+                },
+            ),
+            ("message_stop", {"type": "message_stop"}),
+        ]
+        chunks = [self._build_anthropic_sse(events)]
+
+        async def byte_iter():
+            for chunk in chunks:
+                yield chunk
+
+        async def collect():
+            translator = AnthropicToResponsesStreamTranslator(model="claude-sonnet-4.6")
+            body = b""
+            async for ev in translator.translate(byte_iter()):
+                body += ev
+            return body.decode("utf-8"), translator.build_response_payload()
+
+        body, payload = proxy.asyncio.run(collect())
+
+        self.assertIn('"input_tokens":126242', body)
+        self.assertEqual(payload["usage"]["input_tokens"], 126242)
+        self.assertEqual(payload["usage"]["output_tokens"], 321)
+        self.assertEqual(payload["usage"]["total_tokens"], 126563)
+        self.assertEqual(
+            payload["usage"]["input_tokens_details"],
+            {"cached_tokens": 125000, "cache_creation_input_tokens": 42},
         )
 
     def test_reasoning_output_item_done_splits_signature_id(self):

@@ -2800,7 +2800,10 @@ async def _post_bridge_non_streaming_request(plan: UpstreamRequestPlan, bridge_p
         # the raw upstream usage regardless of caller protocol. The translated
         # payload's usage (Responses-shape for responses callers) loses cache
         # creation tokens and miscomputes ``fresh_input_tokens`` because the
-        # Responses-shape input_tokens already excludes cache reads.
+        # Responses-shape input_tokens is gross prompt input with cache reads
+        # moved into ``input_tokens_details.cached_tokens`` for the client.
+        # Cache writes remain part of gross input so Codex does not undercount
+        # a turn that created or refreshed a prompt-cache segment.
         usage=tracking_usage,
     )
     return JSONResponse(content=translated_payload, status_code=upstream.status_code)

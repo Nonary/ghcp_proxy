@@ -879,13 +879,18 @@ def _anthropic_usage_to_responses_usage(usage) -> dict:
     in_t = int(in_t) if isinstance(in_t, (int, float)) else 0
     out_t = int(out_t) if isinstance(out_t, (int, float)) else 0
     cached = usage.get("cache_read_input_tokens")
+    if cached is None:
+        cached = usage.get("cached_input_tokens")
     cached = int(cached) if isinstance(cached, (int, float)) else 0
     cache_create = usage.get("cache_creation_input_tokens")
     cache_create = int(cache_create) if isinstance(cache_create, (int, float)) else 0
     # Responses API usage keeps input_tokens as gross prompt input and exposes
-    # cache reads as a detail. Anthropic Messages input_tokens is fresh-only, so
-    # add cache reads back when translating upstream Messages usage for Codex.
-    gross_in_t = in_t + cached
+    # cache reads as a detail. Anthropic Messages input_tokens is fresh-only
+    # with cache reads and cache writes split out, so add both back when
+    # translating upstream Messages usage for Codex. Codex then subtracts
+    # cached_tokens for its visible fresh-input display while still seeing the
+    # cache-creation tokens as normal input.
+    gross_in_t = in_t + cached + cache_create
     out: dict = {
         "input_tokens": gross_in_t,
         "output_tokens": out_t,
@@ -1522,16 +1527,27 @@ class AnthropicToResponsesStreamTranslator:
                 in_t = usage.get("input_tokens")
                 out_t = usage.get("output_tokens")
                 cached = usage.get("cache_read_input_tokens")
+                if cached is None:
+                    cached = usage.get("cached_input_tokens")
+                if cached is None:
+                    prior_details = merged.get("input_tokens_details")
+                    if isinstance(prior_details, dict):
+                        cached = prior_details.get("cached_tokens")
+                cache_creation = usage.get("cache_creation_input_tokens")
+                if cache_creation is None:
+                    prior_details = merged.get("input_tokens_details")
+                    if isinstance(prior_details, dict):
+                        cache_creation = prior_details.get("cache_creation_input_tokens")
                 if isinstance(in_t, (int, float)):
                     cache_read_for_input = int(cached) if isinstance(cached, (int, float)) else 0
-                    merged["input_tokens"] = int(in_t) + cache_read_for_input
+                    cache_create_for_input = int(cache_creation) if isinstance(cache_creation, (int, float)) else 0
+                    merged["input_tokens"] = int(in_t) + cache_read_for_input + cache_create_for_input
                 if isinstance(out_t, (int, float)):
                     merged["output_tokens"] = int(out_t)
                 merged["total_tokens"] = int(merged.get("input_tokens", 0)) + int(merged.get("output_tokens", 0))
                 details = dict(merged.get("input_tokens_details") or {})
                 if isinstance(cached, (int, float)) and cached:
                     details["cached_tokens"] = int(cached)
-                cache_creation = usage.get("cache_creation_input_tokens")
                 if isinstance(cache_creation, (int, float)) and cache_creation:
                     details["cache_creation_input_tokens"] = int(cache_creation)
                 if details:

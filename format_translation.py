@@ -2486,16 +2486,20 @@ def _anthropic_usage_to_responses_usage(usage) -> dict:
     input_tokens = usage.get("input_tokens") or 0
     output_tokens = usage.get("output_tokens") or 0
     cache_read = usage.get("cache_read_input_tokens")
+    if cache_read is None:
+        cache_read = usage.get("cached_input_tokens")
     cache_create = usage.get("cache_creation_input_tokens")
     # Responses API usage reports input_tokens as gross prompt input, with
     # cached input called out separately in input_tokens_details.cached_tokens.
     # Anthropic Messages reports input_tokens as fresh/non-cache-read input,
-    # with cache reads separate. Add cache reads back when translating to the
-    # Responses shape so Codex's native input/cache reporting sees the same
-    # gross+details contract it expects from /responses.
+    # with cache reads and cache writes separate. Add both back when translating
+    # to the Responses shape so Codex's native input/cache reporting sees the
+    # same gross+details contract it expects from /responses.
     gross_input_tokens = input_tokens
     if isinstance(cache_read, int):
         gross_input_tokens += cache_read
+    if isinstance(cache_create, int):
+        gross_input_tokens += cache_create
     out: dict = {
         "input_tokens": gross_input_tokens,
         "output_tokens": output_tokens,

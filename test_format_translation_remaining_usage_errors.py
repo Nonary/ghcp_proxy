@@ -137,13 +137,28 @@ class FormatTranslationRemainingUsageErrorsTests(unittest.TestCase):
                 }
             ),
             {
-                "input_tokens": 18,
+                "input_tokens": 20,
                 "output_tokens": 8,
-                "total_tokens": 26,
+                "total_tokens": 28,
                 "input_tokens_details": {
                     "cached_tokens": 5,
                     "cache_creation_input_tokens": 2,
                 },
+            },
+        )
+        self.assertEqual(
+            format_translation._anthropic_usage_to_responses_usage(
+                {
+                    "input_tokens": 13,
+                    "output_tokens": 8,
+                    "cached_input_tokens": 5,
+                }
+            ),
+            {
+                "input_tokens": 18,
+                "output_tokens": 8,
+                "total_tokens": 26,
+                "input_tokens_details": {"cached_tokens": 5},
             },
         )
 
