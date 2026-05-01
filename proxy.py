@@ -4010,23 +4010,6 @@ def _responses_input_developer_message_count(input_value) -> int:
     return sum(1 for item in input_value if _responses_message_role(item) == "developer")
 
 
-def _responses_input_has_tool_history(input_value) -> bool:
-    if not isinstance(input_value, list):
-        return False
-    tool_item_types = {
-        "function_call",
-        "function_call_output",
-        "custom_tool_call",
-        "custom_tool_call_output",
-    }
-    for item in input_value:
-        if not isinstance(item, dict):
-            continue
-        if str(item.get("type", "")).lower() in tool_item_types:
-            return True
-    return False
-
-
 def _responses_body_has_cache_lineage(body: dict | None) -> bool:
     if not isinstance(body, dict):
         return False
@@ -4047,9 +4030,9 @@ def _encrypted_reasoning_strip_reason_for_responses_context(
     Codex subagent/fork starts can replay the parent transcript, including
     encrypted reasoning blobs, under a fresh prompt-cache key. Copilot/OpenAI
     validates those blobs against the active lineage and rejects foreign ones
-    with ``invalid_request_body``. Copilot CLI keeps encrypted reasoning when
-    the request carries an explicit cache lineage hint, including subagent
-    turns. Without that hint, strip ciphertext when we have an explicit
+    with ``invalid_request_body``. Copilot CLI also replays tool history with
+    encrypted reasoning and no body cache-lineage fields, so tool history alone
+    is not a fork signal. Strip ciphertext only when we have an explicit
     subagent marker or the input has a fork shape Codex has emitted before.
     Summaries remain available, so the visible transcript is preserved.
     """
@@ -4060,10 +4043,6 @@ def _encrypted_reasoning_strip_reason_for_responses_context(
         return "subagent_header"
     if _responses_input_developer_message_count(input_value) > 1:
         return "multiple_developer_messages_without_cache_lineage"
-    if (
-        _responses_input_has_tool_history(input_value)
-    ):
-        return "tool_history_without_cache_lineage"
     return None
 
 

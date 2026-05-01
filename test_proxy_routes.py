@@ -1949,7 +1949,7 @@ class ProxyRoutesTests(unittest.TestCase):
         self.assertNotIn("encrypted_content", json.dumps(forwarded_input))
         self.assertEqual([item for item in forwarded_input if item.get("type") == "reasoning"], [])
 
-    def test_responses_route_strips_encrypted_reasoning_for_tool_history_without_lineage(self):
+    def test_responses_route_preserves_encrypted_reasoning_for_copilot_tool_history_without_body_lineage(self):
         request = SimpleNamespace(
             url=SimpleNamespace(path="/v1/responses"),
             method="POST",
@@ -2023,18 +2023,25 @@ class ProxyRoutesTests(unittest.TestCase):
 
         forwarded_input = post.await_args.kwargs["json"]["input"]
         self.assertEqual(response.status_code, 200)
-        self.assertNotIn("encrypted_content", json.dumps(forwarded_input))
-        self.assertEqual([item for item in forwarded_input if item.get("type") == "reasoning"], [])
+        self.assertEqual(proxy._responses_input_encrypted_content_count(forwarded_input), 2)
+        self.assertEqual([item.get("type") for item in forwarded_input], [
+            "message",
+            "message",
+            "reasoning",
+            "reasoning",
+            "function_call",
+            "function_call_output",
+        ])
         request_started = next(
             call.args[0]
             for call in append_trace.call_args_list
             if call.args and call.args[0].get("event") == "request_started"
         )
         sanitization = request_started["trace"]["responses_input_sanitization"]
-        self.assertEqual(sanitization["encrypted_content_preservation"], "disabled")
-        self.assertEqual(sanitization["encrypted_content_strip_reason"], "tool_history_without_cache_lineage")
-        self.assertEqual(sanitization["encrypted_content_items_dropped"], 2)
-        self.assertTrue(sanitization["reasoning_items_dropped"])
+        self.assertEqual(sanitization["encrypted_content_preservation"], "preserved")
+        self.assertIsNone(sanitization["encrypted_content_strip_reason"])
+        self.assertEqual(sanitization["encrypted_content_items_dropped"], 0)
+        self.assertFalse(sanitization["reasoning_items_dropped"])
 
     def test_responses_route_preserves_encrypted_reasoning_for_tool_history_with_cache_lineage(self):
         request = SimpleNamespace(
