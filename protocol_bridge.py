@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable
 
 import effort_mapping
@@ -100,6 +100,7 @@ class BridgeExecutionPlan:
     upstream_body: dict
     stream: bool
     is_compact: bool = False
+    approval_agent: bool = False
     diagnostics: tuple[dict, ...] = ()
 
     @property
@@ -420,11 +421,12 @@ class ProtocolBridgePlanner:
     ) -> BridgeExecutionPlan:
         requested_model = body.get("model") if isinstance(body, dict) else None
         mapped_model = None
-        if is_approval_agent_request(
+        approval_agent = is_approval_agent_request(
             subagent=subagent,
             inbound_protocol=inbound_protocol,
             body=body if isinstance(body, dict) else None,
-        ):
+        )
+        if approval_agent:
             mapped_model = self._routing_config_service.resolve_approval_target_model(requested_model)
         if mapped_model is None:
             mapped_model = self._routing_config_service.resolve_target_model(requested_model)
@@ -442,7 +444,7 @@ class ProtocolBridgePlanner:
             resolved_model,
             capability_override=capability_override,
         )
-        return await strategy.build_plan(
+        plan = await strategy.build_plan(
             body,
             requested_model=requested_model,
             resolved_model=resolved_model,
@@ -450,6 +452,7 @@ class ProtocolBridgePlanner:
             api_key=api_key,
             is_compact=is_compact,
         )
+        return replace(plan, approval_agent=approval_agent)
 
     def _strategy_for(
         self,

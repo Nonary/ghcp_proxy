@@ -476,6 +476,7 @@ def build_responses_headers_for_request(
     verdict_sink: dict | None = None,
     affinity_body: dict | None = None,
     stable_user_affinity: bool = False,
+    synthetic_subagent: str | None = None,
 ) -> dict:
     headers = build_responses_copilot_headers(api_key)
     identity_source = affinity_body if isinstance(affinity_body, dict) else body
@@ -496,25 +497,32 @@ def build_responses_headers_for_request(
         if isinstance(inbound_subagent, str) and inbound_subagent.strip()
         else None
     )
+    effective_subagent = inbound_subagent
+    if (
+        effective_subagent is None
+        and isinstance(synthetic_subagent, str)
+        and synthetic_subagent.strip()
+    ):
+        effective_subagent = synthetic_subagent.strip()
     headers.pop("x-openai-subagent", None)
 
     had_input = "input" in body
     effective_input, initiator = initiator_policy.resolve_responses_input(
         body.get("input"),
         body.get("model"),
-        subagent=request.headers.get("x-openai-subagent"),
+        subagent=effective_subagent,
         force_initiator=force_initiator,
         request_id=request_id,
         verdict_sink=verdict_sink,
     )
     if had_input:
         body["input"] = effective_input
-    if inbound_subagent:
+    if effective_subagent:
         initiator = "agent"
     headers["X-Initiator"] = initiator
     headers["x-interaction-type"] = (
         "conversation-subagent"
-        if inbound_subagent
+        if effective_subagent
         else _interaction_type_for_initiator(initiator)
     )
     stable_affinity = stable_user_affinity or _responses_body_has_affinity_hint(identity_source)
@@ -530,12 +538,12 @@ def build_responses_headers_for_request(
             session_id,
             request_id=request_id,
             stable_affinity=stable_affinity,
-            subagent=inbound_subagent,
+            subagent=effective_subagent,
             client_session_id=headers.get("x-client-session-id"),
         )
     )
-    if inbound_subagent:
-        _apply_responses_current_subagent_parent(headers, inbound_subagent)
+    if effective_subagent:
+        _apply_responses_current_subagent_parent(headers, effective_subagent)
     else:
         _remember_responses_current_parent(headers)
 

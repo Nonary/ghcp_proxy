@@ -1321,6 +1321,84 @@ class ProxyRoutesTests(unittest.TestCase):
         self.assertEqual(response_payload["id"], "resp_123")
         self.assertEqual(response_payload["output"][0]["content"][0]["text"], "done")
 
+    def test_responses_route_prompt_detected_approval_uses_guardian_headers(self):
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/responses"),
+            method="POST",
+            headers={},
+        )
+        body = {
+            "model": "gpt-5.5",
+            "prompt_cache_key": "approval-cache",
+            "stream": False,
+            "input": [
+                {
+                    "type": "message",
+                    "role": "developer",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": "You are a security monitor for autonomous AI coding agents.",
+                        }
+                    ],
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "review this approval request"}],
+                },
+            ],
+        }
+        upstream = httpx.Response(
+            200,
+            json={
+                "id": "resp_approval",
+                "model": "gpt-5.4-mini",
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "approved"}],
+                    }
+                ],
+                "usage": {
+                    "input_tokens": 32,
+                    "input_tokens_details": {"cached_tokens": 16},
+                    "output_tokens": 4,
+                    "total_tokens": 36,
+                },
+            },
+            headers={"content-type": "application/json"},
+        )
+
+        with (
+            mock.patch.object(proxy, "parse_json_request", mock.AsyncMock(return_value=body)),
+            mock.patch.object(auth, "get_api_key", return_value="test-key"),
+            mock.patch.object(auth, "get_api_base", return_value="https://example.invalid"),
+            mock.patch.object(
+                proxy.model_routing_config_service,
+                "resolve_approval_target_model",
+                return_value="gpt-5.4-mini",
+            ) as approval_route,
+            mock.patch.object(proxy.model_routing_config_service, "resolve_target_model") as normal_route,
+            mock.patch.object(proxy.usage_tracker, "start_event", return_value=None),
+            mock.patch.object(proxy.usage_tracker, "finish_event"),
+            mock.patch.object(proxy, "throttled_client_post", mock.AsyncMock(return_value=upstream)) as post,
+        ):
+            response = proxy.asyncio.run(proxy.responses(request))
+
+        forwarded_body = post.await_args.kwargs["json"]
+        forwarded_headers = post.await_args.kwargs["headers"]
+        self.assertEqual(response.status_code, 200)
+        approval_route.assert_called_once_with("gpt-5.5")
+        normal_route.assert_not_called()
+        self.assertEqual(forwarded_body["model"], "gpt-5.4-mini")
+        self.assertEqual(forwarded_headers["X-Initiator"], "agent")
+        self.assertEqual(forwarded_headers["x-interaction-type"], "conversation-subagent")
+        self.assertIn("x-parent-agent-id", forwarded_headers)
+        self.assertIn("x-agent-task-id", forwarded_headers)
+        self.assertNotEqual(forwarded_headers["x-parent-agent-id"], forwarded_headers["x-agent-task-id"])
+
     def test_responses_route_session_affinity_is_deterministic_across_calls(self):
         body_template = {
             "model": "gpt-5.4",

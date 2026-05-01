@@ -2527,6 +2527,7 @@ def _build_bridge_headers(
             stable_user_affinity=(
                 bridge_plan.caller_protocol == "anthropic" or stable_affinity_hint
             ),
+            synthetic_subagent="guardian" if bridge_plan.approval_agent else None,
         )
         return headers
     if bridge_plan.header_kind == "chat":

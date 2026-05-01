@@ -839,6 +839,39 @@ class RequestHeadersTests(unittest.TestCase):
         self.assertEqual(headers["x-interaction-type"], "conversation-subagent")
         self.assertNotIn("x-openai-subagent", headers)
 
+    def test_responses_synthetic_guardian_request_gets_subagent_lineage(self):
+        request = SimpleNamespace(url=SimpleNamespace(path="/v1/responses"), headers={})
+        body = {
+            "model": "gpt-5.4-mini",
+            "prompt_cache_key": "approval-cache",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "developer",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": "You are a security monitor for autonomous AI coding agents.",
+                        }
+                    ],
+                },
+            ],
+        }
+
+        headers = format_translation.build_responses_headers_for_request(
+            request, body, "test-key",
+            initiator_policy=proxy._initiator_policy,
+            session_id_resolver=usage_tracking.request_session_id,
+            synthetic_subagent="guardian",
+        )
+
+        self.assertEqual(headers["X-Initiator"], "agent")
+        self.assertEqual(headers["x-interaction-type"], "conversation-subagent")
+        self.assertIn("x-parent-agent-id", headers)
+        self.assertIn("x-agent-task-id", headers)
+        self.assertNotEqual(headers["x-parent-agent-id"], headers["x-agent-task-id"])
+        self.assertNotIn("x-openai-subagent", headers)
+
     def test_chat_tool_message_follow_up_stays_agent(self):
         request = SimpleNamespace(url=SimpleNamespace(path="/v1/chat/completions"), headers={})
         messages = [
