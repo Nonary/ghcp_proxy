@@ -542,7 +542,7 @@ class ResponsesToAnthropicMessagesUpstreamFormattingTests(unittest.TestCase):
         )
 
         self.assertEqual(out["system"], "instructions\n\ndev\n\nsys")
-        self.assertEqual(out["max_tokens"], 4096)
+        self.assertEqual(out["max_tokens"], 64000)
         self.assertEqual(out["temperature"], 1)
         self.assertEqual(out["top_p"], 0.5)
         self.assertEqual(out["metadata"], {"k": "v"})

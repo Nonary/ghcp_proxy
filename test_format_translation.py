@@ -2825,7 +2825,7 @@ class ResponsesToAnthropicMessagesTests(unittest.TestCase):
     def test_default_max_tokens_when_unset(self):
         body = {"model": "claude-sonnet-4.6", "input": []}
         out = format_translation.responses_request_to_anthropic_messages(body)
-        self.assertEqual(out["max_tokens"], 4096)
+        self.assertEqual(out["max_tokens"], 64000)
         self.assertEqual(out["messages"], [])
         self.assertNotIn("system", out)
 

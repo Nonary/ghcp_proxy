@@ -7,6 +7,7 @@ import os
 
 import effort_mapping
 import util
+from constants import CLAUDE_MAX_OUTPUT_TOKENS
 
 
 _COPILOT_UNSUPPORTED_RESPONSES_TOOL_TYPES = {"image_generation"}
@@ -929,7 +930,16 @@ def responses_request_to_anthropic_messages(body: dict) -> dict:  # pragma: no m
 
     max_tokens = body.get("max_output_tokens")
     if not isinstance(max_tokens, int) or max_tokens <= 0:
-        max_tokens = 4096
+        # Anthropic Claude (Opus/Sonnet 4.x) treats ``max_tokens`` as the
+        # combined budget for adaptive thinking + visible output.  Codex-style
+        # clients frequently omit ``max_output_tokens``, and an over-eager
+        # 4k default lets extended thinking consume the entire budget,
+        # producing empty assistant turns that look like the stream "stopped
+        # abruptly" downstream.  Match the documented Claude ceiling instead.
+        try:
+            max_tokens = int(CLAUDE_MAX_OUTPUT_TOKENS)
+        except (TypeError, ValueError):
+            max_tokens = 64000
     payload["max_tokens"] = max_tokens
 
     for source_key, target_key in (
