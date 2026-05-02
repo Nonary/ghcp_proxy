@@ -1363,6 +1363,50 @@ class FormatTranslationTests(unittest.TestCase):
         self.assertIs(sanitized, body)
         self.assertEqual(sanitized["tool_choice"], choice)
 
+    def test_cache_keyed_responses_input_preserves_instruction_message_positions(self):
+        body = {
+            "model": "gpt-5.5",
+            "prompt_cache_key": "cache-123",
+            "instructions": "base instructions",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "developer",
+                    "content": [{"type": "input_text", "text": "developer guidance"}],
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "first user"}],
+                },
+                {
+                    "type": "message",
+                    "role": "developer",
+                    "content": [{"type": "input_text", "text": "mid-turn guidance"}],
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "second user"}],
+                },
+            ],
+        }
+        diagnostics = []
+
+        normalized = format_translation.normalize_responses_instructions_for_copilot(
+            body,
+            diagnostics=diagnostics,
+        )
+        normalized = format_translation.normalize_responses_input_for_copilot(
+            normalized,
+            diagnostics=diagnostics,
+        )
+
+        self.assertIs(normalized, body)
+        self.assertEqual([item["role"] for item in normalized["input"]], ["developer", "user", "developer", "user"])
+        self.assertEqual(normalized["instructions"], "base instructions")
+        self.assertEqual(diagnostics, [])
+
     def test_responses_request_to_chat_drops_dangerous_execute_code_tool_and_choice(self):
         body = {
             "model": "claude-opus-4.6",

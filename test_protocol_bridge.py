@@ -658,6 +658,32 @@ class ProtocolBridgePlannerTests(unittest.TestCase):
         self.assertEqual(plan.upstream_body["input"][1]["role"], "user")
         self.assertNotIn("metadata", plan.upstream_body)
 
+    def test_responses_cache_lineage_preserves_input_item_positions(self):
+        planner = ProtocolBridgePlanner(_RoutingConfigStub("gpt-5.5"))
+        body = {
+            "model": "gpt-5.5",
+            "prompt_cache_key": "cache-123",
+            "input": [
+                {"type": "message", "role": "developer", "content": "first developer"},
+                {"type": "message", "role": "user", "content": "first user"},
+                {"type": "message", "role": "developer", "content": "middle developer"},
+                {"type": "message", "role": "user", "content": "second user"},
+            ],
+            "stream": False,
+        }
+
+        plan = proxy.asyncio.run(
+            planner.plan("responses", body, api_base="https://example.invalid", api_key="test-key")
+        )
+
+        self.assertEqual(plan.strategy_name, "responses_to_responses")
+        self.assertNotIn("prompt_cache_key", plan.upstream_body)
+        self.assertNotIn("instructions", plan.upstream_body)
+        self.assertEqual(
+            [item["role"] for item in plan.upstream_body["input"]],
+            ["developer", "user", "developer", "user"],
+        )
+
     def test_planner_selects_messages_to_chat_strategy_when_mapping_targets_grok(self):
         planner = ProtocolBridgePlanner(_RoutingConfigStub("grok-code-fast-1"))
         body = {
