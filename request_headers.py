@@ -134,33 +134,37 @@ def _apply_responses_current_parent(headers: dict) -> None:
     headers["x-interaction-id"] = interaction_id
 
 
+_ISOLATED_RESPONSES_SUBAGENTS = {"guardian", "memory_consolidation"}
+
+
 def _apply_responses_current_subagent_parent(headers: dict, subagent: str | None) -> None:
     if not isinstance(subagent, str) or not subagent.strip():
         return
     sub = subagent.strip()
-    if sub.lower() == "guardian":
-        # Guardians are Codex's approval-flow subagent. Pinning their
-        # x-parent-agent-id to the main agent's task makes them share the
-        # main agent's parent_task cache namespace upstream — every main-agent
-        # write evicts the guardian's cached prefix and vice versa, so each
-        # guardian after main-agent activity busts to 0% cache. Anchor every
-        # guardian in a client session to one synthetic parent so all
-        # guardians share their own namespace, disjoint from main-agent
-        # traffic. Verified by byte-identical 107KB prefixes between
-        # consecutive guardians flipping HIT/BUST around main-agent writes.
+    isolated_subagent = sub.lower()
+    if isolated_subagent in _ISOLATED_RESPONSES_SUBAGENTS:
+        # Approval and memory workers are background subagents. Pinning their
+        # x-parent-agent-id to the main agent's task makes them share the main
+        # parent_task cache namespace upstream, so writes from either side can
+        # evict the other's cached prefix. Anchor each worker family in a
+        # synthetic parent per client session, disjoint from main-agent traffic.
         client_session_id = headers.get("x-client-session-id") or "default"
-        guardian_parent = _copilot_uuid(f"responses-guardian-parent:{client_session_id}")
-        guardian_interaction = _copilot_uuid(f"responses-guardian-interaction:{client_session_id}")
-        headers["x-parent-agent-id"] = guardian_parent
-        headers["x-interaction-id"] = guardian_interaction
+        isolated_parent = _copilot_uuid(
+            f"responses-{isolated_subagent}-parent:{client_session_id}"
+        )
+        isolated_interaction = _copilot_uuid(
+            f"responses-{isolated_subagent}-interaction:{client_session_id}"
+        )
+        headers["x-parent-agent-id"] = isolated_parent
+        headers["x-interaction-id"] = isolated_interaction
         current_task_id = headers.get("x-agent-task-id")
         if (
             not isinstance(current_task_id, str)
             or not current_task_id.strip()
-            or current_task_id == guardian_parent
+            or current_task_id == isolated_parent
         ):
             headers["x-agent-task-id"] = _copilot_uuid(
-                f"responses-guardian-task:{client_session_id}"
+                f"responses-{isolated_subagent}-task:{client_session_id}"
             )
         return
     parent = _responses_current_parent(headers)

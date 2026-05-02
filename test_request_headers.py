@@ -873,6 +873,56 @@ class RequestHeadersTests(unittest.TestCase):
         self.assertNotEqual(headers["x-parent-agent-id"], headers["x-agent-task-id"])
         self.assertNotIn("x-openai-subagent", headers)
 
+    def test_responses_memory_consolidation_subagent_uses_isolated_parent(self):
+        parent_request = SimpleNamespace(url=SimpleNamespace(path="/v1/responses"), headers={})
+        parent_body = {
+            "model": "gpt-5.5",
+            "prompt_cache_key": "shared-cache",
+            "input": "parent turn",
+        }
+        parent_headers = format_translation.build_responses_headers_for_request(
+            parent_request,
+            parent_body,
+            "test-key",
+            initiator_policy=proxy._initiator_policy,
+            session_id_resolver=usage_tracking.request_session_id,
+        )
+
+        memory_request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/responses"),
+            headers={"x-openai-subagent": "memory_consolidation"},
+        )
+        memory_body = {
+            "model": "gpt-5.4",
+            "prompt_cache_key": "shared-cache",
+            "input": "consolidate memory",
+        }
+        repeat_memory_body = dict(memory_body)
+
+        memory_headers = format_translation.build_responses_headers_for_request(
+            memory_request,
+            memory_body,
+            "test-key",
+            initiator_policy=proxy._initiator_policy,
+            session_id_resolver=usage_tracking.request_session_id,
+        )
+        repeat_memory_headers = format_translation.build_responses_headers_for_request(
+            memory_request,
+            repeat_memory_body,
+            "test-key",
+            initiator_policy=proxy._initiator_policy,
+            session_id_resolver=usage_tracking.request_session_id,
+        )
+
+        self.assertEqual(memory_headers["X-Initiator"], "agent")
+        self.assertEqual(memory_headers["x-interaction-type"], "conversation-subagent")
+        self.assertNotEqual(memory_headers["x-parent-agent-id"], parent_headers["x-agent-task-id"])
+        self.assertNotEqual(memory_headers["x-interaction-id"], parent_headers["x-interaction-id"])
+        self.assertEqual(memory_headers["x-parent-agent-id"], repeat_memory_headers["x-parent-agent-id"])
+        self.assertEqual(memory_headers["x-agent-task-id"], repeat_memory_headers["x-agent-task-id"])
+        self.assertEqual(memory_headers["x-interaction-id"], repeat_memory_headers["x-interaction-id"])
+        self.assertNotIn("x-openai-subagent", memory_headers)
+
     def test_chat_tool_message_follow_up_stays_agent(self):
         request = SimpleNamespace(url=SimpleNamespace(path="/v1/chat/completions"), headers={})
         messages = [
