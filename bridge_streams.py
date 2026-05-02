@@ -11,6 +11,19 @@ from uuid import uuid4
 import format_translation
 
 
+_CODEX_THINKING_SUMMARY_HEADER = "**Thinking**\n\n"
+
+
+def _summary_text_needs_codex_header(parts: list) -> bool:
+    """Return True until a reasoning summary has Codex-renderable text.
+
+    Codex currently hides reasoning summary cells whose text lacks a bold
+    heading. Anthropic thinking deltas are raw prose, so bridge translators
+    synthesize a stable header before the first thought chunk.
+    """
+    return not parts
+
+
 @dataclass
 class _TextItemState:
     output_index: int
@@ -278,11 +291,11 @@ class ChatToResponsesStreamTranslator:
                 # Codex's `new_reasoning_summary_block` drops cells whose text
                 # has no `**bold**` header; Claude's reasoning_text doesn't
                 # include one, so prepend a synthetic "**Thinking**" header.
-                first_chunk_needs_header = not self._reasoning_parts
+                first_chunk_needs_header = _summary_text_needs_codex_header(self._reasoning_parts)
                 for event in self._ensure_reasoning_item():
                     yield event
                 if first_chunk_needs_header:
-                    header = "**Thinking**\n\n"
+                    header = _CODEX_THINKING_SUMMARY_HEADER
                     self._reasoning_parts.append(header)
                     yield format_translation.sse_encode(
                         "response.reasoning_summary_text.delta",
@@ -1477,9 +1490,23 @@ class AnthropicToResponsesStreamTranslator:
             elif delta_type == "thinking_delta" and isinstance(state, _AnthropicReasoningBlockState):
                 text = delta.get("thinking")
                 if isinstance(text, str) and text:
+                    first_chunk_needs_header = _summary_text_needs_codex_header(state.summary_parts)
+                    if first_chunk_needs_header:
+                        state.summary_parts.append(_CODEX_THINKING_SUMMARY_HEADER)
                     state.summary_parts.append(text)
                     if self._mark_first_output is not None:
                         self._mark_first_output()
+                    if first_chunk_needs_header:
+                        yield format_translation.sse_encode(
+                            "response.reasoning_summary_text.delta",
+                            {
+                                "type": "response.reasoning_summary_text.delta",
+                                "item_id": state.item_id,
+                                "output_index": state.output_index,
+                                "summary_index": 0,
+                                "delta": _CODEX_THINKING_SUMMARY_HEADER,
+                            },
+                        )
                     yield format_translation.sse_encode(
                         "response.reasoning_summary_text.delta",
                         {

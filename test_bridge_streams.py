@@ -476,6 +476,17 @@ class AnthropicToResponsesStreamTranslatorTests(unittest.TestCase):
         self.assertEqual(len(payload["output"]), 3)
         self.assertEqual(payload["output"][0]["type"], "reasoning")
         self.assertEqual(payload["output"][0]["encrypted_content"], "SIG-PART-1")
+        # Native Anthropic /v1/messages streams expose thinking as raw prose.
+        # Keep parity with the chat-completions Claude bridge by prepending the
+        # Codex-renderable bold header before the first model thought chunk.
+        self.assertIn('"delta":"**Thinking**\\n\\n"', body)
+        header_pos = body.index('"delta":"**Thinking**\\n\\n"')
+        first_thought_pos = body.index('"delta":"hmm "')
+        self.assertLess(header_pos, first_thought_pos)
+        self.assertEqual(
+            payload["output"][0]["summary"],
+            [{"type": "summary_text", "text": "**Thinking**\n\nhmm "}],
+        )
         self.assertEqual(payload["output"][1]["type"], "message")
         self.assertEqual(
             payload["output"][1]["content"][0]["text"], "hello world"
@@ -655,3 +666,7 @@ class AnthropicToResponsesStreamTranslatorTests(unittest.TestCase):
         self.assertEqual(done_payload["item"]["encrypted_content"], "ENC")
         self.assertEqual(payload["output"][0]["id"], "reason_1")
         self.assertEqual(payload["output"][0]["encrypted_content"], "ENC")
+        self.assertEqual(
+            payload["output"][0]["summary"],
+            [{"type": "summary_text", "text": "**Thinking**\n\nhmm"}],
+        )
