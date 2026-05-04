@@ -15,6 +15,7 @@ class RequestHeadersTests(unittest.TestCase):
     def setUp(self):
         proxy.set_initiator_policy(initiator_policy.InitiatorPolicy())
         proxy.usage_tracker.clear_state()
+        request_headers._RESPONSES_CURRENT_PARENT_BY_CLIENT_SESSION.clear()
 
     def test_base_copilot_header_contract_is_exact(self):
         self.assertEqual(
@@ -259,25 +260,26 @@ class RequestHeadersTests(unittest.TestCase):
         self.assertEqual(headers["x-client-session-id"], request_headers._CLIENT_SESSION_ID)
 
     def test_responses_subagent_task_id_is_stable_and_parent_scoped(self):
+        parent_scope = "019dd1ff-526a-7293-aaaa-aaaaaaaaaaaa"
         self.assertEqual(
-            request_headers._responses_task_affinity_scope("019dd1ff-526a-7293-aaaa-aaaaaaaaaaaa"),
-            "019dd1ff",
+            request_headers._responses_task_affinity_scope(parent_scope),
+            parent_scope,
         )
         self.assertEqual(request_headers._responses_task_affinity_scope(" cache-key "), "cache-key")
         first = request_headers._responses_subagent_task_id(
-            "019dd1ff",
+            parent_scope,
             "worker",
-            "019dd1ff-526a-7293-aaaa-aaaaaaaaaaaa",
+            parent_scope,
         )
         second = request_headers._responses_subagent_task_id(
-            "019dd1ff",
+            parent_scope,
             "worker",
-            "019dd1ff-526a-7293-aaaa-aaaaaaaaaaaa",
+            parent_scope,
         )
         third = request_headers._responses_subagent_task_id(
-            "019dd1ff",
+            parent_scope,
             "reviewer",
-            "019dd1ff-526a-7293-aaaa-aaaaaaaaaaaa",
+            parent_scope,
         )
         self.assertEqual(first, second)
         self.assertNotEqual(first, third)
@@ -1529,7 +1531,8 @@ class RequestHeadersTests(unittest.TestCase):
             session_id_resolver=usage_tracking.request_session_id,
         )
 
-        self.assertNotEqual(first_headers["x-interaction-id"], second_headers["x-interaction-id"])
+        self.assertEqual(first_headers["x-client-session-id"], second_headers["x-client-session-id"])
+        self.assertEqual(first_headers["x-interaction-id"], second_headers["x-interaction-id"])
         self.assertNotEqual(first_headers["x-agent-task-id"], second_headers["x-agent-task-id"])
         self.assertEqual(first_headers["x-interaction-id"], third_headers["x-interaction-id"])
         self.assertEqual(first_headers["x-agent-task-id"], third_headers["x-agent-task-id"])
@@ -1565,9 +1568,100 @@ class RequestHeadersTests(unittest.TestCase):
             session_id_resolver=usage_tracking.request_session_id,
         )
 
-        self.assertNotEqual(first_headers["x-client-session-id"], second_headers["x-client-session-id"])
-        self.assertNotEqual(first_headers["x-interaction-id"], second_headers["x-interaction-id"])
+        self.assertEqual(first_headers["x-client-session-id"], second_headers["x-client-session-id"])
+        self.assertEqual(first_headers["x-interaction-id"], second_headers["x-interaction-id"])
         self.assertNotEqual(first_headers["x-agent-task-id"], second_headers["x-agent-task-id"])
+        self.assertNotIn("x-parent-agent-id", first_headers)
+        self.assertNotIn("x-parent-agent-id", second_headers)
+        self.assertEqual(
+            first_headers["x-agent-task-id"],
+            request_headers._copilot_uuid(
+                "responses-task:019defba-0000-7000-8000-000000000001"
+            ),
+        )
+        self.assertEqual(
+            second_headers["x-agent-task-id"],
+            request_headers._copilot_uuid(
+                "responses-task:019defba-ffff-7000-8000-000000000002"
+            ),
+        )
+
+    def test_build_responses_headers_for_request_attaches_subagents_to_current_parent(self):
+        parent_request = SimpleNamespace(headers={}, url=SimpleNamespace(path="/v1/responses"))
+        parent_body = {
+            "model": "gpt-5.5",
+            "input": "parent",
+            "prompt_cache_key": "019defba-800e-7572-8ee2-944a33b19ea0",
+        }
+        first_child_request = SimpleNamespace(
+            headers={"x-openai-subagent": "worker"},
+            url=SimpleNamespace(path="/v1/responses"),
+        )
+        first_child_body = {
+            "model": "gpt-5.5",
+            "input": "child one",
+            "prompt_cache_key": "019defba-800e-7572-8ee2-944a33b19ea1",
+        }
+        second_child_request = SimpleNamespace(
+            headers={"x-openai-subagent": "worker"},
+            url=SimpleNamespace(path="/v1/responses"),
+        )
+        second_child_body = {
+            "model": "gpt-5.5",
+            "input": "child two",
+            "prompt_cache_key": "019defba-800e-7572-8ee2-944a33b19ea2",
+        }
+        repeat_child_request = SimpleNamespace(
+            headers={"x-openai-subagent": "worker"},
+            url=SimpleNamespace(path="/v1/responses"),
+        )
+        repeat_child_body = dict(first_child_body)
+
+        parent_headers = format_translation.build_responses_headers_for_request(
+            parent_request,
+            parent_body,
+            "test-key",
+            initiator_policy=proxy._initiator_policy,
+            session_id_resolver=usage_tracking.request_session_id,
+        )
+        first_child_headers = format_translation.build_responses_headers_for_request(
+            first_child_request,
+            first_child_body,
+            "test-key",
+            initiator_policy=proxy._initiator_policy,
+            session_id_resolver=usage_tracking.request_session_id,
+        )
+        second_child_headers = format_translation.build_responses_headers_for_request(
+            second_child_request,
+            second_child_body,
+            "test-key",
+            initiator_policy=proxy._initiator_policy,
+            session_id_resolver=usage_tracking.request_session_id,
+        )
+        repeat_child_headers = format_translation.build_responses_headers_for_request(
+            repeat_child_request,
+            repeat_child_body,
+            "test-key",
+            initiator_policy=proxy._initiator_policy,
+            session_id_resolver=usage_tracking.request_session_id,
+        )
+
+        self.assertNotIn("x-parent-agent-id", parent_headers)
+        self.assertEqual(
+            parent_headers["x-agent-task-id"],
+            request_headers._copilot_uuid(
+                "responses-task:019defba-800e-7572-8ee2-944a33b19ea0"
+            ),
+        )
+        self.assertEqual(parent_headers["x-client-session-id"], first_child_headers["x-client-session-id"])
+        self.assertEqual(parent_headers["x-client-session-id"], second_child_headers["x-client-session-id"])
+        self.assertEqual(parent_headers["x-interaction-id"], first_child_headers["x-interaction-id"])
+        self.assertEqual(parent_headers["x-interaction-id"], second_child_headers["x-interaction-id"])
+        self.assertEqual(first_child_headers["x-parent-agent-id"], parent_headers["x-agent-task-id"])
+        self.assertEqual(second_child_headers["x-parent-agent-id"], parent_headers["x-agent-task-id"])
+        self.assertNotEqual(first_child_headers["x-agent-task-id"], parent_headers["x-agent-task-id"])
+        self.assertNotEqual(first_child_headers["x-agent-task-id"], second_child_headers["x-agent-task-id"])
+        self.assertEqual(first_child_headers["x-agent-task-id"], repeat_child_headers["x-agent-task-id"])
 
     def test_build_responses_headers_for_request_keeps_cache_key_affinity_by_default(self):
         first_request = SimpleNamespace(headers={}, url=SimpleNamespace(path="/v1/responses"))
@@ -1921,7 +2015,7 @@ class RequestHeadersTests(unittest.TestCase):
         self.assertNotEqual(compact_headers["x-agent-task-id"], user_headers["x-agent-task-id"])
         self.assertEqual(
             compact_headers["x-interaction-id"],
-            request_headers._copilot_uuid("responses-interaction:cache-123"),
+            request_headers._copilot_uuid("responses-interaction:session-123"),
         )
         self.assertEqual(
             compact_headers["x-agent-task-id"],

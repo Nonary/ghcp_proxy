@@ -49,24 +49,7 @@ def _responses_task_affinity_scope(affinity_value) -> str | None:
 
 
 def _responses_client_session_id_for_affinity(affinity_value, model=None) -> str | None:
-    """Return the Copilot client-session bucket for a Responses cache lineage.
-
-    The proxy process can multiplex multiple Codex conversations.  A single
-    process-wide ``x-client-session-id`` lets unrelated ``prompt_cache_key``
-    lineages fight over the same upstream prompt-cache/LRU namespace; in live
-    traces, switching from one large prompt_cache_key to another for ~100s made
-    the first key come back with only the tiny initial prefix cached despite an
-    append-only body.  Copilot CLI normally gets a fresh client session per CLI
-    process/conversation, so mirror that by deriving the client session from the
-    full explicit affinity key.
-
-    Also include the model in the derivation: same Codex conversation can fan
-    out to multiple models (e.g. gpt-5.5 main + gpt-5.4 memory_consolidation +
-    gpt-5.4-mini routing) and they have non-overlapping cache prefixes. Sharing
-    one upstream client_session across them lets each model's write evict
-    sister-model cache slots — observed live as 50% bust rate on gpt-5.5 main
-    when gpt-5.4 traffic shared the same affinity bucket.
-    """
+    """Return a dedicated client-session bucket for isolated Responses traffic."""
     if os.environ.get("GHCP_COPILOT_CLIENT_SESSION_ID"):
         return None
     if not isinstance(affinity_value, str):
@@ -74,10 +57,32 @@ def _responses_client_session_id_for_affinity(affinity_value, model=None) -> str
     normalized = affinity_value.strip()
     if not normalized:
         return None
+    if not _responses_affinity_is_isolated(normalized):
+        return None
     model_key = ""
     if isinstance(model, str) and model.strip():
         model_key = model.strip().lower()
     return _copilot_uuid(f"responses-client-session:{normalized}:{model_key}")
+
+
+def _responses_affinity_is_isolated(affinity_value) -> bool:
+    if not isinstance(affinity_value, str):
+        return False
+    return affinity_value.strip().startswith("codex-rollout-memory:")
+
+
+def _responses_family_affinity_scope(
+    affinity_value,
+    session_id: str | None = None,
+    client_session_id: str | None = None,
+) -> str | None:
+    if _responses_affinity_is_isolated(affinity_value):
+        return _responses_task_affinity_scope(affinity_value)
+    if isinstance(session_id, str) and session_id.strip():
+        return session_id.strip()
+    if isinstance(client_session_id, str) and client_session_id.strip():
+        return client_session_id.strip()
+    return _responses_task_affinity_scope(affinity_value)
 
 
 def _responses_subagent_task_id(parent_scope, subagent, affinity_value=None) -> str | None:
@@ -391,9 +396,17 @@ def _responses_copilot_identity_headers(
     if stable_affinity:
         affinity_value = _responses_affinity_value(payload, session_id)
         if affinity_value:
-            parent_scope = _responses_task_affinity_scope(affinity_value) or affinity_value
-            interaction_id = _copilot_uuid(f"responses-interaction:{parent_scope}")
-            parent_task_id = _copilot_uuid(f"responses-task:{parent_scope}")
+            task_scope = _responses_task_affinity_scope(affinity_value) or affinity_value
+            family_scope = (
+                _responses_family_affinity_scope(
+                    affinity_value,
+                    session_id=session_id,
+                    client_session_id=client_session_id,
+                )
+                or task_scope
+            )
+            interaction_id = _copilot_uuid(f"responses-interaction:{family_scope}")
+            parent_task_id = _copilot_uuid(f"responses-task:{task_scope}")
             headers = {
                 "x-agent-task-id": parent_task_id,
                 "x-interaction-id": interaction_id,
@@ -401,7 +414,7 @@ def _responses_copilot_identity_headers(
             normalized_subagent = subagent.strip() if isinstance(subagent, str) and subagent.strip() else None
             if normalized_subagent:
                 child_task_id = _responses_subagent_task_id(
-                    parent_scope,
+                    task_scope,
                     normalized_subagent,
                     affinity_value,
                 )
