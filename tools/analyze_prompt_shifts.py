@@ -21,10 +21,17 @@ import argparse
 import json
 import math
 import os
+import sys
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from hashlib import sha256
 from typing import Any
+
+TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
+if TOOLS_DIR not in sys.path:
+    sys.path.insert(0, TOOLS_DIR)
+
+import trace_prompt_decryption
 
 
 NOTICE_PATTERNS = (
@@ -32,6 +39,28 @@ NOTICE_PATTERNS = (
     "5h-usage reminder",
     "Weekly limit:",
 )
+PROMPT_TRACE_JSONL_FIELDS = ("request_body", "upstream_body", "source_body", "request_prompt")
+PROMPT_TRACE_BODY_FIELDS = ("request_body", "upstream_body", "upstream_body_wire")
+_TRACE_DECRYPTOR: trace_prompt_decryption.TracePromptDecryptor | None = None
+
+
+def trace_decryptor() -> trace_prompt_decryption.TracePromptDecryptor:
+    global _TRACE_DECRYPTOR
+    if _TRACE_DECRYPTOR is None:
+        _TRACE_DECRYPTOR = trace_prompt_decryption.TracePromptDecryptor.from_environment()
+    return _TRACE_DECRYPTOR
+
+
+def decrypt_prompt_trace_fields(payload: Any, fields: tuple[str, ...]) -> Any:
+    if isinstance(payload, dict):
+        trace_prompt_decryption.decrypt_mapping_fields(payload, fields, trace_decryptor())
+    return payload
+
+
+def print_decryption_status() -> None:
+    status = trace_decryptor().status_line()
+    if status:
+        print(status, file=sys.stderr)
 
 
 def default_trace_paths() -> list[str]:
@@ -128,6 +157,7 @@ def parse_trace(path: str) -> list[Row]:
                 obj = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            decrypt_prompt_trace_fields(obj, PROMPT_TRACE_JSONL_FIELDS)
             event = obj.get("event")
             request_id = obj.get("request_id")
             if not isinstance(request_id, str) or not request_id:
@@ -189,6 +219,7 @@ def load_artifact(body_dir: str, request_id: str) -> dict | None:
             obj = json.load(f)
     except Exception:
         return None
+    decrypt_prompt_trace_fields(obj, PROMPT_TRACE_BODY_FIELDS)
     return obj if isinstance(obj, dict) else None
 
 
@@ -461,6 +492,7 @@ def main() -> None:
                 print(" -", json.dumps(item, ensure_ascii=False, sort_keys=True))
             if len(appended) > 8:
                 print(f" ... {len(appended) - 8} more")
+    print_decryption_status()
 
 
 if __name__ == "__main__":

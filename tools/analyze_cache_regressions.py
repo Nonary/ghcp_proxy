@@ -5,8 +5,17 @@ import os
 import sys
 from collections import defaultdict, Counter
 
+TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
+if TOOLS_DIR not in sys.path:
+    sys.path.insert(0, TOOLS_DIR)
+
+import trace_prompt_decryption
+
 DEFAULT_MIN_DROP = 10_000
 DEFAULT_CONTEXT_ROWS = 3
+PROMPT_TRACE_JSONL_FIELDS = ("request_body", "upstream_body", "source_body", "request_prompt")
+PROMPT_TRACE_BODY_FIELDS = ("request_body", "upstream_body", "upstream_body_wire")
+_TRACE_DECRYPTOR = None
 
 PROXY_NOTICE_PATTERNS = (
     "By the way, an update is available for GHCP Proxy.",
@@ -144,6 +153,19 @@ CONFIG_FINGERPRINT_FIELDS = (
 )
 
 
+def _trace_decryptor():
+    global _TRACE_DECRYPTOR
+    if _TRACE_DECRYPTOR is None:
+        _TRACE_DECRYPTOR = trace_prompt_decryption.TracePromptDecryptor.from_environment()
+    return _TRACE_DECRYPTOR
+
+
+def _decrypt_prompt_trace_fields(payload, fields):
+    if isinstance(payload, dict):
+        trace_prompt_decryption.decrypt_mapping_fields(payload, fields, _trace_decryptor())
+    return payload
+
+
 def default_trace_paths():
     paths=[]
     local=os.environ.get('LOCALAPPDATA')
@@ -256,6 +278,7 @@ def parse(path):
             try: o=json.loads(line)
             except Exception as e:
                 print(f'bad json line {lineno}: {e}', file=sys.stderr); continue
+            _decrypt_prompt_trace_fields(o, PROMPT_TRACE_JSONL_FIELDS)
             ev=o.get('event')
             rid=o.get('request_id')
             if ev=='request_started' and rid:
@@ -380,9 +403,10 @@ def _load_body_artifact(body_dir, request_id):
         return None
     try:
         with open(path, encoding="utf-8") as f:
-            return json.load(f)
+            payload = json.load(f)
     except Exception:
         return None
+    return _decrypt_prompt_trace_fields(payload, PROMPT_TRACE_BODY_FIELDS)
 
 
 def _text_from_node(value):
@@ -906,6 +930,12 @@ def _print_lineage_health(by, regressions, limit=10):
         )
 
 
+def _print_decryption_status():
+    status = _trace_decryptor().status_line()
+    if status:
+        print(status, file=sys.stderr)
+
+
 def main():
     ap=argparse.ArgumentParser(description='Find prompt-cache regressions in ghcp_proxy request-trace.jsonl')
     ap.add_argument('trace', nargs='?', help='request-trace.jsonl path')
@@ -979,6 +1009,7 @@ def main():
             ],
         }
         print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False))
+        _print_decryption_status()
         return
 
     print(f'Trace: {path}')
@@ -1011,6 +1042,7 @@ def main():
     _print_lineage_health(by, regressions, limit=ns.lineage_limit)
     print()
     if ns.limit <= 0 and not ns.all:
+        _print_decryption_status()
         return
     shown=0
     for drop,key,prev,cur,reasons in regressions:
@@ -1083,5 +1115,6 @@ def main():
             remaining=len(regressions)-shown
             if remaining>0: print(f'... {remaining} more (use --all)')
             break
+    _print_decryption_status()
 
 if __name__=='__main__': main()
