@@ -191,6 +191,7 @@ CACHE_TRIPWIRE_FRESH_CACHED_GAP_THRESHOLD = 50_000
 CACHE_TRIPWIRE_CONSECUTIVE_HIT_THRESHOLD = 3
 CACHE_TRIPWIRE_REASON = "token_tripwire"
 CACHE_SETTLE_DELAY_SECONDS = 5.0
+PROMPT_DRIFT_SNAPSHOT_LIMIT = 32
 
 safeguard_event_store = dashboard_module.create_safeguard_event_store()
 _CACHE_TRIPWIRE_LOCK = threading.Lock()
@@ -198,7 +199,7 @@ _CACHE_TRIPWIRE_CONSECUTIVE_HITS = 0
 _PROMPT_CACHE_SETTLE_LOCK = threading.Lock()
 _PROMPT_CACHE_LAST_FINISH_BY_LINEAGE: dict[tuple[str, str], float] = {}
 _PROMPT_CACHE_TRACE_LOCK = threading.Lock()
-_PROMPT_CACHE_LAST_INPUT_BY_LINEAGE: dict[tuple[str, str], dict] = {}
+_PROMPT_CACHE_LAST_PROMPT_BY_LINEAGE: dict[tuple[str, str], dict] = {}
 _PROMPT_CACHE_AFFINITY_TRACE_LOCK = threading.Lock()
 _PROMPT_CACHE_LAST_AFFINITY_BY_LINEAGE: dict[tuple[str, str], dict] = {}
 _TRACE_PROMPT_KEY_LOCK = threading.Lock()
@@ -1641,10 +1642,44 @@ def _trace_hash(value) -> str | None:
     return hashlib.sha256(encoded).hexdigest()[:16]
 
 
-def _trace_input_item_hashes(input_value) -> list[str | None] | None:
-    if not isinstance(input_value, list):
+def _trace_canonical(value) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
+
+
+def _prompt_drift_projection(upstream_body: dict) -> tuple[str, int] | None:
+    """Build an append-friendly projection of cache-sensitive prompt material."""
+    if not isinstance(upstream_body, dict):
         return None
-    return [_trace_hash(item) for item in input_value]
+
+    config_keys = (
+        "instructions",
+        "system",
+        "tools",
+        "tool_choice",
+        "parallel_tool_calls",
+        "reasoning",
+        "reasoning_effort",
+        "thinking",
+        "output_config",
+    )
+    config = {key: upstream_body.get(key) for key in config_keys if key in upstream_body}
+    lines = ["CONFIG\t" + _trace_canonical(config) + "\n"]
+    prompt_items = 0
+
+    def append_sequence(label: str, value) -> None:
+        nonlocal prompt_items
+        if isinstance(value, list):
+            for item in value:
+                lines.append(label + "\t" + _trace_canonical(item) + "\n")
+                prompt_items += 1
+            return
+        if value is not None:
+            lines.append(label + "_SCALAR\t" + _trace_canonical(value) + "\n")
+            prompt_items += 1
+
+    append_sequence("INPUT", upstream_body.get("input"))
+    append_sequence("MESSAGE", upstream_body.get("messages"))
+    return "".join(lines), prompt_items
 
 
 def _trace_text_chars(value) -> int:
@@ -1809,69 +1844,60 @@ def _prompt_cache_trace_lineage(
     return None
 
 
-def _prompt_cache_prefix_diagnostics(
+def _prompt_drift_diagnostics(
     *,
     request_id: str,
     upstream_body: dict | None,
     resolved_model: str | None,
-    outbound_headers: dict | None,
+    outbound_headers: dict | None = None,
 ) -> dict | None:
     lineage = _prompt_cache_trace_lineage(upstream_body, resolved_model, outbound_headers)
     if lineage is None or not isinstance(upstream_body, dict):
         return None
-    item_hashes = _trace_input_item_hashes(upstream_body.get("input"))
-    if item_hashes is None:
+    projection = _prompt_drift_projection(upstream_body)
+    if projection is None:
         return None
+    prompt_projection, prompt_item_count = projection
 
     snapshot = {
         "request_id": request_id,
-        "item_hashes": item_hashes,
-        "item_count": len(item_hashes),
+        "prompt_projection": prompt_projection,
+        "prompt_projection_fingerprint": _trace_hash(prompt_projection),
+        "prompt_projection_chars": len(prompt_projection),
+        "prompt_item_count": prompt_item_count,
         "body_fingerprint": _trace_hash(upstream_body),
     }
     with _PROMPT_CACHE_TRACE_LOCK:
-        previous = _PROMPT_CACHE_LAST_INPUT_BY_LINEAGE.get(lineage)
-        _PROMPT_CACHE_LAST_INPUT_BY_LINEAGE[lineage] = snapshot
+        previous = _PROMPT_CACHE_LAST_PROMPT_BY_LINEAGE.pop(lineage, None)
+        _PROMPT_CACHE_LAST_PROMPT_BY_LINEAGE[lineage] = snapshot
+        while len(_PROMPT_CACHE_LAST_PROMPT_BY_LINEAGE) > PROMPT_DRIFT_SNAPSHOT_LIMIT:
+            _PROMPT_CACHE_LAST_PROMPT_BY_LINEAGE.pop(next(iter(_PROMPT_CACHE_LAST_PROMPT_BY_LINEAGE)))
 
     if not isinstance(previous, dict):
         return {
             "lineage_model": lineage[0],
             "previous_request_id": None,
-            "current_item_count": len(item_hashes),
+            "prompt_drifted": None,
+            "current_prompt_item_count": prompt_item_count,
+            "current_prompt_projection_fingerprint": snapshot["prompt_projection_fingerprint"],
+            "current_body_fingerprint": snapshot["body_fingerprint"],
         }
 
-    previous_hashes = previous.get("item_hashes")
-    if not isinstance(previous_hashes, list):
+    previous_projection = previous.get("prompt_projection")
+    if not isinstance(previous_projection, str):
         return None
-    common_prefix_items = 0
-    for previous_hash, current_hash in zip(previous_hashes, item_hashes):
-        if previous_hash != current_hash:
-            break
-        common_prefix_items += 1
-    previous_is_prefix = common_prefix_items == len(previous_hashes)
+    prompt_drifted = not prompt_projection.startswith(previous_projection)
     diagnostics = {
         "lineage_model": lineage[0],
         "previous_request_id": previous.get("request_id"),
-        "previous_item_count": previous.get("item_count"),
-        "current_item_count": len(item_hashes),
-        "common_prefix_items": common_prefix_items,
-        "previous_is_prefix": previous_is_prefix,
-        "current_extends_previous": previous_is_prefix and len(item_hashes) >= len(previous_hashes),
+        "prompt_drifted": prompt_drifted,
+        "previous_prompt_item_count": previous.get("prompt_item_count"),
+        "current_prompt_item_count": prompt_item_count,
+        "previous_prompt_projection_fingerprint": previous.get("prompt_projection_fingerprint"),
+        "current_prompt_projection_fingerprint": snapshot["prompt_projection_fingerprint"],
         "previous_body_fingerprint": previous.get("body_fingerprint"),
         "current_body_fingerprint": snapshot["body_fingerprint"],
     }
-    if not previous_is_prefix:
-        diagnostics["first_mismatch_index"] = common_prefix_items
-        diagnostics["previous_item_hash"] = (
-            previous_hashes[common_prefix_items]
-            if common_prefix_items < len(previous_hashes)
-            else None
-        )
-        diagnostics["current_item_hash"] = (
-            item_hashes[common_prefix_items]
-            if common_prefix_items < len(item_hashes)
-            else None
-        )
     return diagnostics
 
 
@@ -2569,15 +2595,15 @@ def _emit_request_trace_start(
         if isinstance(raw_verdict, dict):
             initiator_verdict = dict(raw_verdict)
     trace_details = trace_metadata if isinstance(trace_metadata, dict) else {}
-    cache_prefix_diagnostics = _prompt_cache_prefix_diagnostics(
+    prompt_drift_diagnostics = _prompt_drift_diagnostics(
         request_id=request_id,
         upstream_body=upstream_body,
         resolved_model=resolved_model,
         outbound_headers=outbound_headers,
     )
-    if cache_prefix_diagnostics is not None:
+    if prompt_drift_diagnostics is not None:
         trace_details = dict(trace_details)
-        trace_details["prompt_cache_prefix"] = cache_prefix_diagnostics
+        trace_details["prompt_drift"] = prompt_drift_diagnostics
     cache_affinity_diagnostics = _prompt_cache_affinity_diagnostics(
         request_id=request_id,
         upstream_body=upstream_body,

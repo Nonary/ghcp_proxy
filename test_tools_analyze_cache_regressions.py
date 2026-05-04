@@ -56,6 +56,7 @@ class AnalyzeCacheRegressionsTests(unittest.TestCase):
                 "encrypted_content_preservation": False,
                 "encrypted_content_strip_reason": "foreign_lineage",
             },
+            "prompt_drift_diag": {"prompt_drifted": True},
         }
 
         reasons = self.tool.classify(prev, cur)
@@ -64,6 +65,7 @@ class AnalyzeCacheRegressionsTests(unittest.TestCase):
         self.assertIn("headers:x_agent_task_id:task-a->task-b", reasons)
         self.assertIn("body_config:tools_changed", reasons)
         self.assertIn("prompt_sequence:mismatch@1", reasons)
+        self.assertIn("prompt_drift:drifted", reasons)
         self.assertIn("encrypted_reasoning:dropped:foreign_lineage", reasons)
 
     def test_full_body_delta_reports_append_projection_and_prompt_notice(self):

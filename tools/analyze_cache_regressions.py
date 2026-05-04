@@ -303,6 +303,7 @@ def parse(path):
         ck_name, ck_val=cache_key(st)
         trace=st.get('trace') if isinstance(st.get('trace'),dict) else {}
         san=trace.get('responses_input_sanitization') if isinstance(trace.get('responses_input_sanitization'),dict) else {}
+        drift=trace.get('prompt_drift') if isinstance(trace.get('prompt_drift'),dict) else {}
         pref=trace.get('prompt_cache_prefix') if isinstance(trace.get('prompt_cache_prefix'),dict) else {}
         aff = (
             trace.get('prompt_cache_affinity_drift')
@@ -356,6 +357,7 @@ def parse(path):
             'metadata_keys': ub.get('metadata_keys') if isinstance(ub.get('metadata_keys'), list) else [],
             'sanitization': san,
             'sanitizer_diagnostics': trace.get('sanitizer_diagnostics') if isinstance(trace.get('sanitizer_diagnostics'), list) else [],
+            'prompt_drift_diag': drift,
             'prefix_diag': pref,
             'affinity_diag': aff,
             'prompt_cache_retention_retry': trace.get('prompt_cache_retention_retry') if isinstance(trace.get('prompt_cache_retention_retry'), dict) else None,
@@ -649,6 +651,7 @@ def _reason(category, detail):
 
 def classify(prev, cur):
     reasons=[]
+    drift=cur.get('prompt_drift_diag') or {}
     pfx=cur.get('prefix_diag') or {}
     san=cur.get('sanitization') or {}
     aff=cur.get('affinity_diag') or {}
@@ -692,7 +695,12 @@ def classify(prev, cur):
     if cur.get('prompt_cache_retention_retry'):
         reasons.append(_reason('body_config', 'prompt_cache_retention_retry_dropped'))
 
-    if pfx:
+    if drift:
+        if drift.get('prompt_drifted') is True:
+            reasons.append(_reason('prompt_drift', 'drifted'))
+        elif drift.get('prompt_drifted') is False:
+            reasons.append(_reason('prompt_drift', 'stable_append'))
+    elif pfx:
         if pfx.get('previous_is_prefix') is True:
             reasons.append(_reason('prompt_prefix', 'outbound_extends_previous'))
         elif pfx.get('previous_is_prefix') is False:
@@ -809,6 +817,7 @@ def _json_row(row):
         "input_summary",
         "messages_summary",
         "sanitization",
+        "prompt_drift_diag",
         "prefix_diag",
         "affinity_diag",
         "prompt_cache_retention_retry",
@@ -1066,6 +1075,7 @@ def main():
         if cp < len(prev.get('sequence') or []) and prev.get('sequence') and cur.get('sequence'):
             print('  prev mismatch item:', brief_item(prev['sequence'][cp]) if cp < len(prev['sequence']) else None)
             print('  cur  mismatch item:', brief_item(cur['sequence'][cp]) if cp < len(cur['sequence']) else None)
+        if cur.get('prompt_drift_diag'): print('  trace prompt_drift:', json.dumps(cur['prompt_drift_diag'], sort_keys=True))
         if cur.get('prefix_diag'): print('  trace prefix_diag:', json.dumps(cur['prefix_diag'], sort_keys=True))
         if cur.get('affinity_diag'): print('  trace affinity_diag:', json.dumps(cur['affinity_diag'], sort_keys=True))
         if body_dir:

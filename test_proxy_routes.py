@@ -24,7 +24,7 @@ class ProxyRoutesTests(unittest.TestCase):
         with proxy._PROMPT_CACHE_SETTLE_LOCK:
             proxy._PROMPT_CACHE_LAST_FINISH_BY_LINEAGE.clear()
         with proxy._PROMPT_CACHE_TRACE_LOCK:
-            proxy._PROMPT_CACHE_LAST_INPUT_BY_LINEAGE.clear()
+            proxy._PROMPT_CACHE_LAST_PROMPT_BY_LINEAGE.clear()
         with proxy._PROMPT_CACHE_AFFINITY_TRACE_LOCK:
             proxy._PROMPT_CACHE_LAST_AFFINITY_BY_LINEAGE.clear()
         proxy._CLIENT_PROXY_STARTUP_RESTORE_COMPLETE = False
@@ -56,7 +56,7 @@ class ProxyRoutesTests(unittest.TestCase):
         self.assertEqual(captured_limits["keepalive_expiry"], 300.0)
         proxy._UPSTREAM_CLIENT = None
 
-    def test_prompt_cache_prefix_diagnostics_uses_full_item_hashes(self):
+    def test_prompt_drift_diagnostics_uses_full_prompt_projection(self):
         first_body = {
             "model": "gpt-5.5",
             "prompt_cache_key": "cache-key",
@@ -72,24 +72,27 @@ class ProxyRoutesTests(unittest.TestCase):
             ],
         }
 
-        first = proxy._prompt_cache_prefix_diagnostics(
+        first = proxy._prompt_drift_diagnostics(
             request_id="req-1",
             upstream_body=first_body,
             resolved_model="gpt-5.5",
         )
-        second = proxy._prompt_cache_prefix_diagnostics(
+        second = proxy._prompt_drift_diagnostics(
             request_id="req-2",
             upstream_body=second_body,
             resolved_model="gpt-5.5",
         )
 
         self.assertIsNone(first["previous_request_id"])
+        self.assertIsNone(first["prompt_drifted"])
         self.assertEqual(second["previous_request_id"], "req-1")
-        self.assertFalse(second["previous_is_prefix"])
-        self.assertEqual(second["first_mismatch_index"], 0)
-        self.assertNotEqual(second["previous_item_hash"], second["current_item_hash"])
+        self.assertTrue(second["prompt_drifted"])
+        self.assertNotEqual(
+            second["previous_prompt_projection_fingerprint"],
+            second["current_prompt_projection_fingerprint"],
+        )
 
-    def test_prompt_cache_prefix_diagnostics_marks_append_only_prefix(self):
+    def test_prompt_drift_diagnostics_accepts_append_only_prompt_growth(self):
         first_body = {
             "model": "gpt-5.5",
             "prompt_cache_key": "cache-key",
@@ -104,20 +107,105 @@ class ProxyRoutesTests(unittest.TestCase):
             ],
         }
 
-        proxy._prompt_cache_prefix_diagnostics(
+        proxy._prompt_drift_diagnostics(
             request_id="req-1",
             upstream_body=first_body,
             resolved_model="gpt-5.5",
         )
-        diagnostics = proxy._prompt_cache_prefix_diagnostics(
+        diagnostics = proxy._prompt_drift_diagnostics(
             request_id="req-2",
             upstream_body=second_body,
             resolved_model="gpt-5.5",
         )
 
-        self.assertTrue(diagnostics["previous_is_prefix"])
-        self.assertTrue(diagnostics["current_extends_previous"])
-        self.assertEqual(diagnostics["common_prefix_items"], 1)
+        self.assertFalse(diagnostics["prompt_drifted"])
+        self.assertEqual(diagnostics["previous_prompt_item_count"], 1)
+        self.assertEqual(diagnostics["current_prompt_item_count"], 2)
+
+    def test_prompt_drift_diagnostics_tracks_system_and_reasoning_material(self):
+        first_body = {
+            "model": "gpt-5.5",
+            "prompt_cache_key": "system-cache",
+            "instructions": "keep the system stable",
+            "input": [{"type": "message", "role": "user", "content": "one"}],
+        }
+        changed_system_body = {
+            **first_body,
+            "instructions": "shifted system text",
+        }
+
+        proxy._prompt_drift_diagnostics(
+            request_id="req-1",
+            upstream_body=first_body,
+            resolved_model="gpt-5.5",
+        )
+        system_diagnostics = proxy._prompt_drift_diagnostics(
+            request_id="req-2",
+            upstream_body=changed_system_body,
+            resolved_model="gpt-5.5",
+        )
+
+        reasoning_first = {
+            "model": "gpt-5.5",
+            "prompt_cache_key": "reasoning-cache",
+            "input": [
+                {"type": "message", "role": "user", "content": "one"},
+                {"type": "reasoning", "encrypted_content": "cipher-a"},
+            ],
+        }
+        reasoning_changed = {
+            **reasoning_first,
+            "input": [
+                {"type": "message", "role": "user", "content": "one"},
+                {"type": "reasoning", "encrypted_content": "cipher-b"},
+            ],
+        }
+
+        proxy._prompt_drift_diagnostics(
+            request_id="req-3",
+            upstream_body=reasoning_first,
+            resolved_model="gpt-5.5",
+        )
+        reasoning_diagnostics = proxy._prompt_drift_diagnostics(
+            request_id="req-4",
+            upstream_body=reasoning_changed,
+            resolved_model="gpt-5.5",
+        )
+
+        self.assertTrue(system_diagnostics["prompt_drifted"])
+        self.assertTrue(reasoning_diagnostics["prompt_drifted"])
+
+    def test_prompt_drift_diagnostics_keeps_only_bounded_lineages(self):
+        for index in range(proxy.PROMPT_DRIFT_SNAPSHOT_LIMIT + 1):
+            proxy._prompt_drift_diagnostics(
+                request_id=f"req-{index}",
+                upstream_body={
+                    "model": "gpt-5.5",
+                    "prompt_cache_key": f"cache-{index}",
+                    "input": [{"type": "message", "role": "user", "content": str(index)}],
+                },
+                resolved_model="gpt-5.5",
+            )
+
+        with proxy._PROMPT_CACHE_TRACE_LOCK:
+            self.assertEqual(
+                len(proxy._PROMPT_CACHE_LAST_PROMPT_BY_LINEAGE),
+                proxy.PROMPT_DRIFT_SNAPSHOT_LIMIT,
+            )
+            self.assertNotIn(("gpt-5.5", "cache-0"), proxy._PROMPT_CACHE_LAST_PROMPT_BY_LINEAGE)
+
+        diagnostics = proxy._prompt_drift_diagnostics(
+            request_id="req-evicted",
+            upstream_body={
+                "model": "gpt-5.5",
+                "prompt_cache_key": "cache-0",
+                "input": [{"type": "message", "role": "user", "content": "0"}],
+            },
+            resolved_model="gpt-5.5",
+        )
+
+        self.assertIsNone(diagnostics["previous_request_id"])
+        self.assertIsNone(diagnostics["prompt_drifted"])
 
     def test_responses_cache_settle_waits_for_recent_same_lineage_finish(self):
         plan = proxy.UpstreamRequestPlan(
