@@ -1537,6 +1537,38 @@ class RequestHeadersTests(unittest.TestCase):
         self.assertEqual(second_body.get("prompt_cache_key"), "cache-b")
         self.assertEqual(third_body.get("prompt_cache_key"), "cache-a")
 
+    def test_build_responses_headers_for_request_uses_full_uuid_cache_key_identity(self):
+        request = SimpleNamespace(headers={}, url=SimpleNamespace(path="/v1/responses"))
+        first_body = {
+            "model": "gpt-5.5",
+            "input": "first",
+            "prompt_cache_key": "019defba-0000-7000-8000-000000000001",
+        }
+        second_body = {
+            "model": "gpt-5.5",
+            "input": "second",
+            "prompt_cache_key": "019defba-ffff-7000-8000-000000000002",
+        }
+
+        first_headers = format_translation.build_responses_headers_for_request(
+            request,
+            first_body,
+            "test-key",
+            initiator_policy=proxy._initiator_policy,
+            session_id_resolver=usage_tracking.request_session_id,
+        )
+        second_headers = format_translation.build_responses_headers_for_request(
+            request,
+            second_body,
+            "test-key",
+            initiator_policy=proxy._initiator_policy,
+            session_id_resolver=usage_tracking.request_session_id,
+        )
+
+        self.assertNotEqual(first_headers["x-client-session-id"], second_headers["x-client-session-id"])
+        self.assertNotEqual(first_headers["x-interaction-id"], second_headers["x-interaction-id"])
+        self.assertNotEqual(first_headers["x-agent-task-id"], second_headers["x-agent-task-id"])
+
     def test_build_responses_headers_for_request_keeps_cache_key_affinity_by_default(self):
         first_request = SimpleNamespace(headers={}, url=SimpleNamespace(path="/v1/responses"))
         first_body = {"model": "gpt-5.4", "input": "first", "prompt_cache_key": "cache-user-turns"}

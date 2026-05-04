@@ -45,8 +45,6 @@ def _responses_task_affinity_scope(affinity_value) -> str | None:
     normalized = affinity_value.strip()
     if not normalized:
         return None
-    if len(normalized) >= 36 and normalized[8:9] == "-":
-        return normalized[:8]
     return normalized
 
 
