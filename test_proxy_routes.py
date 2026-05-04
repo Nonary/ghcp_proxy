@@ -30,6 +30,31 @@ class ProxyRoutesTests(unittest.TestCase):
         proxy._CLIENT_PROXY_STARTUP_RESTORE_COMPLETE = False
         proxy._CLIENT_PROXY_SHUTDOWN_REVERT_COMPLETE = False
 
+    def test_upstream_client_uses_single_connection_cache_lane(self):
+        proxy._UPSTREAM_CLIENT = None
+        captured_limits = {}
+
+        class FakeLimits:
+            def __init__(self, **kwargs):
+                captured_limits.update(kwargs)
+
+        class FakeClient:
+            async def aclose(self):
+                return None
+
+        fake_client = FakeClient()
+        with (
+            mock.patch.object(proxy.httpx, "Limits", FakeLimits),
+            mock.patch.object(proxy.httpx, "AsyncClient", return_value=fake_client),
+        ):
+            client = proxy._get_upstream_client()
+
+        self.assertIs(client, fake_client)
+        self.assertEqual(captured_limits["max_connections"], 1)
+        self.assertEqual(captured_limits["max_keepalive_connections"], 1)
+        self.assertEqual(captured_limits["keepalive_expiry"], 300.0)
+        proxy._UPSTREAM_CLIENT = None
+
     def test_prompt_cache_prefix_diagnostics_uses_full_item_hashes(self):
         first_body = {
             "model": "gpt-5.5",

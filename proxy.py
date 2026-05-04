@@ -349,10 +349,10 @@ def configured_upstream_timeout_seconds() -> int:
 # each new TCP connection lands on a randomly-chosen pod whose cache may be
 # cold for the prefix, while a long-lived HTTP/2 connection multiplexes every
 # request onto the same pod and lets the cache grow monotonically — the same
-# behavior the official Copilot CLI gets out of the box. Constructing an
-# httpx.AsyncClient per request fragments the cache and produces wildly
-# oscillating cached_input_tokens values for byte-identical payloads. Use a
-# single process-wide client for all upstream Copilot calls instead.
+# behavior the official Copilot CLI gets out of the box. Multiple keep-alive
+# connections can still create multiple cache lanes, visible as cached tokens
+# oscillating between a warm prefix and the small baseline prefix. Keep one
+# upstream connection and rely on HTTP/2 multiplexing for concurrent requests.
 # ---------------------------------------------------------------------------
 _UPSTREAM_CLIENT: "httpx.AsyncClient | None" = None
 _UPSTREAM_CLIENT_LOCK = threading.Lock()
@@ -367,8 +367,8 @@ def _get_upstream_client() -> "httpx.AsyncClient":
             return _UPSTREAM_CLIENT
         timeout = httpx.Timeout(configured_upstream_timeout_seconds())
         limits = httpx.Limits(
-            max_connections=8,
-            max_keepalive_connections=4,
+            max_connections=1,
+            max_keepalive_connections=1,
             keepalive_expiry=300.0,
         )
         try:
