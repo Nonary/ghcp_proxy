@@ -93,6 +93,8 @@ class ClientConfigTests(unittest.TestCase):
 
         self.assertTrue(settings["revert_on_shutdown"])
         self.assertTrue(settings["token_tripwire_enabled"])
+        self.assertFalse(settings["trace_prompt_logging_enabled"])
+        self.assertFalse(settings["trace_prompt_logging_configured"])
         self.assertEqual(settings["path"], str(settings_path))
         self.assertEqual(settings["pending_restore_targets"], [])
 
@@ -113,6 +115,9 @@ class ClientConfigTests(unittest.TestCase):
             {
                 "revert_on_shutdown": False,
                 "token_tripwire_enabled": True,
+                "trace_prompt_logging_enabled": False,
+                "trace_prompt_logging_salt": "",
+                "trace_prompt_logging_verifier": None,
                 "pending_restore_targets": [],
             },
         )
@@ -134,6 +139,41 @@ class ClientConfigTests(unittest.TestCase):
             {
                 "revert_on_shutdown": True,
                 "token_tripwire_enabled": False,
+                "trace_prompt_logging_enabled": False,
+                "trace_prompt_logging_salt": "",
+                "trace_prompt_logging_verifier": None,
+                "pending_restore_targets": [],
+            },
+        )
+
+    def test_client_proxy_settings_persist_trace_prompt_logging_metadata(self):
+        temp_dir = self._make_temp_dir("client-proxy-settings-trace-")
+        settings_path = temp_dir / "client-proxy.json"
+        service = self._make_client_proxy_service(
+            codex_managed_config_file=str(temp_dir / "managed_config.toml"),
+            client_proxy_settings_file=str(settings_path),
+        )
+
+        verifier = {"_encrypted": "ghcp_proxy.aesgcm.v1", "ciphertext": "abc"}
+        saved = service.save_client_proxy_settings(
+            {
+                "trace_prompt_logging_enabled": True,
+                "trace_prompt_logging_salt": "salt",
+                "trace_prompt_logging_verifier": verifier,
+            }
+        )
+
+        self.assertTrue(saved["trace_prompt_logging_enabled"])
+        self.assertTrue(saved["trace_prompt_logging_configured"])
+        self.assertNotIn("trace_prompt_logging_verifier", saved)
+        self.assertEqual(
+            json.loads(settings_path.read_text(encoding="utf-8")),
+            {
+                "revert_on_shutdown": True,
+                "token_tripwire_enabled": True,
+                "trace_prompt_logging_enabled": True,
+                "trace_prompt_logging_salt": "salt",
+                "trace_prompt_logging_verifier": verifier,
                 "pending_restore_targets": [],
             },
         )

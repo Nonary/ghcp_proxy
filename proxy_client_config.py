@@ -222,23 +222,43 @@ class ProxyClientConfigService:
         return {
             "revert_on_shutdown": True,
             "token_tripwire_enabled": True,
+            "trace_prompt_logging_enabled": False,
+            "trace_prompt_logging_salt": "",
+            "trace_prompt_logging_verifier": None,
             "pending_restore_targets": [],
         }
 
     def load_client_proxy_settings(self) -> dict[str, object]:
         payload = self._raw_client_proxy_settings()
+        defaults = self.default_client_proxy_settings()
         return {
             "revert_on_shutdown": bool(
                 payload.get(
                     "revert_on_shutdown",
-                    self.default_client_proxy_settings()["revert_on_shutdown"],
+                    defaults["revert_on_shutdown"],
                 )
             ),
             "token_tripwire_enabled": bool(
                 payload.get(
                     "token_tripwire_enabled",
-                    self.default_client_proxy_settings()["token_tripwire_enabled"],
+                    defaults["token_tripwire_enabled"],
                 )
+            ),
+            "trace_prompt_logging_enabled": bool(
+                payload.get(
+                    "trace_prompt_logging_enabled",
+                    defaults["trace_prompt_logging_enabled"],
+                )
+            ),
+            "trace_prompt_logging_salt": (
+                payload.get("trace_prompt_logging_salt")
+                if isinstance(payload.get("trace_prompt_logging_salt"), str)
+                else ""
+            ),
+            "trace_prompt_logging_verifier": (
+                payload.get("trace_prompt_logging_verifier")
+                if isinstance(payload.get("trace_prompt_logging_verifier"), dict)
+                else None
             ),
             "pending_restore_targets": self._normalize_restore_targets(
                 payload.get("pending_restore_targets"),
@@ -246,15 +266,29 @@ class ProxyClientConfigService:
         }
 
     def client_proxy_settings_payload(self) -> dict[str, object]:
+        settings = self.load_client_proxy_settings()
         return {
-            **self.load_client_proxy_settings(),
+            "revert_on_shutdown": settings["revert_on_shutdown"],
+            "token_tripwire_enabled": settings["token_tripwire_enabled"],
+            "trace_prompt_logging_enabled": settings["trace_prompt_logging_enabled"],
+            "trace_prompt_logging_configured": bool(
+                settings.get("trace_prompt_logging_salt")
+                and isinstance(settings.get("trace_prompt_logging_verifier"), dict)
+            ),
+            "pending_restore_targets": settings["pending_restore_targets"],
             "path": self._config.client_proxy_settings_file,
         }
 
     def save_client_proxy_settings(self, payload: dict) -> dict[str, object]:
         if not isinstance(payload, dict):
             raise HTTPException(status_code=400, detail="Request body must be an object")
-        known_keys = {"revert_on_shutdown", "token_tripwire_enabled"}
+        known_keys = {
+            "revert_on_shutdown",
+            "token_tripwire_enabled",
+            "trace_prompt_logging_enabled",
+            "trace_prompt_logging_salt",
+            "trace_prompt_logging_verifier",
+        }
         if not any(key in payload for key in known_keys):
             raise HTTPException(
                 status_code=400,
@@ -264,6 +298,16 @@ class ProxyClientConfigService:
             raise HTTPException(status_code=400, detail="revert_on_shutdown must be true or false.")
         if "token_tripwire_enabled" in payload and not isinstance(payload.get("token_tripwire_enabled"), bool):
             raise HTTPException(status_code=400, detail="token_tripwire_enabled must be true or false.")
+        if "trace_prompt_logging_enabled" in payload and not isinstance(payload.get("trace_prompt_logging_enabled"), bool):
+            raise HTTPException(status_code=400, detail="trace_prompt_logging_enabled must be true or false.")
+        if "trace_prompt_logging_salt" in payload and not isinstance(payload.get("trace_prompt_logging_salt"), str):
+            raise HTTPException(status_code=400, detail="trace_prompt_logging_salt must be a string.")
+        if (
+            "trace_prompt_logging_verifier" in payload
+            and payload.get("trace_prompt_logging_verifier") is not None
+            and not isinstance(payload.get("trace_prompt_logging_verifier"), dict)
+        ):
+            raise HTTPException(status_code=400, detail="trace_prompt_logging_verifier must be an object.")
 
         existing = self.load_client_proxy_settings()
         settings = {
@@ -271,6 +315,18 @@ class ProxyClientConfigService:
             "token_tripwire_enabled": payload.get(
                 "token_tripwire_enabled",
                 existing.get("token_tripwire_enabled", True),
+            ),
+            "trace_prompt_logging_enabled": payload.get(
+                "trace_prompt_logging_enabled",
+                existing.get("trace_prompt_logging_enabled", False),
+            ),
+            "trace_prompt_logging_salt": payload.get(
+                "trace_prompt_logging_salt",
+                existing.get("trace_prompt_logging_salt", ""),
+            ),
+            "trace_prompt_logging_verifier": payload.get(
+                "trace_prompt_logging_verifier",
+                existing.get("trace_prompt_logging_verifier"),
             ),
             "pending_restore_targets": existing.get("pending_restore_targets", []),
         }
@@ -594,6 +650,17 @@ class ProxyClientConfigService:
         normalized = {
             "revert_on_shutdown": bool(payload.get("revert_on_shutdown", True)),
             "token_tripwire_enabled": bool(payload.get("token_tripwire_enabled", True)),
+            "trace_prompt_logging_enabled": bool(payload.get("trace_prompt_logging_enabled", False)),
+            "trace_prompt_logging_salt": (
+                payload.get("trace_prompt_logging_salt")
+                if isinstance(payload.get("trace_prompt_logging_salt"), str)
+                else ""
+            ),
+            "trace_prompt_logging_verifier": (
+                payload.get("trace_prompt_logging_verifier")
+                if isinstance(payload.get("trace_prompt_logging_verifier"), dict)
+                else None
+            ),
             "pending_restore_targets": self._normalize_restore_targets(payload.get("pending_restore_targets")),
         }
         self._write_json_atomic(self._config.client_proxy_settings_file, normalized)

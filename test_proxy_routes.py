@@ -29,6 +29,7 @@ class ProxyRoutesTests(unittest.TestCase):
             proxy._PROMPT_CACHE_LAST_AFFINITY_BY_LINEAGE.clear()
         proxy._CLIENT_PROXY_STARTUP_RESTORE_COMPLETE = False
         proxy._CLIENT_PROXY_SHUTDOWN_REVERT_COMPLETE = False
+        proxy._set_trace_prompt_active_key(None, None)
 
     def test_upstream_client_uses_single_connection_cache_lane(self):
         proxy._UPSTREAM_CLIENT = None
@@ -678,6 +679,64 @@ class ProxyRoutesTests(unittest.TestCase):
         save_settings.assert_called_once_with(payload)
         self.assertEqual(response.status_code, 200)
         self.assertEqual(json.loads(response.body), saved)
+
+    def test_trace_prompt_password_reset_route_replaces_verifier_without_old_password(self):
+        request = SimpleNamespace()
+        settings = {
+            "trace_prompt_logging_enabled": True,
+            "trace_prompt_logging_salt": "old-salt",
+            "trace_prompt_logging_verifier": {"old": True},
+        }
+        saved = {
+            "trace_prompt_logging_enabled": True,
+            "trace_prompt_logging_configured": True,
+            "path": "/tmp/client-proxy.json",
+        }
+        verifier = {"_encrypted": "ghcp_proxy.aesgcm.v1", "ciphertext": "new"}
+
+        with (
+            mock.patch.object(proxy, "parse_json_request", mock.AsyncMock(return_value={"password": "new-password"})),
+            mock.patch.object(proxy, "_trace_prompt_logging_settings", return_value=settings),
+            mock.patch.object(proxy.trace_prompt_security, "new_salt", return_value="new-salt"),
+            mock.patch.object(proxy.trace_prompt_security, "derive_key", return_value=b"new-key") as derive_key,
+            mock.patch.object(proxy.trace_prompt_security, "make_password_verifier", return_value=verifier) as make_verifier,
+            mock.patch.object(
+                proxy.client_proxy_config_service,
+                "save_client_proxy_settings",
+                return_value=saved,
+            ) as save_settings,
+            mock.patch.object(proxy.dashboard_service, "notify_dashboard_stream_listeners") as notify,
+        ):
+            response = proxy.asyncio.run(proxy.trace_prompts_reset_password_api(request))
+
+        derive_key.assert_called_once_with("new-password", "new-salt")
+        make_verifier.assert_called_once_with(b"new-key", "new-salt")
+        save_settings.assert_called_once_with(
+            {
+                "trace_prompt_logging_enabled": True,
+                "trace_prompt_logging_salt": "new-salt",
+                "trace_prompt_logging_verifier": verifier,
+            }
+        )
+        notify.assert_called_once_with()
+        self.assertEqual(response.status_code, 200)
+        body = json.loads(response.body)
+        self.assertTrue(body["trace_prompt_logging_enabled"])
+        self.assertTrue(body["trace_prompt_logging_configured"])
+        self.assertTrue(body["trace_prompt_logging_unlocked"])
+
+    def test_trace_prompt_password_reset_route_requires_configured_traces(self):
+        request = SimpleNamespace()
+
+        with (
+            mock.patch.object(proxy, "parse_json_request", mock.AsyncMock(return_value={"password": "new-password"})),
+            mock.patch.object(proxy, "_trace_prompt_logging_settings", return_value={"trace_prompt_logging_enabled": True}),
+        ):
+            with self.assertRaises(proxy.HTTPException) as ctx:
+                proxy.asyncio.run(proxy.trace_prompts_reset_password_api(request))
+
+        self.assertEqual(ctx.exception.status_code, 400)
+        self.assertIn("not been configured", ctx.exception.detail)
 
     def test_revert_client_proxy_configs_on_shutdown_is_idempotent(self):
         result = {

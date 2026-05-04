@@ -57,6 +57,7 @@ class DashboardDependencies:
     snapshot_all_usage_events: Callable[[], list[dict]] = lambda: []
     snapshot_usage_events: Callable[[], list[dict]] = lambda: []
     load_safeguard_trigger_stats: Callable[[datetime], dict] = lambda _now: {}
+    decrypt_prompt_payload: Callable[[object], object] = lambda value: value
 
 
 # ─── SQLite cache functions ──────────────────────────────────────────────────
@@ -1902,7 +1903,7 @@ class DashboardService:
             day_cursor += timedelta(days=1)
 
         recent_requests = sorted(
-            detailed_usage_events,
+            [self._dashboard_request_event(event) for event in detailed_usage_events],
             key=lambda item: item.get("finished_at") or item.get("started_at") or "",
             reverse=True,
         )[:DETAILED_REQUEST_HISTORY_LIMIT]
@@ -1937,6 +1938,20 @@ class DashboardService:
             "recent_requests": recent_requests,
             "month_history": (local_usage.get("month_history") or [])[:12],
         }
+
+    def _dashboard_request_event(self, event: dict) -> dict:
+        if not isinstance(event, dict):
+            return {}
+        result = dict(event)
+        if "request_prompt" not in result:
+            return result
+        decrypted = self.dependencies.decrypt_prompt_payload(result.get("request_prompt"))
+        if isinstance(decrypted, dict):
+            result["request_prompt"] = decrypted
+        else:
+            result.pop("request_prompt", None)
+            result["request_prompt_encrypted"] = True
+        return result
 
     # ─── Stream broker delegation ─────────────────────────────────────────────
 

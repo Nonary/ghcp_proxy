@@ -1,10 +1,14 @@
 import unittest
+import json
+import os
+import tempfile
 from types import SimpleNamespace
 from unittest import mock
 
 import httpx
 
 import proxy
+import trace_prompt_security
 
 
 class ProxyTracingTests(unittest.TestCase):
@@ -249,6 +253,219 @@ class ProxyTracingTests(unittest.TestCase):
         trace_payload = append_trace.call_args.args[0]
         self.assertTrue(trace_payload["reasoning_text_present"])
         self.assertEqual(trace_payload["reasoning_text"], "thinking step by step")
+
+    def test_finish_usage_and_trace_encrypts_in_flight_plaintext_prompt_after_toggle(self):
+        try:
+            trace_prompt_security._crypto_primitives()
+        except RuntimeError as exc:
+            self.skipTest(str(exc))
+
+        salt = trace_prompt_security.new_salt()
+        key = trace_prompt_security.derive_key("pw", salt)
+        plan = proxy.UpstreamRequestPlan(
+            request_id="req_inflight",
+            upstream_url="https://example.invalid/responses",
+            headers={"X-Initiator": "user"},
+            body={"model": "gpt-5.4"},
+            usage_event={"request_id": "req_inflight", "request_prompt": {"user": "plain"}},
+            requested_model="gpt-5.4",
+            resolved_model="gpt-5.4",
+            source_body={"model": "gpt-5.4"},
+            trace_context={"request_id": "req_inflight", "request_prompt": {"user": "plain"}},
+        )
+
+        captured_event = {}
+
+        def _capture_finish(event, _status, **_kwargs):
+            captured_event.update(event)
+
+        with (
+            mock.patch.object(proxy.client_proxy_config_service, "load_client_proxy_settings", return_value={"trace_prompt_logging_enabled": True}),
+            mock.patch.object(proxy.usage_tracker, "finish_event", side_effect=_capture_finish),
+            mock.patch.object(proxy, "request_tracing_enabled", return_value=True),
+            mock.patch.object(proxy, "_append_request_trace") as append_trace,
+        ):
+            proxy._set_trace_prompt_active_key(key, salt)
+            try:
+                proxy._finish_usage_and_trace(plan, 200, response_payload={"id": "resp_1"})
+            finally:
+                proxy._set_trace_prompt_active_key(None, None)
+
+        self.assertTrue(trace_prompt_security.is_encrypted_payload(captured_event["request_prompt"]))
+        self.assertEqual(trace_prompt_security.decrypt_payload(captured_event["request_prompt"], key=key), {"user": "plain"})
+        trace_payload = append_trace.call_args.args[0]
+        self.assertTrue(trace_prompt_security.is_encrypted_payload(trace_payload["request_prompt"]))
+        self.assertEqual(trace_prompt_security.decrypt_payload(trace_payload["request_prompt"], key=key), {"user": "plain"})
+
+    def test_write_request_body_dump_encrypts_late_plaintext_snapshot(self):
+        try:
+            trace_prompt_security._crypto_primitives()
+        except RuntimeError as exc:
+            self.skipTest(str(exc))
+
+        salt = trace_prompt_security.new_salt()
+        key = trace_prompt_security.derive_key("pw", salt)
+        with tempfile.TemporaryDirectory() as tmp:
+            out_path = os.path.join(tmp, "req_1.json")
+            snapshot = {
+                "request_body": {"input": "plain"},
+                "upstream_body": {"messages": [{"role": "user", "content": "plain"}]},
+                "upstream_body_wire": '{"input":"plain"}',
+            }
+
+            with mock.patch.object(
+                proxy.client_proxy_config_service,
+                "load_client_proxy_settings",
+                return_value={"trace_prompt_logging_enabled": True},
+            ):
+                proxy._set_trace_prompt_active_key(key, salt)
+                try:
+                    proxy._write_request_body_dump(out_path, tmp, snapshot)
+                finally:
+                    proxy._set_trace_prompt_active_key(None, None)
+
+            with open(out_path, encoding="utf-8") as f:
+                stored = json.load(f)
+            self.assertTrue(trace_prompt_security.is_encrypted_payload(stored["request_body"]))
+            self.assertEqual(trace_prompt_security.decrypt_payload(stored["request_body"], key=key), {"input": "plain"})
+
+    def test_configured_trace_prompt_logging_can_be_enabled_without_unlock_password(self):
+        verifier = {"_encrypted": "ghcp_proxy.aesgcm.v1", "ciphertext": "abc"}
+        existing = {
+            "trace_prompt_logging_enabled": False,
+            "trace_prompt_logging_salt": "salt",
+            "trace_prompt_logging_verifier": verifier,
+        }
+        saved_payload = {
+            "trace_prompt_logging_enabled": True,
+            "trace_prompt_logging_configured": True,
+        }
+
+        with (
+            mock.patch.object(proxy, "_trace_prompt_logging_settings", return_value=existing),
+            mock.patch.object(proxy.client_proxy_config_service, "save_client_proxy_settings", return_value=saved_payload) as save_settings,
+            mock.patch.object(proxy, "_migrate_existing_prompt_trace_logs") as migrate,
+        ):
+            result = proxy._save_client_proxy_settings_with_trace_prompt_logging(
+                {"trace_prompt_logging_enabled": True}
+            )
+
+        self.assertTrue(result["trace_prompt_logging_enabled"])
+        self.assertFalse(result["trace_prompt_logging_unlocked"])
+        save_settings.assert_called_once()
+        migrate.assert_not_called()
+
+    def test_trace_prompt_unlock_verifies_password_and_refreshes_dashboard_status(self):
+        try:
+            trace_prompt_security._crypto_primitives()
+        except RuntimeError as exc:
+            self.skipTest(str(exc))
+
+        salt = trace_prompt_security.new_salt()
+        key = trace_prompt_security.derive_key("pw", salt)
+        verifier = trace_prompt_security.make_password_verifier(key, salt)
+        settings = {
+            "trace_prompt_logging_enabled": True,
+            "trace_prompt_logging_salt": salt,
+            "trace_prompt_logging_verifier": verifier,
+        }
+        payload = {
+            "trace_prompt_logging_enabled": True,
+            "trace_prompt_logging_configured": True,
+        }
+
+        with (
+            mock.patch.object(proxy, "_trace_prompt_logging_settings", return_value=settings),
+            mock.patch.object(proxy.client_proxy_config_service, "client_proxy_settings_payload", return_value=payload),
+            mock.patch.object(proxy.dashboard_service, "notify_dashboard_stream_listeners") as notify,
+        ):
+            try:
+                result = proxy._unlock_trace_prompt_logging("pw")
+            finally:
+                proxy._set_trace_prompt_active_key(None, None)
+
+        self.assertTrue(result["trace_prompt_logging_unlocked"])
+        notify.assert_called_once()
+
+    def test_prompt_trace_migration_encrypts_existing_prompt_files(self):
+        try:
+            trace_prompt_security._crypto_primitives()
+        except RuntimeError as exc:
+            self.skipTest(str(exc))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            usage_path = os.path.join(tmp, "usage-log.jsonl")
+            trace_path = os.path.join(tmp, "request-trace.jsonl")
+            body_dir = os.path.join(tmp, "request-bodies")
+            os.makedirs(body_dir)
+            with open(usage_path, "w", encoding="utf-8") as f:
+                f.write(json.dumps({"request_id": "req_1", "request_prompt": {"user": "hello"}}) + "\n")
+            with open(trace_path, "w", encoding="utf-8") as f:
+                f.write(json.dumps({"event": "request_started", "request_prompt": {"system": "rules"}}) + "\n")
+                f.write(json.dumps({"event": "request_finished", "source_body": {"input": "secret"}}) + "\n")
+            body_path = os.path.join(body_dir, "req_1.json")
+            with open(body_path, "w", encoding="utf-8") as f:
+                json.dump({"request_body": {"input": "hello"}, "upstream_body_wire": '{"input":"hello"}'}, f)
+
+            salt = trace_prompt_security.new_salt()
+            key = trace_prompt_security.derive_key("pw", salt)
+
+            with (
+                mock.patch.object(proxy.usage_tracker, "usage_log_file", usage_path),
+                mock.patch.dict(
+                    os.environ,
+                    {"GHCP_TRACE_LOG_FILE": trace_path, "GHCP_REQUEST_BODY_DUMP_DIR": body_dir},
+                ),
+            ):
+                stats = proxy._migrate_existing_prompt_trace_logs(key, salt)
+
+            self.assertEqual(stats["usage_log"]["encrypted_fields"], 1)
+            self.assertEqual(stats["request_trace"]["encrypted_fields"], 2)
+            self.assertEqual(stats["request_bodies"]["encrypted_fields"], 2)
+
+            with open(usage_path, encoding="utf-8") as f:
+                usage_row = json.loads(f.readline())
+            with open(trace_path, encoding="utf-8") as f:
+                trace_rows = [json.loads(line) for line in f if line.strip()]
+            with open(body_path, encoding="utf-8") as f:
+                body_row = json.load(f)
+
+            self.assertTrue(trace_prompt_security.is_encrypted_payload(usage_row["request_prompt"]))
+            self.assertEqual(trace_prompt_security.decrypt_payload(usage_row["request_prompt"], key=key), {"user": "hello"})
+            self.assertEqual(trace_prompt_security.decrypt_payload(trace_rows[0]["request_prompt"], key=key), {"system": "rules"})
+            self.assertEqual(trace_prompt_security.decrypt_payload(trace_rows[1]["source_body"], key=key), {"input": "secret"})
+            self.assertEqual(trace_prompt_security.decrypt_payload(body_row["request_body"], key=key), {"input": "hello"})
+            self.assertEqual(trace_prompt_security.decrypt_payload(body_row["upstream_body_wire"], key=key), '{"input":"hello"}')
+
+    def test_prompt_trace_jsonl_migration_uses_supplied_lock(self):
+        class RecordingLock:
+            def __init__(self):
+                self.entered = 0
+                self.exited = 0
+
+            def __enter__(self):
+                self.entered += 1
+
+            def __exit__(self, exc_type, exc, tb):
+                self.exited += 1
+
+        try:
+            trace_prompt_security._crypto_primitives()
+        except RuntimeError as exc:
+            self.skipTest(str(exc))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "request-trace.jsonl")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(json.dumps({"request_prompt": {"user": "hello"}}) + "\n")
+            salt = trace_prompt_security.new_salt()
+            key = trace_prompt_security.derive_key("pw", salt)
+            lock = RecordingLock()
+
+            proxy._migrate_prompt_jsonl_file(path, ("request_prompt",), key, salt, lock=lock)
+
+            self.assertEqual(lock.entered, 1)
+            self.assertEqual(lock.exited, 1)
 
 
 if __name__ == "__main__":

@@ -2206,6 +2206,26 @@
                   <pre class="prompt-box">{{ selectedRequest.request_prompt.user }}</pre>
                 </div>
               </article>
+              <article class="detail-block" v-if="tracePromptUnlockVisible">
+                <div class="detail-label">Encrypted Prompt Access</div>
+                <div class="subtle" style="margin-top: 6px;">Enter the AES password to decrypt prompt previews in the Requests explorer for this proxy process.</div>
+                <div class="toolbar" style="margin-top: 10px;">
+                  <input
+                    v-model="tracePromptUnlock.password"
+                    type="password"
+                    autocomplete="current-password"
+                    placeholder="AES password"
+                    :disabled="tracePromptUnlock.saving"
+                    @keyup.enter="unlockTracePrompts"
+                    style="max-width: 360px;">
+                  <button class="primary" type="button" @click="unlockTracePrompts" :disabled="tracePromptUnlock.saving || !tracePromptUnlock.password">
+                    <span v-if="tracePromptUnlock.saving" class="spinner"></span>
+                    {{ tracePromptUnlock.saving ? 'Decrypting…' : 'Decrypt prompts' }}
+                  </button>
+                </div>
+                <div v-if="tracePromptUnlock.error" class="status error" style="margin-top: 10px;">{{ tracePromptUnlock.error }}</div>
+                <div v-else-if="tracePromptUnlock.statusMessage" class="status good" style="margin-top: 10px;">{{ tracePromptUnlock.statusMessage }}</div>
+              </article>
             </div>
           </div>
           <div v-else class="empty">No requests match the current filter.</div>
@@ -2686,6 +2706,51 @@
             </div>
             <div v-if="clientProxySettings.error" class="status error" style="margin-top: 10px;">{{ clientProxySettings.error }}</div>
             <div v-else-if="clientProxySettings.statusMessage" class="status good" style="margin-top: 10px;">{{ clientProxySettings.statusMessage }}</div>
+          </article>
+          <article class="mini-card" style="margin-top: 12px;">
+            <div class="eyebrow">Encrypted Trace Prompts</div>
+            <label style="display:flex; align-items:center; gap:10px; margin-top:6px;">
+              <input type="checkbox" v-model="clientProxySettings.trace_prompt_logging_enabled" :disabled="savingClientProxySettings">
+              <span>Store prompt trace details encrypted with an AES password</span>
+            </label>
+            <input
+              v-if="tracePromptLoggingNeedsInitialPassword"
+              v-model="clientProxySettings.trace_prompt_logging_password"
+              type="password"
+              autocomplete="new-password"
+              placeholder="Initial AES password"
+              :disabled="savingClientProxySettings"
+              style="margin-top: 10px; max-width: 360px;">
+            <div class="subtle" style="margin-top: 8px;">{{ tracePromptLoggingLabel }}</div>
+            <div class="toolbar" style="margin-top: 10px;">
+              <button class="primary" @click="saveClientProxySettings" :disabled="savingClientProxySettings">
+                <span v-if="savingClientProxySettings && savingClientProxySettingsDetail === 'trace'" class="spinner"></span>
+                {{ savingClientProxySettings && savingClientProxySettingsDetail === 'trace' ? 'Encrypting traces…' : 'Save trace setting' }}
+              </button>
+            </div>
+            <div v-if="savingClientProxySettings && savingClientProxySettingsDetail === 'trace'" class="subtle" style="margin-top: 8px;">Encrypting previous prompt traces. The request list will refresh when this finishes.</div>
+          </article>
+          <article class="mini-card" v-if="tracePromptPasswordResetVisible" style="margin-top: 12px;">
+            <div class="eyebrow">Reset Trace Password</div>
+            <div class="subtle" style="margin-top: 6px;">
+              Use only if the AES password is lost. Previous encrypted request prompt data cannot be decrypted after a reset unless you recover the old password.
+            </div>
+            <div class="toolbar" style="margin-top: 10px;">
+              <input
+                v-model="tracePromptReset.password"
+                type="password"
+                autocomplete="new-password"
+                placeholder="New AES password"
+                :disabled="tracePromptReset.saving"
+                @keyup.enter="resetTracePromptPassword"
+                style="max-width: 360px;">
+              <button class="danger" type="button" @click="resetTracePromptPassword" :disabled="tracePromptReset.saving || !tracePromptReset.password">
+                <span v-if="tracePromptReset.saving" class="spinner"></span>
+                {{ tracePromptReset.saving ? 'Resetting…' : 'Reset AES password' }}
+              </button>
+            </div>
+            <div v-if="tracePromptReset.error" class="status error" style="margin-top: 10px;">{{ tracePromptReset.error }}</div>
+            <div v-else-if="tracePromptReset.statusMessage" class="status warn" style="margin-top: 10px;">{{ tracePromptReset.statusMessage }}</div>
           </article>
           <article class="mini-card" style="margin-top: 12px;">
             <div class="eyebrow">Background Proxy</div>
@@ -3925,6 +3990,7 @@
           loadingClientProxyStatus: false,
           savingProxyConfig: false,
           savingClientProxySettings: false,
+          savingClientProxySettingsDetail: '',
           savingBackgroundProxy: false,
           loadingModelRoutingConfig: false,
           savingModelRoutingConfig: false,
@@ -3966,7 +4032,23 @@
           clientProxySettings: {
             revert_on_shutdown: true,
             token_tripwire_enabled: true,
+            trace_prompt_logging_enabled: false,
+            trace_prompt_logging_configured: false,
+            trace_prompt_logging_unlocked: false,
+            trace_prompt_logging_password: '',
             path: '',
+            error: '',
+            statusMessage: '',
+          },
+          tracePromptReset: {
+            password: '',
+            saving: false,
+            error: '',
+            statusMessage: '',
+          },
+          tracePromptUnlock: {
+            password: '',
+            saving: false,
             error: '',
             statusMessage: '',
           },
@@ -5249,6 +5331,25 @@
         noClientProxyConfigured() {
           return !this.clientProxyStatus.codex?.configured && !this.clientProxyStatus.claude?.configured;
         },
+        tracePromptLoggingLabel() {
+          if (!this.clientProxySettings.trace_prompt_logging_enabled) return 'Off. Existing encrypted prompt traces stay encrypted.';
+          if (this.clientProxySettings.trace_prompt_logging_unlocked) return 'On. Requests explorer can decrypt prompt previews for this proxy process.';
+          if (this.clientProxySettings.trace_prompt_logging_configured) return 'On. Enter the AES password in Requests when prompt previews need to be decrypted.';
+          return 'Enter an initial AES password to enable encrypted prompt trace storage.';
+        },
+        tracePromptLoggingNeedsInitialPassword() {
+          return Boolean(this.clientProxySettings.trace_prompt_logging_enabled && !this.clientProxySettings.trace_prompt_logging_configured);
+        },
+        tracePromptPasswordResetVisible() {
+          return Boolean(this.clientProxySettings.trace_prompt_logging_configured);
+        },
+        tracePromptUnlockVisible() {
+          return Boolean(
+            this.clientProxySettings.trace_prompt_logging_enabled
+            && this.clientProxySettings.trace_prompt_logging_configured
+            && !this.clientProxySettings.trace_prompt_logging_unlocked
+          );
+        },
         backgroundProxyCommandNames() {
           const commands = this.backgroundProxyStatus.commands || {};
           return [commands.start, commands.stop].filter(Boolean);
@@ -6291,17 +6392,33 @@
         },
         async saveClientProxySettings() {
           if (this.savingClientProxySettings) return;
+          const savingTraceSetting = Boolean(
+            this.clientProxySettings.trace_prompt_logging_enabled
+            || this.clientProxySettings.trace_prompt_logging_configured
+            || this.clientProxySettings.trace_prompt_logging_password
+          );
           this.savingClientProxySettings = true;
+          this.savingClientProxySettingsDetail = savingTraceSetting ? 'trace' : 'general';
           this.clientProxySettings.statusMessage = '';
           this.clientProxySettings.error = '';
+          if (savingTraceSetting && this.clientProxySettings.trace_prompt_logging_enabled) {
+            this.clientProxySettings.statusMessage = this.tracePromptLoggingNeedsInitialPassword
+              ? 'Encrypting existing prompt traces...'
+              : 'Saving encrypted trace setting...';
+          }
           try {
+            const body = {
+              revert_on_shutdown: Boolean(this.clientProxySettings.revert_on_shutdown),
+              token_tripwire_enabled: Boolean(this.clientProxySettings.token_tripwire_enabled),
+              trace_prompt_logging_enabled: Boolean(this.clientProxySettings.trace_prompt_logging_enabled),
+            };
+            if (this.tracePromptLoggingNeedsInitialPassword || this.clientProxySettings.trace_prompt_logging_password) {
+              body.trace_prompt_logging_password = this.clientProxySettings.trace_prompt_logging_password || '';
+            }
             const response = await fetch('/api/config/client-proxy/settings', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                revert_on_shutdown: Boolean(this.clientProxySettings.revert_on_shutdown),
-                token_tripwire_enabled: Boolean(this.clientProxySettings.token_tripwire_enabled),
-              }),
+              body: JSON.stringify(body),
             });
             if (!response.ok) {
               let message = `client proxy settings request failed: ${response.status}`;
@@ -6316,13 +6433,104 @@
             this.clientProxySettings = {
               ...this.clientProxySettings,
               ...payload,
+              trace_prompt_logging_password: '',
               error: '',
             };
-            this.clientProxySettings.statusMessage = 'Settings saved.';
+            if (payload?.trace_prompt_logging_migration) {
+              this.clientProxySettings.statusMessage = this.tracePromptMigrationSummary(payload.trace_prompt_logging_migration);
+              await this.load(true);
+            } else {
+              this.clientProxySettings.statusMessage = 'Settings saved.';
+            }
           } catch (error) {
             this.clientProxySettings.error = error.message;
           } finally {
             this.savingClientProxySettings = false;
+            this.savingClientProxySettingsDetail = '';
+          }
+        },
+        tracePromptMigrationSummary(migration) {
+          const usageFields = Number(migration?.usage_log?.encrypted_fields || 0);
+          const traceFields = Number(migration?.request_trace?.encrypted_fields || 0);
+          const bodyFields = Number(migration?.request_bodies?.encrypted_fields || 0);
+          const memoryEvents = Number(migration?.memory_usage_events || 0);
+          const total = usageFields + traceFields + bodyFields + memoryEvents;
+          return total > 0
+            ? `Encrypted previous prompt traces (${this.integer(total)} item${total === 1 ? '' : 's'}). Requests refreshed.`
+            : 'Encrypted trace setting saved. Requests refreshed.';
+        },
+        async unlockTracePrompts() {
+          if (this.tracePromptUnlock.saving || !this.tracePromptUnlock.password) return;
+          this.tracePromptUnlock.saving = true;
+          this.tracePromptUnlock.error = '';
+          this.tracePromptUnlock.statusMessage = '';
+          try {
+            const response = await fetch('/api/trace-prompts/unlock', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ password: this.tracePromptUnlock.password }),
+            });
+            if (!response.ok) {
+              let message = `trace prompt unlock request failed: ${response.status}`;
+              try {
+                const data = await response.json();
+                if (data?.detail) message = data.detail;
+              } catch (_error) {}
+              throw new Error(message);
+            }
+            const payload = await response.json();
+            this.clientProxySettings = {
+              ...this.clientProxySettings,
+              ...payload,
+              error: '',
+            };
+            this.tracePromptUnlock.password = '';
+            this.tracePromptUnlock.statusMessage = 'Prompt previews decrypted.';
+            await this.load(true);
+          } catch (error) {
+            this.tracePromptUnlock.error = error.message;
+          } finally {
+            this.tracePromptUnlock.saving = false;
+          }
+        },
+        async resetTracePromptPassword() {
+          if (this.tracePromptReset.saving || !this.tracePromptReset.password) return;
+          const confirmed = window.confirm(
+            'Reset the AES password? Previous encrypted request prompt data cannot be decrypted without the old password. Future prompt traces will use the new password.'
+          );
+          if (!confirmed) return;
+          this.tracePromptReset.saving = true;
+          this.tracePromptReset.error = '';
+          this.tracePromptReset.statusMessage = '';
+          this.tracePromptUnlock.error = '';
+          this.tracePromptUnlock.statusMessage = '';
+          try {
+            const response = await fetch('/api/trace-prompts/reset-password', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ password: this.tracePromptReset.password }),
+            });
+            if (!response.ok) {
+              let message = `trace prompt password reset request failed: ${response.status}`;
+              try {
+                const data = await response.json();
+                if (data?.detail) message = data.detail;
+              } catch (_error) {}
+              throw new Error(message);
+            }
+            const payload = await response.json();
+            this.clientProxySettings = {
+              ...this.clientProxySettings,
+              ...payload,
+              error: '',
+            };
+            this.tracePromptReset.password = '';
+            this.tracePromptReset.statusMessage = 'AES password reset. Older encrypted prompt traces still require the old password.';
+            await this.load(true);
+          } catch (error) {
+            this.tracePromptReset.error = error.message;
+          } finally {
+            this.tracePromptReset.saving = false;
           }
         },
         async loadBackgroundProxyStatus() {
@@ -6963,7 +7171,7 @@
           if (this.sortMode === 'tokens') return sorted.sort((a, b) => Number(b.total_tokens || b?.usage?.total_tokens || 0) - Number(a.total_tokens || a?.usage?.total_tokens || 0));
           return sorted.sort((a, b) => String(b[dateKey] || b.started_at || '').localeCompare(String(a[dateKey] || a.started_at || '')));
         },
-        _applyDashboardPayload(payload) {
+        _applyDashboardPayload(payload, options = {}) {
           if (!payload || typeof payload !== 'object') {
             return;
           }
@@ -6975,7 +7183,10 @@
           const preserveScroll = this.activeTab === 'requests';
           const requestList = preserveScroll ? this.$refs.requestList : null;
           const previousScrollTop = requestList ? requestList.scrollTop : null;
-          const mergedRequests = this.mergeRecentRequests(this.data.recent_requests, payload?.recent_requests);
+          const incomingRequests = Array.isArray(payload?.recent_requests) ? payload.recent_requests : [];
+          const mergedRequests = options.replaceRequests
+            ? incomingRequests.map((row) => ({ ...row }))
+            : this.mergeRecentRequests(this.data.recent_requests, incomingRequests);
           Object.assign(this.data, { ...payload, recent_requests: mergedRequests });
           this.requestPage = Math.min(this.requestPageCount, Math.max(1, this.requestPage));
           const requestKeys = new Set((this.data.recent_requests || []).map((row) => this.requestKey(row)));
@@ -7061,7 +7272,7 @@
             const response = await fetch(`/api/dashboard${suffix}`, { cache: 'no-store' });
             if (!response.ok) throw new Error(`dashboard request failed: ${response.status}`);
             const payload = await response.json();
-            this._applyDashboardPayload(payload);
+            this._applyDashboardPayload(payload, { replaceRequests: forceRefresh });
           } catch (error) {
             console.error('Dashboard load failed:', error.message);
           }

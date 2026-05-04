@@ -67,6 +67,7 @@ import time
 import threading
 import safeguard_config as safeguard_config_module
 import protocol_replies
+import trace_prompt_security
 import upstream_errors
 import update_notice
 import usage_reminder
@@ -200,6 +201,10 @@ _PROMPT_CACHE_TRACE_LOCK = threading.Lock()
 _PROMPT_CACHE_LAST_INPUT_BY_LINEAGE: dict[tuple[str, str], dict] = {}
 _PROMPT_CACHE_AFFINITY_TRACE_LOCK = threading.Lock()
 _PROMPT_CACHE_LAST_AFFINITY_BY_LINEAGE: dict[tuple[str, str], dict] = {}
+_TRACE_PROMPT_KEY_LOCK = threading.Lock()
+_TRACE_PROMPT_AES_KEY: bytes | None = None
+_TRACE_PROMPT_SALT: str | None = None
+_TRACE_PROMPT_ENABLE_PENDING = False
 
 
 def _stream_with_update_notice(byte_iter, protocol: str, upstream_headers=None):
@@ -295,12 +300,85 @@ bridge_planner = ProtocolBridgePlanner(
     capability_resolver=lambda model: model_supports_native_messages(model) if model else False,
 )
 
+
+def _trace_prompt_logging_settings() -> dict[str, object]:
+    try:
+        settings = client_proxy_config_service.load_client_proxy_settings()
+    except Exception:
+        return {}
+    return settings if isinstance(settings, dict) else {}
+
+
+def _trace_prompt_logging_enabled() -> bool:
+    with _TRACE_PROMPT_KEY_LOCK:
+        if _TRACE_PROMPT_ENABLE_PENDING:
+            return True
+    return bool(_trace_prompt_logging_settings().get("trace_prompt_logging_enabled"))
+
+
+def _trace_prompt_logging_unlocked() -> bool:
+    if not _trace_prompt_logging_enabled():
+        return False
+    with _TRACE_PROMPT_KEY_LOCK:
+        return _TRACE_PROMPT_AES_KEY is not None
+
+
+def _trace_prompt_active_key() -> tuple[bytes, str] | None:
+    if not _trace_prompt_logging_enabled():
+        return None
+    with _TRACE_PROMPT_KEY_LOCK:
+        if _TRACE_PROMPT_AES_KEY is None or not _TRACE_PROMPT_SALT:
+            return None
+        return _TRACE_PROMPT_AES_KEY, _TRACE_PROMPT_SALT
+
+
+def _set_trace_prompt_active_key(key: bytes | None, salt: str | None) -> None:
+    global _TRACE_PROMPT_AES_KEY, _TRACE_PROMPT_SALT
+    with _TRACE_PROMPT_KEY_LOCK:
+        _TRACE_PROMPT_AES_KEY = key
+        _TRACE_PROMPT_SALT = salt
+
+
+def _set_trace_prompt_enable_pending(enabled: bool) -> None:
+    global _TRACE_PROMPT_ENABLE_PENDING
+    with _TRACE_PROMPT_KEY_LOCK:
+        _TRACE_PROMPT_ENABLE_PENDING = bool(enabled)
+
+
+def _protect_prompt_trace_value(value):
+    if not _trace_prompt_logging_enabled():
+        return value
+    active = _trace_prompt_active_key()
+    if active is None:
+        return trace_prompt_security.locked_payload()
+    key, salt = active
+    return trace_prompt_security.encrypt_payload(value, key, salt)
+
+
+def _decrypt_prompt_payload_for_dashboard(value):
+    if not trace_prompt_security.is_encrypted_payload(value):
+        return value
+    active = _trace_prompt_active_key()
+    if active is None:
+        return {
+            "system": "[Encrypted prompt trace locked. Enter the AES password in Settings to view prompt text.]",
+        }
+    key, _salt = active
+    try:
+        return trace_prompt_security.decrypt_payload(value, key=key)
+    except Exception:
+        return {
+            "system": "[Encrypted prompt trace could not be decrypted with the loaded AES password.]",
+        }
+
+
 dashboard_service = dashboard_module.create_dashboard_service(
     dependencies=dashboard_module.DashboardDependencies(
         load_api_key_payload=auth.load_api_key_payload,
         snapshot_all_usage_events=usage_tracker.snapshot_all_usage_events,
         snapshot_usage_events=usage_tracker.snapshot_usage_events,
         load_safeguard_trigger_stats=safeguard_event_store.load_stats,
+        decrypt_prompt_payload=_decrypt_prompt_payload_for_dashboard,
     ),
     utc_now=util.utc_now,
     utc_now_iso=util.utc_now_iso,
@@ -556,6 +634,143 @@ def _cache_tripwire_enabled() -> bool:
     if not isinstance(settings, dict):
         return True
     return bool(settings.get("token_tripwire_enabled", True))
+
+
+def _client_proxy_settings_with_trace_status(payload: dict[str, object]) -> dict[str, object]:
+    result = dict(payload)
+    result["trace_prompt_logging_unlocked"] = _trace_prompt_logging_unlocked()
+    return result
+
+
+def _trace_prompt_settings_configured(settings: dict[str, object] | None = None) -> bool:
+    settings = settings if isinstance(settings, dict) else _trace_prompt_logging_settings()
+    return bool(
+        settings.get("trace_prompt_logging_salt")
+        and isinstance(settings.get("trace_prompt_logging_verifier"), dict)
+    )
+
+
+def _unlock_trace_prompt_logging(password: str) -> dict[str, object]:
+    if not isinstance(password, str) or not password:
+        raise HTTPException(status_code=400, detail="AES password is required.")
+    settings = _trace_prompt_logging_settings()
+    if not bool(settings.get("trace_prompt_logging_enabled")):
+        raise HTTPException(status_code=400, detail="Encrypted prompt trace logging is not enabled.")
+    salt = settings.get("trace_prompt_logging_salt")
+    verifier = settings.get("trace_prompt_logging_verifier")
+    if not isinstance(salt, str) or not salt or not isinstance(verifier, dict):
+        raise HTTPException(status_code=400, detail="Encrypted prompt trace logging has not been configured with a password.")
+    try:
+        key = trace_prompt_security.derive_key(password, salt)
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not trace_prompt_security.verify_password_payload(verifier, key):
+        raise HTTPException(status_code=403, detail="AES password did not match encrypted prompt trace settings.")
+    _set_trace_prompt_active_key(key, salt)
+    try:
+        dashboard_service.notify_dashboard_stream_listeners()
+    except NameError:
+        pass
+    return _client_proxy_settings_with_trace_status(client_proxy_config_service.client_proxy_settings_payload())
+
+
+def _reset_trace_prompt_logging_password(password: str) -> dict[str, object]:
+    if not isinstance(password, str) or not password:
+        raise HTTPException(status_code=400, detail="New AES password is required.")
+    settings = _trace_prompt_logging_settings()
+    if not _trace_prompt_settings_configured(settings):
+        raise HTTPException(status_code=400, detail="Encrypted prompt trace logging has not been configured with a password.")
+    salt = trace_prompt_security.new_salt()
+    try:
+        key = trace_prompt_security.derive_key(password, salt)
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    verifier = trace_prompt_security.make_password_verifier(key, salt)
+    result = client_proxy_config_service.save_client_proxy_settings(
+        {
+            "trace_prompt_logging_enabled": bool(settings.get("trace_prompt_logging_enabled")),
+            "trace_prompt_logging_salt": salt,
+            "trace_prompt_logging_verifier": verifier,
+        }
+    )
+    _set_trace_prompt_active_key(key, salt)
+    try:
+        dashboard_service.notify_dashboard_stream_listeners()
+    except NameError:
+        pass
+    return _client_proxy_settings_with_trace_status(result)
+
+
+def _save_client_proxy_settings_with_trace_prompt_logging(payload: dict) -> dict[str, object]:
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Request body must be an object")
+
+    existing = _trace_prompt_logging_settings()
+    requested_enabled = bool(payload.get("trace_prompt_logging_enabled", existing.get("trace_prompt_logging_enabled", False)))
+    password = payload.get("trace_prompt_logging_password")
+    password = password if isinstance(password, str) else ""
+    save_payload = {
+        key: value
+        for key, value in payload.items()
+        if key != "trace_prompt_logging_password"
+    }
+
+    migration: dict[str, object] | None = None
+    pending_key: bytes | None = None
+    pending_salt: str | None = None
+    clear_key_after_save = False
+    if requested_enabled:
+        salt = existing.get("trace_prompt_logging_salt")
+        verifier = existing.get("trace_prompt_logging_verifier")
+        has_configured_password = _trace_prompt_settings_configured(existing)
+        if not password and not has_configured_password:
+            raise HTTPException(
+                status_code=400,
+                detail="AES password is required to enable encrypted prompt trace logging.",
+            )
+        if password:
+            if not isinstance(salt, str) or not salt:
+                salt = trace_prompt_security.new_salt()
+            try:
+                key = trace_prompt_security.derive_key(password, salt)
+            except (RuntimeError, ValueError) as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            if has_configured_password and not trace_prompt_security.verify_password_payload(verifier, key):
+                raise HTTPException(status_code=403, detail="AES password did not match encrypted prompt trace settings.")
+            if not has_configured_password:
+                verifier = trace_prompt_security.make_password_verifier(key, salt)
+            save_payload["trace_prompt_logging_salt"] = salt
+            save_payload["trace_prompt_logging_verifier"] = verifier
+            pending_key = key
+            pending_salt = salt
+        else:
+            save_payload["trace_prompt_logging_salt"] = existing.get("trace_prompt_logging_salt", "")
+            save_payload["trace_prompt_logging_verifier"] = existing.get("trace_prompt_logging_verifier")
+    else:
+        save_payload["trace_prompt_logging_salt"] = existing.get("trace_prompt_logging_salt", "")
+        save_payload["trace_prompt_logging_verifier"] = existing.get("trace_prompt_logging_verifier")
+        clear_key_after_save = True
+
+    if pending_key is not None and pending_salt:
+        _set_trace_prompt_active_key(pending_key, pending_salt)
+        _set_trace_prompt_enable_pending(True)
+    try:
+        result = client_proxy_config_service.save_client_proxy_settings(save_payload)
+        if pending_key is not None and pending_salt:
+            migration = _migrate_existing_prompt_trace_logs(pending_key, pending_salt)
+        elif clear_key_after_save:
+            _set_trace_prompt_active_key(None, None)
+    finally:
+        if pending_key is not None:
+            _set_trace_prompt_enable_pending(False)
+    result = _client_proxy_settings_with_trace_status(result)
+    if migration is not None:
+        result["trace_prompt_logging_migration"] = migration
+        try:
+            dashboard_service.notify_dashboard_stream_listeners()
+        except NameError:
+            pass
+    return result
 
 
 def _prompt_cache_settle_delay_seconds() -> float:
@@ -1820,6 +2035,10 @@ def _dump_outbound_request_body(
         # Build a snapshot on the caller's thread so we don't race the request
         # handler mutating the body after we hand off; serialization happens
         # in the background thread.
+        try:
+            upstream_wire_bytes = json.dumps(upstream_body, default=util._json_default).encode("utf-8")
+        except (TypeError, ValueError):
+            upstream_wire_bytes = None
         snapshot = {
             "request_id": request_id,
             "time": util.utc_now_iso(),
@@ -1830,9 +2049,15 @@ def _dump_outbound_request_body(
             "requested_model": requested_model,
             "resolved_model": resolved_model,
             "outbound_headers": dict(outbound_headers) if isinstance(outbound_headers, dict) else None,
-            "request_body": request_body,
-            "upstream_body": upstream_body,
+            "request_body": _protect_prompt_trace_value(request_body),
+            "upstream_body": _protect_prompt_trace_value(upstream_body),
         }
+        if upstream_wire_bytes is not None:
+            snapshot["upstream_body_wire"] = _protect_prompt_trace_value(
+                upstream_wire_bytes.decode("utf-8", errors="replace")
+            )
+            snapshot["upstream_body_wire_size"] = len(upstream_wire_bytes)
+            snapshot["upstream_body_wire_sha256"] = hashlib.sha256(upstream_wire_bytes).hexdigest()
         safe_rid = "".join(ch for ch in str(request_id) if ch.isalnum() or ch in ("-", "_")) or "request"
         out_path = os.path.join(dump_dir, f"{safe_rid}.json")
         executor = _get_request_body_dump_executor()
@@ -1849,22 +2074,191 @@ def _write_request_body_dump(out_path: str, dump_dir: str, snapshot: dict) -> No
     out of the worker.
     """
     try:
-        upstream_body = snapshot.get("upstream_body")
-        try:
-            wire_bytes = json.dumps(upstream_body, default=util._json_default).encode("utf-8")
-        except (TypeError, ValueError):
-            wire_bytes = None
-        if wire_bytes is not None:
-            snapshot["upstream_body_wire"] = wire_bytes.decode("utf-8", errors="replace")
-            snapshot["upstream_body_wire_size"] = len(wire_bytes)
-            snapshot["upstream_body_wire_sha256"] = hashlib.sha256(wire_bytes).hexdigest()
         with _REQUEST_BODY_DUMP_LOCK:
+            if isinstance(snapshot, dict):
+                for field in ("request_body", "upstream_body", "upstream_body_wire"):
+                    if field not in snapshot:
+                        continue
+                    value = snapshot.get(field)
+                    if value is None or trace_prompt_security.is_encrypted_payload(value):
+                        continue
+                    snapshot[field] = _protect_prompt_trace_value(value)
             os.makedirs(dump_dir, exist_ok=True)
             with open(out_path, "w", encoding="utf-8") as f:
                 json.dump(snapshot, f, default=util._json_default)
             _enforce_body_dump_retention_locked(dump_dir)
     except Exception as exc:  # pragma: no cover - dump must never raise
         print(f"Warning: failed to write request body dump: {exc}", file=sys.stderr, flush=True)
+
+
+def _encrypt_prompt_fields_for_storage(payload: dict, fields: tuple[str, ...], key: bytes, salt: str) -> int:
+    changed = 0
+    for field in fields:
+        if field not in payload:
+            continue
+        value = payload.get(field)
+        if value is None or trace_prompt_security.is_encrypted_payload(value):
+            continue
+        payload[field] = trace_prompt_security.encrypt_payload(value, key, salt)
+        changed += 1
+    return changed
+
+
+def _migrate_prompt_jsonl_file(
+    path: str,
+    fields: tuple[str, ...],
+    key: bytes,
+    salt: str,
+    *,
+    lock=None,
+) -> dict[str, int | str]:
+    if lock is not None:
+        with lock:
+            return _migrate_prompt_jsonl_file(path, fields, key, salt)
+    stats: dict[str, int | str] = {"path": path, "rows": 0, "encrypted_fields": 0}
+    if not os.path.exists(path):
+        return stats
+    log_dir = os.path.dirname(path) or TOKEN_DIR
+    os.makedirs(log_dir, exist_ok=True)
+    changed_any = False
+    try:
+        fd, temp_path = tempfile.mkstemp(prefix="trace-prompt-migrate-", suffix=".jsonl", dir=log_dir)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as out_f, open(path, encoding="utf-8") as in_f:
+                for line in in_f:
+                    raw_line = line.rstrip("\n")
+                    if not raw_line:
+                        out_f.write(line)
+                        continue
+                    try:
+                        row = json.loads(raw_line)
+                    except json.JSONDecodeError:
+                        out_f.write(line)
+                        continue
+                    if not isinstance(row, dict):
+                        out_f.write(line)
+                        continue
+                    stats["rows"] = int(stats["rows"]) + 1
+                    changed_fields = _encrypt_prompt_fields_for_storage(row, fields, key, salt)
+                    if changed_fields:
+                        changed_any = True
+                        stats["encrypted_fields"] = int(stats["encrypted_fields"]) + changed_fields
+                    out_f.write(json.dumps(row, separators=(",", ":"), default=util._json_default))
+                    out_f.write("\n")
+            if changed_any:
+                os.replace(temp_path, path)
+            else:
+                os.unlink(temp_path)
+        finally:
+            if os.path.exists(temp_path):
+                try:
+                    os.unlink(temp_path)
+                except OSError:
+                    pass
+    except OSError as exc:
+        stats["error"] = str(exc)
+    return stats
+
+
+def _migrate_prompt_body_dump_dir(dump_dir: str, key: bytes, salt: str, *, lock=None) -> dict[str, int | str]:
+    if lock is not None:
+        with lock:
+            return _migrate_prompt_body_dump_dir(dump_dir, key, salt)
+    stats: dict[str, int | str] = {"path": dump_dir, "files": 0, "encrypted_fields": 0}
+    if not os.path.isdir(dump_dir):
+        return stats
+    for name in os.listdir(dump_dir):
+        if not name.endswith(".json"):
+            continue
+        path = os.path.join(dump_dir, name)
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, encoding="utf-8") as f:
+                payload = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        changed_fields = 0
+        for field in ("request_body", "upstream_body", "upstream_body_wire"):
+            if field not in payload:
+                continue
+            value = payload.get(field)
+            if value is None or trace_prompt_security.is_encrypted_payload(value):
+                continue
+            payload[field] = trace_prompt_security.encrypt_payload(value, key, salt)
+            changed_fields += 1
+        if not changed_fields:
+            continue
+        try:
+            fd, temp_path = tempfile.mkstemp(prefix="trace-prompt-body-", suffix=".json", dir=os.path.dirname(path))
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as out_f:
+                    json.dump(payload, out_f, separators=(",", ":"), default=util._json_default)
+                os.replace(temp_path, path)
+            finally:
+                if os.path.exists(temp_path):
+                    try:
+                        os.unlink(temp_path)
+                    except OSError:
+                        pass
+        except OSError:
+            continue
+        stats["files"] = int(stats["files"]) + 1
+        stats["encrypted_fields"] = int(stats["encrypted_fields"]) + changed_fields
+    return stats
+
+
+def _migrate_in_memory_prompt_usage_events(key: bytes, salt: str, *, lock=None) -> int:
+    if lock is not None:
+        with lock:
+            return _migrate_in_memory_prompt_usage_events(key, salt)
+    migrated = 0
+    for event in usage_tracker.state.recent_usage_events:
+        if not isinstance(event, dict) or "request_prompt" not in event:
+            continue
+        value = event.get("request_prompt")
+        if value is None or trace_prompt_security.is_encrypted_payload(value):
+            continue
+        event["request_prompt"] = trace_prompt_security.encrypt_payload(value, key, salt)
+        migrated += 1
+    return migrated
+
+
+def _protect_plan_prompt_trace_state(plan: UpstreamRequestPlan) -> None:
+    if not _trace_prompt_logging_enabled():
+        return
+    for payload in (plan.usage_event, plan.trace_context):
+        if not isinstance(payload, dict) or "request_prompt" not in payload:
+            continue
+        value = payload.get("request_prompt")
+        if value is None or trace_prompt_security.is_encrypted_payload(value):
+            continue
+        payload["request_prompt"] = _protect_prompt_trace_value(value)
+
+
+def _migrate_existing_prompt_trace_logs(key: bytes, salt: str) -> dict[str, object]:
+    with usage_tracker.state.usage_log_lock:
+        usage_log_stats = _migrate_prompt_jsonl_file(
+            usage_tracker.usage_log_file,
+            ("request_prompt",),
+            key,
+            salt,
+        )
+        memory_usage_events = _migrate_in_memory_prompt_usage_events(key, salt)
+    return {
+        "usage_log": usage_log_stats,
+        "request_trace": _migrate_prompt_jsonl_file(
+            request_trace_log_path(),
+            ("request_prompt", "source_body", "upstream_body"),
+            key,
+            salt,
+            lock=_REQUEST_TRACE_LOCK,
+        ),
+        "request_bodies": _migrate_prompt_body_dump_dir(request_body_dump_dir(), key, salt, lock=_REQUEST_BODY_DUMP_LOCK),
+        "memory_usage_events": memory_usage_events,
+    }
 
 
 def _enforce_body_dump_retention_locked(dump_dir: str) -> None:
@@ -2210,8 +2604,9 @@ def _emit_request_trace_start(
             request_body if isinstance(request_body, dict) else upstream_body
         )
     if prompt_preview:
-        payload["request_prompt"] = prompt_preview
-        context["request_prompt"] = prompt_preview
+        protected_prompt_preview = _protect_prompt_trace_value(prompt_preview)
+        payload["request_prompt"] = protected_prompt_preview
+        context["request_prompt"] = protected_prompt_preview
     if initiator_verdict is not None:
         payload["initiator_verdict"] = initiator_verdict
         context["initiator_verdict"] = initiator_verdict
@@ -2248,6 +2643,7 @@ def _finish_usage_and_trace(
 ) -> None:
     if isinstance(plan, UpstreamRequestPlan):
         try:
+            _protect_plan_prompt_trace_state(plan)
             usage_tracker.finish_event(
                 plan.usage_event,
                 status_code,
@@ -2272,10 +2668,12 @@ def _finish_usage_and_trace(
                 if isinstance(reasoning_text, str) and reasoning_text:
                     trace_payload["reasoning_text"] = _trim_trace_text(reasoning_text)
                 if status_code >= 400:
-                    trace_payload["source_body"] = _trim_trace_field(
-                        plan.source_body if isinstance(plan.source_body, dict) else plan.body
+                    trace_payload["source_body"] = _protect_prompt_trace_value(
+                        _trim_trace_field(plan.source_body if isinstance(plan.source_body, dict) else plan.body)
                     )
-                    trace_payload["upstream_body"] = _trim_trace_field(plan.body)
+                    trace_payload["upstream_body"] = _protect_prompt_trace_value(
+                        _trim_trace_field(plan.body)
+                    )
                     trace_payload["outbound_headers"] = _header_trace_subset(plan.headers)
                     if isinstance(response_payload, dict):
                         trace_payload["response_payload"] = _trim_trace_field(response_payload)
@@ -2344,8 +2742,9 @@ def _prepare_upstream_request(
         initiator_verdict = trace_metadata.get("initiator_verdict")
     prompt_preview = _extract_prompt_preview(
         source_body if isinstance(source_body, dict) else body,
-        truncate=initiator != "user",
+        truncate=initiator != "user" and not _trace_prompt_active_key(),
     )
+    stored_prompt_preview = _protect_prompt_trace_value(prompt_preview) if prompt_preview else None
     usage_event = usage_tracker.start_event(
         request,
         requested_model,
@@ -2355,7 +2754,7 @@ def _prepare_upstream_request(
         request_body=body,
         upstream_path=upstream_path,
         outbound_headers=headers,
-        prompt_preview=prompt_preview,
+        prompt_preview=stored_prompt_preview,
         initiator_verdict=initiator_verdict if isinstance(initiator_verdict, dict) else None,
     )
     auto_update_runtime_controller.note_request_started(request_id)
@@ -2379,7 +2778,7 @@ def _prepare_upstream_request(
             upstream_body=body,
             outbound_headers=headers,
             trace_metadata=trace_metadata,
-            prompt_preview=prompt_preview,
+            prompt_preview=stored_prompt_preview,
         )
     return (
         UpstreamRequestPlan(
@@ -3920,14 +4319,36 @@ async def safeguard_config_api(request: Request):
 
 @app.get("/api/config/client-proxy")
 async def client_proxy_status_api():
-    return JSONResponse(content=client_proxy_config_service.proxy_client_status_payload())
+    payload = client_proxy_config_service.proxy_client_status_payload()
+    settings = payload.get("settings")
+    if isinstance(settings, dict):
+        payload["settings"] = _client_proxy_settings_with_trace_status(settings)
+    return JSONResponse(content=payload)
 
 
 @app.post("/api/config/client-proxy/settings")
 async def client_proxy_settings_api(request: Request):
     payload = await parse_json_request(request)
-    result = client_proxy_config_service.save_client_proxy_settings(payload)
+    result = _save_client_proxy_settings_with_trace_prompt_logging(payload)
     return JSONResponse(content=result)
+
+
+@app.post("/api/trace-prompts/unlock")
+async def trace_prompts_unlock_api(request: Request):
+    payload = await parse_json_request(request)
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Request body must be an object")
+    result = _unlock_trace_prompt_logging(payload.get("password") if isinstance(payload.get("password"), str) else "")
+    return JSONResponse(content=result, headers={"Cache-Control": "no-store"})
+
+
+@app.post("/api/trace-prompts/reset-password")
+async def trace_prompts_reset_password_api(request: Request):
+    payload = await parse_json_request(request)
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Request body must be an object")
+    result = _reset_trace_prompt_logging_password(payload.get("password") if isinstance(payload.get("password"), str) else "")
+    return JSONResponse(content=result, headers={"Cache-Control": "no-store"})
 
 
 @app.get("/api/config/model-remapping")
