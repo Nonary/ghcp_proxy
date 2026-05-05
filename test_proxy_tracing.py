@@ -125,6 +125,36 @@ class ProxyTracingTests(unittest.TestCase):
             },
         )
 
+    def test_write_request_trace_line_recreates_deleted_trace_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            trace_path = os.path.join(tmp, "deleted", "request-trace.jsonl")
+
+            proxy._write_request_trace_line(trace_path, '{"event":"request_started"}\n')
+
+            with open(trace_path, encoding="utf-8") as f:
+                self.assertEqual(f.readline(), '{"event":"request_started"}\n')
+
+    def test_append_request_trace_schedules_file_write(self):
+        class RecordingExecutor:
+            def __init__(self):
+                self.calls = []
+
+            def submit(self, *args):
+                self.calls.append(args)
+
+        executor = RecordingExecutor()
+        with (
+            mock.patch.object(proxy, "request_tracing_enabled", return_value=True),
+            mock.patch.object(proxy, "request_trace_log_path", return_value="trace.jsonl"),
+            mock.patch.object(proxy, "_get_request_trace_executor", return_value=executor),
+        ):
+            proxy._append_request_trace({"event": "request_started"})
+
+        self.assertEqual(len(executor.calls), 1)
+        self.assertIs(executor.calls[0][0], proxy._write_request_trace_line)
+        self.assertEqual(executor.calls[0][1], "trace.jsonl")
+        self.assertEqual(executor.calls[0][2], '{"event":"request_started"}\n')
+
     def test_prompt_cache_affinity_diagnostics_reports_header_drift(self):
         body = {"model": "gpt-5.5", "input": "hi", "prompt_cache_key": "cache-123"}
         with proxy._PROMPT_CACHE_AFFINITY_TRACE_LOCK:

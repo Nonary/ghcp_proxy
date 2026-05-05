@@ -2006,11 +2006,20 @@ def _append_request_trace(payload: dict, *, force: bool = False) -> None:
         return
     trace_path = request_trace_log_path()
     try:
-        os.makedirs(os.path.dirname(trace_path), exist_ok=True)
+        line = json.dumps(payload, separators=(",", ":"), default=util._json_default) + "\n"
+        executor = _get_request_trace_executor()
+        executor.submit(_write_request_trace_line, trace_path, line)
+    except Exception as exc:
+        print(f"Warning: failed to schedule request trace log write: {exc}", file=sys.stderr, flush=True)
+
+
+def _write_request_trace_line(trace_path: str, line: str) -> None:
+    try:
+        log_dir = os.path.dirname(trace_path) or TOKEN_DIR
+        os.makedirs(log_dir, exist_ok=True)
         with _REQUEST_TRACE_LOCK:
             with open(trace_path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(payload, separators=(",", ":"), default=util._json_default))
-                f.write("\n")
+                f.write(line)
             _enforce_trace_retention_locked(trace_path)
     except OSError as exc:
         print(f"Warning: failed to write request trace log: {exc}", file=sys.stderr, flush=True)
@@ -2019,6 +2028,21 @@ def _append_request_trace(payload: dict, *, force: bool = False) -> None:
 _REQUEST_BODY_DUMP_LOCK = threading.Lock()
 _REQUEST_BODY_DUMP_EXECUTOR: "concurrent.futures.ThreadPoolExecutor | None" = None
 _REQUEST_BODY_DUMP_EXECUTOR_LOCK = threading.Lock()
+_REQUEST_TRACE_EXECUTOR: "concurrent.futures.ThreadPoolExecutor | None" = None
+_REQUEST_TRACE_EXECUTOR_LOCK = threading.Lock()
+
+
+def _get_request_trace_executor() -> "concurrent.futures.ThreadPoolExecutor":
+    global _REQUEST_TRACE_EXECUTOR
+    if _REQUEST_TRACE_EXECUTOR is not None:
+        return _REQUEST_TRACE_EXECUTOR
+    with _REQUEST_TRACE_EXECUTOR_LOCK:
+        if _REQUEST_TRACE_EXECUTOR is None:
+            import concurrent.futures
+            _REQUEST_TRACE_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="ghcp-trace"
+            )
+    return _REQUEST_TRACE_EXECUTOR
 
 
 def _get_request_body_dump_executor() -> "concurrent.futures.ThreadPoolExecutor":
