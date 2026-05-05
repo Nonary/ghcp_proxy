@@ -1,5 +1,6 @@
 __pycache__/
 *.pyc
+.env
 .ghcp_proxy-cache.sqlite3
 .ghcp_proxy-cache*
 .tmp/

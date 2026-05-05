@@ -41,6 +41,7 @@
     a { color: inherit; text-decoration: none; }
     button { font-family: inherit; }
     code, .mono { font-family: "JetBrains Mono", "SF Mono", Consolas, monospace; font-size: 0.85em; }
+    .detail-value.mono { word-break: break-all; }
 
     /* ─── Layout shell ──────────────────────────────────────────── */
     .app {
@@ -523,6 +524,9 @@
     }
     .copy-btn:hover { color: var(--text); }
     .req-table .req-id { display: inline-flex; align-items: center; gap: 6px; font-family: "JetBrains Mono", monospace; font-size: 0.78rem; color: var(--muted); }
+    .session-id-cell { max-width: 420px; }
+    .session-id-full { display: inline-flex; align-items: center; gap: 6px; max-width: 100%; font-family: "JetBrains Mono", monospace; font-size: 0.76rem; color: var(--text); word-break: break-all; }
+    .session-id-line { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
 
     .pager {
       display: flex; justify-content: space-between; align-items: center;
@@ -1699,7 +1703,7 @@
                       @click="selectedSessionKey = row.session_key; activeView = 'sessions'"
                       style="cursor: pointer;">
                     <td><span class="pill">{{ sourceLabel(row.source) }}</span></td>
-                    <td><span class="req-id"><span class="mono">{{ shortHash(row.session_display_id || row.session_id) }}</span><button class="copy-btn" @click.stop="copyText(row.session_display_id || row.session_id)" title="Copy"><svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button></span></td>
+                    <td class="session-id-cell"><span class="session-id-full"><span>{{ row.session_display_id || row.session_id || '-' }}</span><button class="copy-btn" @click.stop="copyText(row.session_display_id || row.session_id)" title="Copy full session ID"><svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button></span></td>
                     <td>{{ modelLabel(row.models) }}</td>
                     <td>{{ shortStamp(row.last_activity) }}</td>
                     <td>{{ sessionDurationLabel(row) }}</td>
@@ -2032,7 +2036,7 @@
                 <tr v-for="row in filteredSessions" :key="row.session_key"
                     @click="selectedSessionKey = row.session_key" style="cursor:pointer;">
                   <td><span class="pill">{{ sourceLabel(row.source) }}</span></td>
-                  <td><span class="mono">{{ shortHash(row.session_display_id || row.session_id) }}</span></td>
+                  <td class="session-id-cell"><span class="session-id-full"><span>{{ row.session_display_id || row.session_id || '-' }}</span><button class="copy-btn" @click.stop="copyText(row.session_display_id || row.session_id)" title="Copy full session ID"><svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button></span></td>
                   <td>{{ modelLabel(row.models) }}</td>
                   <td>{{ shortStamp(row.last_activity) }}</td>
                   <td>{{ sessionDurationLabel(row) }}</td>
@@ -2050,7 +2054,8 @@
           <div class="card-head">
             <div>
               <button class="tabbtn" @click="selectedSessionKey = ''">‹ Back to sessions</button>
-              <h3 style="margin-top:8px;">Session {{ shortHash(selectedSession.session_display_id || selectedSession.session_id) }}</h3>
+              <h3 style="margin-top:8px;">Session</h3>
+              <div class="session-id-line"><span class="session-id-full">{{ selectedSession.session_display_id || selectedSession.session_id || '-' }}</span><button class="copy-btn" @click.stop="copyText(selectedSession.session_display_id || selectedSession.session_id)" title="Copy full session ID"><svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button></div>
               <div class="subtle">{{ sourceLabel(selectedSession.source) }} · {{ modelLabel(selectedSession.models) }}</div>
             </div>
             <div class="subtle" style="text-align:right; line-height:1.5;">
@@ -2182,6 +2187,7 @@
                   <div><div class="detail-label">Premium</div><div class="detail-value">{{ selectedRequest.premium_requests ?? '-' }}</div></div>
                   <div><div class="detail-label">Duration</div><div class="detail-value">{{ selectedRequest.duration_ms != null ? `${selectedRequest.duration_ms} ms` : '-' }}</div></div>
                   <div><div class="detail-label">Cost</div><div class="detail-value">{{ money(selectedRequest.cost_usd) }}</div></div>
+                  <div><div class="detail-label">Session ID</div><div class="detail-value mono">{{ selectedRequest.session_id || '-' }}</div></div>
                   <div><div class="detail-label">Request ID</div><div class="detail-value mono">{{ selectedRequest.request_id || '-' }}</div></div>
                   <div><div class="detail-label">Server Request ID</div><div class="detail-value mono">{{ selectedRequest.server_request_id || '-' }}</div></div>
                 </div>
