@@ -1,5 +1,5 @@
-fastapi>=0.115,<1
-httpx[http2]>=0.27,<1
-uvicorn>=0.30,<1
-zstandard>=0.23,<1
-cryptography>=42,<47
+fastapi>=0.136.1,<1
+httpx[http2]>=0.28.1,<1
+uvicorn>=0.46.0,<1
+zstandard>=0.25.0,<1
+cryptography>=48.0.0,<49
