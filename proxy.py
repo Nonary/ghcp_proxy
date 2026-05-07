@@ -73,6 +73,7 @@ import update_notice
 import usage_reminder
 import usage_tracking
 import util
+from collections import deque
 from dataclasses import dataclass
 from threading import Lock, Thread
 from urllib.parse import urlsplit
@@ -192,6 +193,11 @@ CACHE_TRIPWIRE_CONSECUTIVE_HIT_THRESHOLD = 3
 CACHE_TRIPWIRE_REASON = "token_tripwire"
 CACHE_SETTLE_DELAY_SECONDS = 5.0
 PROMPT_DRIFT_SNAPSHOT_LIMIT = 32
+DEBUG_DETAIL_CONTEXT_REQUESTS = 20
+CACHE_BUST_DRIFT_PREVIOUS_TOKEN_THRESHOLD = 30_000
+CACHE_BUST_DRIFT_DROP_TOKEN_THRESHOLD = 20_000
+CACHE_BUST_DRIFT_CURRENT_RATIO_THRESHOLD = 0.5
+CACHE_BUST_DRIFT_ESTIMATED_CHARS_PER_TOKEN = 4
 
 safeguard_event_store = dashboard_module.create_safeguard_event_store()
 _CACHE_TRIPWIRE_LOCK = threading.Lock()
@@ -207,6 +213,20 @@ _TRACE_PROMPT_AES_KEY: bytes | None = None
 _TRACE_PROMPT_SALT: str | None = None
 _TRACE_PROMPT_PRIVATE_KEY_PEM: str | None = None
 _TRACE_PROMPT_ENABLE_PENDING = False
+_DEBUG_DETAIL_CAPTURE_LOCK = threading.Lock()
+_DEBUG_DETAIL_RECENT_REQUESTS: deque[dict] = deque(maxlen=DEBUG_DETAIL_CONTEXT_REQUESTS)
+_DEBUG_DETAIL_FUTURE_REMAINING = 0
+_DEBUG_DETAIL_INCIDENT_COUNTER = 0
+_DEBUG_DETAIL_ACTIVE_INCIDENT_ID: str | None = None
+
+
+def _reset_debug_detail_capture_state() -> None:
+    global _DEBUG_DETAIL_FUTURE_REMAINING, _DEBUG_DETAIL_INCIDENT_COUNTER, _DEBUG_DETAIL_ACTIVE_INCIDENT_ID
+    with _DEBUG_DETAIL_CAPTURE_LOCK:
+        _DEBUG_DETAIL_RECENT_REQUESTS.clear()
+        _DEBUG_DETAIL_FUTURE_REMAINING = 0
+        _DEBUG_DETAIL_INCIDENT_COUNTER = 0
+        _DEBUG_DETAIL_ACTIVE_INCIDENT_ID = None
 
 
 def _stream_with_update_notice(byte_iter, protocol: str, upstream_headers=None):
@@ -386,8 +406,11 @@ def _set_trace_prompt_enable_pending(enabled: bool) -> None:
         _TRACE_PROMPT_ENABLE_PENDING = bool(enabled)
 
 
-def _protect_prompt_trace_value(value):
-    if not _trace_prompt_logging_enabled():
+def _protect_prompt_trace_value(value, *, require_encryption: bool = False):
+    if trace_prompt_security.is_encrypted_payload(value):
+        return value
+    encryption_enabled = _trace_prompt_logging_enabled()
+    if not require_encryption and not encryption_enabled:
         return value
     public_key = _trace_prompt_public_key()
     if public_key:
@@ -395,11 +418,14 @@ def _protect_prompt_trace_value(value):
             return trace_prompt_security.encrypt_payload_with_public_key(value, public_key)
         except Exception as exc:
             print(f"Warning: failed to envelope-encrypt prompt trace payload: {exc}", file=sys.stderr, flush=True)
-    active = _trace_prompt_active_key()
-    if active is None:
+    with _TRACE_PROMPT_KEY_LOCK:
+        active_key = _TRACE_PROMPT_AES_KEY
+        active_salt = _TRACE_PROMPT_SALT
+    if active_key is not None and active_salt:
+        return trace_prompt_security.encrypt_payload(value, active_key, active_salt)
+    if require_encryption:
         return trace_prompt_security.locked_payload()
-    key, salt = active
-    return trace_prompt_security.encrypt_payload(value, key, salt)
+    return trace_prompt_security.locked_payload()
 
 
 def _decrypt_prompt_payload_for_dashboard(value):
@@ -1569,8 +1595,8 @@ def request_trace_log_path() -> str:
 
 
 def request_body_dump_enabled() -> bool:
-    # Default-on so cache-bust diagnosis has full outbound bytes for byte-diffing
-    # paired requests. Opt out with GHCP_DUMP_REQUEST_BODIES=0.
+    # Body dumps are still gated by the debug-detail privacy policy; this flag
+    # only controls whether approved encrypted full-detail captures are written.
     return _env_flag_default("GHCP_DUMP_REQUEST_BODIES", default=True)
 
 
@@ -1943,6 +1969,16 @@ def _prompt_cache_trace_lineage(
     return None
 
 
+def _prompt_projection_token_estimate(chars) -> int | None:
+    try:
+        char_count = int(chars)
+    except (TypeError, ValueError):
+        return None
+    if char_count <= 0:
+        return 0
+    return max(1, int(round(char_count / CACHE_BUST_DRIFT_ESTIMATED_CHARS_PER_TOKEN)))
+
+
 def _prompt_drift_diagnostics(
     *,
     request_id: str,
@@ -1979,6 +2015,8 @@ def _prompt_drift_diagnostics(
             "prompt_drifted": None,
             "current_prompt_item_count": prompt_item_count,
             "current_prompt_projection_fingerprint": snapshot["prompt_projection_fingerprint"],
+            "current_prompt_projection_chars": snapshot["prompt_projection_chars"],
+            "current_prompt_token_estimate": _prompt_projection_token_estimate(snapshot["prompt_projection_chars"]),
             "current_body_fingerprint": snapshot["body_fingerprint"],
         }
 
@@ -1994,6 +2032,10 @@ def _prompt_drift_diagnostics(
         "current_prompt_item_count": prompt_item_count,
         "previous_prompt_projection_fingerprint": previous.get("prompt_projection_fingerprint"),
         "current_prompt_projection_fingerprint": snapshot["prompt_projection_fingerprint"],
+        "previous_prompt_projection_chars": previous.get("prompt_projection_chars"),
+        "current_prompt_projection_chars": snapshot["prompt_projection_chars"],
+        "previous_prompt_token_estimate": _prompt_projection_token_estimate(previous.get("prompt_projection_chars")),
+        "current_prompt_token_estimate": _prompt_projection_token_estimate(snapshot["prompt_projection_chars"]),
         "previous_body_fingerprint": previous.get("body_fingerprint"),
         "current_body_fingerprint": snapshot["body_fingerprint"],
     }
@@ -2049,6 +2091,241 @@ def _prompt_cache_affinity_diagnostics(
         "previous": {field: previous.get(field) for field in changed_fields},
         "current": {field: snapshot.get(field) for field in changed_fields},
     }
+
+
+def _header_value_case_insensitive(headers: dict | None, name: str) -> str | None:
+    if not isinstance(headers, dict):
+        return None
+    target = str(name).lower()
+    for key, value in headers.items():
+        if isinstance(key, str) and key.lower() == target and isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _trace_metadata_verdict(trace_metadata: dict | None) -> dict:
+    if not isinstance(trace_metadata, dict):
+        return {}
+    verdict = trace_metadata.get("initiator_verdict")
+    return dict(verdict) if isinstance(verdict, dict) else {}
+
+
+def _debug_detail_always_capture_reasons(
+    outbound_headers: dict | None,
+    trace_metadata: dict | None,
+) -> list[str]:
+    reasons: list[str] = []
+    initiator = str(_header_value_case_insensitive(outbound_headers, "x-initiator") or "").strip().lower()
+    verdict = _trace_metadata_verdict(trace_metadata)
+    resolved_initiator = str(verdict.get("resolved_initiator") or "").strip().lower()
+    if initiator == "user" or resolved_initiator == "user":
+        reasons.append("user_initiated")
+    safeguard_reason = verdict.get("safeguard_reason")
+    if isinstance(safeguard_reason, str) and safeguard_reason.strip():
+        reasons.append("safeguarded")
+    return reasons
+
+
+def _is_cache_bust_prompt_drift(diagnostics: dict | None) -> bool:
+    if not isinstance(diagnostics, dict) or diagnostics.get("prompt_drifted") is not True:
+        return False
+    previous_tokens = diagnostics.get("previous_prompt_token_estimate")
+    current_tokens = diagnostics.get("current_prompt_token_estimate")
+    if not isinstance(previous_tokens, int) or not isinstance(current_tokens, int):
+        return False
+    if previous_tokens < CACHE_BUST_DRIFT_PREVIOUS_TOKEN_THRESHOLD:
+        return False
+    if previous_tokens - current_tokens < CACHE_BUST_DRIFT_DROP_TOKEN_THRESHOLD:
+        return False
+    return current_tokens <= int(previous_tokens * CACHE_BUST_DRIFT_CURRENT_RATIO_THRESHOLD)
+
+
+def _debug_detail_capture_info(
+    *,
+    reasons: list[str],
+    phase: str | None = None,
+    incident_id: str | None = None,
+    context_window: int = DEBUG_DETAIL_CONTEXT_REQUESTS,
+) -> dict:
+    info = {
+        "enabled": True,
+        "reasons": list(dict.fromkeys(reason for reason in reasons if reason)),
+        "encrypted": True,
+        "context_window": context_window,
+    }
+    if phase:
+        info["phase"] = phase
+    if incident_id:
+        info["incident_id"] = incident_id
+    return info
+
+
+def _with_debug_detail_capture_info(
+    snapshot: dict,
+    *,
+    reasons: list[str],
+    phase: str | None = None,
+    incident_id: str | None = None,
+) -> dict:
+    event = dict(snapshot)
+    event["debug_detail_capture"] = _debug_detail_capture_info(
+        reasons=reasons,
+        phase=phase,
+        incident_id=incident_id,
+    )
+    return event
+
+
+def _build_debug_detail_snapshot(
+    *,
+    request_id: str,
+    context: dict,
+    request: Request,
+    requested_model: str | None,
+    resolved_model: str | None,
+    request_body: dict | None,
+    upstream_body: dict | None,
+    outbound_headers: dict | None,
+) -> dict:
+    full_prompt_preview = _extract_prompt_preview(
+        request_body if isinstance(request_body, dict) else upstream_body,
+        truncate=False,
+    )
+    snapshot = {
+        "event": "request_debug_detail",
+        "time": util.utc_now_iso(),
+        "request_id": request_id,
+        "client_path": context.get("client_path") or getattr(getattr(request, "url", None), "path", None),
+        "upstream_host": context.get("upstream_host"),
+        "upstream_path": context.get("upstream_path"),
+        "method": getattr(request, "method", None),
+        "requested_model": requested_model,
+        "resolved_model": resolved_model,
+        "request_body_summary": _trace_body_summary(request_body),
+        "upstream_body_summary": _trace_body_summary(upstream_body),
+        "outbound_headers": _header_trace_subset(outbound_headers),
+    }
+    if full_prompt_preview:
+        snapshot["request_prompt"] = _protect_prompt_trace_value(
+            full_prompt_preview,
+            require_encryption=True,
+        )
+    if isinstance(request_body, dict):
+        snapshot["source_body"] = _protect_prompt_trace_value(request_body, require_encryption=True)
+    if isinstance(upstream_body, dict):
+        snapshot["upstream_body"] = _protect_prompt_trace_value(upstream_body, require_encryption=True)
+        try:
+            upstream_wire = json.dumps(upstream_body, default=util._json_default)
+        except (TypeError, ValueError):
+            upstream_wire = None
+        if upstream_wire is not None:
+            upstream_wire_bytes = upstream_wire.encode("utf-8", errors="replace")
+            snapshot["upstream_body_wire"] = _protect_prompt_trace_value(
+                upstream_wire,
+                require_encryption=True,
+            )
+            snapshot["upstream_body_wire_size"] = len(upstream_wire_bytes)
+            snapshot["upstream_body_wire_sha256"] = hashlib.sha256(upstream_wire_bytes).hexdigest()
+    return snapshot
+
+
+def _register_debug_detail_snapshot(
+    snapshot: dict,
+    *,
+    always_reasons: list[str],
+    cache_bust_drift: bool,
+) -> tuple[dict | None, list[dict]]:
+    """Register a protected full-detail snapshot and choose what to persist.
+
+    Normal trace rows retain only summaries. Full prompt/body detail is written
+    only for user/safeguarded requests, cache-bust trigger requests, and the
+    +/- DEBUG_DETAIL_CONTEXT_REQUESTS window around a large prompt-shrink drift.
+    """
+    global _DEBUG_DETAIL_FUTURE_REMAINING, _DEBUG_DETAIL_INCIDENT_COUNTER, _DEBUG_DETAIL_ACTIVE_INCIDENT_ID
+    always_reasons = list(dict.fromkeys(always_reasons))
+    detail_events: list[dict] = []
+    current_capture: dict | None = None
+
+    with _DEBUG_DETAIL_CAPTURE_LOCK:
+        incident_id = None
+        if cache_bust_drift:
+            _DEBUG_DETAIL_INCIDENT_COUNTER += 1
+            incident_id = f"cache-bust-{_DEBUG_DETAIL_INCIDENT_COUNTER}"
+            _DEBUG_DETAIL_ACTIVE_INCIDENT_ID = incident_id
+            for previous_snapshot in list(_DEBUG_DETAIL_RECENT_REQUESTS):
+                detail_events.append(
+                    _with_debug_detail_capture_info(
+                        previous_snapshot,
+                        reasons=["cache_bust_context"],
+                        phase="before",
+                        incident_id=incident_id,
+                    )
+                )
+            _DEBUG_DETAIL_FUTURE_REMAINING = DEBUG_DETAIL_CONTEXT_REQUESTS
+            current_reasons = [*always_reasons, "cache_bust_drift"]
+            current_capture = _debug_detail_capture_info(
+                reasons=current_reasons,
+                phase="trigger",
+                incident_id=incident_id,
+            )
+            detail_events.append(
+                _with_debug_detail_capture_info(
+                    snapshot,
+                    reasons=current_reasons,
+                    phase="trigger",
+                    incident_id=incident_id,
+                )
+            )
+        elif _DEBUG_DETAIL_FUTURE_REMAINING > 0:
+            _DEBUG_DETAIL_FUTURE_REMAINING -= 1
+            current_reasons = [*always_reasons, "cache_bust_context"]
+            incident_id = _DEBUG_DETAIL_ACTIVE_INCIDENT_ID
+            current_capture = _debug_detail_capture_info(
+                reasons=current_reasons,
+                phase="after",
+                incident_id=incident_id,
+            )
+            detail_events.append(
+                _with_debug_detail_capture_info(
+                    snapshot,
+                    reasons=current_reasons,
+                    phase="after",
+                    incident_id=incident_id,
+                )
+            )
+            if _DEBUG_DETAIL_FUTURE_REMAINING <= 0:
+                _DEBUG_DETAIL_ACTIVE_INCIDENT_ID = None
+        elif always_reasons:
+            current_capture = _debug_detail_capture_info(reasons=always_reasons)
+            detail_events.append(
+                _with_debug_detail_capture_info(
+                    snapshot,
+                    reasons=always_reasons,
+                )
+            )
+
+        _DEBUG_DETAIL_RECENT_REQUESTS.append(snapshot)
+
+    return current_capture, detail_events
+
+
+def _trace_context_allows_full_debug_detail(trace_context: dict | None) -> bool:
+    if not isinstance(trace_context, dict):
+        return False
+    capture = trace_context.get("debug_detail_capture")
+    return isinstance(capture, dict) and capture.get("enabled") is True
+
+
+def _plan_allows_full_debug_detail(plan: "UpstreamRequestPlan | None") -> bool:
+    if not isinstance(plan, UpstreamRequestPlan):
+        return False
+    if _trace_context_allows_full_debug_detail(plan.trace_context):
+        return True
+    if "user_initiated" in _debug_detail_always_capture_reasons(plan.headers, plan.trace_context):
+        return True
+    if "safeguarded" in _debug_detail_always_capture_reasons(plan.headers, plan.trace_context):
+        return True
+    return False
 
 
 def _trace_response_summary(
@@ -2167,15 +2444,16 @@ def _dump_outbound_request_body(
     request_body: dict | None,
     upstream_body: dict | None,
     outbound_headers: dict | None,
+    require_encryption: bool = True,
 ) -> None:
-    """Persist the exact outbound body and full headers for a request.
+    """Persist the exact outbound body and full headers for an approved capture.
 
-    Default-on so paired hit/bust analysis can byte-diff what we sent upstream
-    — which fingerprints in the trace cannot expose. Opt out with
-    GHCP_DUMP_REQUEST_BODIES=0. The actual file write runs on a background
-    thread so it never blocks the event loop, and any failure is swallowed
-    so a serialization issue cannot fail the upstream request itself. Files
-    are bounded by REQUEST_TRACE_HISTORY_LIMIT.
+    Callers only invoke this for user/safeguarded requests or cache-bust debug
+    windows. Prompt-bearing fields are encrypted (or stored as locked payloads
+    if no key is available). The actual file write runs on a background thread
+    so it never blocks the event loop, and any failure is swallowed so a
+    serialization issue cannot fail the upstream request itself. Files are
+    bounded by REQUEST_TRACE_HISTORY_LIMIT.
     """
     if not request_body_dump_enabled():
         return
@@ -2198,12 +2476,13 @@ def _dump_outbound_request_body(
             "requested_model": requested_model,
             "resolved_model": resolved_model,
             "outbound_headers": dict(outbound_headers) if isinstance(outbound_headers, dict) else None,
-            "request_body": _protect_prompt_trace_value(request_body),
-            "upstream_body": _protect_prompt_trace_value(upstream_body),
+            "request_body": _protect_prompt_trace_value(request_body, require_encryption=require_encryption),
+            "upstream_body": _protect_prompt_trace_value(upstream_body, require_encryption=require_encryption),
         }
         if upstream_wire_bytes is not None:
             snapshot["upstream_body_wire"] = _protect_prompt_trace_value(
-                upstream_wire_bytes.decode("utf-8", errors="replace")
+                upstream_wire_bytes.decode("utf-8", errors="replace"),
+                require_encryption=require_encryption,
             )
             snapshot["upstream_body_wire_size"] = len(upstream_wire_bytes)
             snapshot["upstream_body_wire_sha256"] = hashlib.sha256(upstream_wire_bytes).hexdigest()
@@ -2231,7 +2510,7 @@ def _write_request_body_dump(out_path: str, dump_dir: str, snapshot: dict) -> No
                     value = snapshot.get(field)
                     if value is None or trace_prompt_security.is_encrypted_payload(value):
                         continue
-                    snapshot[field] = _protect_prompt_trace_value(value)
+                    snapshot[field] = _protect_prompt_trace_value(value, require_encryption=True)
             os.makedirs(dump_dir, exist_ok=True)
             with open(out_path, "w", encoding="utf-8") as f:
                 json.dump(snapshot, f, default=util._json_default)
@@ -2376,15 +2655,13 @@ def _migrate_in_memory_prompt_usage_events(key: bytes, salt: str, *, lock=None) 
 
 
 def _protect_plan_prompt_trace_state(plan: UpstreamRequestPlan) -> None:
-    if not _trace_prompt_logging_enabled():
-        return
     for payload in (plan.usage_event, plan.trace_context):
         if not isinstance(payload, dict) or "request_prompt" not in payload:
             continue
         value = payload.get("request_prompt")
         if value is None or trace_prompt_security.is_encrypted_payload(value):
             continue
-        payload["request_prompt"] = _protect_prompt_trace_value(value)
+        payload["request_prompt"] = _protect_prompt_trace_value(value, require_encryption=True)
 
 
 def _migrate_existing_prompt_trace_logs(key: bytes, salt: str) -> dict[str, object]:
@@ -2736,6 +3013,27 @@ def _emit_request_trace_start(
     if cache_affinity_diagnostics is not None:
         trace_details = dict(trace_details)
         trace_details["prompt_cache_affinity_drift"] = cache_affinity_diagnostics
+    always_capture_reasons = _debug_detail_always_capture_reasons(outbound_headers, trace_metadata)
+    cache_bust_drift = _is_cache_bust_prompt_drift(prompt_drift_diagnostics)
+    debug_detail_snapshot = _build_debug_detail_snapshot(
+        request_id=request_id,
+        context=context,
+        request=request,
+        requested_model=requested_model,
+        resolved_model=resolved_model,
+        request_body=request_body,
+        upstream_body=upstream_body,
+        outbound_headers=outbound_headers,
+    )
+    debug_detail_capture, debug_detail_events = _register_debug_detail_snapshot(
+        debug_detail_snapshot,
+        always_reasons=always_capture_reasons,
+        cache_bust_drift=cache_bust_drift,
+    )
+    if debug_detail_capture is not None:
+        context["debug_detail_capture"] = debug_detail_capture
+        if "request_prompt" in debug_detail_snapshot:
+            context["request_prompt"] = debug_detail_snapshot["request_prompt"]
     payload = {
         "event": "request_started",
         "time": util.utc_now_iso(),
@@ -2748,28 +3046,33 @@ def _emit_request_trace_start(
         "outbound_headers": _header_trace_subset(outbound_headers),
         "trace": trace_details,
     }
-    if prompt_preview is None:
+    if debug_detail_capture is not None and prompt_preview is None:
         prompt_preview = _extract_prompt_preview(
-            request_body if isinstance(request_body, dict) else upstream_body
+            request_body if isinstance(request_body, dict) else upstream_body,
+            truncate=False,
         )
-    if prompt_preview:
-        protected_prompt_preview = _protect_prompt_trace_value(prompt_preview)
+    if debug_detail_capture is not None and prompt_preview:
+        protected_prompt_preview = _protect_prompt_trace_value(prompt_preview, require_encryption=True)
         payload["request_prompt"] = protected_prompt_preview
         context["request_prompt"] = protected_prompt_preview
     if initiator_verdict is not None:
         payload["initiator_verdict"] = initiator_verdict
         context["initiator_verdict"] = initiator_verdict
     _append_request_trace(payload)
-    _dump_outbound_request_body(
-        request_id=request_id,
-        context=context,
-        request=request,
-        requested_model=requested_model,
-        resolved_model=resolved_model,
-        request_body=request_body,
-        upstream_body=upstream_body,
-        outbound_headers=outbound_headers,
-    )
+    for debug_detail_event in debug_detail_events:
+        _append_request_trace(debug_detail_event)
+    if debug_detail_capture is not None:
+        _dump_outbound_request_body(
+            request_id=request_id,
+            context=context,
+            request=request,
+            requested_model=requested_model,
+            resolved_model=resolved_model,
+            request_body=request_body,
+            upstream_body=upstream_body,
+            outbound_headers=outbound_headers,
+            require_encryption=True,
+        )
     return context
 
 
@@ -2817,12 +3120,20 @@ def _finish_usage_and_trace(
                 if isinstance(reasoning_text, str) and reasoning_text:
                     trace_payload["reasoning_text"] = _trim_trace_text(reasoning_text)
                 if status_code >= 400:
-                    trace_payload["source_body"] = _protect_prompt_trace_value(
-                        _trim_trace_field(plan.source_body if isinstance(plan.source_body, dict) else plan.body)
-                    )
-                    trace_payload["upstream_body"] = _protect_prompt_trace_value(
-                        _trim_trace_field(plan.body)
-                    )
+                    if _plan_allows_full_debug_detail(plan):
+                        trace_payload["source_body"] = _protect_prompt_trace_value(
+                            _trim_trace_field(plan.source_body if isinstance(plan.source_body, dict) else plan.body),
+                            require_encryption=True,
+                        )
+                        trace_payload["upstream_body"] = _protect_prompt_trace_value(
+                            _trim_trace_field(plan.body),
+                            require_encryption=True,
+                        )
+                    else:
+                        trace_payload["source_body"] = _trace_body_summary(
+                            plan.source_body if isinstance(plan.source_body, dict) else plan.body
+                        )
+                        trace_payload["upstream_body"] = _trace_body_summary(plan.body)
                     trace_payload["outbound_headers"] = _header_trace_subset(plan.headers)
                     if isinstance(response_payload, dict):
                         trace_payload["response_payload"] = _trim_trace_field(response_payload)
@@ -2889,11 +3200,19 @@ def _prepare_upstream_request(
     initiator_verdict = None
     if isinstance(trace_metadata, dict):
         initiator_verdict = trace_metadata.get("initiator_verdict")
-    prompt_preview = _extract_prompt_preview(
-        source_body if isinstance(source_body, dict) else body,
-        truncate=initiator != "user" and not _trace_prompt_active_key(),
-    )
-    stored_prompt_preview = _protect_prompt_trace_value(prompt_preview) if prompt_preview else None
+    always_capture_reasons = _debug_detail_always_capture_reasons(headers, trace_metadata)
+    prompt_preview = None
+    stored_prompt_preview = None
+    if always_capture_reasons:
+        prompt_preview = _extract_prompt_preview(
+            source_body if isinstance(source_body, dict) else body,
+            truncate=False,
+        )
+        stored_prompt_preview = (
+            _protect_prompt_trace_value(prompt_preview, require_encryption=True)
+            if prompt_preview
+            else None
+        )
     usage_event = usage_tracker.start_event(
         request,
         requested_model,
@@ -2929,6 +3248,13 @@ def _prepare_upstream_request(
             trace_metadata=trace_metadata,
             prompt_preview=stored_prompt_preview,
         )
+        if (
+            isinstance(usage_event, dict)
+            and "request_prompt" not in usage_event
+            and isinstance(trace_context, dict)
+            and "request_prompt" in trace_context
+        ):
+            usage_event["request_prompt"] = trace_context["request_prompt"]
     return (
         UpstreamRequestPlan(
             request_id=request_id,

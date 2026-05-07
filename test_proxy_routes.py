@@ -30,6 +30,7 @@ class ProxyRoutesTests(unittest.TestCase):
         proxy._CLIENT_PROXY_STARTUP_RESTORE_COMPLETE = False
         proxy._CLIENT_PROXY_SHUTDOWN_REVERT_COMPLETE = False
         proxy._set_trace_prompt_active_key(None, None)
+        proxy._reset_debug_detail_capture_state()
 
     def test_upstream_client_uses_single_connection_cache_lane(self):
         proxy._UPSTREAM_CLIENT = None

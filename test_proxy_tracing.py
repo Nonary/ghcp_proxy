@@ -15,6 +15,7 @@ class ProxyTracingTests(unittest.TestCase):
     def setUp(self):
         proxy._set_trace_prompt_active_key(None, None)
         proxy._set_trace_prompt_enable_pending(False)
+        proxy._reset_debug_detail_capture_state()
         self._settings_patcher = mock.patch.object(
             proxy.client_proxy_config_service,
             "load_client_proxy_settings",
@@ -32,6 +33,12 @@ class ProxyTracingTests(unittest.TestCase):
         self.addCleanup(proxy._set_trace_prompt_active_key, None, None)
 
     def test_prepare_upstream_request_keeps_full_prompt_preview_for_user_initiator(self):
+        try:
+            trace_prompt_security._crypto_primitives()
+        except RuntimeError as exc:
+            self.skipTest(str(exc))
+        salt = trace_prompt_security.new_salt()
+        key = trace_prompt_security.derive_key("pw", salt)
         request = SimpleNamespace(
             url=SimpleNamespace(path="/v1/responses"),
             method="POST",
@@ -52,6 +59,7 @@ class ProxyTracingTests(unittest.TestCase):
             mock.patch.object(proxy.usage_tracker, "start_event", return_value={"request_id": "req_123"}) as start_event,
             mock.patch.object(proxy, "_append_request_trace") as append_trace,
         ):
+            proxy._set_trace_prompt_active_key(key, salt)
             plan, error_response = proxy._prepare_upstream_request(
                 request,
                 body=source_body,
@@ -63,19 +71,225 @@ class ProxyTracingTests(unittest.TestCase):
                 error_response=proxy.format_translation.openai_error_response,
                 api_key="test-key",
             )
+            proxy._set_trace_prompt_active_key(None, None)
 
         self.assertIsNone(error_response)
         self.assertIsNotNone(plan)
 
         prompt_preview = start_event.call_args.kwargs["prompt_preview"]
+        prompt_preview = trace_prompt_security.decrypt_payload(prompt_preview, key=key)
         self.assertEqual(prompt_preview["system"], long_system)
         self.assertEqual(prompt_preview["user"], long_user)
         self.assertNotIn("system_truncated", prompt_preview)
         self.assertNotIn("user_truncated", prompt_preview)
 
+        trace_payloads = [call.args[0] for call in append_trace.call_args_list]
+        request_started = next(payload for payload in trace_payloads if payload["event"] == "request_started")
+        self.assertEqual(
+            trace_prompt_security.decrypt_payload(request_started["request_prompt"], key=key)["system"],
+            long_system,
+        )
+        detail = next(payload for payload in trace_payloads if payload["event"] == "request_debug_detail")
+        self.assertEqual(detail["debug_detail_capture"]["reasons"], ["user_initiated"])
+        self.assertEqual(
+            trace_prompt_security.decrypt_payload(detail["source_body"], key=key),
+            source_body,
+        )
+
+    def test_prepare_upstream_request_omits_prompt_for_basic_agent_trace(self):
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/responses"),
+            method="POST",
+            headers={},
+        )
+        body = {
+            "model": "gpt-5.4",
+            "messages": [
+                {"role": "system", "content": "do not retain me"},
+                {"role": "user", "content": "secret user prompt"},
+            ],
+        }
+
+        with (
+            mock.patch.object(proxy, "request_tracing_enabled", return_value=True),
+            mock.patch.object(proxy.usage_tracker, "start_event", return_value={"request_id": "req_agent"}) as start_event,
+            mock.patch.object(proxy, "_append_request_trace") as append_trace,
+            mock.patch.object(proxy, "_dump_outbound_request_body") as dump_body,
+        ):
+            plan, error_response = proxy._prepare_upstream_request(
+                request,
+                body=body,
+                requested_model="gpt-5.4",
+                resolved_model="gpt-5.4",
+                upstream_path="/chat/completions",
+                upstream_url="https://example.invalid/chat/completions",
+                header_builder=lambda _api_key, _request_id: {"X-Initiator": "agent"},
+                error_response=proxy.format_translation.openai_error_response,
+                api_key="test-key",
+            )
+
+        self.assertIsNone(error_response)
+        self.assertIsNotNone(plan)
+        self.assertIsNone(start_event.call_args.kwargs["prompt_preview"])
+        dump_body.assert_not_called()
+        self.assertEqual(append_trace.call_count, 1)
         trace_payload = append_trace.call_args.args[0]
-        self.assertEqual(trace_payload["request_prompt"]["system"], long_system)
-        self.assertEqual(trace_payload["request_prompt"]["user"], long_user)
+        self.assertEqual(trace_payload["event"], "request_started")
+        self.assertNotIn("request_prompt", trace_payload)
+        self.assertNotIn("debug_detail_capture", trace_payload)
+
+    def test_safeguarded_agent_request_gets_encrypted_debug_detail(self):
+        try:
+            trace_prompt_security._crypto_primitives()
+        except RuntimeError as exc:
+            self.skipTest(str(exc))
+        salt = trace_prompt_security.new_salt()
+        key = trace_prompt_security.derive_key("pw", salt)
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/responses"),
+            method="POST",
+            headers={},
+        )
+        body = {
+            "model": "gpt-5.4",
+            "messages": [{"role": "user", "content": "safeguarded prompt"}],
+        }
+
+        with (
+            mock.patch.object(proxy, "request_tracing_enabled", return_value=True),
+            mock.patch.object(proxy.usage_tracker, "start_event", return_value={"request_id": "req_safe"}) as start_event,
+            mock.patch.object(proxy, "_append_request_trace") as append_trace,
+            mock.patch.object(proxy, "_dump_outbound_request_body"),
+        ):
+            proxy._set_trace_prompt_active_key(key, salt)
+            try:
+                plan, error_response = proxy._prepare_upstream_request(
+                    request,
+                    body=body,
+                    requested_model="gpt-5.4",
+                    resolved_model="gpt-5.4",
+                    upstream_path="/chat/completions",
+                    upstream_url="https://example.invalid/chat/completions",
+                    header_builder=lambda _api_key, _request_id: {"X-Initiator": "agent"},
+                    error_response=proxy.format_translation.openai_error_response,
+                    api_key="test-key",
+                    trace_metadata={
+                        "initiator_verdict": {
+                            "candidate_initiator": "user",
+                            "resolved_initiator": "agent",
+                            "safeguard_reason": "cooldown",
+                        }
+                    },
+                )
+            finally:
+                proxy._set_trace_prompt_active_key(None, None)
+
+        self.assertIsNone(error_response)
+        self.assertIsNotNone(plan)
+        self.assertEqual(
+            trace_prompt_security.decrypt_payload(start_event.call_args.kwargs["prompt_preview"], key=key),
+            {"user": "safeguarded prompt"},
+        )
+        detail_events = [
+            call.args[0]
+            for call in append_trace.call_args_list
+            if call.args[0].get("event") == "request_debug_detail"
+        ]
+        self.assertEqual(len(detail_events), 1)
+        self.assertEqual(detail_events[0]["debug_detail_capture"]["reasons"], ["safeguarded"])
+        self.assertEqual(trace_prompt_security.decrypt_payload(detail_events[0]["source_body"], key=key), body)
+
+    def test_cache_bust_prompt_shrink_flushes_before_and_after_debug_detail(self):
+        try:
+            trace_prompt_security._crypto_primitives()
+        except RuntimeError as exc:
+            self.skipTest(str(exc))
+        salt = trace_prompt_security.new_salt()
+        key = trace_prompt_security.derive_key("pw", salt)
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/responses"),
+            method="POST",
+            headers={},
+        )
+        first_body = {
+            "model": "gpt-5.5",
+            "prompt_cache_key": "lineage",
+            "input": [{"type": "message", "role": "user", "content": "A" * 240}],
+        }
+        shrunk_body = {
+            "model": "gpt-5.5",
+            "prompt_cache_key": "lineage",
+            "input": [{"type": "message", "role": "user", "content": "short and different"}],
+        }
+        after_body = {
+            "model": "gpt-5.5",
+            "prompt_cache_key": "lineage",
+            "input": [{"type": "message", "role": "user", "content": "after context"}],
+        }
+
+        with (
+            mock.patch.object(proxy, "_append_request_trace") as append_trace,
+            mock.patch.object(proxy, "_dump_outbound_request_body"),
+            mock.patch.object(proxy, "CACHE_BUST_DRIFT_PREVIOUS_TOKEN_THRESHOLD", 10),
+            mock.patch.object(proxy, "CACHE_BUST_DRIFT_DROP_TOKEN_THRESHOLD", 5),
+        ):
+            proxy._set_trace_prompt_active_key(key, salt)
+            try:
+                proxy._emit_request_trace_start(
+                    request_id="req_before",
+                    request=request,
+                    upstream_url="https://example.invalid/responses",
+                    upstream_path="/v1/responses",
+                    requested_model="gpt-5.5",
+                    resolved_model="gpt-5.5",
+                    request_body=first_body,
+                    upstream_body=first_body,
+                    outbound_headers={"X-Initiator": "agent"},
+                )
+                proxy._emit_request_trace_start(
+                    request_id="req_trigger",
+                    request=request,
+                    upstream_url="https://example.invalid/responses",
+                    upstream_path="/v1/responses",
+                    requested_model="gpt-5.5",
+                    resolved_model="gpt-5.5",
+                    request_body=shrunk_body,
+                    upstream_body=shrunk_body,
+                    outbound_headers={"X-Initiator": "agent"},
+                )
+                proxy._emit_request_trace_start(
+                    request_id="req_after",
+                    request=request,
+                    upstream_url="https://example.invalid/responses",
+                    upstream_path="/v1/responses",
+                    requested_model="gpt-5.5",
+                    resolved_model="gpt-5.5",
+                    request_body=after_body,
+                    upstream_body=after_body,
+                    outbound_headers={"X-Initiator": "agent"},
+                )
+            finally:
+                proxy._set_trace_prompt_active_key(None, None)
+
+        detail_events = [
+            call.args[0]
+            for call in append_trace.call_args_list
+            if call.args[0].get("event") == "request_debug_detail"
+        ]
+        phases = [event["debug_detail_capture"].get("phase") for event in detail_events]
+        self.assertIn("before", phases)
+        self.assertIn("trigger", phases)
+        self.assertIn("after", phases)
+        before_event = next(event for event in detail_events if event["debug_detail_capture"].get("phase") == "before")
+        self.assertEqual(before_event["request_id"], "req_before")
+        self.assertEqual(
+            trace_prompt_security.decrypt_payload(before_event["source_body"], key=key),
+            first_body,
+        )
+        trigger_event = next(event for event in detail_events if event["debug_detail_capture"].get("phase") == "trigger")
+        self.assertIn("cache_bust_drift", trigger_event["debug_detail_capture"]["reasons"])
+        after_event = next(event for event in detail_events if event["debug_detail_capture"].get("phase") == "after")
+        self.assertEqual(after_event["request_id"], "req_after")
 
     def test_extract_prompt_preview_truncates_agent_requests_normally(self):
         long_system = "system-" + ("s" * 5000)
@@ -218,6 +432,12 @@ class ProxyTracingTests(unittest.TestCase):
         self.assertEqual(drift["current"]["x_agent_task_id"], "task-b")
 
     def test_finish_usage_and_trace_emits_failure_diagnostic_for_bridge_request(self):
+        try:
+            trace_prompt_security._crypto_primitives()
+        except RuntimeError as exc:
+            self.skipTest(str(exc))
+        salt = trace_prompt_security.new_salt()
+        key = trace_prompt_security.derive_key("pw", salt)
         plan = proxy.UpstreamRequestPlan(
             request_id="req_123",
             upstream_url="https://example.invalid/chat/completions",
@@ -243,6 +463,7 @@ class ProxyTracingTests(unittest.TestCase):
             mock.patch.object(proxy, "request_tracing_enabled", return_value=False),
             mock.patch.object(proxy, "_append_request_trace") as append_trace,
         ):
+            proxy._set_trace_prompt_active_key(key, salt)
             proxy._finish_usage_and_trace(
                 plan,
                 400,
@@ -250,6 +471,7 @@ class ProxyTracingTests(unittest.TestCase):
                 response_payload=response_payload,
                 response_text="unsupported field: tool_choice",
             )
+            proxy._set_trace_prompt_active_key(None, None)
 
         append_trace.assert_called_once()
         trace_payload = append_trace.call_args.args[0]
@@ -258,8 +480,14 @@ class ProxyTracingTests(unittest.TestCase):
         self.assertTrue(trace_kwargs["force"])
         self.assertEqual(trace_payload["requested_model"], "gpt-5.4-mini")
         self.assertEqual(trace_payload["resolved_model"], "claude-sonnet-4.6")
-        self.assertEqual(trace_payload["source_body"], {"model": "gpt-5.4-mini", "input": "hello"})
-        self.assertEqual(trace_payload["upstream_body"]["model"], "claude-sonnet-4.6")
+        self.assertEqual(
+            trace_prompt_security.decrypt_payload(trace_payload["source_body"], key=key),
+            {"model": "gpt-5.4-mini", "input": "hello"},
+        )
+        self.assertEqual(
+            trace_prompt_security.decrypt_payload(trace_payload["upstream_body"], key=key)["model"],
+            "claude-sonnet-4.6",
+        )
         self.assertEqual(trace_payload["outbound_headers"], {"X-Initiator": "user"})
         self.assertEqual(trace_payload["response_text"], "unsupported field: tool_choice")
 
