@@ -205,6 +205,7 @@ _PROMPT_CACHE_LAST_AFFINITY_BY_LINEAGE: dict[tuple[str, str], dict] = {}
 _TRACE_PROMPT_KEY_LOCK = threading.Lock()
 _TRACE_PROMPT_AES_KEY: bytes | None = None
 _TRACE_PROMPT_SALT: str | None = None
+_TRACE_PROMPT_PRIVATE_KEY_PEM: str | None = None
 _TRACE_PROMPT_ENABLE_PENDING = False
 
 
@@ -324,6 +325,40 @@ def _trace_prompt_logging_unlocked() -> bool:
         return _TRACE_PROMPT_AES_KEY is not None
 
 
+def _settings_trace_prompt_password_configured(settings: dict[str, object] | None) -> bool:
+    if not isinstance(settings, dict):
+        return False
+    return bool(
+        settings.get("trace_prompt_logging_salt")
+        and isinstance(settings.get("trace_prompt_logging_verifier"), dict)
+    )
+
+
+def _trace_prompt_public_key(settings: dict[str, object] | None = None) -> str | None:
+    settings = settings if isinstance(settings, dict) else _trace_prompt_logging_settings()
+    public_key = settings.get("trace_prompt_logging_public_key") if isinstance(settings, dict) else None
+    if isinstance(public_key, str) and public_key.strip():
+        return public_key
+    return None
+
+
+def _decrypt_trace_prompt_private_key_payload(
+    private_key_payload: object,
+    *,
+    password: str | None = None,
+    key: bytes | None = None,
+) -> str | None:
+    if not isinstance(private_key_payload, dict):
+        return None
+    try:
+        private_key = trace_prompt_security.decrypt_payload(private_key_payload, password=password, key=key)
+    except Exception:
+        return None
+    if isinstance(private_key, str) and private_key.strip():
+        return private_key
+    return None
+
+
 def _trace_prompt_active_key() -> tuple[bytes, str] | None:
     if not _trace_prompt_logging_enabled():
         return None
@@ -333,11 +368,16 @@ def _trace_prompt_active_key() -> tuple[bytes, str] | None:
         return _TRACE_PROMPT_AES_KEY, _TRACE_PROMPT_SALT
 
 
-def _set_trace_prompt_active_key(key: bytes | None, salt: str | None) -> None:
-    global _TRACE_PROMPT_AES_KEY, _TRACE_PROMPT_SALT
+def _set_trace_prompt_active_key(
+    key: bytes | None,
+    salt: str | None,
+    private_key_pem: str | None = None,
+) -> None:
+    global _TRACE_PROMPT_AES_KEY, _TRACE_PROMPT_SALT, _TRACE_PROMPT_PRIVATE_KEY_PEM
     with _TRACE_PROMPT_KEY_LOCK:
         _TRACE_PROMPT_AES_KEY = key
         _TRACE_PROMPT_SALT = salt
+        _TRACE_PROMPT_PRIVATE_KEY_PEM = private_key_pem
 
 
 def _set_trace_prompt_enable_pending(enabled: bool) -> None:
@@ -349,6 +389,12 @@ def _set_trace_prompt_enable_pending(enabled: bool) -> None:
 def _protect_prompt_trace_value(value):
     if not _trace_prompt_logging_enabled():
         return value
+    public_key = _trace_prompt_public_key()
+    if public_key:
+        try:
+            return trace_prompt_security.encrypt_payload_with_public_key(value, public_key)
+        except Exception as exc:
+            print(f"Warning: failed to envelope-encrypt prompt trace payload: {exc}", file=sys.stderr, flush=True)
     active = _trace_prompt_active_key()
     if active is None:
         return trace_prompt_security.locked_payload()
@@ -359,6 +405,20 @@ def _protect_prompt_trace_value(value):
 def _decrypt_prompt_payload_for_dashboard(value):
     if not trace_prompt_security.is_encrypted_payload(value):
         return value
+    if trace_prompt_security.is_envelope_payload(value):
+        _trace_prompt_active_key()
+        with _TRACE_PROMPT_KEY_LOCK:
+            private_key_pem = _TRACE_PROMPT_PRIVATE_KEY_PEM
+        if not private_key_pem:
+            return {
+                "system": "[Encrypted prompt trace locked. Enter the AES password in Settings to unlock the private key.]",
+            }
+        try:
+            return trace_prompt_security.decrypt_payload(value, private_key_pem=private_key_pem)
+        except Exception:
+            return {
+                "system": "[Encrypted prompt trace could not be decrypted with the loaded private key.]",
+            }
     active = _trace_prompt_active_key()
     if active is None:
         return {
@@ -645,10 +705,7 @@ def _client_proxy_settings_with_trace_status(payload: dict[str, object]) -> dict
 
 def _trace_prompt_settings_configured(settings: dict[str, object] | None = None) -> bool:
     settings = settings if isinstance(settings, dict) else _trace_prompt_logging_settings()
-    return bool(
-        settings.get("trace_prompt_logging_salt")
-        and isinstance(settings.get("trace_prompt_logging_verifier"), dict)
-    )
+    return _settings_trace_prompt_password_configured(settings)
 
 
 def _unlock_trace_prompt_logging(password: str) -> dict[str, object]:
@@ -667,7 +724,22 @@ def _unlock_trace_prompt_logging(password: str) -> dict[str, object]:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not trace_prompt_security.verify_password_payload(verifier, key):
         raise HTTPException(status_code=403, detail="AES password did not match encrypted prompt trace settings.")
-    _set_trace_prompt_active_key(key, salt)
+    public_key = settings.get("trace_prompt_logging_public_key")
+    private_key_pem = _decrypt_trace_prompt_private_key_payload(settings.get("trace_prompt_logging_private_key"), key=key)
+    if not isinstance(public_key, str) or not public_key.strip() or not private_key_pem:
+        key_pair = trace_prompt_security.generate_envelope_key_pair()
+        public_key = key_pair["public_key"]
+        private_key_pem = key_pair["private_key"]
+        client_proxy_config_service.save_client_proxy_settings(
+            {
+                "trace_prompt_logging_enabled": True,
+                "trace_prompt_logging_salt": salt,
+                "trace_prompt_logging_verifier": verifier,
+                "trace_prompt_logging_public_key": public_key,
+                "trace_prompt_logging_private_key": trace_prompt_security.encrypt_payload(private_key_pem, key, salt),
+            }
+        )
+    _set_trace_prompt_active_key(key, salt, private_key_pem)
     try:
         dashboard_service.notify_dashboard_stream_listeners()
     except NameError:
@@ -687,14 +759,26 @@ def _reset_trace_prompt_logging_password(password: str) -> dict[str, object]:
     except (RuntimeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     verifier = trace_prompt_security.make_password_verifier(key, salt)
+    private_key_payload = settings.get("trace_prompt_logging_private_key")
+    with _TRACE_PROMPT_KEY_LOCK:
+        current_private_key_pem = _TRACE_PROMPT_PRIVATE_KEY_PEM
+        current_aes_key = _TRACE_PROMPT_AES_KEY
+    private_key_pem = current_private_key_pem or _decrypt_trace_prompt_private_key_payload(private_key_payload, key=current_aes_key)
+    public_key = settings.get("trace_prompt_logging_public_key") if isinstance(settings.get("trace_prompt_logging_public_key"), str) else ""
+    if not private_key_pem:
+        key_pair = trace_prompt_security.generate_envelope_key_pair()
+        public_key = key_pair["public_key"]
+        private_key_pem = key_pair["private_key"]
     result = client_proxy_config_service.save_client_proxy_settings(
         {
             "trace_prompt_logging_enabled": bool(settings.get("trace_prompt_logging_enabled")),
             "trace_prompt_logging_salt": salt,
             "trace_prompt_logging_verifier": verifier,
+            "trace_prompt_logging_public_key": public_key,
+            "trace_prompt_logging_private_key": trace_prompt_security.encrypt_payload(private_key_pem, key, salt),
         }
     )
-    _set_trace_prompt_active_key(key, salt)
+    _set_trace_prompt_active_key(key, salt, private_key_pem)
     try:
         dashboard_service.notify_dashboard_stream_listeners()
     except NameError:
@@ -719,10 +803,13 @@ def _save_client_proxy_settings_with_trace_prompt_logging(payload: dict) -> dict
     migration: dict[str, object] | None = None
     pending_key: bytes | None = None
     pending_salt: str | None = None
+    pending_private_key_pem: str | None = None
     clear_key_after_save = False
     if requested_enabled:
         salt = existing.get("trace_prompt_logging_salt")
         verifier = existing.get("trace_prompt_logging_verifier")
+        public_key = existing.get("trace_prompt_logging_public_key")
+        private_key_payload = existing.get("trace_prompt_logging_private_key")
         has_configured_password = _trace_prompt_settings_configured(existing)
         if not password and not has_configured_password:
             raise HTTPException(
@@ -740,20 +827,32 @@ def _save_client_proxy_settings_with_trace_prompt_logging(payload: dict) -> dict
                 raise HTTPException(status_code=403, detail="AES password did not match encrypted prompt trace settings.")
             if not has_configured_password:
                 verifier = trace_prompt_security.make_password_verifier(key, salt)
+            private_key_pem = _decrypt_trace_prompt_private_key_payload(private_key_payload, key=key)
+            if not isinstance(public_key, str) or not public_key.strip() or not private_key_pem:
+                key_pair = trace_prompt_security.generate_envelope_key_pair()
+                public_key = key_pair["public_key"]
+                private_key_pem = key_pair["private_key"]
             save_payload["trace_prompt_logging_salt"] = salt
             save_payload["trace_prompt_logging_verifier"] = verifier
+            save_payload["trace_prompt_logging_public_key"] = public_key
+            save_payload["trace_prompt_logging_private_key"] = trace_prompt_security.encrypt_payload(private_key_pem, key, salt)
             pending_key = key
             pending_salt = salt
+            pending_private_key_pem = private_key_pem
         else:
             save_payload["trace_prompt_logging_salt"] = existing.get("trace_prompt_logging_salt", "")
             save_payload["trace_prompt_logging_verifier"] = existing.get("trace_prompt_logging_verifier")
+            save_payload["trace_prompt_logging_public_key"] = existing.get("trace_prompt_logging_public_key", "")
+            save_payload["trace_prompt_logging_private_key"] = existing.get("trace_prompt_logging_private_key")
     else:
         save_payload["trace_prompt_logging_salt"] = existing.get("trace_prompt_logging_salt", "")
         save_payload["trace_prompt_logging_verifier"] = existing.get("trace_prompt_logging_verifier")
+        save_payload["trace_prompt_logging_public_key"] = existing.get("trace_prompt_logging_public_key", "")
+        save_payload["trace_prompt_logging_private_key"] = existing.get("trace_prompt_logging_private_key")
         clear_key_after_save = True
 
     if pending_key is not None and pending_salt:
-        _set_trace_prompt_active_key(pending_key, pending_salt)
+        _set_trace_prompt_active_key(pending_key, pending_salt, pending_private_key_pem)
         _set_trace_prompt_enable_pending(True)
     try:
         result = client_proxy_config_service.save_client_proxy_settings(save_payload)

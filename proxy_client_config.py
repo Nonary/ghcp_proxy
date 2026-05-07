@@ -225,6 +225,8 @@ class ProxyClientConfigService:
             "trace_prompt_logging_enabled": False,
             "trace_prompt_logging_salt": "",
             "trace_prompt_logging_verifier": None,
+            "trace_prompt_logging_public_key": "",
+            "trace_prompt_logging_private_key": None,
             "pending_restore_targets": [],
         }
 
@@ -260,6 +262,16 @@ class ProxyClientConfigService:
                 if isinstance(payload.get("trace_prompt_logging_verifier"), dict)
                 else None
             ),
+            "trace_prompt_logging_public_key": (
+                payload.get("trace_prompt_logging_public_key")
+                if isinstance(payload.get("trace_prompt_logging_public_key"), str)
+                else ""
+            ),
+            "trace_prompt_logging_private_key": (
+                payload.get("trace_prompt_logging_private_key")
+                if isinstance(payload.get("trace_prompt_logging_private_key"), dict)
+                else None
+            ),
             "pending_restore_targets": self._normalize_restore_targets(
                 payload.get("pending_restore_targets"),
             ),
@@ -275,6 +287,10 @@ class ProxyClientConfigService:
                 settings.get("trace_prompt_logging_salt")
                 and isinstance(settings.get("trace_prompt_logging_verifier"), dict)
             ),
+            "trace_prompt_logging_public_key_configured": bool(
+                settings.get("trace_prompt_logging_public_key")
+                and isinstance(settings.get("trace_prompt_logging_private_key"), dict)
+            ),
             "pending_restore_targets": settings["pending_restore_targets"],
             "path": self._config.client_proxy_settings_file,
         }
@@ -288,6 +304,8 @@ class ProxyClientConfigService:
             "trace_prompt_logging_enabled",
             "trace_prompt_logging_salt",
             "trace_prompt_logging_verifier",
+            "trace_prompt_logging_public_key",
+            "trace_prompt_logging_private_key",
         }
         if not any(key in payload for key in known_keys):
             raise HTTPException(
@@ -308,6 +326,14 @@ class ProxyClientConfigService:
             and not isinstance(payload.get("trace_prompt_logging_verifier"), dict)
         ):
             raise HTTPException(status_code=400, detail="trace_prompt_logging_verifier must be an object.")
+        if "trace_prompt_logging_public_key" in payload and not isinstance(payload.get("trace_prompt_logging_public_key"), str):
+            raise HTTPException(status_code=400, detail="trace_prompt_logging_public_key must be a string.")
+        if (
+            "trace_prompt_logging_private_key" in payload
+            and payload.get("trace_prompt_logging_private_key") is not None
+            and not isinstance(payload.get("trace_prompt_logging_private_key"), dict)
+        ):
+            raise HTTPException(status_code=400, detail="trace_prompt_logging_private_key must be an object.")
 
         existing = self.load_client_proxy_settings()
         settings = {
@@ -327,6 +353,14 @@ class ProxyClientConfigService:
             "trace_prompt_logging_verifier": payload.get(
                 "trace_prompt_logging_verifier",
                 existing.get("trace_prompt_logging_verifier"),
+            ),
+            "trace_prompt_logging_public_key": payload.get(
+                "trace_prompt_logging_public_key",
+                existing.get("trace_prompt_logging_public_key", ""),
+            ),
+            "trace_prompt_logging_private_key": payload.get(
+                "trace_prompt_logging_private_key",
+                existing.get("trace_prompt_logging_private_key"),
             ),
             "pending_restore_targets": existing.get("pending_restore_targets", []),
         }
@@ -659,6 +693,16 @@ class ProxyClientConfigService:
             "trace_prompt_logging_verifier": (
                 payload.get("trace_prompt_logging_verifier")
                 if isinstance(payload.get("trace_prompt_logging_verifier"), dict)
+                else None
+            ),
+            "trace_prompt_logging_public_key": (
+                payload.get("trace_prompt_logging_public_key")
+                if isinstance(payload.get("trace_prompt_logging_public_key"), str)
+                else ""
+            ),
+            "trace_prompt_logging_private_key": (
+                payload.get("trace_prompt_logging_private_key")
+                if isinstance(payload.get("trace_prompt_logging_private_key"), dict)
                 else None
             ),
             "pending_restore_targets": self._normalize_restore_targets(payload.get("pending_restore_targets")),

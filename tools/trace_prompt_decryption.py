@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sys
+import json
 from dataclasses import dataclass
 from typing import Any
 
@@ -14,6 +15,7 @@ if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
 import trace_prompt_security
+from constants import CLIENT_PROXY_SETTINGS_FILE
 
 
 PASSWORD_ENV_NAME = "GHCP_TRACE_PROMPT_PASSWORD"
@@ -31,14 +33,16 @@ class DecryptionStats:
 
 
 class TracePromptDecryptor:
-    def __init__(self, *, password: str | None = None):
+    def __init__(self, *, password: str | None = None, private_key_pem: str | None = None):
         self.password = password
+        self.private_key_pem = private_key_pem
         self.stats = DecryptionStats()
 
     @classmethod
     def from_environment(cls) -> "TracePromptDecryptor":
         load_dotenv_files()
-        return cls(password=os.environ.get(PASSWORD_ENV_NAME) or None)
+        password = os.environ.get(PASSWORD_ENV_NAME) or None
+        return cls(password=password, private_key_pem=_load_private_key_from_settings(password))
 
     def decrypt(self, value: Any) -> Any:
         if not trace_prompt_security.is_encrypted_payload(value):
@@ -47,11 +51,19 @@ class TracePromptDecryptor:
         if value.get("locked") is True:
             self.stats.locked += 1
             return value
-        if not self.password:
+        if trace_prompt_security.is_envelope_payload(value):
+            if not self.private_key_pem:
+                self.stats.missing_secret += 1
+                return value
+        elif not self.password:
             self.stats.missing_secret += 1
             return value
         try:
-            decrypted = trace_prompt_security.decrypt_payload(value, password=self.password)
+            decrypted = trace_prompt_security.decrypt_payload(
+                value,
+                password=self.password,
+                private_key_pem=self.private_key_pem,
+            )
         except Exception:
             self.stats.failed += 1
             return value
@@ -74,8 +86,8 @@ def load_dotenv_files(paths: list[str] | None = None) -> None:
     candidates: list[str] = []
     if paths:
         candidates.extend(paths)
-    candidates.append(os.path.join(REPO_ROOT, ".env"))
     candidates.append(os.path.join(os.getcwd(), ".env"))
+    candidates.append(os.path.join(REPO_ROOT, ".env"))
 
     seen: set[str] = set()
     for candidate in candidates:
@@ -87,6 +99,35 @@ def load_dotenv_files(paths: list[str] | None = None) -> None:
             continue
         _load_dotenv_file(path)
         _LOADED_ENV_FILES.add(path)
+
+
+def _load_private_key_from_settings(password: str | None) -> str | None:
+    if not password:
+        return None
+    settings_path = os.path.abspath(os.path.expanduser(os.environ.get("GHCP_CLIENT_PROXY_SETTINGS_FILE", CLIENT_PROXY_SETTINGS_FILE)))
+    try:
+        with open(settings_path, encoding="utf-8") as f:
+            settings = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(settings, dict):
+        return None
+    salt = settings.get("trace_prompt_logging_salt")
+    verifier = settings.get("trace_prompt_logging_verifier")
+    private_key_payload = settings.get("trace_prompt_logging_private_key")
+    if not isinstance(salt, str) or not salt or not isinstance(verifier, dict) or not isinstance(private_key_payload, dict):
+        return None
+    try:
+        key = trace_prompt_security.derive_key(password, salt)
+    except Exception:
+        return None
+    if not trace_prompt_security.verify_password_payload(verifier, key):
+        return None
+    try:
+        private_key = trace_prompt_security.decrypt_payload(private_key_payload, key=key)
+    except Exception:
+        return None
+    return private_key if isinstance(private_key, str) and private_key.strip() else None
 
 
 def decrypt_mapping_fields(payload: dict[str, Any], fields: tuple[str, ...], decryptor: TracePromptDecryptor) -> dict[str, Any]:

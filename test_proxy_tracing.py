@@ -12,6 +12,25 @@ import trace_prompt_security
 
 
 class ProxyTracingTests(unittest.TestCase):
+    def setUp(self):
+        proxy._set_trace_prompt_active_key(None, None)
+        proxy._set_trace_prompt_enable_pending(False)
+        self._settings_patcher = mock.patch.object(
+            proxy.client_proxy_config_service,
+            "load_client_proxy_settings",
+            return_value={
+                "trace_prompt_logging_enabled": False,
+                "trace_prompt_logging_salt": "",
+                "trace_prompt_logging_verifier": None,
+                "trace_prompt_logging_public_key": "",
+                "trace_prompt_logging_private_key": None,
+            },
+        )
+        self._settings_patcher.start()
+        self.addCleanup(self._settings_patcher.stop)
+        self.addCleanup(proxy._set_trace_prompt_enable_pending, False)
+        self.addCleanup(proxy._set_trace_prompt_active_key, None, None)
+
     def test_prepare_upstream_request_keeps_full_prompt_preview_for_user_initiator(self):
         request = SimpleNamespace(
             url=SimpleNamespace(path="/v1/responses"),
@@ -359,6 +378,59 @@ class ProxyTracingTests(unittest.TestCase):
             self.assertTrue(trace_prompt_security.is_encrypted_payload(stored["request_body"]))
             self.assertEqual(trace_prompt_security.decrypt_payload(stored["request_body"], key=key), {"input": "plain"})
 
+    def test_prompt_trace_protection_encrypts_with_public_key_without_unlock(self):
+        try:
+            trace_prompt_security._crypto_primitives()
+        except RuntimeError as exc:
+            self.skipTest(str(exc))
+
+        key_pair = trace_prompt_security.generate_envelope_key_pair()
+        settings = {
+            "trace_prompt_logging_enabled": True,
+            "trace_prompt_logging_public_key": key_pair["public_key"],
+        }
+
+        with mock.patch.object(proxy.client_proxy_config_service, "load_client_proxy_settings", return_value=settings):
+            proxy._set_trace_prompt_active_key(None, None)
+            protected = proxy._protect_prompt_trace_value({"input": "plain"})
+
+        self.assertEqual(protected.get("_encrypted"), trace_prompt_security.ENVELOPE_PAYLOAD_MARKER)
+        self.assertEqual(
+            trace_prompt_security.decrypt_payload(protected, private_key_pem=key_pair["private_key"]),
+            {"input": "plain"},
+        )
+
+    def test_write_request_body_dump_uses_public_key_without_password(self):
+        try:
+            trace_prompt_security._crypto_primitives()
+        except RuntimeError as exc:
+            self.skipTest(str(exc))
+
+        key_pair = trace_prompt_security.generate_envelope_key_pair()
+        with tempfile.TemporaryDirectory() as tmp:
+            out_path = os.path.join(tmp, "req_1.json")
+            snapshot = {
+                "request_body": {"input": "plain"},
+                "upstream_body": {"messages": [{"role": "user", "content": "plain"}]},
+            }
+            settings = {
+                "trace_prompt_logging_enabled": True,
+                "trace_prompt_logging_public_key": key_pair["public_key"],
+            }
+
+            with mock.patch.object(proxy.client_proxy_config_service, "load_client_proxy_settings", return_value=settings):
+                proxy._set_trace_prompt_active_key(None, None)
+                proxy._write_request_body_dump(out_path, tmp, snapshot)
+
+            with open(out_path, encoding="utf-8") as f:
+                stored = json.load(f)
+            self.assertEqual(stored["request_body"].get("_encrypted"), trace_prompt_security.ENVELOPE_PAYLOAD_MARKER)
+            self.assertNotEqual(stored["request_body"].get("locked"), True)
+            self.assertEqual(
+                trace_prompt_security.decrypt_payload(stored["request_body"], private_key_pem=key_pair["private_key"]),
+                {"input": "plain"},
+            )
+
     def test_configured_trace_prompt_logging_can_be_enabled_without_unlock_password(self):
         verifier = {"_encrypted": "ghcp_proxy.aesgcm.v1", "ciphertext": "abc"}
         existing = {
@@ -394,10 +466,13 @@ class ProxyTracingTests(unittest.TestCase):
         salt = trace_prompt_security.new_salt()
         key = trace_prompt_security.derive_key("pw", salt)
         verifier = trace_prompt_security.make_password_verifier(key, salt)
+        key_pair = trace_prompt_security.generate_envelope_key_pair()
         settings = {
             "trace_prompt_logging_enabled": True,
             "trace_prompt_logging_salt": salt,
             "trace_prompt_logging_verifier": verifier,
+            "trace_prompt_logging_public_key": key_pair["public_key"],
+            "trace_prompt_logging_private_key": trace_prompt_security.encrypt_payload(key_pair["private_key"], key, salt),
         }
         payload = {
             "trace_prompt_logging_enabled": True,
@@ -416,6 +491,46 @@ class ProxyTracingTests(unittest.TestCase):
 
         self.assertTrue(result["trace_prompt_logging_unlocked"])
         notify.assert_called_once()
+
+    def test_trace_prompt_unlock_upgrades_legacy_password_settings_with_envelope_keypair(self):
+        try:
+            trace_prompt_security._crypto_primitives()
+        except RuntimeError as exc:
+            self.skipTest(str(exc))
+
+        salt = trace_prompt_security.new_salt()
+        key = trace_prompt_security.derive_key("pw", salt)
+        verifier = trace_prompt_security.make_password_verifier(key, salt)
+        settings = {
+            "trace_prompt_logging_enabled": True,
+            "trace_prompt_logging_salt": salt,
+            "trace_prompt_logging_verifier": verifier,
+            "trace_prompt_logging_public_key": "",
+            "trace_prompt_logging_private_key": None,
+        }
+        saved_payload = {
+            "trace_prompt_logging_enabled": True,
+            "trace_prompt_logging_configured": True,
+            "trace_prompt_logging_public_key_configured": True,
+        }
+
+        with (
+            mock.patch.object(proxy, "_trace_prompt_logging_settings", return_value=settings),
+            mock.patch.object(proxy.client_proxy_config_service, "save_client_proxy_settings", return_value=saved_payload) as save_settings,
+            mock.patch.object(proxy.client_proxy_config_service, "client_proxy_settings_payload", return_value=saved_payload),
+            mock.patch.object(proxy.dashboard_service, "notify_dashboard_stream_listeners"),
+        ):
+            try:
+                result = proxy._unlock_trace_prompt_logging("pw")
+            finally:
+                proxy._set_trace_prompt_active_key(None, None)
+
+        self.assertTrue(result["trace_prompt_logging_unlocked"])
+        saved = save_settings.call_args.args[0]
+        self.assertIn("BEGIN PUBLIC KEY", saved["trace_prompt_logging_public_key"])
+        self.assertTrue(trace_prompt_security.is_encrypted_payload(saved["trace_prompt_logging_private_key"]))
+        private_key = trace_prompt_security.decrypt_payload(saved["trace_prompt_logging_private_key"], key=key)
+        self.assertIn("BEGIN PRIVATE KEY", private_key)
 
     def test_prompt_trace_migration_encrypts_existing_prompt_files(self):
         try:
