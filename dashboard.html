@@ -797,15 +797,23 @@
     .status.warn { background: rgba(244,183,64,0.10); color: var(--warn); border: 1px solid rgba(244,183,64,0.20); }
 
     /* Auth / setup mode (kept) */
-    .auth-panel { width: min(640px, 100%); padding: 32px; background: var(--panel); border: 1px solid var(--line); border-radius: 16px; }
-    .auth-panel .auth-grid { display: grid; grid-template-columns: 220px 1fr; gap: 22px; align-items: start; margin-top: 18px; }
-    .auth-code-card {
-      padding: 18px; border-radius: 12px; border: 1px solid var(--line);
-      background: rgba(0,0,0,0.30);
+    .auth-panel { width: min(760px, 100%); padding: 36px; background: var(--panel); border: 1px solid var(--line); border-radius: 16px; }
+    .auth-panel h2 { font-size: 1.5rem; }
+    .auth-panel > div:first-child > .subtle { font-size: 0.95rem; color: #b6bfc8; line-height: 1.45; }
+    .auth-panel .auth-grid { display: grid; grid-template-columns: 280px 1fr; gap: 28px; align-items: start; margin-top: 22px; }
+    @media (max-width: 640px) {
+      .auth-panel { padding: 24px; }
+      .auth-panel .auth-grid { grid-template-columns: 1fr; gap: 20px; }
     }
-    .auth-code { font-family: "JetBrains Mono", monospace; font-size: 1.6rem; font-weight: 700; letter-spacing: 0.18em; color: var(--accent); margin: 8px 0; }
-    .auth-copy { display: grid; gap: 12px; }
-    .auth-steps { display: grid; gap: 4px; color: var(--muted); font-size: 0.85rem; }
+    .auth-code-card {
+      padding: 22px; border-radius: 12px; border: 1px solid var(--line);
+      background: rgba(0,0,0,0.30); text-align: center;
+    }
+    .auth-code-card .subtle { font-size: 0.85rem; }
+    .auth-code { font-family: "JetBrains Mono", monospace; font-size: 2.2rem; font-weight: 700; letter-spacing: 0.16em; color: var(--accent); margin: 10px 0; word-break: break-all; }
+    .auth-copy { display: grid; gap: 14px; }
+    .auth-copy > .subtle { font-size: 0.95rem; color: #b6bfc8; line-height: 1.45; }
+    .auth-steps { display: grid; gap: 6px; color: var(--text); font-size: 0.95rem; line-height: 1.45; }
     .button-link {
       display: inline-flex; align-items: center; padding: 8px 14px; border-radius: 8px;
       border: 1px solid var(--line); background: var(--panel-soft); color: var(--text);
