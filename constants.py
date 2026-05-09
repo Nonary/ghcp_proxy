@@ -93,6 +93,14 @@ CLAUDE_PROXY_SETTINGS = {
     "effortLevel": "medium",
 }
 DETAILED_REQUEST_HISTORY_LIMIT = 5000
+# Cap on the number of detailed request rows serialized into the dashboard
+# bulk payload. The in-memory deque still holds DETAILED_REQUEST_HISTORY_LIMIT
+# events for aggregations (premium summary, daily history, sessions) and for
+# lazy /api/request-prompt lookups, but the dashboard table only paginates
+# 100 per page; shipping all 5000 events on every refresh sent megabytes of
+# JSON the UI never rendered. 500 covers ~5 pages of history without
+# capping common debugging workflows.
+DASHBOARD_RECENT_REQUEST_LIMIT = 500
 # Rolling retention for the request-trace log. Appends past this count are
 # compacted down to the most recent N rows via a temp-file rewrite (same
 # pattern as the usage log). See proxy._enforce_trace_retention.

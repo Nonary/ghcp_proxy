@@ -20,7 +20,7 @@ from threading import Lock, Thread
 from typing import Callable
 
 from constants import (
-    TOKEN_DIR, SQLITE_CACHE_FILE, DETAILED_REQUEST_HISTORY_LIMIT,
+    TOKEN_DIR, SQLITE_CACHE_FILE, DASHBOARD_RECENT_REQUEST_LIMIT,
 )
 from util import (
     _json_default, _coerce_float, _coerce_int,
@@ -1902,11 +1902,16 @@ class DashboardService:
             filled_daily_history.append(daily_history_by_key.get(day_key) or _empty_day_history_row(day_key))
             day_cursor += timedelta(days=1)
 
-        recent_requests = sorted(
-            [self._dashboard_request_event(event) for event in detailed_usage_events],
+        # Sort newest-first and trim to DASHBOARD_RECENT_REQUEST_LIMIT before
+        # constructing dashboard rows, so we don't pay copy/sort cost on
+        # events that won't ship. Older detailed rows still live in the
+        # in-memory deque and stay reachable via /api/request-prompt.
+        sorted_events = sorted(
+            detailed_usage_events,
             key=lambda item: item.get("finished_at") or item.get("started_at") or "",
             reverse=True,
-        )[:DETAILED_REQUEST_HISTORY_LIMIT]
+        )[:DASHBOARD_RECENT_REQUEST_LIMIT]
+        recent_requests = [self._dashboard_request_event(event) for event in sorted_events]
 
         return {
             "generated_at": now.isoformat(),
