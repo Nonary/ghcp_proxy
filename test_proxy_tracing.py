@@ -398,6 +398,98 @@ class ProxyTracingTests(unittest.TestCase):
         self.assertNotIn("_lineage", before_event)
         self.assertNotIn("_lineage", trigger_event)
 
+    def test_post_response_cache_bust_keeps_ten_global_before_requests_after_future_started(self):
+        try:
+            trace_prompt_security._crypto_primitives()
+        except RuntimeError as exc:
+            self.skipTest(str(exc))
+        salt = trace_prompt_security.new_salt()
+        key = trace_prompt_security.derive_key("pw", salt)
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/responses"),
+            method="POST",
+            headers={},
+        )
+
+        def body_for(prompt_cache_key: str, content: str) -> dict:
+            return {
+                "model": "gpt-5.5",
+                "prompt_cache_key": prompt_cache_key,
+                "input": [{"type": "message", "role": "user", "content": content}],
+            }
+
+        def emit(request_id: str, body: dict) -> None:
+            proxy._emit_request_trace_start(
+                request_id=request_id,
+                request=request,
+                upstream_url="https://example.invalid/responses",
+                upstream_path="/v1/responses",
+                requested_model="gpt-5.5",
+                resolved_model="gpt-5.5",
+                request_body=body,
+                upstream_body=body,
+                outbound_headers={"X-Initiator": "agent"},
+            )
+
+        proxy._set_trace_prompt_active_key(key, salt)
+        try:
+            with (
+                mock.patch.object(proxy, "_append_request_trace"),
+                mock.patch.object(proxy, "_dump_outbound_request_body"),
+            ):
+                for index in range(10):
+                    emit(
+                        f"req_prior_{index}",
+                        body_for(f"unrelated-prior-{index}", f"prior {index}"),
+                    )
+                buster_body = body_for("target-lineage", "buster")
+                emit("req_bust", buster_body)
+                for index in range(10):
+                    emit(
+                        f"req_after_{index}",
+                        body_for(f"unrelated-after-{index}", f"after {index}"),
+                    )
+
+            diagnostics = {
+                "lineage_model": "gpt-5.5",
+                "previous_request_id": "req_previous_usage",
+                "previous_cached_input_tokens": 85_000,
+                "current_cached_input_tokens": 20_000,
+                "cache_drop": 65_000,
+            }
+            detail_events = proxy._register_post_response_cache_bust_capture(
+                "req_bust",
+                ("gpt-5.5", "target-lineage"),
+                diagnostics,
+            )
+        finally:
+            proxy._set_trace_prompt_active_key(None, None)
+
+        phases = [event["debug_detail_capture"]["phase"] for event in detail_events]
+        self.assertEqual(phases.count("before"), 10)
+        self.assertEqual(phases.count("trigger"), 1)
+        self.assertEqual(phases.count("after"), 10)
+        self.assertEqual(
+            [event["request_id"] for event in detail_events if event["debug_detail_capture"]["phase"] == "before"],
+            [f"req_prior_{index}" for index in range(10)],
+        )
+        trigger_event = next(event for event in detail_events if event["debug_detail_capture"]["phase"] == "trigger")
+        self.assertEqual(trigger_event["request_id"], "req_bust")
+        self.assertEqual(
+            trace_prompt_security.decrypt_payload(trigger_event["source_body"], key=key),
+            buster_body,
+        )
+        self.assertEqual(
+            [event["request_id"] for event in detail_events if event["debug_detail_capture"]["phase"] == "after"],
+            [f"req_after_{index}" for index in range(10)],
+        )
+        for event in detail_events:
+            self.assertEqual(
+                event["debug_detail_capture"]["cache_bust_usage_diagnostics"],
+                diagnostics,
+            )
+            self.assertNotIn("_lineage", event)
+
     def test_post_response_cache_bust_skips_when_encryption_not_set_up(self):
         # No active key, no public key — encryption is not set up, so prompt
         # logging is not permitted. Detection must skip rather than capture

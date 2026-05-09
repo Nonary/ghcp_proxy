@@ -224,7 +224,16 @@ _TRACE_PROMPT_SALT: str | None = None
 _TRACE_PROMPT_PRIVATE_KEY_PEM: str | None = None
 _TRACE_PROMPT_ENABLE_PENDING = False
 _DEBUG_DETAIL_CAPTURE_LOCK = threading.Lock()
-_DEBUG_DETAIL_RECENT_REQUESTS: deque[dict] = deque(maxlen=DEBUG_DETAIL_CONTEXT_REQUESTS)
+# Keep enough request-start snapshots to reconstruct both sides of a
+# post-response cache-bust incident.  Usage-based cache-bust detection runs when
+# the buster response finishes, so several "future" requests may already have
+# started by then.  A 10-entry deque can be entirely consumed by those future
+# requests and lose the 10 requests that were immediately behind the buster.
+_DEBUG_DETAIL_RECENT_REQUESTS_MAXLEN = max(
+    PROMPT_DRIFT_SNAPSHOT_LIMIT,
+    (DEBUG_DETAIL_CONTEXT_REQUESTS * 3) + 1,
+)
+_DEBUG_DETAIL_RECENT_REQUESTS: deque[dict] = deque(maxlen=_DEBUG_DETAIL_RECENT_REQUESTS_MAXLEN)
 _DEBUG_DETAIL_FUTURE_REMAINING = 0
 _DEBUG_DETAIL_INCIDENT_COUNTER = 0
 _DEBUG_DETAIL_ACTIVE_INCIDENT_ID: str | None = None
@@ -2291,7 +2300,8 @@ def _register_debug_detail_snapshot(
             _DEBUG_DETAIL_INCIDENT_COUNTER += 1
             incident_id = f"cache-bust-{_DEBUG_DETAIL_INCIDENT_COUNTER}"
             _DEBUG_DETAIL_ACTIVE_INCIDENT_ID = incident_id
-            for previous_snapshot in list(_DEBUG_DETAIL_RECENT_REQUESTS):
+            previous_snapshots = list(_DEBUG_DETAIL_RECENT_REQUESTS)[-DEBUG_DETAIL_CONTEXT_REQUESTS:]
+            for previous_snapshot in previous_snapshots:
                 detail_events.append(
                     _with_debug_detail_capture_info(
                         previous_snapshot,
@@ -2415,20 +2425,22 @@ def _register_post_response_cache_bust_capture(
 ) -> list[dict]:
     """Emit retroactive debug-detail events for an in-flight cache eviction.
 
-    Walks the recent-snapshot deque, filters to the same lineage, and emits
-    earlier snapshots as ``before`` events, the buster as ``trigger``, and
-    any later snapshots as ``after`` events. Sets ``_DEBUG_DETAIL_FUTURE_REMAINING``
-    so subsequent requests in the chain capture themselves at request_started time.
+    Walks the recent-snapshot deque, locates the buster in its lineage, and
+    emits the surrounding global request window: up to 10 earlier snapshots as
+    ``before`` events, the buster as ``trigger``, and up to 10 later snapshots
+    as ``after`` events. Sets ``_DEBUG_DETAIL_FUTURE_REMAINING`` so subsequent
+    requests capture themselves at request_started time when fewer than 10
+    later snapshots have already started.
     """
     global _DEBUG_DETAIL_FUTURE_REMAINING, _DEBUG_DETAIL_INCIDENT_COUNTER, _DEBUG_DETAIL_ACTIVE_INCIDENT_ID
     detail_events: list[dict] = []
     if not _prompt_logging_permitted():
         return detail_events
     with _DEBUG_DETAIL_CAPTURE_LOCK:
-        relevant = [s for s in _DEBUG_DETAIL_RECENT_REQUESTS if s.get("_lineage") == lineage]
+        recent = list(_DEBUG_DETAIL_RECENT_REQUESTS)
         buster_index = None
-        for index, snapshot in enumerate(relevant):
-            if snapshot.get("request_id") == buster_request_id:
+        for index, snapshot in enumerate(recent):
+            if snapshot.get("request_id") == buster_request_id and snapshot.get("_lineage") == lineage:
                 buster_index = index
                 break
         if buster_index is None:
@@ -2436,7 +2448,9 @@ def _register_post_response_cache_bust_capture(
         _DEBUG_DETAIL_INCIDENT_COUNTER += 1
         incident_id = f"cache-bust-usage-{_DEBUG_DETAIL_INCIDENT_COUNTER}"
         _DEBUG_DETAIL_ACTIVE_INCIDENT_ID = incident_id
-        for snapshot in relevant[:buster_index]:
+        before_start = max(0, buster_index - DEBUG_DETAIL_CONTEXT_REQUESTS)
+        before_snapshots = recent[before_start:buster_index]
+        for snapshot in before_snapshots:
             detail_events.append(
                 _with_debug_detail_capture_info(
                     snapshot,
@@ -2447,13 +2461,15 @@ def _register_post_response_cache_bust_capture(
             )
         detail_events.append(
             _with_debug_detail_capture_info(
-                relevant[buster_index],
+                recent[buster_index],
                 reasons=["cache_bust_usage_drift"],
                 phase="trigger",
                 incident_id=incident_id,
             )
         )
-        after_snapshots = relevant[buster_index + 1 :]
+        after_snapshots = recent[
+            buster_index + 1 : buster_index + 1 + DEBUG_DETAIL_CONTEXT_REQUESTS
+        ]
         for snapshot in after_snapshots:
             detail_events.append(
                 _with_debug_detail_capture_info(
