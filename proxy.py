@@ -194,10 +194,10 @@ CACHE_TRIPWIRE_CONSECUTIVE_HIT_THRESHOLD = 3
 CACHE_TRIPWIRE_REASON = "token_tripwire"
 CACHE_SETTLE_DELAY_SECONDS = 5.0
 PROMPT_DRIFT_SNAPSHOT_LIMIT = 32
-DEBUG_DETAIL_CONTEXT_REQUESTS = 20
-CACHE_BUST_DRIFT_PREVIOUS_TOKEN_THRESHOLD = 30_000
-CACHE_BUST_DRIFT_DROP_TOKEN_THRESHOLD = 20_000
-CACHE_BUST_DRIFT_CURRENT_RATIO_THRESHOLD = 0.5
+DEBUG_DETAIL_CONTEXT_REQUESTS = 10
+CACHE_BUST_DRIFT_PREVIOUS_TOKEN_THRESHOLD = 500
+CACHE_BUST_DRIFT_DROP_TOKEN_THRESHOLD = 1
+CACHE_BUST_DRIFT_CURRENT_RATIO_THRESHOLD = 1.0
 CACHE_BUST_DRIFT_ESTIMATED_CHARS_PER_TOKEN = 4
 
 safeguard_event_store = dashboard_module.create_safeguard_event_store()
@@ -2240,7 +2240,11 @@ def _register_debug_detail_snapshot(
 
     Normal trace rows retain only summaries. Full prompt/body detail is written
     only for user/safeguarded requests, cache-bust trigger requests, and the
-    +/- DEBUG_DETAIL_CONTEXT_REQUESTS window around a large prompt-shrink drift.
+    +/- DEBUG_DETAIL_CONTEXT_REQUESTS window around any in-chain prompt shrink
+    (within the same prompt_cache_key/agent-task lineage, current tokens <
+    previous tokens). Within a normally cached chain the prompt grows turn over
+    turn; a shrink means the cache lineage broke, so we capture surrounding
+    requests for postmortem decryption.
     """
     global _DEBUG_DETAIL_FUTURE_REMAINING, _DEBUG_DETAIL_INCIDENT_COUNTER, _DEBUG_DETAIL_ACTIVE_INCIDENT_ID
     always_reasons = list(dict.fromkeys(always_reasons))
