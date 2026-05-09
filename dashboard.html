@@ -1721,7 +1721,7 @@
                 </thead>
                 <tbody>
                   <tr v-for="row in pagedSessions" :key="row.session_key"
-                      @click="selectedSessionKey = row.session_key; activeView = 'sessions'"
+                      @click="openSessionRequests(row)"
                       style="cursor: pointer;">
                     <td><span class="pill">{{ sourceLabel(row.source) }}</span></td>
                     <td class="session-id-cell"><span class="session-id-full"><span>{{ row.session_display_id || row.session_id || '-' }}</span><button class="copy-btn" @click.stop="copyText(row.session_display_id || row.session_id)" title="Copy full session ID"><svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button></span></td>
@@ -2055,7 +2055,7 @@
               </thead>
               <tbody>
                 <tr v-for="row in filteredSessions" :key="row.session_key"
-                    @click="selectedSessionKey = row.session_key" style="cursor:pointer;">
+                    @click="openSessionRequests(row)" style="cursor:pointer;">
                   <td><span class="pill">{{ sourceLabel(row.source) }}</span></td>
                   <td class="session-id-cell"><span class="session-id-full"><span>{{ row.session_display_id || row.session_id || '-' }}</span><button class="copy-btn" @click.stop="copyText(row.session_display_id || row.session_id)" title="Copy full session ID"><svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button></span></td>
                   <td>{{ modelLabel(row.models) }}</td>
@@ -2094,7 +2094,7 @@
               </thead>
               <tbody>
                 <tr v-for="row in selectedSessionRequests" :key="requestKey(row)"
-                    @click="selectedRequestKey = requestKey(row); activeView = 'requests'"
+                    @click="openRequestFromSession(row)"
                     style="cursor:pointer;">
                   <td>{{ shortStamp(row.finished_at || row.started_at) }}</td>
                   <td>
@@ -5280,7 +5280,7 @@
         enrichedSessions() {
           const idx = this.sessionRequestIndex;
           return (this.data.recent_sessions || []).map((row) => {
-            const key = `${row.source}::${row.session_id || ''}`;
+            const key = `${row.source}::${row.session_id || row.session_display_id || ''}`;
             const reqs = idx.get(key) || [];
             let firstAt = null, lastAt = null, totalDuration = 0, durationCount = 0;
             for (const r of reqs) {
@@ -5319,7 +5319,7 @@
         selectedSessionRequests() {
           const sess = this.selectedSession;
           if (!sess) return [];
-          const key = `${sess.source}::${sess.session_id || ''}`;
+          const key = `${sess.source}::${sess.session_id || sess.session_display_id || ''}`;
           return this.sessionRequestIndex.get(key) || [];
         },
         filteredRequests() {
@@ -6241,6 +6241,41 @@
         },
         requestKey(row) {
           return row?.request_id || row?.client_request_id || row?.started_at || '';
+        },
+        sessionIdentifier(row) {
+          return row?.session_id
+            || row?.session_display_id
+            || row?.client_request_id
+            || row?.request_id
+            || row?.server_request_id
+            || '';
+        },
+        applySessionSearch(row, selectFirst = true) {
+          const identifier = this.sessionIdentifier(row);
+          if (!identifier) return;
+          this.selectedSessionKey = row.session_key || this.selectedSessionKey;
+          this.search = String(identifier);
+          this.initiatorFilter = 'all';
+          this.safeguardFilter = 'all';
+          this.requestPage = 1;
+          if (selectFirst) {
+            this.$nextTick(() => {
+              this.selectedRequestKey = this.requestKey((this.pagedRequests || [])[0]);
+            });
+          }
+        },
+        openSessionRequests(row) {
+          if (!row) return;
+          this.applySessionSearch(row);
+          this.activeView = 'requests';
+        },
+        openRequestFromSession(row) {
+          const session = this.selectedSession;
+          if (session) {
+            this.applySessionSearch(session, false);
+          }
+          this.selectedRequestKey = this.requestKey(row);
+          this.activeView = 'requests';
         },
         shortId(value) { return !value ? '-' : (value.length > 36 ? value.slice(-36) : value); },
         _lowerField(row, key) {
@@ -7476,6 +7511,9 @@
         activeView: {
           immediate: true,
           handler(view) {
+            if (view === 'overview') {
+              this.search = '';
+            }
             this.ensureViewData(view);
           },
         },
