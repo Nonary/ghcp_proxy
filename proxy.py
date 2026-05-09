@@ -4702,27 +4702,37 @@ _DASHBOARD_HTML_LOCK = threading.Lock()
 _DASHBOARD_HTML_RAW: bytes | None = None
 _DASHBOARD_HTML_GZIPPED: bytes | None = None
 _DASHBOARD_HTML_MTIME: float = 0.0
+_DASHBOARD_HTML_ETAG: str = ""
 
 
-def _load_dashboard_html_bytes() -> tuple[bytes, bytes]:
-    global _DASHBOARD_HTML_RAW, _DASHBOARD_HTML_GZIPPED, _DASHBOARD_HTML_MTIME
+def _load_dashboard_html_bytes() -> tuple[bytes, bytes, str]:
+    global _DASHBOARD_HTML_RAW, _DASHBOARD_HTML_GZIPPED, _DASHBOARD_HTML_MTIME, _DASHBOARD_HTML_ETAG
     with _DASHBOARD_HTML_LOCK:
         try:
-            mtime = os.path.getmtime(DASHBOARD_FILE)
+            stat = os.stat(DASHBOARD_FILE)
+            mtime = stat.st_mtime
+            size = stat.st_size
         except OSError:
             mtime = 0.0
+            size = 0
         if _DASHBOARD_HTML_RAW is None or mtime != _DASHBOARD_HTML_MTIME:
             with open(DASHBOARD_FILE, "rb") as f:
                 raw = f.read()
             _DASHBOARD_HTML_RAW = raw
             _DASHBOARD_HTML_GZIPPED = gzip.compress(raw, compresslevel=9)
             _DASHBOARD_HTML_MTIME = mtime
-        return _DASHBOARD_HTML_RAW, _DASHBOARD_HTML_GZIPPED
+            # Strong-ish ETag from size + mtime + content hash; cheap to
+            # compute once at load time and stable for the file's lifetime.
+            digest = hashlib.sha256(raw).hexdigest()[:16]
+            _DASHBOARD_HTML_ETAG = f'"dash-{size}-{int(mtime)}-{digest}"'
+        return _DASHBOARD_HTML_RAW, _DASHBOARD_HTML_GZIPPED, _DASHBOARD_HTML_ETAG
 
 
 @app.get("/ui", response_class=HTMLResponse)
 async def dashboard(request: Request):
-    raw, gzipped = _load_dashboard_html_bytes()
+    raw, gzipped, etag = _load_dashboard_html_bytes()
+    if request.headers.get("if-none-match") == etag:
+        return Response(status_code=304, headers={"ETag": etag, "Cache-Control": "no-cache"})
     accept_encoding = request.headers.get("accept-encoding", "")
     if "gzip" in accept_encoding.lower():
         return Response(
@@ -4732,12 +4742,16 @@ async def dashboard(request: Request):
                 "Content-Encoding": "gzip",
                 "Vary": "Accept-Encoding",
                 "Cache-Control": "no-cache",
+                "ETag": etag,
             },
         )
     return Response(
         content=raw,
         media_type="text/html; charset=utf-8",
-        headers={"Cache-Control": "no-cache"},
+        headers={
+            "Cache-Control": "no-cache",
+            "ETag": etag,
+        },
     )
 
 

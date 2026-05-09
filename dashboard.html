@@ -4,6 +4,8 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>GHCP Proxy Dashboard</title>
+  <link rel="preconnect" href="https://unpkg.com" crossorigin>
+  <link rel="preload" as="fetch" href="/api/dashboard?refresh=1">
   <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
   <style>
     :root {
@@ -7312,7 +7314,10 @@
         async load(forceRefresh = false) {
           try {
             const suffix = forceRefresh ? '?refresh=1' : '';
-            const response = await fetch(`/api/dashboard${suffix}`, { cache: 'no-store' });
+            // Default cache mode (no explicit option) so the browser can
+            // reuse the <link rel="preload"> response on first load. The
+            // server pins Cache-Control: no-store on the response itself.
+            const response = await fetch(`/api/dashboard${suffix}`);
             if (!response.ok) throw new Error(`dashboard request failed: ${response.status}`);
             const payload = await response.json();
             this._applyDashboardPayload(payload, { replaceRequests: forceRefresh });
