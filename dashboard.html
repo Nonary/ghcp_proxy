@@ -783,7 +783,7 @@
     }
     button.danger { background: rgba(248,114,114,0.10); color: var(--danger); border-color: rgba(248,114,114,0.22); }
     button.sm { padding: 4px 8px; font-size: 0.78rem; }
-    select, input[type="text"], input[type="search"], input[type="number"] {
+    select, input[type="text"], input[type="search"], input[type="number"], input[type="password"] {
       background: var(--panel-soft); color: var(--text);
       border: 1px solid var(--line); border-radius: 8px; padding: 7px 10px;
       font: inherit; font-size: 0.84rem; outline: none;
@@ -2252,7 +2252,7 @@
                     placeholder="AES password"
                     :disabled="tracePromptUnlock.saving"
                     @keyup.enter="unlockTracePrompts"
-                    style="max-width: 360px;">
+                    style="flex: 1 1 240px; min-width: 200px; max-width: 360px;">
                   <button class="primary" type="button" @click="unlockTracePrompts" :disabled="tracePromptUnlock.saving || !tracePromptUnlock.password">
                     <span v-if="tracePromptUnlock.saving" class="spinner"></span>
                     {{ tracePromptUnlock.saving ? 'Decrypting…' : 'Decrypt prompts' }}
@@ -2755,7 +2755,7 @@
               autocomplete="new-password"
               placeholder="Initial AES password"
               :disabled="savingClientProxySettings"
-              style="margin-top: 10px; max-width: 360px;">
+              style="margin-top: 10px; width: 100%; max-width: 360px;">
             <div class="subtle" style="margin-top: 8px;">{{ tracePromptLoggingLabel }}</div>
             <div class="toolbar" style="margin-top: 10px;">
               <button class="primary" @click="saveClientProxySettings" :disabled="savingClientProxySettings">
@@ -2778,7 +2778,7 @@
                 placeholder="New AES password"
                 :disabled="tracePromptReset.saving"
                 @keyup.enter="resetTracePromptPassword"
-                style="max-width: 360px;">
+                style="flex: 1 1 240px; min-width: 200px; max-width: 360px;">
               <button class="danger" type="button" @click="resetTracePromptPassword" :disabled="tracePromptReset.saving || !tracePromptReset.password">
                 <span v-if="tracePromptReset.saving" class="spinner"></span>
                 {{ tracePromptReset.saving ? 'Resetting…' : 'Reset AES password' }}
