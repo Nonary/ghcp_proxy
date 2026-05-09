@@ -199,6 +199,13 @@ CACHE_BUST_DRIFT_PREVIOUS_TOKEN_THRESHOLD = 500
 CACHE_BUST_DRIFT_DROP_TOKEN_THRESHOLD = 1
 CACHE_BUST_DRIFT_CURRENT_RATIO_THRESHOLD = 1.0
 CACHE_BUST_DRIFT_ESTIMATED_CHARS_PER_TOKEN = 4
+# Post-response detector: catches upstream cache evictions where the local
+# prompt projection still grows monotonically but ``cached_input_tokens``
+# collapses between consecutive in-chain requests. The local-shrink detector
+# above can't see this because the request body is unchanged from our side.
+CACHE_BUST_USAGE_PREVIOUS_CACHE_THRESHOLD = 5_000
+CACHE_BUST_USAGE_CACHE_DROP_THRESHOLD = 5_000
+CACHE_BUST_USAGE_CURRENT_RATIO_THRESHOLD = 0.5
 
 safeguard_event_store = dashboard_module.create_safeguard_event_store()
 _CACHE_TRIPWIRE_LOCK = threading.Lock()
@@ -209,6 +216,8 @@ _PROMPT_CACHE_TRACE_LOCK = threading.Lock()
 _PROMPT_CACHE_LAST_PROMPT_BY_LINEAGE: dict[tuple[str, str], dict] = {}
 _PROMPT_CACHE_AFFINITY_TRACE_LOCK = threading.Lock()
 _PROMPT_CACHE_LAST_AFFINITY_BY_LINEAGE: dict[tuple[str, str], dict] = {}
+_PROMPT_CACHE_USAGE_TRACE_LOCK = threading.Lock()
+_PROMPT_CACHE_LAST_USAGE_BY_LINEAGE: dict[tuple[str, str], dict] = {}
 _TRACE_PROMPT_KEY_LOCK = threading.Lock()
 _TRACE_PROMPT_AES_KEY: bytes | None = None
 _TRACE_PROMPT_SALT: str | None = None
@@ -228,6 +237,8 @@ def _reset_debug_detail_capture_state() -> None:
         _DEBUG_DETAIL_FUTURE_REMAINING = 0
         _DEBUG_DETAIL_INCIDENT_COUNTER = 0
         _DEBUG_DETAIL_ACTIVE_INCIDENT_ID = None
+    with _PROMPT_CACHE_USAGE_TRACE_LOCK:
+        _PROMPT_CACHE_LAST_USAGE_BY_LINEAGE.clear()
 
 
 def _stream_with_update_notice(byte_iter, protocol: str, upstream_headers=None):
@@ -342,6 +353,20 @@ def _trace_prompt_logging_enabled() -> bool:
 def _trace_prompt_logging_unlocked() -> bool:
     if not _trace_prompt_logging_enabled():
         return False
+    with _TRACE_PROMPT_KEY_LOCK:
+        return _TRACE_PROMPT_AES_KEY is not None
+
+
+def _prompt_logging_permitted() -> bool:
+    """Encryption setup is the gate for capturing prompt-bearing trace data.
+
+    Returns True iff we have a way to encrypt prompts at write time —
+    either an envelope public key configured in settings, or an unlocked AES
+    key in memory. With no key available, no prompt-bearing detail is logged
+    (no user prompts, no safeguarded prompts, no cache-bust detail events).
+    """
+    if _trace_prompt_public_key():
+        return True
     with _TRACE_PROMPT_KEY_LOCK:
         return _TRACE_PROMPT_AES_KEY is not None
 
@@ -2115,6 +2140,8 @@ def _debug_detail_always_capture_reasons(
     outbound_headers: dict | None,
     trace_metadata: dict | None,
 ) -> list[str]:
+    if not _prompt_logging_permitted():
+        return []
     reasons: list[str] = []
     initiator = str(_header_value_case_insensitive(outbound_headers, "x-initiator") or "").strip().lower()
     verdict = _trace_metadata_verdict(trace_metadata)
@@ -2169,6 +2196,7 @@ def _with_debug_detail_capture_info(
     incident_id: str | None = None,
 ) -> dict:
     event = dict(snapshot)
+    event.pop("_lineage", None)
     event["debug_detail_capture"] = _debug_detail_capture_info(
         reasons=reasons,
         phase=phase,
@@ -2192,6 +2220,7 @@ def _build_debug_detail_snapshot(
         request_body if isinstance(request_body, dict) else upstream_body,
         truncate=False,
     )
+    lineage = _prompt_cache_trace_lineage(upstream_body, resolved_model, outbound_headers)
     snapshot = {
         "event": "request_debug_detail",
         "time": util.utc_now_iso(),
@@ -2206,6 +2235,8 @@ def _build_debug_detail_snapshot(
         "upstream_body_summary": _trace_body_summary(upstream_body),
         "outbound_headers": _header_trace_subset(outbound_headers),
     }
+    if lineage is not None:
+        snapshot["_lineage"] = lineage
     if full_prompt_preview:
         snapshot["request_prompt"] = _protect_prompt_trace_value(
             full_prompt_preview,
@@ -2250,6 +2281,9 @@ def _register_debug_detail_snapshot(
     always_reasons = list(dict.fromkeys(always_reasons))
     detail_events: list[dict] = []
     current_capture: dict | None = None
+
+    if not _prompt_logging_permitted():
+        return current_capture, detail_events
 
     with _DEBUG_DETAIL_CAPTURE_LOCK:
         incident_id = None
@@ -2314,6 +2348,131 @@ def _register_debug_detail_snapshot(
     return current_capture, detail_events
 
 
+def _post_response_cache_bust_diagnostics(
+    *,
+    request_id: str,
+    upstream_body: dict | None,
+    resolved_model: str | None,
+    outbound_headers: dict | None,
+    usage: dict | None,
+) -> tuple[tuple[str, str], dict] | None:
+    """Detect upstream cache eviction visible only in response usage.
+
+    The local prompt-shrink detector (``_is_cache_bust_prompt_drift``) only
+    fires when the request body itself shrinks. Some chains keep growing
+    monotonically while the upstream evicts the prompt cache — visible only
+    as a sharp drop in ``cached_input_tokens`` between consecutive requests
+    in the same lineage. This runs at request_finished time, so the trigger
+    happens after the request that took the cache miss.
+    """
+    if not _prompt_logging_permitted():
+        return None
+    lineage = _prompt_cache_trace_lineage(upstream_body, resolved_model, outbound_headers)
+    if lineage is None:
+        return None
+    normalized = util.normalize_usage_payload(usage)
+    if not isinstance(normalized, dict):
+        return None
+    cached = util._coerce_int(normalized.get("cached_input_tokens"), default=None)
+    input_tokens = util._coerce_int(normalized.get("input_tokens"), default=None)
+    if cached is None or input_tokens is None:
+        return None
+    snapshot = {
+        "request_id": request_id,
+        "cached_input_tokens": cached,
+        "input_tokens": input_tokens,
+    }
+    with _PROMPT_CACHE_USAGE_TRACE_LOCK:
+        previous = _PROMPT_CACHE_LAST_USAGE_BY_LINEAGE.pop(lineage, None)
+        _PROMPT_CACHE_LAST_USAGE_BY_LINEAGE[lineage] = snapshot
+        while len(_PROMPT_CACHE_LAST_USAGE_BY_LINEAGE) > PROMPT_DRIFT_SNAPSHOT_LIMIT:
+            _PROMPT_CACHE_LAST_USAGE_BY_LINEAGE.pop(next(iter(_PROMPT_CACHE_LAST_USAGE_BY_LINEAGE)))
+    if not isinstance(previous, dict):
+        return None
+    prev_cached = previous.get("cached_input_tokens")
+    if not isinstance(prev_cached, int) or prev_cached < CACHE_BUST_USAGE_PREVIOUS_CACHE_THRESHOLD:
+        return None
+    if prev_cached - cached < CACHE_BUST_USAGE_CACHE_DROP_THRESHOLD:
+        return None
+    if input_tokens > 0 and (cached / input_tokens) >= CACHE_BUST_USAGE_CURRENT_RATIO_THRESHOLD:
+        return None
+    diagnostics = {
+        "lineage_model": lineage[0],
+        "previous_request_id": previous.get("request_id"),
+        "previous_cached_input_tokens": prev_cached,
+        "current_cached_input_tokens": cached,
+        "previous_input_tokens": previous.get("input_tokens"),
+        "current_input_tokens": input_tokens,
+        "cache_drop": prev_cached - cached,
+    }
+    return lineage, diagnostics
+
+
+def _register_post_response_cache_bust_capture(
+    buster_request_id: str,
+    lineage: tuple[str, str],
+    diagnostics: dict,
+) -> list[dict]:
+    """Emit retroactive debug-detail events for an in-flight cache eviction.
+
+    Walks the recent-snapshot deque, filters to the same lineage, and emits
+    earlier snapshots as ``before`` events, the buster as ``trigger``, and
+    any later snapshots as ``after`` events. Sets ``_DEBUG_DETAIL_FUTURE_REMAINING``
+    so subsequent requests in the chain capture themselves at request_started time.
+    """
+    global _DEBUG_DETAIL_FUTURE_REMAINING, _DEBUG_DETAIL_INCIDENT_COUNTER, _DEBUG_DETAIL_ACTIVE_INCIDENT_ID
+    detail_events: list[dict] = []
+    if not _prompt_logging_permitted():
+        return detail_events
+    with _DEBUG_DETAIL_CAPTURE_LOCK:
+        relevant = [s for s in _DEBUG_DETAIL_RECENT_REQUESTS if s.get("_lineage") == lineage]
+        buster_index = None
+        for index, snapshot in enumerate(relevant):
+            if snapshot.get("request_id") == buster_request_id:
+                buster_index = index
+                break
+        if buster_index is None:
+            return detail_events
+        _DEBUG_DETAIL_INCIDENT_COUNTER += 1
+        incident_id = f"cache-bust-usage-{_DEBUG_DETAIL_INCIDENT_COUNTER}"
+        _DEBUG_DETAIL_ACTIVE_INCIDENT_ID = incident_id
+        for snapshot in relevant[:buster_index]:
+            detail_events.append(
+                _with_debug_detail_capture_info(
+                    snapshot,
+                    reasons=["cache_bust_usage_context"],
+                    phase="before",
+                    incident_id=incident_id,
+                )
+            )
+        detail_events.append(
+            _with_debug_detail_capture_info(
+                relevant[buster_index],
+                reasons=["cache_bust_usage_drift"],
+                phase="trigger",
+                incident_id=incident_id,
+            )
+        )
+        after_snapshots = relevant[buster_index + 1 :]
+        for snapshot in after_snapshots:
+            detail_events.append(
+                _with_debug_detail_capture_info(
+                    snapshot,
+                    reasons=["cache_bust_usage_context"],
+                    phase="after",
+                    incident_id=incident_id,
+                )
+            )
+        for event in detail_events:
+            event.setdefault("debug_detail_capture", {})["cache_bust_usage_diagnostics"] = diagnostics
+        _DEBUG_DETAIL_FUTURE_REMAINING = max(
+            0, DEBUG_DETAIL_CONTEXT_REQUESTS - len(after_snapshots)
+        )
+        if _DEBUG_DETAIL_FUTURE_REMAINING <= 0:
+            _DEBUG_DETAIL_ACTIVE_INCIDENT_ID = None
+    return detail_events
+
+
 def _trace_context_allows_full_debug_detail(trace_context: dict | None) -> bool:
     if not isinstance(trace_context, dict):
         return False
@@ -2323,6 +2482,8 @@ def _trace_context_allows_full_debug_detail(trace_context: dict | None) -> bool:
 
 def _plan_allows_full_debug_detail(plan: "UpstreamRequestPlan | None") -> bool:
     if not isinstance(plan, UpstreamRequestPlan):
+        return False
+    if not _prompt_logging_permitted():
         return False
     if _trace_context_allows_full_debug_detail(plan.trace_context):
         return True
@@ -3144,7 +3305,23 @@ def _finish_usage_and_trace(
                         trace_payload["response_payload"] = _trim_trace_field(response_payload)
                     if isinstance(response_text, str) and response_text:
                         trace_payload["response_text"] = _trim_trace_text(response_text)
+                bust_diagnostics_pair = _post_response_cache_bust_diagnostics(
+                    request_id=plan.request_id,
+                    upstream_body=plan.body,
+                    resolved_model=plan.resolved_model,
+                    outbound_headers=plan.headers,
+                    usage=usage,
+                )
+                if bust_diagnostics_pair is not None:
+                    trace_payload["cache_bust_usage"] = bust_diagnostics_pair[1]
                 _append_request_trace(trace_payload, force=force_trace)
+                if bust_diagnostics_pair is not None:
+                    bust_lineage, bust_diagnostics = bust_diagnostics_pair
+                    bust_events = _register_post_response_cache_bust_capture(
+                        plan.request_id, bust_lineage, bust_diagnostics
+                    )
+                    for event in bust_events:
+                        _append_request_trace(event, force=force_trace)
         finally:
             _remember_responses_cache_settle_finish(plan, status_code)
             _remember_parent_for_keepalive(plan, status_code)

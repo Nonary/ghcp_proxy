@@ -291,6 +291,204 @@ class ProxyTracingTests(unittest.TestCase):
         after_event = next(event for event in detail_events if event["debug_detail_capture"].get("phase") == "after")
         self.assertEqual(after_event["request_id"], "req_after")
 
+    def test_post_response_cache_bust_flushes_chain_when_cached_tokens_collapse(self):
+        try:
+            trace_prompt_security._crypto_primitives()
+        except RuntimeError as exc:
+            self.skipTest(str(exc))
+        salt = trace_prompt_security.new_salt()
+        key = trace_prompt_security.derive_key("pw", salt)
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/responses"),
+            method="POST",
+            headers={},
+        )
+        # Two requests in the same lineage where the prompt keeps growing
+        # — the local prompt-shrink detector cannot fire on this trace —
+        # but the upstream evicts the cache between them.
+        first_body = {
+            "model": "gpt-5.5",
+            "prompt_cache_key": "lineage-a",
+            "input": [{"type": "message", "role": "user", "content": "A" * 2000}],
+        }
+        bust_body = {
+            "model": "gpt-5.5",
+            "prompt_cache_key": "lineage-a",
+            "input": [
+                {"type": "message", "role": "user", "content": "A" * 2000},
+                {"type": "message", "role": "user", "content": "B" * 200},
+            ],
+        }
+        outbound_headers = {"X-Initiator": "agent"}
+
+        proxy._set_trace_prompt_active_key(key, salt)
+        try:
+            with (
+                mock.patch.object(proxy, "_append_request_trace"),
+                mock.patch.object(proxy, "_dump_outbound_request_body"),
+            ):
+                proxy._emit_request_trace_start(
+                    request_id="req_first",
+                    request=request,
+                    upstream_url="https://example.invalid/responses",
+                    upstream_path="/v1/responses",
+                    requested_model="gpt-5.5",
+                    resolved_model="gpt-5.5",
+                    request_body=first_body,
+                    upstream_body=first_body,
+                    outbound_headers=outbound_headers,
+                )
+                proxy._emit_request_trace_start(
+                    request_id="req_bust",
+                    request=request,
+                    upstream_url="https://example.invalid/responses",
+                    upstream_path="/v1/responses",
+                    requested_model="gpt-5.5",
+                    resolved_model="gpt-5.5",
+                    request_body=bust_body,
+                    upstream_body=bust_body,
+                    outbound_headers=outbound_headers,
+                )
+
+            # First request had a strong cache hit, second collapses.
+            proxy._post_response_cache_bust_diagnostics(
+                request_id="req_first",
+                upstream_body=first_body,
+                resolved_model="gpt-5.5",
+                outbound_headers=outbound_headers,
+                usage={"input_tokens": 87000, "cached_input_tokens": 85000},
+            )
+            bust_pair = proxy._post_response_cache_bust_diagnostics(
+                request_id="req_bust",
+                upstream_body=bust_body,
+                resolved_model="gpt-5.5",
+                outbound_headers=outbound_headers,
+                usage={"input_tokens": 88000, "cached_input_tokens": 22000},
+            )
+
+            self.assertIsNotNone(bust_pair)
+            bust_lineage, bust_diagnostics = bust_pair
+            self.assertEqual(bust_diagnostics["previous_request_id"], "req_first")
+            self.assertEqual(bust_diagnostics["previous_cached_input_tokens"], 85000)
+            self.assertEqual(bust_diagnostics["current_cached_input_tokens"], 22000)
+
+            detail_events = proxy._register_post_response_cache_bust_capture(
+                "req_bust", bust_lineage, bust_diagnostics
+            )
+        finally:
+            proxy._set_trace_prompt_active_key(None, None)
+
+        phases = [event["debug_detail_capture"]["phase"] for event in detail_events]
+        self.assertEqual(phases.count("before"), 1)
+        self.assertEqual(phases.count("trigger"), 1)
+        before_event = next(e for e in detail_events if e["debug_detail_capture"]["phase"] == "before")
+        trigger_event = next(e for e in detail_events if e["debug_detail_capture"]["phase"] == "trigger")
+        self.assertEqual(before_event["request_id"], "req_first")
+        self.assertEqual(trigger_event["request_id"], "req_bust")
+        self.assertIn("cache_bust_usage_drift", trigger_event["debug_detail_capture"]["reasons"])
+        self.assertEqual(
+            trigger_event["debug_detail_capture"]["cache_bust_usage_diagnostics"],
+            bust_diagnostics,
+        )
+        self.assertEqual(
+            trace_prompt_security.decrypt_payload(trigger_event["source_body"], key=key),
+            bust_body,
+        )
+        # No `_lineage` scratch field should leak into emitted events.
+        self.assertNotIn("_lineage", before_event)
+        self.assertNotIn("_lineage", trigger_event)
+
+    def test_post_response_cache_bust_skips_when_encryption_not_set_up(self):
+        # No active key, no public key — encryption is not set up, so prompt
+        # logging is not permitted. Detection must skip rather than capture
+        # plaintext or write a locked placeholder.
+        proxy._set_trace_prompt_active_key(None, None)
+        body = {
+            "model": "gpt-5.5",
+            "prompt_cache_key": "lineage-locked",
+            "input": [{"type": "message", "role": "user", "content": "hi"}],
+        }
+        outbound_headers = {"X-Initiator": "agent"}
+        first = proxy._post_response_cache_bust_diagnostics(
+            request_id="req_first",
+            upstream_body=body,
+            resolved_model="gpt-5.5",
+            outbound_headers=outbound_headers,
+            usage={"input_tokens": 87000, "cached_input_tokens": 85000},
+        )
+        second = proxy._post_response_cache_bust_diagnostics(
+            request_id="req_bust",
+            upstream_body=body,
+            resolved_model="gpt-5.5",
+            outbound_headers=outbound_headers,
+            usage={"input_tokens": 88000, "cached_input_tokens": 22000},
+        )
+        self.assertIsNone(first)
+        self.assertIsNone(second)
+
+    def test_user_initiated_capture_skips_when_encryption_not_set_up(self):
+        # Without a key, an X-Initiator: user request must not produce a
+        # debug-detail event or a stored prompt preview.
+        proxy._set_trace_prompt_active_key(None, None)
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/responses"),
+            method="POST",
+            headers={},
+        )
+        body = {
+            "model": "gpt-5.4",
+            "messages": [{"role": "user", "content": "secret prompt"}],
+        }
+
+        with (
+            mock.patch.object(proxy, "request_tracing_enabled", return_value=True),
+            mock.patch.object(proxy.usage_tracker, "start_event", return_value={"request_id": "req_user"}) as start_event,
+            mock.patch.object(proxy, "_append_request_trace") as append_trace,
+            mock.patch.object(proxy, "_dump_outbound_request_body") as dump_body,
+        ):
+            plan, _ = proxy._prepare_upstream_request(
+                request,
+                body=body,
+                requested_model="gpt-5.4",
+                resolved_model="gpt-5.4",
+                upstream_path="/chat/completions",
+                upstream_url="https://example.invalid/chat/completions",
+                header_builder=lambda _api_key, _request_id: {"X-Initiator": "user"},
+                error_response=proxy.format_translation.openai_error_response,
+                api_key="test-key",
+            )
+
+        self.assertIsNotNone(plan)
+        self.assertIsNone(start_event.call_args.kwargs.get("prompt_preview"))
+        events = [call.args[0] for call in append_trace.call_args_list]
+        self.assertFalse(any(event.get("event") == "request_debug_detail" for event in events))
+        request_started = next(event for event in events if event.get("event") == "request_started")
+        self.assertNotIn("request_prompt", request_started)
+        dump_body.assert_not_called()
+
+    def test_post_response_cache_bust_ignores_stable_cache_hit_rate(self):
+        body = {
+            "model": "gpt-5.5",
+            "prompt_cache_key": "lineage-stable",
+            "input": [{"type": "message", "role": "user", "content": "hi"}],
+        }
+        outbound_headers = {"X-Initiator": "agent"}
+        proxy._post_response_cache_bust_diagnostics(
+            request_id="req_first",
+            upstream_body=body,
+            resolved_model="gpt-5.5",
+            outbound_headers=outbound_headers,
+            usage={"input_tokens": 50000, "cached_input_tokens": 49000},
+        )
+        result = proxy._post_response_cache_bust_diagnostics(
+            request_id="req_second",
+            upstream_body=body,
+            resolved_model="gpt-5.5",
+            outbound_headers=outbound_headers,
+            usage={"input_tokens": 51000, "cached_input_tokens": 49500},
+        )
+        self.assertIsNone(result)
+
     def test_extract_prompt_preview_truncates_agent_requests_normally(self):
         long_system = "system-" + ("s" * 5000)
         long_user = "user-" + ("u" * 5000)
