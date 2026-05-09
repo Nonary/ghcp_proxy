@@ -6585,7 +6585,12 @@
             };
             this.tracePromptUnlock.password = '';
             this.tracePromptUnlock.statusMessage = 'Prompt previews decrypted.';
+            this.requestPromptCache = {};
+            this.requestPromptStatus = {};
+            this.requestPromptInflight = {};
             await this.load(true);
+            const selectedKey = this.selectedRequestPromptKey;
+            if (selectedKey) this.fetchSelectedRequestPrompt(selectedKey);
           } catch (error) {
             this.tracePromptUnlock.error = error.message;
           } finally {
@@ -6625,7 +6630,12 @@
             };
             this.tracePromptReset.password = '';
             this.tracePromptReset.statusMessage = 'AES password reset. Older encrypted prompt traces still require the old password.';
+            this.requestPromptCache = {};
+            this.requestPromptStatus = {};
+            this.requestPromptInflight = {};
             await this.load(true);
+            const selectedKey = this.selectedRequestPromptKey;
+            if (selectedKey) this.fetchSelectedRequestPrompt(selectedKey);
           } catch (error) {
             this.tracePromptReset.error = error.message;
           } finally {
