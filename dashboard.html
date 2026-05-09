@@ -2201,16 +2201,24 @@
                   <div><div class="detail-label">Total Tokens</div><div class="detail-value">{{ compact(displayTotalTokens(selectedRequest.usage)) }}</div></div>
                 </div>
               </article>
-              <article class="detail-block" v-if="selectedRequest.request_prompt && (selectedRequest.request_prompt.system || selectedRequest.request_prompt.user)">
+              <article class="detail-block" v-if="selectedRequest.request_prompt_available || selectedRequestPrompt">
                 <div class="detail-label">Prompt Preview</div>
-                <div v-if="selectedRequest.request_prompt.system">
-                  <div class="subtle" style="margin-top:6px">System</div>
-                  <pre class="prompt-box system">{{ selectedRequest.request_prompt.system }}</pre>
+                <div v-if="selectedRequestPromptStatus === 'loading'" class="subtle" style="margin-top: 6px;">
+                  <span class="spinner"></span> Loading prompt…
                 </div>
-                <div v-if="selectedRequest.request_prompt.user">
-                  <div class="subtle" style="margin-top:6px">User</div>
-                  <pre class="prompt-box">{{ selectedRequest.request_prompt.user }}</pre>
+                <div v-else-if="selectedRequestPromptStatus === 'error'" class="status error" style="margin-top: 6px;">
+                  Failed to load prompt: {{ selectedRequestPromptError }}
                 </div>
+                <template v-else-if="selectedRequestPrompt">
+                  <div v-if="selectedRequestPrompt.system">
+                    <div class="subtle" style="margin-top:6px">System</div>
+                    <pre class="prompt-box system">{{ selectedRequestPrompt.system }}</pre>
+                  </div>
+                  <div v-if="selectedRequestPrompt.user">
+                    <div class="subtle" style="margin-top:6px">User</div>
+                    <pre class="prompt-box">{{ selectedRequestPrompt.user }}</pre>
+                  </div>
+                </template>
               </article>
               <article class="detail-block" v-if="tracePromptUnlockVisible">
                 <div class="detail-label">Encrypted Prompt Access</div>
@@ -4097,6 +4105,9 @@
           sortMode: 'recent',
           requestPage: 1,
           selectedRequestKey: '',
+          requestPromptCache: {},
+          requestPromptInflight: {},
+          requestPromptStatus: {},
           debugModalRow: null,
           data: {
             premium: {},
@@ -5327,6 +5338,32 @@
           if (!rows.length) return null;
           if (!this.selectedRequestKey) return rows[0];
           return rows.find((row) => this.requestKey(row) === this.selectedRequestKey) || rows[0];
+        },
+        selectedRequestPromptKey() {
+          const row = this.selectedRequest;
+          if (!row || !row.request_prompt_available) return '';
+          return row.request_id || row.client_request_id || '';
+        },
+        selectedRequestPrompt() {
+          const key = this.selectedRequestPromptKey;
+          if (!key) return null;
+          const cached = this.requestPromptCache[key];
+          if (!cached) return null;
+          if (cached.locked) {
+            return { system: '[Encrypted prompt trace locked. Enter the AES password in Settings to view prompt text.]' };
+          }
+          return cached.request_prompt || null;
+        },
+        selectedRequestPromptStatus() {
+          const key = this.selectedRequestPromptKey;
+          if (!key) return 'idle';
+          if (this.requestPromptCache[key]) return 'ready';
+          return this.requestPromptStatus[key] || 'idle';
+        },
+        selectedRequestPromptError() {
+          return this.requestPromptStatus[this.selectedRequestPromptKey] === 'error'
+            ? (this.requestPromptCache[this.selectedRequestPromptKey + ':error'] || 'unknown error')
+            : '';
         },
         anyClientProxyError() {
           return Boolean(this.clientProxyStatus.codex?.error || this.clientProxyStatus.claude?.error);
@@ -7362,6 +7399,41 @@
           const next = Math.max(1, Math.min(this.requestPageCount, Math.round(num)));
           this.requestPage = next;
           this.selectedRequestKey = this.requestKey((this.pagedRequests || [])[0]);
+        },
+        async fetchSelectedRequestPrompt(requestId) {
+          if (!requestId) return;
+          if (this.requestPromptCache[requestId]) return;
+          if (this.requestPromptInflight[requestId]) return;
+          this.requestPromptInflight[requestId] = true;
+          this.requestPromptStatus[requestId] = 'loading';
+          try {
+            const response = await fetch(`/api/request-prompt/${encodeURIComponent(requestId)}`, { cache: 'no-store' });
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            const payload = await response.json();
+            if (!payload || payload.available === false) {
+              this.requestPromptCache[requestId] = { request_prompt: null };
+              this.requestPromptStatus[requestId] = 'ready';
+              return;
+            }
+            this.requestPromptCache[requestId] = {
+              request_prompt: payload.request_prompt || null,
+              locked: Boolean(payload.locked),
+            };
+            this.requestPromptStatus[requestId] = 'ready';
+          } catch (error) {
+            this.requestPromptCache[requestId + ':error'] = error?.message || 'unknown error';
+            this.requestPromptStatus[requestId] = 'error';
+          } finally {
+            delete this.requestPromptInflight[requestId];
+          }
+        },
+      },
+      watch: {
+        selectedRequestPromptKey: {
+          immediate: true,
+          handler(key) {
+            if (key) this.fetchSelectedRequestPrompt(key);
+          },
         },
       },
       mounted() {

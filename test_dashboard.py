@@ -361,6 +361,73 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(response.media_type, "application/json")
         self.assertEqual(response.body, b'{"ok":true}')
 
+    def test_recent_requests_strip_prompt_and_set_availability_marker(self):
+        fixed_now = datetime(2026, 4, 4, 18, 0, tzinfo=timezone.utc)
+        usage_events = [
+            {
+                "request_id": "req-with-prompt",
+                "started_at": "2026-04-04T17:50:00+00:00",
+                "finished_at": "2026-04-04T17:51:00+00:00",
+                "request_prompt": {"system": "secret", "user": "hello"},
+            },
+            {
+                "request_id": "req-no-prompt",
+                "started_at": "2026-04-04T17:55:00+00:00",
+                "finished_at": "2026-04-04T17:56:00+00:00",
+            },
+        ]
+
+        decrypt_mock = mock.MagicMock(side_effect=AssertionError("bulk path must not decrypt prompts"))
+        service = dashboard.DashboardService(
+            dependencies=dashboard.DashboardDependencies(
+                snapshot_all_usage_events=lambda: usage_events,
+                snapshot_usage_events=lambda: usage_events,
+                load_safeguard_trigger_stats=lambda _now: {},
+                decrypt_prompt_payload=decrypt_mock,
+            ),
+            utc_now=lambda: fixed_now,
+        )
+
+        payload = service.build_payload()
+        rows = {row["request_id"]: row for row in payload["recent_requests"]}
+
+        self.assertNotIn("request_prompt", rows["req-with-prompt"])
+        self.assertTrue(rows["req-with-prompt"]["request_prompt_available"])
+        self.assertNotIn("request_prompt_available", rows["req-no-prompt"])
+        decrypt_mock.assert_not_called()
+
+    def test_request_prompt_api_returns_decrypted_prompt_for_known_request(self):
+        proxy.usage_tracker.replace_history(recent_events=[
+            {
+                "request_id": "req-lazy",
+                "started_at": "2026-04-04T17:50:00+00:00",
+                "finished_at": "2026-04-04T17:51:00+00:00",
+                "request_prompt": {"system": "ctx", "user": "ask"},
+            },
+        ])
+
+        try:
+            with mock.patch.object(
+                proxy,
+                "_decrypt_prompt_payload_for_dashboard",
+                lambda value: {"system": "ctx", "user": "ask"} if value else value,
+            ):
+                response = proxy.asyncio.run(proxy.request_prompt_api("req-lazy"))
+        finally:
+            proxy.usage_tracker.clear_state()
+
+        self.assertEqual(response.headers["cache-control"], "no-store")
+        body = response.body.decode("utf-8")
+        self.assertIn('"available":true', body)
+        self.assertIn('"user":"ask"', body)
+
+    def test_request_prompt_api_reports_missing_event(self):
+        proxy.usage_tracker.clear_state()
+        response = proxy.asyncio.run(proxy.request_prompt_api("does-not-exist"))
+        body = response.body.decode("utf-8")
+        self.assertIn('"available":false', body)
+        self.assertIn('"not_found":true', body)
+
     def test_premium_summary_derived_from_quota_snapshot_headers(self):
         fixed_now = datetime(2026, 4, 17, 12, 0, tzinfo=timezone.utc)
         usage_events = [

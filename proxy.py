@@ -4729,10 +4729,13 @@ async def dashboard_stream(request: Request):
 
     async def stream():
         nonlocal last_version
+        # Emit an initial heartbeat so EventSource clients see the stream is
+        # live immediately. The page concurrently fetches /api/dashboard, so
+        # we deliberately skip a redundant initial dashboard build here and
+        # only stream payloads when the version changes.
+        yield format_translation.sse_encode("heartbeat", {"at": util.utc_now_iso()})
         last_heartbeat = time.monotonic()
         try:
-            initial_chunk = await asyncio.to_thread(_build_dashboard_sse_event, "dashboard")
-            yield initial_chunk
             while True:
                 if await request.is_disconnected():
                     break
@@ -4762,6 +4765,31 @@ async def dashboard_stream(request: Request):
             "X-Accel-Buffering": "no",
         },
     )
+
+
+def _load_request_prompt_payload(request_id: str) -> dict:
+    if not isinstance(request_id, str) or not request_id:
+        return {"available": False}
+    target = None
+    for event in reversed(usage_tracker.snapshot_usage_events()):
+        if isinstance(event, dict) and event.get("request_id") == request_id:
+            target = event
+            break
+    if target is None:
+        return {"available": False, "not_found": True}
+    raw_prompt = target.get("request_prompt")
+    if not isinstance(raw_prompt, dict):
+        return {"available": False}
+    decrypted = _decrypt_prompt_payload_for_dashboard(raw_prompt)
+    if isinstance(decrypted, dict):
+        return {"available": True, "request_prompt": decrypted}
+    return {"available": True, "locked": True}
+
+
+@app.get("/api/request-prompt/{request_id}")
+async def request_prompt_api(request_id: str):
+    payload = await asyncio.to_thread(_load_request_prompt_payload, request_id)
+    return JSONResponse(content=payload, headers={"Cache-Control": "no-store"})
 
 
 # ─── Auth routes ──────────────────────────────────────────────────────────────

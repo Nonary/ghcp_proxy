@@ -1940,17 +1940,17 @@ class DashboardService:
         }
 
     def _dashboard_request_event(self, event: dict) -> dict:
+        # Strip the prompt from the bulk payload — decrypting up to
+        # DETAILED_REQUEST_HISTORY_LIMIT prompts per refresh dominated server
+        # CPU and inflated the response by tens of MB. The UI only renders the
+        # prompt for the currently-selected row, so it lazy-fetches via
+        # /api/request-prompt/{request_id} when the user opens a row.
         if not isinstance(event, dict):
             return {}
         result = dict(event)
-        if "request_prompt" not in result:
-            return result
-        decrypted = self.dependencies.decrypt_prompt_payload(result.get("request_prompt"))
-        if isinstance(decrypted, dict):
-            result["request_prompt"] = decrypted
-        else:
+        if "request_prompt" in result:
             result.pop("request_prompt", None)
-            result["request_prompt_encrypted"] = True
+            result["request_prompt_available"] = True
         return result
 
     # ─── Stream broker delegation ─────────────────────────────────────────────
