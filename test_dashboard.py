@@ -351,13 +351,15 @@ class DashboardTests(unittest.TestCase):
 
     def test_dashboard_api_refresh_param_forces_refresh_and_disables_http_caching(self):
         request = SimpleNamespace(query_params={"refresh": "1"})
-        mocked_to_thread = mock.AsyncMock(return_value={"ok": True})
+        mocked_to_thread = mock.AsyncMock(return_value=b'{"ok":true}')
 
         with mock.patch.object(proxy.asyncio, "to_thread", mocked_to_thread):
             response = proxy.asyncio.run(proxy.dashboard_api(request))
 
-        mocked_to_thread.assert_awaited_once_with(proxy.dashboard_service.build_payload, True)
+        mocked_to_thread.assert_awaited_once_with(proxy._build_dashboard_response_body, True)
         self.assertEqual(response.headers["cache-control"], "no-store")
+        self.assertEqual(response.media_type, "application/json")
+        self.assertEqual(response.body, b'{"ok":true}')
 
     def test_premium_summary_derived_from_quota_snapshot_headers(self):
         fixed_now = datetime(2026, 4, 17, 12, 0, tzinfo=timezone.utc)

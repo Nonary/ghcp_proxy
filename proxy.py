@@ -4699,11 +4699,25 @@ async def dashboard():
     return FileResponse(DASHBOARD_FILE, media_type="text/html")
 
 
+def _build_dashboard_response_body(refresh: bool) -> bytes:
+    payload = dashboard_service.build_payload(refresh)
+    return json.dumps(payload, separators=(",", ":"), default=util._json_default).encode("utf-8")
+
+
+def _build_dashboard_sse_event(event_name: str) -> bytes:
+    payload = dashboard_service.build_payload(False)
+    return format_translation.sse_encode(event_name, payload)
+
+
 @app.get("/api/dashboard")
 async def dashboard_api(request: Request):
     refresh = request.query_params.get("refresh", "").lower() in {"1", "true", "yes"}
-    payload = await asyncio.to_thread(dashboard_service.build_payload, refresh)
-    return JSONResponse(content=payload, headers={"Cache-Control": "no-store"})
+    body = await asyncio.to_thread(_build_dashboard_response_body, refresh)
+    return Response(
+        content=body,
+        media_type="application/json",
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @app.get("/api/dashboard/stream")
@@ -4717,8 +4731,8 @@ async def dashboard_stream(request: Request):
         nonlocal last_version
         last_heartbeat = time.monotonic()
         try:
-            initial_payload = await asyncio.to_thread(dashboard_service.build_payload, False)
-            yield format_translation.sse_encode("dashboard", initial_payload)
+            initial_chunk = await asyncio.to_thread(_build_dashboard_sse_event, "dashboard")
+            yield initial_chunk
             while True:
                 if await request.is_disconnected():
                     break
@@ -4735,8 +4749,8 @@ async def dashboard_stream(request: Request):
                 if version == last_version:
                     continue
                 last_version = version
-                payload = await asyncio.to_thread(dashboard_service.build_payload, False)
-                yield format_translation.sse_encode("dashboard", payload)
+                chunk = await asyncio.to_thread(_build_dashboard_sse_event, "dashboard")
+                yield chunk
         finally:
             dashboard_service.unregister_stream_listener(queue)
 
