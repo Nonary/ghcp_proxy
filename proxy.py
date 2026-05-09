@@ -57,6 +57,7 @@ import auto_update
 import background_proxy
 import dashboard as dashboard_module
 import format_translation
+import gzip
 import hashlib
 import messages_preprocess
 import migrate_runtime_paths
@@ -4694,14 +4695,58 @@ async def dashboard_root():
     return RedirectResponse(url="/ui", status_code=307)
 
 
+# Pre-load and pre-compress the dashboard HTML at import time. The file is
+# ~400KB raw and compresses to ~50KB; serving the precompressed bytes saves
+# both the network transfer and the per-request gzip cost.
+_DASHBOARD_HTML_LOCK = threading.Lock()
+_DASHBOARD_HTML_RAW: bytes | None = None
+_DASHBOARD_HTML_GZIPPED: bytes | None = None
+_DASHBOARD_HTML_MTIME: float = 0.0
+
+
+def _load_dashboard_html_bytes() -> tuple[bytes, bytes]:
+    global _DASHBOARD_HTML_RAW, _DASHBOARD_HTML_GZIPPED, _DASHBOARD_HTML_MTIME
+    with _DASHBOARD_HTML_LOCK:
+        try:
+            mtime = os.path.getmtime(DASHBOARD_FILE)
+        except OSError:
+            mtime = 0.0
+        if _DASHBOARD_HTML_RAW is None or mtime != _DASHBOARD_HTML_MTIME:
+            with open(DASHBOARD_FILE, "rb") as f:
+                raw = f.read()
+            _DASHBOARD_HTML_RAW = raw
+            _DASHBOARD_HTML_GZIPPED = gzip.compress(raw, compresslevel=9)
+            _DASHBOARD_HTML_MTIME = mtime
+        return _DASHBOARD_HTML_RAW, _DASHBOARD_HTML_GZIPPED
+
+
 @app.get("/ui", response_class=HTMLResponse)
-async def dashboard():
-    return FileResponse(DASHBOARD_FILE, media_type="text/html")
+async def dashboard(request: Request):
+    raw, gzipped = _load_dashboard_html_bytes()
+    accept_encoding = request.headers.get("accept-encoding", "")
+    if "gzip" in accept_encoding.lower():
+        return Response(
+            content=gzipped,
+            media_type="text/html; charset=utf-8",
+            headers={
+                "Content-Encoding": "gzip",
+                "Vary": "Accept-Encoding",
+                "Cache-Control": "no-cache",
+            },
+        )
+    return Response(
+        content=raw,
+        media_type="text/html; charset=utf-8",
+        headers={"Cache-Control": "no-cache"},
+    )
 
 
-def _build_dashboard_response_body(refresh: bool) -> bytes:
+def _build_dashboard_response_body(refresh: bool, gzip_body: bool = False) -> tuple[bytes, bool]:
     payload = dashboard_service.build_payload(refresh)
-    return json.dumps(payload, separators=(",", ":"), default=util._json_default).encode("utf-8")
+    body = json.dumps(payload, separators=(",", ":"), default=util._json_default).encode("utf-8")
+    if gzip_body and len(body) >= 1024:
+        return gzip.compress(body, compresslevel=6), True
+    return body, False
 
 
 def _build_dashboard_sse_event(event_name: str) -> bytes:
@@ -4712,11 +4757,19 @@ def _build_dashboard_sse_event(event_name: str) -> bytes:
 @app.get("/api/dashboard")
 async def dashboard_api(request: Request):
     refresh = request.query_params.get("refresh", "").lower() in {"1", "true", "yes"}
-    body = await asyncio.to_thread(_build_dashboard_response_body, refresh)
+    accept_encoding = request.headers.get("accept-encoding", "")
+    accepts_gzip = "gzip" in accept_encoding.lower()
+    body, encoded = await asyncio.to_thread(
+        _build_dashboard_response_body, refresh, accepts_gzip
+    )
+    headers = {"Cache-Control": "no-store"}
+    if encoded:
+        headers["Content-Encoding"] = "gzip"
+        headers["Vary"] = "Accept-Encoding"
     return Response(
         content=body,
         media_type="application/json",
-        headers={"Cache-Control": "no-store"},
+        headers=headers,
     )
 
 

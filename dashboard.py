@@ -1852,6 +1852,13 @@ class DashboardService:
         self.notify_dashboard_stream_listeners = notify_dashboard_stream_listeners
         self._stream_broker = stream_broker or dashboard_stream_broker
         self.thread_class = thread_class
+        # Coalesce concurrent build_payload() calls within a short window so
+        # bursts of SSE notifications (one per AI request) don't each scan
+        # the full event history. force_refresh=True bypasses the cache.
+        self._payload_cache_ttl = 0.25
+        self._payload_cache_value: dict | None = None
+        self._payload_cache_monotonic: float = 0.0
+        self._payload_cache_lock = Lock()
 
     def _resolved_thread_class(self):
         resolved_thread_class = self.thread_class
@@ -1860,6 +1867,19 @@ class DashboardService:
         return resolved_thread_class
 
     def build_payload(self, force_refresh: bool = False) -> dict:
+        if not force_refresh:
+            with self._payload_cache_lock:
+                cached = self._payload_cache_value
+                cached_at = self._payload_cache_monotonic
+            if cached is not None and (time.monotonic() - cached_at) < self._payload_cache_ttl:
+                return cached
+        result = self._build_payload_uncached()
+        with self._payload_cache_lock:
+            self._payload_cache_value = result
+            self._payload_cache_monotonic = time.monotonic()
+        return result
+
+    def _build_payload_uncached(self) -> dict:
         now = self.utc_now()
         month_start, month_end = _current_billing_month_bounds(now)
         current_month_key = _month_key(now)

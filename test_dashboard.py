@@ -350,16 +350,39 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(payload["safeguard"]["latest_triggered_at"], "2026-04-04T17:30:00+00:00")
 
     def test_dashboard_api_refresh_param_forces_refresh_and_disables_http_caching(self):
-        request = SimpleNamespace(query_params={"refresh": "1"})
-        mocked_to_thread = mock.AsyncMock(return_value=b'{"ok":true}')
+        request = SimpleNamespace(
+            query_params={"refresh": "1"},
+            headers={"accept-encoding": "identity"},
+        )
+        mocked_to_thread = mock.AsyncMock(return_value=(b'{"ok":true}', False))
 
         with mock.patch.object(proxy.asyncio, "to_thread", mocked_to_thread):
             response = proxy.asyncio.run(proxy.dashboard_api(request))
 
-        mocked_to_thread.assert_awaited_once_with(proxy._build_dashboard_response_body, True)
+        mocked_to_thread.assert_awaited_once_with(
+            proxy._build_dashboard_response_body, True, False
+        )
         self.assertEqual(response.headers["cache-control"], "no-store")
         self.assertEqual(response.media_type, "application/json")
         self.assertEqual(response.body, b'{"ok":true}')
+        self.assertNotIn("content-encoding", {k.lower() for k in response.headers})
+
+    def test_dashboard_api_gzips_when_client_supports_it(self):
+        request = SimpleNamespace(
+            query_params={},
+            headers={"accept-encoding": "gzip, deflate"},
+        )
+        mocked_to_thread = mock.AsyncMock(return_value=(b'\x1f\x8bcompressed', True))
+
+        with mock.patch.object(proxy.asyncio, "to_thread", mocked_to_thread):
+            response = proxy.asyncio.run(proxy.dashboard_api(request))
+
+        mocked_to_thread.assert_awaited_once_with(
+            proxy._build_dashboard_response_body, False, True
+        )
+        self.assertEqual(response.headers["content-encoding"], "gzip")
+        self.assertEqual(response.headers["vary"], "Accept-Encoding")
+        self.assertEqual(response.body, b'\x1f\x8bcompressed')
 
     def test_recent_requests_strip_prompt_and_set_availability_marker(self):
         fixed_now = datetime(2026, 4, 4, 18, 0, tzinfo=timezone.utc)
@@ -427,6 +450,31 @@ class DashboardTests(unittest.TestCase):
         body = response.body.decode("utf-8")
         self.assertIn('"available":false', body)
         self.assertIn('"not_found":true', body)
+
+    def test_build_payload_coalesces_concurrent_calls_within_ttl(self):
+        snapshot_calls = {"count": 0}
+
+        def counting_snapshot():
+            snapshot_calls["count"] += 1
+            return []
+
+        service = dashboard.DashboardService(
+            dependencies=dashboard.DashboardDependencies(
+                snapshot_all_usage_events=counting_snapshot,
+                snapshot_usage_events=counting_snapshot,
+                load_safeguard_trigger_stats=lambda _now: {},
+            ),
+        )
+
+        first = service.build_payload()
+        cached_count = snapshot_calls["count"]
+        second = service.build_payload()
+        self.assertIs(first, second)
+        self.assertEqual(snapshot_calls["count"], cached_count)
+
+        forced = service.build_payload(force_refresh=True)
+        self.assertIsNot(first, forced)
+        self.assertGreater(snapshot_calls["count"], cached_count)
 
     def test_premium_summary_derived_from_quota_snapshot_headers(self):
         fixed_now = datetime(2026, 4, 17, 12, 0, tzinfo=timezone.utc)
