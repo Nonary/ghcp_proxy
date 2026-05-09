@@ -7400,6 +7400,20 @@
           this.requestPage = next;
           this.selectedRequestKey = this.requestKey((this.pagedRequests || [])[0]);
         },
+        ensureViewData(view) {
+          // Lazy-load view-specific config endpoints the first time the user
+          // navigates to a tab that needs them. Each loader is idempotent — it
+          // returns immediately if data is already loaded — so calling on every
+          // view change is safe.
+          if (view === 'safeguard') {
+            this.loadSafeguardConfig();
+          } else if (view === 'settings' || view === 'integrations') {
+            this.loadClientProxyStatus();
+            this.loadBackgroundProxyStatus();
+          } else if (view === 'routing' || view === 'approvals') {
+            this.loadModelRoutingConfig();
+          }
+        },
         async fetchSelectedRequestPrompt(requestId) {
           if (!requestId) return;
           if (this.requestPromptCache[requestId]) return;
@@ -7435,20 +7449,28 @@
             if (key) this.fetchSelectedRequestPrompt(key);
           },
         },
+        activeView: {
+          immediate: true,
+          handler(view) {
+            this.ensureViewData(view);
+          },
+        },
       },
       mounted() {
         this.loadAuthStatus();
         this.load(true);
-        this.loadSafeguardConfig();
-        this.loadClientProxyStatus();
-        this.loadBackgroundProxyStatus();
+        // Eager: auto-update status feeds the update banner that surfaces on
+        // every view, so we still need it on mount.
         this.loadAutoUpdateStatus();
-        this.loadModelRoutingConfig();
         this.startDashboardStream();
+        // Tab-specific config endpoints are lazy-loaded on view change via
+        // the activeView watcher + ensureViewData(). The 5-minute timer is a
+        // safety net for time-based aggregations and config drift; SSE pushes
+        // dashboard updates whenever an AI request lands.
         this.autoRefreshTimer = window.setInterval(() => {
           this.load(true);
           this.loadAutoUpdateStatus();
-        }, 60000);
+        }, 300000);
         this._debugModalKeyHandler = (event) => {
           if (event.key === 'Escape' && this.debugModalRow) {
             this.closeDebugModal();
