@@ -74,7 +74,7 @@ import update_notice
 import usage_reminder
 import usage_tracking
 import util
-from collections import deque
+from collections import OrderedDict, deque
 from dataclasses import dataclass
 from threading import Lock, Thread
 from urllib.parse import urlsplit
@@ -192,7 +192,7 @@ CACHE_TRIPWIRE_CACHED_INPUT_TOKEN_THRESHOLD = 30_000
 CACHE_TRIPWIRE_FRESH_CACHED_GAP_THRESHOLD = 50_000
 CACHE_TRIPWIRE_CONSECUTIVE_HIT_THRESHOLD = 3
 CACHE_TRIPWIRE_REASON = "token_tripwire"
-CACHE_SETTLE_DELAY_SECONDS = 5.0
+CACHE_SETTLE_DELAY_SECONDS = 2.0
 PROMPT_DRIFT_SNAPSHOT_LIMIT = 32
 DEBUG_DETAIL_CONTEXT_REQUESTS = 10
 CACHE_BUST_DRIFT_PREVIOUS_TOKEN_THRESHOLD = 500
@@ -200,12 +200,10 @@ CACHE_BUST_DRIFT_DROP_TOKEN_THRESHOLD = 1
 CACHE_BUST_DRIFT_CURRENT_RATIO_THRESHOLD = 1.0
 CACHE_BUST_DRIFT_ESTIMATED_CHARS_PER_TOKEN = 4
 # Post-response detector: catches upstream cache evictions where the local
-# prompt projection still grows monotonically but ``cached_input_tokens``
-# collapses between consecutive in-chain requests. The local-shrink detector
-# above can't see this because the request body is unchanged from our side.
-CACHE_BUST_USAGE_PREVIOUS_CACHE_THRESHOLD = 5_000
-CACHE_BUST_USAGE_CACHE_DROP_THRESHOLD = 5_000
-CACHE_BUST_USAGE_CURRENT_RATIO_THRESHOLD = 0.5
+# prompt projection still grows monotonically but ``cached_input_tokens`` drops
+# between consecutive completed requests in the same debug session. The
+# local-shrink detector above can't see this because the request body is
+# unchanged from our side.
 
 safeguard_event_store = dashboard_module.create_safeguard_event_store()
 _CACHE_TRIPWIRE_LOCK = threading.Lock()
@@ -217,37 +215,41 @@ _PROMPT_CACHE_LAST_PROMPT_BY_LINEAGE: dict[tuple[str, str], dict] = {}
 _PROMPT_CACHE_AFFINITY_TRACE_LOCK = threading.Lock()
 _PROMPT_CACHE_LAST_AFFINITY_BY_LINEAGE: dict[tuple[str, str], dict] = {}
 _PROMPT_CACHE_USAGE_TRACE_LOCK = threading.Lock()
-_PROMPT_CACHE_LAST_USAGE_BY_LINEAGE: dict[tuple[str, str], dict] = {}
+_PROMPT_CACHE_LAST_USAGE_BY_SESSION: OrderedDict[str, dict] = OrderedDict()
 _TRACE_PROMPT_KEY_LOCK = threading.Lock()
 _TRACE_PROMPT_AES_KEY: bytes | None = None
 _TRACE_PROMPT_SALT: str | None = None
 _TRACE_PROMPT_PRIVATE_KEY_PEM: str | None = None
 _TRACE_PROMPT_ENABLE_PENDING = False
 _DEBUG_DETAIL_CAPTURE_LOCK = threading.Lock()
-# Keep enough request-start snapshots to reconstruct both sides of a
-# post-response cache-bust incident.  Usage-based cache-bust detection runs when
-# the buster response finishes, so several "future" requests may already have
-# started by then.  A 10-entry deque can be entirely consumed by those future
-# requests and lose the 10 requests that were immediately behind the buster.
-_DEBUG_DETAIL_RECENT_REQUESTS_MAXLEN = max(
-    PROMPT_DRIFT_SNAPSHOT_LIMIT,
-    (DEBUG_DETAIL_CONTEXT_REQUESTS * 3) + 1,
+DEBUG_DETAIL_SESSION_BUFFER_LIMIT = 6
+_DEBUG_DETAIL_REQUEST_SNAPSHOT_INDEX_MAXLEN = (
+    DEBUG_DETAIL_SESSION_BUFFER_LIMIT * ((DEBUG_DETAIL_CONTEXT_REQUESTS * 2) + 1)
 )
-_DEBUG_DETAIL_RECENT_REQUESTS: deque[dict] = deque(maxlen=_DEBUG_DETAIL_RECENT_REQUESTS_MAXLEN)
-_DEBUG_DETAIL_FUTURE_REMAINING = 0
+DEBUG_DETAIL_SESSION_DETAIL_LIMIT = DEBUG_DETAIL_CONTEXT_REQUESTS
+# Per-session start snapshots used for debug detail capture.  Each session keeps
+# only its previous-context window; post-response cache-bust triggers use the
+# buster request's frozen copy of this deque so later same-session starts cannot
+# evict the pre-bust context before the buster response finishes.
+_DEBUG_DETAIL_SESSION_RECENT_REQUESTS: OrderedDict[str, deque[dict]] = OrderedDict()
+_DEBUG_DETAIL_SESSION_FUTURE_CAPTURES: dict[str, dict] = {}
+_DEBUG_DETAIL_REQUEST_SNAPSHOTS_BY_ID: OrderedDict[str, dict] = OrderedDict()
+_DEBUG_DETAIL_SESSION_CAPTURED_REQUEST_IDS: OrderedDict[str, set[str]] = OrderedDict()
 _DEBUG_DETAIL_INCIDENT_COUNTER = 0
-_DEBUG_DETAIL_ACTIVE_INCIDENT_ID: str | None = None
+_DEBUG_DETAIL_SNAPSHOT_SEQUENCE = 0
 
 
 def _reset_debug_detail_capture_state() -> None:
-    global _DEBUG_DETAIL_FUTURE_REMAINING, _DEBUG_DETAIL_INCIDENT_COUNTER, _DEBUG_DETAIL_ACTIVE_INCIDENT_ID
+    global _DEBUG_DETAIL_INCIDENT_COUNTER, _DEBUG_DETAIL_SNAPSHOT_SEQUENCE
     with _DEBUG_DETAIL_CAPTURE_LOCK:
-        _DEBUG_DETAIL_RECENT_REQUESTS.clear()
-        _DEBUG_DETAIL_FUTURE_REMAINING = 0
+        _DEBUG_DETAIL_SESSION_RECENT_REQUESTS.clear()
+        _DEBUG_DETAIL_SESSION_FUTURE_CAPTURES.clear()
+        _DEBUG_DETAIL_REQUEST_SNAPSHOTS_BY_ID.clear()
+        _DEBUG_DETAIL_SESSION_CAPTURED_REQUEST_IDS.clear()
         _DEBUG_DETAIL_INCIDENT_COUNTER = 0
-        _DEBUG_DETAIL_ACTIVE_INCIDENT_ID = None
+        _DEBUG_DETAIL_SNAPSHOT_SEQUENCE = 0
     with _PROMPT_CACHE_USAGE_TRACE_LOCK:
-        _PROMPT_CACHE_LAST_USAGE_BY_LINEAGE.clear()
+        _PROMPT_CACHE_LAST_USAGE_BY_SESSION.clear()
 
 
 def _stream_with_update_notice(byte_iter, protocol: str, upstream_headers=None):
@@ -1593,6 +1595,7 @@ class UpstreamRequestPlan:
     resolved_model: str | None
     source_body: dict | None = None
     trace_context: dict | None = None
+    debug_detail_session_key: str | None = None
     auto_update_request_tracked: bool = False
 
 
@@ -2004,6 +2007,163 @@ def _prompt_cache_trace_lineage(
     return None
 
 
+def _debug_detail_normalized_string(value) -> str | None:
+    if isinstance(value, str):
+        normalized = value.strip()
+        if normalized:
+            return normalized
+    return None
+
+
+def _debug_detail_body_session_id(body: dict | None) -> str | None:
+    return usage_tracking.request_body_session_id(body)
+
+
+def _debug_detail_header_value(headers: dict | None, header_name: str) -> str | None:
+    return _debug_detail_normalized_string(_header_value_case_insensitive(headers, header_name))
+
+
+def _debug_detail_prompt_cache_session_key(
+    body: dict | None,
+    model: str | None,
+) -> tuple[str, str] | None:
+    if not isinstance(body, dict):
+        return None
+    model_name = str(model or body.get("model") or "").strip().lower()
+    if not model_name:
+        return None
+    prompt_cache_key = body.get("prompt_cache_key") or body.get("promptCacheKey")
+    prompt_cache_key = _debug_detail_normalized_string(prompt_cache_key)
+    if prompt_cache_key:
+        return f"prompt_cache:{model_name}:{prompt_cache_key}", "prompt_cache_key"
+    return None
+
+
+def _debug_detail_session_key(
+    *,
+    request: Request | None = None,
+    request_body: dict | None = None,
+    upstream_body: dict | None = None,
+    resolved_model: str | None = None,
+    outbound_headers: dict | None = None,
+) -> tuple[str, str] | None:
+    """Resolve the session bucket used for cache-bust debug capture.
+
+    Prefer the caller's explicit session identity (request/body), then session
+    identities that have already been forwarded into outbound headers.  Only
+    fall back to prompt-cache lineage when no session-like identifier exists.
+    """
+
+    if request is not None:
+        session_id = usage_tracking.request_session_id(
+            request,
+            request_body if isinstance(request_body, dict) else upstream_body,
+        )
+        if session_id:
+            return f"session:{session_id}", "request_session_id"
+
+    for body in (request_body, upstream_body):
+        session_id = _debug_detail_body_session_id(body)
+        if session_id:
+            return f"session:{session_id}", "body_session_id"
+
+    for header_name, source in (
+        ("session_id", "header_session_id"),
+        ("session-id", "header_session_id"),
+        ("x-claude-code-session-id", "header_session_id"),
+        ("x-session-affinity", "header_session_id"),
+        ("x-opencode-session", "header_session_id"),
+        ("x-client-request-id", "header_client_request_id"),
+        ("x-client-session-id", "header_client_session_id"),
+        ("x-interaction-id", "header_interaction_id"),
+        ("x-parent-agent-id", "header_parent_agent_id"),
+        ("x-agent-task-id", "header_agent_task_id"),
+    ):
+        value = _debug_detail_header_value(outbound_headers, header_name)
+        if value:
+            return f"{source}:{value}", source
+
+    for body in (request_body, upstream_body):
+        prompt_cache_key = _debug_detail_prompt_cache_session_key(body, resolved_model)
+        if prompt_cache_key is not None:
+            return prompt_cache_key
+
+    return None
+
+
+def _debug_detail_session_buffer_locked(session_key: str) -> deque[dict]:
+    buffer = _DEBUG_DETAIL_SESSION_RECENT_REQUESTS.get(session_key)
+    if buffer is None:
+        buffer = deque(maxlen=DEBUG_DETAIL_CONTEXT_REQUESTS)
+        _DEBUG_DETAIL_SESSION_RECENT_REQUESTS[session_key] = buffer
+    else:
+        _DEBUG_DETAIL_SESSION_RECENT_REQUESTS.move_to_end(session_key)
+    return buffer
+
+
+def _evict_debug_detail_sessions_locked() -> None:
+    while len(_DEBUG_DETAIL_SESSION_RECENT_REQUESTS) > DEBUG_DETAIL_SESSION_BUFFER_LIMIT:
+        evicted_session_key, _ = _DEBUG_DETAIL_SESSION_RECENT_REQUESTS.popitem(last=False)
+        _DEBUG_DETAIL_SESSION_FUTURE_CAPTURES.pop(evicted_session_key, None)
+        _DEBUG_DETAIL_SESSION_CAPTURED_REQUEST_IDS.pop(evicted_session_key, None)
+        for request_id, snapshot in list(_DEBUG_DETAIL_REQUEST_SNAPSHOTS_BY_ID.items()):
+            if snapshot.get("_session_key") == evicted_session_key:
+                _DEBUG_DETAIL_REQUEST_SNAPSHOTS_BY_ID.pop(request_id, None)
+
+
+def _remember_debug_detail_snapshot_locked(snapshot: dict) -> None:
+    request_id = _debug_detail_normalized_string(snapshot.get("request_id"))
+    if not request_id:
+        return
+    _DEBUG_DETAIL_REQUEST_SNAPSHOTS_BY_ID.pop(request_id, None)
+    _DEBUG_DETAIL_REQUEST_SNAPSHOTS_BY_ID[request_id] = snapshot
+    while len(_DEBUG_DETAIL_REQUEST_SNAPSHOTS_BY_ID) > _DEBUG_DETAIL_REQUEST_SNAPSHOT_INDEX_MAXLEN:
+        _DEBUG_DETAIL_REQUEST_SNAPSHOTS_BY_ID.popitem(last=False)
+
+
+def _debug_detail_after_snapshots_locked(session_key: str, buster_snapshot: dict) -> list[dict]:
+    buster_sequence = buster_snapshot.get("_debug_detail_sequence")
+    if not isinstance(buster_sequence, int):
+        return []
+    after_snapshots = [
+        snapshot
+        for snapshot in _DEBUG_DETAIL_REQUEST_SNAPSHOTS_BY_ID.values()
+        if snapshot.get("_session_key") == session_key
+        and isinstance(snapshot.get("_debug_detail_sequence"), int)
+        and snapshot.get("_debug_detail_sequence") > buster_sequence
+    ]
+    after_snapshots.sort(key=lambda snapshot: snapshot.get("_debug_detail_sequence", 0))
+    return after_snapshots[:DEBUG_DETAIL_CONTEXT_REQUESTS]
+
+
+def _debug_detail_session_captured_ids_locked(session_key: str) -> set[str]:
+    captured = _DEBUG_DETAIL_SESSION_CAPTURED_REQUEST_IDS.get(session_key)
+    if captured is None:
+        captured = set()
+        _DEBUG_DETAIL_SESSION_CAPTURED_REQUEST_IDS[session_key] = captured
+    else:
+        _DEBUG_DETAIL_SESSION_CAPTURED_REQUEST_IDS.move_to_end(session_key)
+    return captured
+
+
+def _debug_detail_capture_slots_remaining_locked(session_key: str) -> int:
+    captured = _debug_detail_session_captured_ids_locked(session_key)
+    return max(0, DEBUG_DETAIL_SESSION_DETAIL_LIMIT - len(captured))
+
+
+def _claim_debug_detail_capture_locked(session_key: str, snapshot: dict) -> bool:
+    request_id = _debug_detail_normalized_string(snapshot.get("request_id"))
+    if not request_id:
+        return False
+    captured = _debug_detail_session_captured_ids_locked(session_key)
+    if request_id in captured:
+        return False
+    if len(captured) >= DEBUG_DETAIL_SESSION_DETAIL_LIMIT:
+        return False
+    captured.add(request_id)
+    return True
+
+
 def _prompt_projection_token_estimate(chars) -> int | None:
     try:
         char_count = int(chars)
@@ -2205,7 +2365,9 @@ def _with_debug_detail_capture_info(
     incident_id: str | None = None,
 ) -> dict:
     event = dict(snapshot)
-    event.pop("_lineage", None)
+    for key in list(event.keys()):
+        if isinstance(key, str) and key.startswith("_"):
+            event.pop(key, None)
     event["debug_detail_capture"] = _debug_detail_capture_info(
         reasons=reasons,
         phase=phase,
@@ -2230,6 +2392,13 @@ def _build_debug_detail_snapshot(
         truncate=False,
     )
     lineage = _prompt_cache_trace_lineage(upstream_body, resolved_model, outbound_headers)
+    session_key_pair = _debug_detail_session_key(
+        request=request,
+        request_body=request_body,
+        upstream_body=upstream_body,
+        resolved_model=resolved_model,
+        outbound_headers=outbound_headers,
+    )
     snapshot = {
         "event": "request_debug_detail",
         "time": util.utc_now_iso(),
@@ -2246,6 +2415,8 @@ def _build_debug_detail_snapshot(
     }
     if lineage is not None:
         snapshot["_lineage"] = lineage
+    if session_key_pair is not None:
+        snapshot["_session_key"], snapshot["_session_key_source"] = session_key_pair
     if full_prompt_preview:
         snapshot["request_prompt"] = _protect_prompt_trace_value(
             full_prompt_preview,
@@ -2281,12 +2452,12 @@ def _register_debug_detail_snapshot(
     Normal trace rows retain only summaries. Full prompt/body detail is written
     only for user/safeguarded requests, cache-bust trigger requests, and the
     +/- DEBUG_DETAIL_CONTEXT_REQUESTS window around any in-chain prompt shrink
-    (within the same prompt_cache_key/agent-task lineage, current tokens <
-    previous tokens). Within a normally cached chain the prompt grows turn over
-    turn; a shrink means the cache lineage broke, so we capture surrounding
-    requests for postmortem decryption.
+    (within the same debug session, current tokens < previous tokens). Within a
+    normally cached chain the prompt grows turn over turn; a shrink means the
+    cache lineage broke, so we capture surrounding requests for postmortem
+    decryption.
     """
-    global _DEBUG_DETAIL_FUTURE_REMAINING, _DEBUG_DETAIL_INCIDENT_COUNTER, _DEBUG_DETAIL_ACTIVE_INCIDENT_ID
+    global _DEBUG_DETAIL_INCIDENT_COUNTER, _DEBUG_DETAIL_SNAPSHOT_SEQUENCE
     always_reasons = list(dict.fromkeys(always_reasons))
     detail_events: list[dict] = []
     current_capture: dict | None = None
@@ -2295,13 +2466,27 @@ def _register_debug_detail_snapshot(
         return current_capture, detail_events
 
     with _DEBUG_DETAIL_CAPTURE_LOCK:
+        session_key = _debug_detail_normalized_string(snapshot.get("_session_key"))
+        previous_snapshots: list[dict] = []
+        if session_key:
+            session_buffer = _debug_detail_session_buffer_locked(session_key)
+            previous_snapshots = [dict(previous) for previous in session_buffer]
+            snapshot["_previous_session_snapshots"] = previous_snapshots
+            _DEBUG_DETAIL_SNAPSHOT_SEQUENCE += 1
+            snapshot["_debug_detail_sequence"] = _DEBUG_DETAIL_SNAPSHOT_SEQUENCE
+        else:
+            session_buffer = None
+
         incident_id = None
         if cache_bust_drift:
             _DEBUG_DETAIL_INCIDENT_COUNTER += 1
             incident_id = f"cache-bust-{_DEBUG_DETAIL_INCIDENT_COUNTER}"
-            _DEBUG_DETAIL_ACTIVE_INCIDENT_ID = incident_id
-            previous_snapshots = list(_DEBUG_DETAIL_RECENT_REQUESTS)[-DEBUG_DETAIL_CONTEXT_REQUESTS:]
-            for previous_snapshot in previous_snapshots:
+            trigger_claimed = session_key is not None and _claim_debug_detail_capture_locked(session_key, snapshot)
+            remaining_slots = _debug_detail_capture_slots_remaining_locked(session_key) if session_key else 0
+            selected_previous = previous_snapshots[-remaining_slots:] if remaining_slots > 0 else []
+            for previous_snapshot in selected_previous:
+                if not _claim_debug_detail_capture_locked(session_key, previous_snapshot):
+                    continue
                 detail_events.append(
                     _with_debug_detail_capture_info(
                         previous_snapshot,
@@ -2310,50 +2495,70 @@ def _register_debug_detail_snapshot(
                         incident_id=incident_id,
                     )
                 )
-            _DEBUG_DETAIL_FUTURE_REMAINING = DEBUG_DETAIL_CONTEXT_REQUESTS
+            remaining_slots = _debug_detail_capture_slots_remaining_locked(session_key) if session_key else 0
+            if session_key and remaining_slots > 0:
+                _DEBUG_DETAIL_SESSION_FUTURE_CAPTURES[session_key] = {
+                    "remaining": min(DEBUG_DETAIL_CONTEXT_REQUESTS, remaining_slots),
+                    "incident_id": incident_id,
+                    "context_reason": "cache_bust_context",
+                }
             current_reasons = [*always_reasons, "cache_bust_drift"]
-            current_capture = _debug_detail_capture_info(
-                reasons=current_reasons,
-                phase="trigger",
-                incident_id=incident_id,
-            )
-            detail_events.append(
-                _with_debug_detail_capture_info(
-                    snapshot,
+            if trigger_claimed:
+                current_capture = _debug_detail_capture_info(
                     reasons=current_reasons,
                     phase="trigger",
                     incident_id=incident_id,
                 )
-            )
-        elif _DEBUG_DETAIL_FUTURE_REMAINING > 0:
-            _DEBUG_DETAIL_FUTURE_REMAINING -= 1
+                detail_events.append(
+                    _with_debug_detail_capture_info(
+                        snapshot,
+                        reasons=current_reasons,
+                        phase="trigger",
+                        incident_id=incident_id,
+                    )
+                )
+        elif session_key and isinstance(
+            future_capture := _DEBUG_DETAIL_SESSION_FUTURE_CAPTURES.get(session_key),
+            dict,
+        ) and util._coerce_int(future_capture.get("remaining"), default=0) > 0:
+            future_capture["remaining"] = util._coerce_int(future_capture.get("remaining"), default=0) - 1
+            context_reason = str(future_capture.get("context_reason") or "cache_bust_context")
             current_reasons = [*always_reasons, "cache_bust_context"]
-            incident_id = _DEBUG_DETAIL_ACTIVE_INCIDENT_ID
-            current_capture = _debug_detail_capture_info(
-                reasons=current_reasons,
-                phase="after",
-                incident_id=incident_id,
-            )
-            detail_events.append(
-                _with_debug_detail_capture_info(
+            if context_reason not in current_reasons:
+                current_reasons[-1] = context_reason
+            incident_id = _debug_detail_normalized_string(future_capture.get("incident_id"))
+            if _claim_debug_detail_capture_locked(session_key, snapshot):
+                current_capture = _debug_detail_capture_info(
+                    reasons=current_reasons,
+                    phase="after",
+                    incident_id=incident_id,
+                )
+                after_event = _with_debug_detail_capture_info(
                     snapshot,
                     reasons=current_reasons,
                     phase="after",
                     incident_id=incident_id,
                 )
-            )
-            if _DEBUG_DETAIL_FUTURE_REMAINING <= 0:
-                _DEBUG_DETAIL_ACTIVE_INCIDENT_ID = None
+                diagnostics = future_capture.get("diagnostics")
+                if isinstance(diagnostics, dict):
+                    after_event.setdefault("debug_detail_capture", {})["cache_bust_usage_diagnostics"] = diagnostics
+                detail_events.append(after_event)
+            if future_capture["remaining"] <= 0:
+                _DEBUG_DETAIL_SESSION_FUTURE_CAPTURES.pop(session_key, None)
         elif always_reasons:
-            current_capture = _debug_detail_capture_info(reasons=always_reasons)
-            detail_events.append(
-                _with_debug_detail_capture_info(
-                    snapshot,
-                    reasons=always_reasons,
+            if not session_key or _claim_debug_detail_capture_locked(session_key, snapshot):
+                current_capture = _debug_detail_capture_info(reasons=always_reasons)
+                detail_events.append(
+                    _with_debug_detail_capture_info(
+                        snapshot,
+                        reasons=always_reasons,
+                    )
                 )
-            )
 
-        _DEBUG_DETAIL_RECENT_REQUESTS.append(snapshot)
+        if session_key and session_buffer is not None:
+            session_buffer.append(snapshot)
+            _remember_debug_detail_snapshot_locked(snapshot)
+            _evict_debug_detail_sessions_locked()
 
     return current_capture, detail_events
 
@@ -2365,49 +2570,63 @@ def _post_response_cache_bust_diagnostics(
     resolved_model: str | None,
     outbound_headers: dict | None,
     usage: dict | None,
-) -> tuple[tuple[str, str], dict] | None:
+    session_key: str | None = None,
+) -> tuple[str, dict] | None:
     """Detect upstream cache eviction visible only in response usage.
 
     The local prompt-shrink detector (``_is_cache_bust_prompt_drift``) only
     fires when the request body itself shrinks. Some chains keep growing
     monotonically while the upstream evicts the prompt cache — visible only
-    as a sharp drop in ``cached_input_tokens`` between consecutive requests
-    in the same lineage. This runs at request_finished time, so the trigger
-    happens after the request that took the cache miss.
+    as a drop in ``cached_input_tokens`` between consecutive completed
+    requests in the same debug session. This runs at request_finished time, so
+    the trigger happens after the request that took the cache miss.
     """
     if not _prompt_logging_permitted():
         return None
-    lineage = _prompt_cache_trace_lineage(upstream_body, resolved_model, outbound_headers)
-    if lineage is None:
-        return None
+    normalized_session_key = _debug_detail_normalized_string(session_key)
+    if normalized_session_key:
+        session_key_source = "request_start"
+    else:
+        session_key_pair = _debug_detail_session_key(
+            request_body=upstream_body,
+            upstream_body=upstream_body,
+            resolved_model=resolved_model,
+            outbound_headers=outbound_headers,
+        )
+        if session_key_pair is None:
+            return None
+        normalized_session_key, session_key_source = session_key_pair
+    session_key = normalized_session_key
     normalized = util.normalize_usage_payload(usage)
     if not isinstance(normalized, dict):
         return None
     cached = util._coerce_int(normalized.get("cached_input_tokens"), default=None)
     input_tokens = util._coerce_int(normalized.get("input_tokens"), default=None)
-    if cached is None or input_tokens is None:
+    if cached is None:
         return None
     snapshot = {
         "request_id": request_id,
         "cached_input_tokens": cached,
-        "input_tokens": input_tokens,
+        "session_key": session_key,
+        "session_key_source": session_key_source,
     }
+    if input_tokens is not None:
+        snapshot["input_tokens"] = input_tokens
     with _PROMPT_CACHE_USAGE_TRACE_LOCK:
-        previous = _PROMPT_CACHE_LAST_USAGE_BY_LINEAGE.pop(lineage, None)
-        _PROMPT_CACHE_LAST_USAGE_BY_LINEAGE[lineage] = snapshot
-        while len(_PROMPT_CACHE_LAST_USAGE_BY_LINEAGE) > PROMPT_DRIFT_SNAPSHOT_LIMIT:
-            _PROMPT_CACHE_LAST_USAGE_BY_LINEAGE.pop(next(iter(_PROMPT_CACHE_LAST_USAGE_BY_LINEAGE)))
+        previous = _PROMPT_CACHE_LAST_USAGE_BY_SESSION.pop(session_key, None)
+        _PROMPT_CACHE_LAST_USAGE_BY_SESSION[session_key] = snapshot
+        while len(_PROMPT_CACHE_LAST_USAGE_BY_SESSION) > DEBUG_DETAIL_SESSION_BUFFER_LIMIT:
+            _PROMPT_CACHE_LAST_USAGE_BY_SESSION.popitem(last=False)
     if not isinstance(previous, dict):
         return None
     prev_cached = previous.get("cached_input_tokens")
-    if not isinstance(prev_cached, int) or prev_cached < CACHE_BUST_USAGE_PREVIOUS_CACHE_THRESHOLD:
+    if not isinstance(prev_cached, int):
         return None
-    if prev_cached - cached < CACHE_BUST_USAGE_CACHE_DROP_THRESHOLD:
-        return None
-    if input_tokens > 0 and (cached / input_tokens) >= CACHE_BUST_USAGE_CURRENT_RATIO_THRESHOLD:
+    if cached >= prev_cached:
         return None
     diagnostics = {
-        "lineage_model": lineage[0],
+        "session_key": session_key,
+        "session_key_source": session_key_source,
         "previous_request_id": previous.get("request_id"),
         "previous_cached_input_tokens": prev_cached,
         "current_cached_input_tokens": cached,
@@ -2415,42 +2634,57 @@ def _post_response_cache_bust_diagnostics(
         "current_input_tokens": input_tokens,
         "cache_drop": prev_cached - cached,
     }
-    return lineage, diagnostics
+    prompt_lineage = _prompt_cache_trace_lineage(upstream_body, resolved_model, outbound_headers)
+    if prompt_lineage is not None:
+        diagnostics["lineage_model"] = prompt_lineage[0]
+        diagnostics["lineage_key"] = prompt_lineage[1]
+    return session_key, diagnostics
 
 
 def _register_post_response_cache_bust_capture(
     buster_request_id: str,
-    lineage: tuple[str, str],
+    session_key: str,
     diagnostics: dict,
 ) -> list[dict]:
     """Emit retroactive debug-detail events for an in-flight cache eviction.
 
-    Walks the recent-snapshot deque, locates the buster in its lineage, and
-    emits the surrounding global request window: up to 10 earlier snapshots as
-    ``before`` events, the buster as ``trigger``, and up to 10 later snapshots
-    as ``after`` events. Sets ``_DEBUG_DETAIL_FUTURE_REMAINING`` so subsequent
-    requests capture themselves at request_started time when fewer than 10
-    later snapshots have already started.
+    Locates the buster in its debug session and emits the session-local window:
+    the buster's frozen previous 10 snapshots as ``before``, the buster as
+    ``trigger``, and up to 10 same-session snapshots that already started after
+    the buster as ``after``.  If fewer than 10 later snapshots exist yet, a
+    session-local future capture state records subsequent starts from that same
+    session only.
     """
-    global _DEBUG_DETAIL_FUTURE_REMAINING, _DEBUG_DETAIL_INCIDENT_COUNTER, _DEBUG_DETAIL_ACTIVE_INCIDENT_ID
+    global _DEBUG_DETAIL_INCIDENT_COUNTER
     detail_events: list[dict] = []
     if not _prompt_logging_permitted():
         return detail_events
     with _DEBUG_DETAIL_CAPTURE_LOCK:
-        recent = list(_DEBUG_DETAIL_RECENT_REQUESTS)
-        buster_index = None
-        for index, snapshot in enumerate(recent):
-            if snapshot.get("request_id") == buster_request_id and snapshot.get("_lineage") == lineage:
-                buster_index = index
-                break
-        if buster_index is None:
+        session_key = _debug_detail_normalized_string(session_key)
+        if not session_key:
             return detail_events
+        buster_snapshot = _DEBUG_DETAIL_REQUEST_SNAPSHOTS_BY_ID.get(buster_request_id)
+        if not isinstance(buster_snapshot, dict) or buster_snapshot.get("_session_key") != session_key:
+            for snapshot in _DEBUG_DETAIL_SESSION_RECENT_REQUESTS.get(session_key, []):
+                if snapshot.get("request_id") == buster_request_id:
+                    buster_snapshot = snapshot
+                    break
+        if not isinstance(buster_snapshot, dict) or buster_snapshot.get("_session_key") != session_key:
+            return detail_events
+
         _DEBUG_DETAIL_INCIDENT_COUNTER += 1
         incident_id = f"cache-bust-usage-{_DEBUG_DETAIL_INCIDENT_COUNTER}"
-        _DEBUG_DETAIL_ACTIVE_INCIDENT_ID = incident_id
-        before_start = max(0, buster_index - DEBUG_DETAIL_CONTEXT_REQUESTS)
-        before_snapshots = recent[before_start:buster_index]
-        for snapshot in before_snapshots:
+        trigger_claimed = _claim_debug_detail_capture_locked(session_key, buster_snapshot)
+        before_snapshots = buster_snapshot.get("_previous_session_snapshots")
+        if not isinstance(before_snapshots, list):
+            before_snapshots = []
+        remaining_slots = _debug_detail_capture_slots_remaining_locked(session_key)
+        selected_before = before_snapshots[-remaining_slots:] if remaining_slots > 0 else []
+        for snapshot in selected_before:
+            if not isinstance(snapshot, dict):
+                continue
+            if not _claim_debug_detail_capture_locked(session_key, snapshot):
+                continue
             detail_events.append(
                 _with_debug_detail_capture_info(
                     snapshot,
@@ -2459,18 +2693,21 @@ def _register_post_response_cache_bust_capture(
                     incident_id=incident_id,
                 )
             )
-        detail_events.append(
-            _with_debug_detail_capture_info(
-                recent[buster_index],
-                reasons=["cache_bust_usage_drift"],
-                phase="trigger",
-                incident_id=incident_id,
+        if trigger_claimed:
+            detail_events.append(
+                _with_debug_detail_capture_info(
+                    buster_snapshot,
+                    reasons=["cache_bust_usage_drift"],
+                    phase="trigger",
+                    incident_id=incident_id,
+                )
             )
-        )
-        after_snapshots = recent[
-            buster_index + 1 : buster_index + 1 + DEBUG_DETAIL_CONTEXT_REQUESTS
-        ]
+        after_snapshots = _debug_detail_after_snapshots_locked(session_key, buster_snapshot)
+        after_captured = 0
         for snapshot in after_snapshots:
+            if not _claim_debug_detail_capture_locked(session_key, snapshot):
+                continue
+            after_captured += 1
             detail_events.append(
                 _with_debug_detail_capture_info(
                     snapshot,
@@ -2481,11 +2718,19 @@ def _register_post_response_cache_bust_capture(
             )
         for event in detail_events:
             event.setdefault("debug_detail_capture", {})["cache_bust_usage_diagnostics"] = diagnostics
-        _DEBUG_DETAIL_FUTURE_REMAINING = max(
-            0, DEBUG_DETAIL_CONTEXT_REQUESTS - len(after_snapshots)
+        future_remaining = min(
+            max(0, DEBUG_DETAIL_CONTEXT_REQUESTS - after_captured),
+            _debug_detail_capture_slots_remaining_locked(session_key),
         )
-        if _DEBUG_DETAIL_FUTURE_REMAINING <= 0:
-            _DEBUG_DETAIL_ACTIVE_INCIDENT_ID = None
+        if future_remaining > 0:
+            _DEBUG_DETAIL_SESSION_FUTURE_CAPTURES[session_key] = {
+                "remaining": future_remaining,
+                "incident_id": incident_id,
+                "context_reason": "cache_bust_usage_context",
+                "diagnostics": diagnostics,
+            }
+        else:
+            _DEBUG_DETAIL_SESSION_FUTURE_CAPTURES.pop(session_key, None)
     return detail_events
 
 
@@ -3207,6 +3452,7 @@ def _emit_request_trace_start(
         upstream_body=upstream_body,
         outbound_headers=outbound_headers,
     )
+    debug_detail_session_key = _debug_detail_normalized_string(debug_detail_snapshot.get("_session_key"))
     debug_detail_capture, debug_detail_events = _register_debug_detail_snapshot(
         debug_detail_snapshot,
         always_reasons=always_capture_reasons,
@@ -3255,6 +3501,8 @@ def _emit_request_trace_start(
             outbound_headers=outbound_headers,
             require_encryption=True,
         )
+    if debug_detail_session_key:
+        context["_debug_detail_session_key"] = debug_detail_session_key
     return context
 
 
@@ -3289,10 +3537,12 @@ def _finish_usage_and_trace(
             )
             force_trace = _should_force_failure_trace(plan, status_code)
             if request_tracing_enabled() or force_trace:
+                trace_context = dict(plan.trace_context or {"request_id": plan.request_id})
+                trace_context.pop("_debug_detail_session_key", None)
                 trace_payload = {
                     "event": "request_finished",
                     "time": util.utc_now_iso(),
-                    **(plan.trace_context or {"request_id": plan.request_id}),
+                    **trace_context,
                     "requested_model": plan.requested_model,
                     "resolved_model": plan.resolved_model,
                     "response": _trace_response_summary(upstream=upstream, response_payload=response_payload, usage=usage),
@@ -3327,6 +3577,7 @@ def _finish_usage_and_trace(
                     resolved_model=plan.resolved_model,
                     outbound_headers=plan.headers,
                     usage=usage,
+                    session_key=plan.debug_detail_session_key,
                 )
                 if bust_diagnostics_pair is not None:
                     trace_payload["cache_bust_usage"] = bust_diagnostics_pair[1]
@@ -3432,6 +3683,7 @@ def _prepare_upstream_request(
     }
     if initiator_verdict is not None:
         trace_context["initiator_verdict"] = initiator_verdict
+    debug_detail_session_key = None
     if request_tracing_enabled():
         trace_context = _emit_request_trace_start(
             request_id=request_id,
@@ -3446,6 +3698,10 @@ def _prepare_upstream_request(
             trace_metadata=trace_metadata,
             prompt_preview=stored_prompt_preview,
         )
+        if isinstance(trace_context, dict):
+            debug_detail_session_key = _debug_detail_normalized_string(
+                trace_context.pop("_debug_detail_session_key", None)
+            )
         if (
             isinstance(usage_event, dict)
             and "request_prompt" not in usage_event
@@ -3464,6 +3720,7 @@ def _prepare_upstream_request(
             resolved_model=resolved_model,
             source_body=source_body if isinstance(source_body, dict) else body,
             trace_context=trace_context,
+            debug_detail_session_key=debug_detail_session_key,
             auto_update_request_tracked=True,
         ),
         None,
@@ -4129,20 +4386,79 @@ async def proxy_streaming_response(
         source_iter = _stream_with_update_notice(upstream.aiter_bytes(), stream_type, getattr(upstream, "headers", None))
         if stream_type == "responses":
             source_iter = ResponsesStreamIdSyncer().sync(source_iter)
-        buffered_chunks: list[bytes] = []
+        tripwire_reply: upstream_errors.SyntheticReply | None = None
+        tripwire_usage: dict | None = None
+        response_payload: dict | None = None
         finish_called = False
         try:
-            async for chunk in source_iter:
-                if capture.feed(chunk):
-                    usage_tracker.mark_first_output(usage_event)
-                buffered_chunks.append(chunk if isinstance(chunk, bytes) else str(chunk).encode("utf-8"))
-            tripwire_usage = (
-                _cache_tripwire_usage(capture.usage if isinstance(capture.usage, dict) else None)
-                if stream_type == "responses"
-                else None
-            )
-            if isinstance(tripwire_usage, dict):
-                reply = _cache_tripwire_reply(tripwire_usage)
+            if stream_type == "responses":
+                text_buffer = ""
+                terminal_blocks: list[bytes] = []
+                holding_terminal = False
+                output_index = 0
+                content_index = 0
+
+                async for chunk in source_iter:
+                    if capture.feed(chunk):
+                        usage_tracker.mark_first_output(usage_event)
+                    if isinstance(chunk, bytes):
+                        text_buffer += chunk.decode("utf-8", errors="replace")
+                    else:
+                        text_buffer += str(chunk)
+                    normalized = text_buffer.replace("\r\n", "\n")
+                    while "\n\n" in normalized:
+                        raw_block, normalized = normalized.split("\n\n", 1)
+                        if not raw_block.strip():
+                            continue
+                        event_name, data = format_translation.parse_sse_block(raw_block)
+                        payload = None
+                        if data and data != "[DONE]":
+                            try:
+                                payload = json.loads(data)
+                            except json.JSONDecodeError:
+                                payload = None
+                        if isinstance(payload, dict):
+                            event_type = str(payload.get("type") or event_name or "").strip().lower()
+                            if event_type == "response.output_text.delta":
+                                if isinstance(payload.get("output_index"), int):
+                                    output_index = payload["output_index"]
+                                if isinstance(payload.get("content_index"), int):
+                                    content_index = payload["content_index"]
+                        block = f"{raw_block}\n\n".encode("utf-8")
+                        if holding_terminal or data == "[DONE]" or _is_response_completed_event(event_name, data):
+                            holding_terminal = True
+                            terminal_blocks.append(block)
+                        else:
+                            yield block
+                    text_buffer = normalized
+
+                if text_buffer:
+                    trailing = text_buffer.encode("utf-8")
+                    if holding_terminal:
+                        terminal_blocks.append(trailing)
+                    else:
+                        yield trailing
+
+                tripwire_usage = _cache_tripwire_usage(capture.usage if isinstance(capture.usage, dict) else None)
+                if isinstance(tripwire_usage, dict):
+                    tripwire_reply = _cache_tripwire_reply(tripwire_usage)
+                    yield _cache_tripwire_warning_delta(
+                        tripwire_reply,
+                        output_index=output_index,
+                        content_index=content_index,
+                    )
+                for block in terminal_blocks:
+                    yield block
+                if isinstance(tripwire_usage, dict) and not any(b"data: [DONE]" in block for block in terminal_blocks):
+                    yield b"data: [DONE]\n\n"
+            else:
+                async for chunk in source_iter:
+                    if capture.feed(chunk):
+                        usage_tracker.mark_first_output(usage_event)
+                    yield chunk
+
+            if isinstance(tripwire_usage, dict) and tripwire_reply is not None:
+                reply = tripwire_reply
                 model = trace_plan.resolved_model if isinstance(trace_plan, UpstreamRequestPlan) else None
                 response_payload = _cache_tripwire_response_payload(
                     reply,
@@ -4159,9 +4475,6 @@ async def proxy_streaming_response(
                 )
                 finish_called = True
                 _publish_synthetic_reply_event(reply, trace_plan)
-                usage_tracker.mark_first_output(usage_event)
-                for appended_chunk in _cache_tripwire_appended_stream_chunks(buffered_chunks, reply):
-                    yield appended_chunk
                 return
             _finish_usage_and_trace(
                 trace_plan,
@@ -4170,8 +4483,6 @@ async def proxy_streaming_response(
                 usage=capture.usage if isinstance(capture.usage, dict) else None,
             )
             finish_called = True
-            for chunk in buffered_chunks:
-                yield chunk
         finally:
             if not finish_called:
                 _finish_usage_and_trace(

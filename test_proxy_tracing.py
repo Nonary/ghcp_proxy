@@ -1,7 +1,9 @@
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 import tempfile
+import threading
 from types import SimpleNamespace
 from unittest import mock
 
@@ -398,7 +400,7 @@ class ProxyTracingTests(unittest.TestCase):
         self.assertNotIn("_lineage", before_event)
         self.assertNotIn("_lineage", trigger_event)
 
-    def test_post_response_cache_bust_keeps_ten_global_before_requests_after_future_started(self):
+    def test_post_response_cache_bust_caps_full_detail_to_ten_same_session_requests(self):
         try:
             trace_prompt_security._crypto_primitives()
         except RuntimeError as exc:
@@ -411,10 +413,10 @@ class ProxyTracingTests(unittest.TestCase):
             headers={},
         )
 
-        def body_for(prompt_cache_key: str, content: str) -> dict:
+        def body_for(session_id: str, content: str) -> dict:
             return {
                 "model": "gpt-5.5",
-                "prompt_cache_key": prompt_cache_key,
+                "session_id": session_id,
                 "input": [{"type": "message", "role": "user", "content": content}],
             }
 
@@ -439,19 +441,27 @@ class ProxyTracingTests(unittest.TestCase):
             ):
                 for index in range(10):
                     emit(
-                        f"req_prior_{index}",
-                        body_for(f"unrelated-prior-{index}", f"prior {index}"),
+                        f"req_unrelated_prior_{index}",
+                        body_for(f"unrelated-prior-{index}", f"unrelated prior {index}"),
                     )
-                buster_body = body_for("target-lineage", "buster")
+                    emit(
+                        f"req_prior_{index}",
+                        body_for("target-session", f"prior {index}"),
+                    )
+                buster_body = body_for("target-session", "buster")
                 emit("req_bust", buster_body)
                 for index in range(10):
                     emit(
                         f"req_after_{index}",
-                        body_for(f"unrelated-after-{index}", f"after {index}"),
+                        body_for("target-session", f"after {index}"),
+                    )
+                    emit(
+                        f"req_unrelated_after_{index}",
+                        body_for(f"unrelated-after-{index}", f"unrelated after {index}"),
                     )
 
             diagnostics = {
-                "lineage_model": "gpt-5.5",
+                "session_key": "session:target-session",
                 "previous_request_id": "req_previous_usage",
                 "previous_cached_input_tokens": 85_000,
                 "current_cached_input_tokens": 20_000,
@@ -459,19 +469,20 @@ class ProxyTracingTests(unittest.TestCase):
             }
             detail_events = proxy._register_post_response_cache_bust_capture(
                 "req_bust",
-                ("gpt-5.5", "target-lineage"),
+                "session:target-session",
                 diagnostics,
             )
         finally:
             proxy._set_trace_prompt_active_key(None, None)
 
         phases = [event["debug_detail_capture"]["phase"] for event in detail_events]
-        self.assertEqual(phases.count("before"), 10)
+        self.assertEqual(len(detail_events), 10)
+        self.assertEqual(phases.count("before"), 9)
         self.assertEqual(phases.count("trigger"), 1)
-        self.assertEqual(phases.count("after"), 10)
+        self.assertEqual(phases.count("after"), 0)
         self.assertEqual(
             [event["request_id"] for event in detail_events if event["debug_detail_capture"]["phase"] == "before"],
-            [f"req_prior_{index}" for index in range(10)],
+            [f"req_prior_{index}" for index in range(1, 10)],
         )
         trigger_event = next(event for event in detail_events if event["debug_detail_capture"]["phase"] == "trigger")
         self.assertEqual(trigger_event["request_id"], "req_bust")
@@ -479,16 +490,334 @@ class ProxyTracingTests(unittest.TestCase):
             trace_prompt_security.decrypt_payload(trigger_event["source_body"], key=key),
             buster_body,
         )
-        self.assertEqual(
-            [event["request_id"] for event in detail_events if event["debug_detail_capture"]["phase"] == "after"],
-            [f"req_after_{index}" for index in range(10)],
-        )
         for event in detail_events:
             self.assertEqual(
                 event["debug_detail_capture"]["cache_bust_usage_diagnostics"],
                 diagnostics,
             )
             self.assertNotIn("_lineage", event)
+
+    def test_post_response_cache_bust_future_capture_records_remaining_same_session_slots(self):
+        try:
+            trace_prompt_security._crypto_primitives()
+        except RuntimeError as exc:
+            self.skipTest(str(exc))
+        salt = trace_prompt_security.new_salt()
+        key = trace_prompt_security.derive_key("pw", salt)
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/responses"),
+            method="POST",
+            headers={},
+        )
+
+        def body_for(session_id: str, content: str) -> dict:
+            return {
+                "model": "gpt-5.5",
+                "session_id": session_id,
+                "input": [{"type": "message", "role": "user", "content": content}],
+            }
+
+        def emit(request_id: str, body: dict) -> None:
+            proxy._emit_request_trace_start(
+                request_id=request_id,
+                request=request,
+                upstream_url="https://example.invalid/responses",
+                upstream_path="/v1/responses",
+                requested_model="gpt-5.5",
+                resolved_model="gpt-5.5",
+                request_body=body,
+                upstream_body=body,
+                outbound_headers={"X-Initiator": "agent"},
+            )
+
+        proxy._set_trace_prompt_active_key(key, salt)
+        try:
+            with (
+                mock.patch.object(proxy, "_append_request_trace") as append_trace,
+                mock.patch.object(proxy, "_dump_outbound_request_body"),
+            ):
+                emit("req_before", body_for("target-session", "before"))
+                emit("req_bust", body_for("target-session", "buster"))
+                diagnostics = {
+                    "session_key": "session:target-session",
+                    "previous_request_id": "req_before",
+                    "previous_cached_input_tokens": 11,
+                    "current_cached_input_tokens": 10,
+                    "cache_drop": 1,
+                }
+                initial_events = proxy._register_post_response_cache_bust_capture(
+                    "req_bust",
+                    "session:target-session",
+                    diagnostics,
+                )
+                self.assertEqual(
+                    [event["debug_detail_capture"]["phase"] for event in initial_events],
+                    ["before", "trigger"],
+                )
+                append_trace.reset_mock()
+
+                for index in range(12):
+                    emit(
+                        f"req_unrelated_after_{index}",
+                        body_for("unrelated-session", f"unrelated {index}"),
+                    )
+                    emit(
+                        f"req_after_{index}",
+                        body_for("target-session", f"after {index}"),
+                    )
+        finally:
+            proxy._set_trace_prompt_active_key(None, None)
+
+        after_detail_events = [
+            call.args[0]
+            for call in append_trace.call_args_list
+            if call.args[0].get("event") == "request_debug_detail"
+            and call.args[0].get("debug_detail_capture", {}).get("phase") == "after"
+        ]
+        self.assertEqual(
+            [event["request_id"] for event in after_detail_events],
+            [f"req_after_{index}" for index in range(8)],
+        )
+        for event in after_detail_events:
+            self.assertEqual(
+                event["debug_detail_capture"]["cache_bust_usage_diagnostics"],
+                diagnostics,
+            )
+
+    def test_repeated_post_response_cache_bust_dedupes_full_detail_per_session(self):
+        try:
+            trace_prompt_security._crypto_primitives()
+        except RuntimeError as exc:
+            self.skipTest(str(exc))
+        salt = trace_prompt_security.new_salt()
+        key = trace_prompt_security.derive_key("pw", salt)
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/responses"),
+            method="POST",
+            headers={},
+        )
+
+        def body_for(content: str) -> dict:
+            return {
+                "model": "gpt-5.5",
+                "session_id": "target-session",
+                "input": [{"type": "message", "role": "user", "content": content}],
+            }
+
+        proxy._set_trace_prompt_active_key(key, salt)
+        try:
+            with (
+                mock.patch.object(proxy, "_append_request_trace"),
+                mock.patch.object(proxy, "_dump_outbound_request_body"),
+            ):
+                for index in range(12):
+                    body = body_for(f"request {index}")
+                    proxy._emit_request_trace_start(
+                        request_id=f"req_{index}",
+                        request=request,
+                        upstream_url="https://example.invalid/responses",
+                        upstream_path="/v1/responses",
+                        requested_model="gpt-5.5",
+                        resolved_model="gpt-5.5",
+                        request_body=body,
+                        upstream_body=body,
+                        outbound_headers={"X-Initiator": "agent"},
+                    )
+
+            diagnostics = {
+                "session_key": "session:target-session",
+                "previous_cached_input_tokens": 85_000,
+                "current_cached_input_tokens": 20_000,
+                "cache_drop": 65_000,
+            }
+            first_events = proxy._register_post_response_cache_bust_capture(
+                "req_10",
+                "session:target-session",
+                diagnostics,
+            )
+            second_events = proxy._register_post_response_cache_bust_capture(
+                "req_11",
+                "session:target-session",
+                diagnostics,
+            )
+        finally:
+            proxy._set_trace_prompt_active_key(None, None)
+
+        all_events = first_events + second_events
+        self.assertEqual(len(all_events), 10)
+        self.assertEqual(len({event["request_id"] for event in all_events}), 10)
+        self.assertEqual(second_events, [])
+
+    def test_debug_detail_full_capture_limit_survives_concurrent_future_starts(self):
+        try:
+            trace_prompt_security._crypto_primitives()
+        except RuntimeError as exc:
+            self.skipTest(str(exc))
+        salt = trace_prompt_security.new_salt()
+        key = trace_prompt_security.derive_key("pw", salt)
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/responses"),
+            method="POST",
+            headers={},
+        )
+        trace_events = []
+        trace_events_lock = threading.Lock()
+
+        def append_trace(event: dict) -> None:
+            with trace_events_lock:
+                trace_events.append(event)
+
+        def body_for(content: str) -> dict:
+            return {
+                "model": "gpt-5.5",
+                "session_id": "target-session",
+                "input": [{"type": "message", "role": "user", "content": content}],
+            }
+
+        def emit(request_id: str, content: str) -> None:
+            body = body_for(content)
+            proxy._emit_request_trace_start(
+                request_id=request_id,
+                request=request,
+                upstream_url="https://example.invalid/responses",
+                upstream_path="/v1/responses",
+                requested_model="gpt-5.5",
+                resolved_model="gpt-5.5",
+                request_body=body,
+                upstream_body=body,
+                outbound_headers={"X-Initiator": "agent"},
+            )
+
+        proxy._set_trace_prompt_active_key(key, salt)
+        try:
+            with (
+                mock.patch.object(proxy, "_append_request_trace", side_effect=append_trace),
+                mock.patch.object(proxy, "_dump_outbound_request_body"),
+            ):
+                emit("req_bust", "buster")
+                diagnostics = {
+                    "session_key": "session:target-session",
+                    "previous_cached_input_tokens": 85_000,
+                    "current_cached_input_tokens": 20_000,
+                    "cache_drop": 65_000,
+                }
+                initial_events = proxy._register_post_response_cache_bust_capture(
+                    "req_bust",
+                    "session:target-session",
+                    diagnostics,
+                )
+
+                with ThreadPoolExecutor(max_workers=12) as executor:
+                    list(
+                        executor.map(
+                            lambda index: emit(f"req_after_{index}", f"after {index}"),
+                            range(30),
+                        )
+                    )
+        finally:
+            proxy._set_trace_prompt_active_key(None, None)
+
+        future_detail_events = [
+            event
+            for event in trace_events
+            if event.get("event") == "request_debug_detail"
+            and event.get("debug_detail_capture", {}).get("phase") == "after"
+        ]
+        all_detail_events = initial_events + future_detail_events
+        self.assertEqual(len(all_detail_events), 10)
+        self.assertEqual(len({event["request_id"] for event in all_detail_events}), 10)
+        self.assertEqual(len(future_detail_events), 9)
+        self.assertEqual(
+            proxy._DEBUG_DETAIL_SESSION_CAPTURED_REQUEST_IDS["session:target-session"],
+            {event["request_id"] for event in all_detail_events},
+        )
+
+    def test_debug_detail_session_lru_keeps_at_most_six_session_buffers(self):
+        try:
+            trace_prompt_security._crypto_primitives()
+        except RuntimeError as exc:
+            self.skipTest(str(exc))
+        salt = trace_prompt_security.new_salt()
+        key = trace_prompt_security.derive_key("pw", salt)
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/responses"),
+            method="POST",
+            headers={},
+        )
+
+        proxy._set_trace_prompt_active_key(key, salt)
+        try:
+            with (
+                mock.patch.object(proxy, "_append_request_trace"),
+                mock.patch.object(proxy, "_dump_outbound_request_body"),
+            ):
+                for index in range(7):
+                    body = {
+                        "model": "gpt-5.5",
+                        "session_id": f"session-{index}",
+                        "input": [{"type": "message", "role": "user", "content": str(index)}],
+                    }
+                    proxy._emit_request_trace_start(
+                        request_id=f"req_{index}",
+                        request=request,
+                        upstream_url="https://example.invalid/responses",
+                        upstream_path="/v1/responses",
+                        requested_model="gpt-5.5",
+                        resolved_model="gpt-5.5",
+                        request_body=body,
+                        upstream_body=body,
+                        outbound_headers={"X-Initiator": "agent"},
+                    )
+        finally:
+            proxy._set_trace_prompt_active_key(None, None)
+
+        self.assertEqual(len(proxy._DEBUG_DETAIL_SESSION_RECENT_REQUESTS), 6)
+        self.assertNotIn("session:session-0", proxy._DEBUG_DETAIL_SESSION_RECENT_REQUESTS)
+        self.assertEqual(
+            list(proxy._DEBUG_DETAIL_SESSION_RECENT_REQUESTS.keys()),
+            [f"session:session-{index}" for index in range(1, 7)],
+        )
+
+    def test_post_response_cache_bust_triggers_on_any_cached_token_decrease(self):
+        try:
+            trace_prompt_security._crypto_primitives()
+        except RuntimeError as exc:
+            self.skipTest(str(exc))
+        salt = trace_prompt_security.new_salt()
+        key = trace_prompt_security.derive_key("pw", salt)
+        body = {
+            "model": "gpt-5.5",
+            "session_id": "small-decrease-session",
+            "input": [{"type": "message", "role": "user", "content": "hi"}],
+        }
+        outbound_headers = {"X-Initiator": "agent"}
+
+        proxy._set_trace_prompt_active_key(key, salt)
+        try:
+            first = proxy._post_response_cache_bust_diagnostics(
+                request_id="req_first",
+                upstream_body=body,
+                resolved_model="gpt-5.5",
+                outbound_headers=outbound_headers,
+                usage={"input_tokens": 100, "cached_input_tokens": 10},
+            )
+            second = proxy._post_response_cache_bust_diagnostics(
+                request_id="req_second",
+                upstream_body=body,
+                resolved_model="gpt-5.5",
+                outbound_headers=outbound_headers,
+                usage={"input_tokens": 101, "cached_input_tokens": 9},
+            )
+        finally:
+            proxy._set_trace_prompt_active_key(None, None)
+
+        self.assertIsNone(first)
+        self.assertIsNotNone(second)
+        session_key, diagnostics = second
+        self.assertEqual(session_key, "session:small-decrease-session")
+        self.assertEqual(diagnostics["cache_drop"], 1)
+        self.assertEqual(diagnostics["previous_cached_input_tokens"], 10)
+        self.assertEqual(diagnostics["current_cached_input_tokens"], 9)
 
     def test_post_response_cache_bust_skips_when_encryption_not_set_up(self):
         # No active key, no public key — encryption is not set up, so prompt

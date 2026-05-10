@@ -3016,6 +3016,75 @@ class ProxyRoutesTests(unittest.TestCase):
             b'{"error":{"message":"Upstream connection failed","type":"server_error","param":null,"code":null}}',
         )
 
+    def test_proxy_streaming_response_yields_before_upstream_finishes(self):
+        first_chunk = (
+            'event: response.output_text.delta\n'
+            'data: {"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"hello"}\n\n'
+        ).encode("utf-8")
+        done_chunk = (
+            'event: response.completed\n'
+            'data: {"type":"response.completed","response":{"id":"resp_123","status":"completed",'
+            '"usage":{"input_tokens":10,"input_tokens_details":{"cached_tokens":8},"output_tokens":1,"total_tokens":11}}}\n\n'
+            'data: [DONE]\n\n'
+        ).encode("utf-8")
+
+        class FakeUpstream:
+            status_code = 200
+            headers = {"content-type": "text/event-stream"}
+
+            def __init__(self, release_done: asyncio.Event):
+                self.release_done = release_done
+
+            async def aiter_bytes(self):
+                yield first_chunk
+                await self.release_done.wait()
+                yield done_chunk
+
+            async def aclose(self):
+                return None
+
+        class FakeClient:
+            def build_request(self, *args, **kwargs):
+                return httpx.Request("POST", "https://example.invalid/responses")
+
+        async def run_stream():
+            release_done = asyncio.Event()
+            upstream = FakeUpstream(release_done)
+            with (
+                mock.patch.object(proxy.httpx, "AsyncClient", return_value=FakeClient()),
+                mock.patch.object(proxy, "throttled_client_send", mock.AsyncMock(return_value=upstream)),
+                mock.patch.object(proxy.usage_tracker, "finish_event") as finish_usage,
+            ):
+                response = await proxy.proxy_streaming_response(
+                    "https://example.invalid/responses",
+                    {},
+                    {"stream": True},
+                    stream_type="responses",
+                    trace_plan=proxy.UpstreamRequestPlan(
+                        request_id="req-stream-immediate",
+                        upstream_url="https://example.invalid/responses",
+                        headers={},
+                        body={"stream": True},
+                        usage_event=None,
+                        requested_model="gpt-5.5",
+                        resolved_model="gpt-5.5",
+                    ),
+                )
+                iterator = response.body_iterator.__aiter__()
+                first = await asyncio.wait_for(iterator.__anext__(), timeout=0.1)
+                release_done.set()
+                rest = bytearray()
+                async for chunk in iterator:
+                    rest.extend(chunk)
+                return first, bytes(rest), finish_usage
+
+        first, rest, finish_usage = proxy.asyncio.run(run_stream())
+
+        self.assertEqual(first, first_chunk)
+        self.assertIn(b"response.completed", rest)
+        self.assertIn(b"[DONE]", rest)
+        finish_usage.assert_called_once()
+
     def test_proxy_streaming_response_retries_without_prompt_cache_retention_when_rejected(self):
         class RecordingClient:
             def __init__(self):
