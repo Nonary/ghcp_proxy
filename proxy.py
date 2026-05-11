@@ -191,9 +191,11 @@ CACHE_TRIPWIRE_INPUT_TOKEN_THRESHOLD = 30_000
 CACHE_TRIPWIRE_CACHED_INPUT_TOKEN_THRESHOLD = 30_000
 CACHE_TRIPWIRE_FRESH_CACHED_GAP_THRESHOLD = 50_000
 CACHE_TRIPWIRE_CONSECUTIVE_HIT_THRESHOLD = 3
+CACHE_TRIPWIRE_STREAK_KEY_LIMIT = 256
 CACHE_TRIPWIRE_REASON = "token_tripwire"
 CACHE_SETTLE_DELAY_SECONDS = 2.0
 PROMPT_DRIFT_SNAPSHOT_LIMIT = 32
+PROMPT_CACHE_USAGE_SNAPSHOT_LIMIT = 256
 DEBUG_DETAIL_CONTEXT_REQUESTS = 10
 CACHE_BUST_DRIFT_PREVIOUS_TOKEN_THRESHOLD = 500
 CACHE_BUST_DRIFT_DROP_TOKEN_THRESHOLD = 1
@@ -208,6 +210,7 @@ CACHE_BUST_DRIFT_ESTIMATED_CHARS_PER_TOKEN = 4
 safeguard_event_store = dashboard_module.create_safeguard_event_store()
 _CACHE_TRIPWIRE_LOCK = threading.Lock()
 _CACHE_TRIPWIRE_CONSECUTIVE_HITS = 0
+_CACHE_TRIPWIRE_CONSECUTIVE_HITS_BY_KEY: OrderedDict[str, int] = OrderedDict()
 _PROMPT_CACHE_SETTLE_LOCK = threading.Lock()
 _PROMPT_CACHE_LAST_FINISH_BY_LINEAGE: dict[tuple[str, str], float] = {}
 _PROMPT_CACHE_TRACE_LOCK = threading.Lock()
@@ -215,14 +218,14 @@ _PROMPT_CACHE_LAST_PROMPT_BY_LINEAGE: dict[tuple[str, str], dict] = {}
 _PROMPT_CACHE_AFFINITY_TRACE_LOCK = threading.Lock()
 _PROMPT_CACHE_LAST_AFFINITY_BY_LINEAGE: dict[tuple[str, str], dict] = {}
 _PROMPT_CACHE_USAGE_TRACE_LOCK = threading.Lock()
-_PROMPT_CACHE_LAST_USAGE_BY_SESSION: OrderedDict[str, dict] = OrderedDict()
+_PROMPT_CACHE_LAST_USAGE_BY_DETECTION_KEY: OrderedDict[str, dict] = OrderedDict()
 _TRACE_PROMPT_KEY_LOCK = threading.Lock()
 _TRACE_PROMPT_AES_KEY: bytes | None = None
 _TRACE_PROMPT_SALT: str | None = None
 _TRACE_PROMPT_PRIVATE_KEY_PEM: str | None = None
 _TRACE_PROMPT_ENABLE_PENDING = False
 _DEBUG_DETAIL_CAPTURE_LOCK = threading.Lock()
-DEBUG_DETAIL_SESSION_BUFFER_LIMIT = 6
+DEBUG_DETAIL_SESSION_BUFFER_LIMIT = 64
 _DEBUG_DETAIL_REQUEST_SNAPSHOT_INDEX_MAXLEN = (
     DEBUG_DETAIL_SESSION_BUFFER_LIMIT * ((DEBUG_DETAIL_CONTEXT_REQUESTS * 2) + 1)
 )
@@ -249,7 +252,7 @@ def _reset_debug_detail_capture_state() -> None:
         _DEBUG_DETAIL_INCIDENT_COUNTER = 0
         _DEBUG_DETAIL_SNAPSHOT_SEQUENCE = 0
     with _PROMPT_CACHE_USAGE_TRACE_LOCK:
-        _PROMPT_CACHE_LAST_USAGE_BY_SESSION.clear()
+        _PROMPT_CACHE_LAST_USAGE_BY_DETECTION_KEY.clear()
 
 
 def _stream_with_update_notice(byte_iter, protocol: str, upstream_headers=None):
@@ -715,6 +718,7 @@ def _reset_cache_tripwire_consecutive_hits() -> None:
     global _CACHE_TRIPWIRE_CONSECUTIVE_HITS
     with _CACHE_TRIPWIRE_LOCK:
         _CACHE_TRIPWIRE_CONSECUTIVE_HITS = 0
+        _CACHE_TRIPWIRE_CONSECUTIVE_HITS_BY_KEY.clear()
 
 
 def _cache_tripwire_candidate_usage(usage: dict | None) -> dict | None:
@@ -734,18 +738,44 @@ def _cache_tripwire_candidate_usage(usage: dict | None) -> dict | None:
     return None
 
 
-def _cache_tripwire_usage(usage: dict | None) -> dict | None:
+def _cache_tripwire_streak_key(plan=None) -> str:
+    if isinstance(plan, UpstreamRequestPlan):
+        lineage = _prompt_cache_trace_lineage(plan.source_body, plan.resolved_model, plan.headers)
+        if lineage is None:
+            lineage = _prompt_cache_trace_lineage(plan.body, plan.resolved_model, plan.headers)
+        if lineage is not None:
+            return f"lineage:{lineage[0]}:{lineage[1]}"
+        session_key_pair = _debug_detail_session_key(
+            request_body=plan.source_body if isinstance(plan.source_body, dict) else plan.body,
+            upstream_body=plan.body,
+            resolved_model=plan.resolved_model,
+            outbound_headers=plan.headers,
+        )
+        if session_key_pair is not None:
+            return session_key_pair[0]
+    return "global"
+
+
+def _cache_tripwire_usage(usage: dict | None, *, plan=None) -> dict | None:
     global _CACHE_TRIPWIRE_CONSECUTIVE_HITS
     if not _cache_tripwire_enabled():
         _reset_cache_tripwire_consecutive_hits()
         return None
     normalized = _cache_tripwire_candidate_usage(usage)
+    streak_key = _cache_tripwire_streak_key(plan)
     with _CACHE_TRIPWIRE_LOCK:
         if not isinstance(normalized, dict):
-            _CACHE_TRIPWIRE_CONSECUTIVE_HITS = 0
+            _CACHE_TRIPWIRE_CONSECUTIVE_HITS_BY_KEY.pop(streak_key, None)
+            if streak_key == "global":
+                _CACHE_TRIPWIRE_CONSECUTIVE_HITS = 0
             return None
-        _CACHE_TRIPWIRE_CONSECUTIVE_HITS += 1
-        if _CACHE_TRIPWIRE_CONSECUTIVE_HITS < CACHE_TRIPWIRE_CONSECUTIVE_HIT_THRESHOLD:
+        streak = _CACHE_TRIPWIRE_CONSECUTIVE_HITS_BY_KEY.pop(streak_key, 0) + 1
+        _CACHE_TRIPWIRE_CONSECUTIVE_HITS_BY_KEY[streak_key] = streak
+        while len(_CACHE_TRIPWIRE_CONSECUTIVE_HITS_BY_KEY) > CACHE_TRIPWIRE_STREAK_KEY_LIMIT:
+            _CACHE_TRIPWIRE_CONSECUTIVE_HITS_BY_KEY.popitem(last=False)
+        if streak_key == "global":
+            _CACHE_TRIPWIRE_CONSECUTIVE_HITS = streak
+        if streak < CACHE_TRIPWIRE_CONSECUTIVE_HIT_THRESHOLD:
             return None
         return normalized
 
@@ -2546,14 +2576,13 @@ def _register_debug_detail_snapshot(
             if future_capture["remaining"] <= 0:
                 _DEBUG_DETAIL_SESSION_FUTURE_CAPTURES.pop(session_key, None)
         elif always_reasons:
-            if not session_key or _claim_debug_detail_capture_locked(session_key, snapshot):
-                current_capture = _debug_detail_capture_info(reasons=always_reasons)
-                detail_events.append(
-                    _with_debug_detail_capture_info(
-                        snapshot,
-                        reasons=always_reasons,
-                    )
+            current_capture = _debug_detail_capture_info(reasons=always_reasons)
+            detail_events.append(
+                _with_debug_detail_capture_info(
+                    snapshot,
+                    reasons=always_reasons,
                 )
+            )
 
         if session_key and session_buffer is not None:
             session_buffer.append(snapshot)
@@ -2567,6 +2596,7 @@ def _post_response_cache_bust_diagnostics(
     *,
     request_id: str,
     upstream_body: dict | None,
+    source_body: dict | None = None,
     resolved_model: str | None,
     outbound_headers: dict | None,
     usage: dict | None,
@@ -2581,21 +2611,26 @@ def _post_response_cache_bust_diagnostics(
     requests in the same debug session. This runs at request_finished time, so
     the trigger happens after the request that took the cache miss.
     """
-    if not _prompt_logging_permitted():
-        return None
     normalized_session_key = _debug_detail_normalized_string(session_key)
     if normalized_session_key:
         session_key_source = "request_start"
     else:
         session_key_pair = _debug_detail_session_key(
-            request_body=upstream_body,
+            request_body=source_body if isinstance(source_body, dict) else upstream_body,
             upstream_body=upstream_body,
             resolved_model=resolved_model,
             outbound_headers=outbound_headers,
         )
-        if session_key_pair is None:
-            return None
-        normalized_session_key, session_key_source = session_key_pair
+        if session_key_pair is not None:
+            normalized_session_key, session_key_source = session_key_pair
+        else:
+            prompt_lineage = _prompt_cache_trace_lineage(source_body, resolved_model, outbound_headers)
+            if prompt_lineage is None:
+                prompt_lineage = _prompt_cache_trace_lineage(upstream_body, resolved_model, outbound_headers)
+            if prompt_lineage is None:
+                return None
+            normalized_session_key = f"lineage:{prompt_lineage[0]}:{prompt_lineage[1]}"
+            session_key_source = "prompt_cache_lineage"
     session_key = normalized_session_key
     normalized = util.normalize_usage_payload(usage)
     if not isinstance(normalized, dict):
@@ -2612,11 +2647,22 @@ def _post_response_cache_bust_diagnostics(
     }
     if input_tokens is not None:
         snapshot["input_tokens"] = input_tokens
+    prompt_lineage = _prompt_cache_trace_lineage(source_body, resolved_model, outbound_headers)
+    if prompt_lineage is None:
+        prompt_lineage = _prompt_cache_trace_lineage(upstream_body, resolved_model, outbound_headers)
+    if prompt_lineage is not None:
+        detection_key = f"lineage:{prompt_lineage[0]}:{prompt_lineage[1]}"
+        detection_key_source = "prompt_cache_lineage"
+    else:
+        detection_key = session_key
+        detection_key_source = session_key_source
+    snapshot["detection_key"] = detection_key
+    snapshot["detection_key_source"] = detection_key_source
     with _PROMPT_CACHE_USAGE_TRACE_LOCK:
-        previous = _PROMPT_CACHE_LAST_USAGE_BY_SESSION.pop(session_key, None)
-        _PROMPT_CACHE_LAST_USAGE_BY_SESSION[session_key] = snapshot
-        while len(_PROMPT_CACHE_LAST_USAGE_BY_SESSION) > DEBUG_DETAIL_SESSION_BUFFER_LIMIT:
-            _PROMPT_CACHE_LAST_USAGE_BY_SESSION.popitem(last=False)
+        previous = _PROMPT_CACHE_LAST_USAGE_BY_DETECTION_KEY.pop(detection_key, None)
+        _PROMPT_CACHE_LAST_USAGE_BY_DETECTION_KEY[detection_key] = snapshot
+        while len(_PROMPT_CACHE_LAST_USAGE_BY_DETECTION_KEY) > PROMPT_CACHE_USAGE_SNAPSHOT_LIMIT:
+            _PROMPT_CACHE_LAST_USAGE_BY_DETECTION_KEY.popitem(last=False)
     if not isinstance(previous, dict):
         return None
     prev_cached = previous.get("cached_input_tokens")
@@ -2627,6 +2673,8 @@ def _post_response_cache_bust_diagnostics(
     diagnostics = {
         "session_key": session_key,
         "session_key_source": session_key_source,
+        "detection_key": detection_key,
+        "detection_key_source": detection_key_source,
         "previous_request_id": previous.get("request_id"),
         "previous_cached_input_tokens": prev_cached,
         "current_cached_input_tokens": cached,
@@ -2634,7 +2682,6 @@ def _post_response_cache_bust_diagnostics(
         "current_input_tokens": input_tokens,
         "cache_drop": prev_cached - cached,
     }
-    prompt_lineage = _prompt_cache_trace_lineage(upstream_body, resolved_model, outbound_headers)
     if prompt_lineage is not None:
         diagnostics["lineage_model"] = prompt_lineage[0]
         diagnostics["lineage_key"] = prompt_lineage[1]
@@ -2755,6 +2802,17 @@ def _plan_allows_full_debug_detail(plan: "UpstreamRequestPlan | None") -> bool:
     return False
 
 
+def _effective_trace_usage(response_payload: dict | None = None, usage: dict | None = None) -> dict | None:
+    normalized_usage = util.normalize_usage_payload(usage)
+    if isinstance(normalized_usage, dict):
+        return normalized_usage
+    if isinstance(response_payload, dict):
+        normalized_usage = util.normalize_usage_payload(response_payload.get("usage"))
+        if isinstance(normalized_usage, dict):
+            return normalized_usage
+    return None
+
+
 def _trace_response_summary(
     upstream: httpx.Response | None = None,
     response_payload: dict | None = None,
@@ -2781,9 +2839,7 @@ def _trace_response_summary(
         if isinstance(output, list):
             summary["output_item_types"] = _count_trace_items(output)
 
-    normalized_usage = util.normalize_usage_payload(usage)
-    if normalized_usage is None and isinstance(response_payload, dict):
-        normalized_usage = util.normalize_usage_payload(response_payload.get("usage"))
+    normalized_usage = _effective_trace_usage(response_payload=response_payload, usage=usage)
     if isinstance(normalized_usage, dict):
         summary["usage"] = normalized_usage
 
@@ -2913,6 +2969,49 @@ def _dump_outbound_request_body(
             )
             snapshot["upstream_body_wire_size"] = len(upstream_wire_bytes)
             snapshot["upstream_body_wire_sha256"] = hashlib.sha256(upstream_wire_bytes).hexdigest()
+        safe_rid = "".join(ch for ch in str(request_id) if ch.isalnum() or ch in ("-", "_")) or "request"
+        out_path = os.path.join(dump_dir, f"{safe_rid}.json")
+        executor = _get_request_body_dump_executor()
+        executor.submit(_write_request_body_dump, out_path, dump_dir, snapshot)
+    except Exception as exc:  # pragma: no cover - never let dump errors fail upstream
+        print(f"Warning: failed to schedule request body dump: {exc}", file=sys.stderr, flush=True)
+
+
+def _dump_debug_detail_event_body_artifact(event: dict) -> None:
+    """Persist body artifacts for retroactive debug-detail events.
+
+    Post-response cache-bust capture emits debug-detail rows after the
+    original request start has already passed. Those rows still contain the
+    approved encrypted prompt/body payloads, so mirror them into the same
+    request-bodies artifact directory used by in-line captures.
+    """
+    if not request_body_dump_enabled() or not isinstance(event, dict):
+        return
+    if event.get("event") != "request_debug_detail":
+        return
+    if not any(key in event for key in ("source_body", "upstream_body", "upstream_body_wire")):
+        return
+    request_id = _debug_detail_normalized_string(event.get("request_id"))
+    if not request_id:
+        return
+    try:
+        dump_dir = request_body_dump_dir()
+        snapshot = {
+            "request_id": request_id,
+            "time": event.get("time") or util.utc_now_iso(),
+            "method": event.get("method"),
+            "client_path": event.get("client_path"),
+            "upstream_host": event.get("upstream_host"),
+            "upstream_path": event.get("upstream_path"),
+            "requested_model": event.get("requested_model"),
+            "resolved_model": event.get("resolved_model"),
+            "outbound_headers": event.get("outbound_headers") if isinstance(event.get("outbound_headers"), dict) else None,
+            "request_body": event.get("source_body") if "source_body" in event else None,
+            "upstream_body": event.get("upstream_body") if "upstream_body" in event else None,
+        }
+        for key in ("upstream_body_wire", "upstream_body_wire_size", "upstream_body_wire_sha256"):
+            if key in event:
+                snapshot[key] = event[key]
         safe_rid = "".join(ch for ch in str(request_id) if ch.isalnum() or ch in ("-", "_")) or "request"
         out_path = os.path.join(dump_dir, f"{safe_rid}.json")
         executor = _get_request_body_dump_executor()
@@ -3489,6 +3588,8 @@ def _emit_request_trace_start(
     _append_request_trace(payload)
     for debug_detail_event in debug_detail_events:
         _append_request_trace(debug_detail_event)
+        if debug_detail_event.get("request_id") != request_id:
+            _dump_debug_detail_event_body_artifact(debug_detail_event)
     if debug_detail_capture is not None:
         _dump_outbound_request_body(
             request_id=request_id,
@@ -3535,6 +3636,7 @@ def _finish_usage_and_trace(
                 reasoning_text=reasoning_text,
                 usage=usage,
             )
+            effective_usage = _effective_trace_usage(response_payload=response_payload, usage=usage)
             force_trace = _should_force_failure_trace(plan, status_code)
             if request_tracing_enabled() or force_trace:
                 trace_context = dict(plan.trace_context or {"request_id": plan.request_id})
@@ -3545,7 +3647,11 @@ def _finish_usage_and_trace(
                     **trace_context,
                     "requested_model": plan.requested_model,
                     "resolved_model": plan.resolved_model,
-                    "response": _trace_response_summary(upstream=upstream, response_payload=response_payload, usage=usage),
+                    "response": _trace_response_summary(
+                        upstream=upstream,
+                        response_payload=response_payload,
+                        usage=effective_usage,
+                    ),
                     "response_text_present": isinstance(response_text, str) and bool(response_text),
                     "reasoning_text_present": isinstance(reasoning_text, str) and bool(reasoning_text),
                 }
@@ -3574,9 +3680,10 @@ def _finish_usage_and_trace(
                 bust_diagnostics_pair = _post_response_cache_bust_diagnostics(
                     request_id=plan.request_id,
                     upstream_body=plan.body,
+                    source_body=plan.source_body,
                     resolved_model=plan.resolved_model,
                     outbound_headers=plan.headers,
-                    usage=usage,
+                    usage=effective_usage,
                     session_key=plan.debug_detail_session_key,
                 )
                 if bust_diagnostics_pair is not None:
@@ -3589,6 +3696,7 @@ def _finish_usage_and_trace(
                     )
                     for event in bust_events:
                         _append_request_trace(event, force=force_trace)
+                        _dump_debug_detail_event_body_artifact(event)
         finally:
             _remember_responses_cache_settle_finish(plan, status_code)
             _remember_parent_for_keepalive(plan, status_code)
@@ -4082,7 +4190,8 @@ async def _post_bridge_non_streaming_request(plan: UpstreamRequestPlan, bridge_p
     )
     tripwire_usage = (
         _cache_tripwire_usage(
-            translated_payload.get("usage") if isinstance(translated_payload, dict) else None
+            translated_payload.get("usage") if isinstance(translated_payload, dict) else None,
+            plan=plan,
         )
         if bridge_plan.upstream_protocol == "responses"
         else None
@@ -4439,7 +4548,10 @@ async def proxy_streaming_response(
                     else:
                         yield trailing
 
-                tripwire_usage = _cache_tripwire_usage(capture.usage if isinstance(capture.usage, dict) else None)
+                tripwire_usage = _cache_tripwire_usage(
+                    capture.usage if isinstance(capture.usage, dict) else None,
+                    plan=trace_plan,
+                )
                 if isinstance(tripwire_usage, dict):
                     tripwire_reply = _cache_tripwire_reply(tripwire_usage)
                     yield _cache_tripwire_warning_delta(

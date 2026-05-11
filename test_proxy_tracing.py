@@ -732,7 +732,7 @@ class ProxyTracingTests(unittest.TestCase):
             {event["request_id"] for event in all_detail_events},
         )
 
-    def test_debug_detail_session_lru_keeps_at_most_six_session_buffers(self):
+    def test_debug_detail_session_lru_keeps_at_most_configured_session_buffers(self):
         try:
             trace_prompt_security._crypto_primitives()
         except RuntimeError as exc:
@@ -751,7 +751,7 @@ class ProxyTracingTests(unittest.TestCase):
                 mock.patch.object(proxy, "_append_request_trace"),
                 mock.patch.object(proxy, "_dump_outbound_request_body"),
             ):
-                for index in range(7):
+                for index in range(proxy.DEBUG_DETAIL_SESSION_BUFFER_LIMIT + 1):
                     body = {
                         "model": "gpt-5.5",
                         "session_id": f"session-{index}",
@@ -771,11 +771,11 @@ class ProxyTracingTests(unittest.TestCase):
         finally:
             proxy._set_trace_prompt_active_key(None, None)
 
-        self.assertEqual(len(proxy._DEBUG_DETAIL_SESSION_RECENT_REQUESTS), 6)
+        self.assertEqual(len(proxy._DEBUG_DETAIL_SESSION_RECENT_REQUESTS), proxy.DEBUG_DETAIL_SESSION_BUFFER_LIMIT)
         self.assertNotIn("session:session-0", proxy._DEBUG_DETAIL_SESSION_RECENT_REQUESTS)
         self.assertEqual(
             list(proxy._DEBUG_DETAIL_SESSION_RECENT_REQUESTS.keys()),
-            [f"session:session-{index}" for index in range(1, 7)],
+            [f"session:session-{index}" for index in range(1, proxy.DEBUG_DETAIL_SESSION_BUFFER_LIMIT + 1)],
         )
 
     def test_post_response_cache_bust_triggers_on_any_cached_token_decrease(self):
@@ -819,10 +819,9 @@ class ProxyTracingTests(unittest.TestCase):
         self.assertEqual(diagnostics["previous_cached_input_tokens"], 10)
         self.assertEqual(diagnostics["current_cached_input_tokens"], 9)
 
-    def test_post_response_cache_bust_skips_when_encryption_not_set_up(self):
-        # No active key, no public key — encryption is not set up, so prompt
-        # logging is not permitted. Detection must skip rather than capture
-        # plaintext or write a locked placeholder.
+    def test_post_response_cache_bust_records_summary_when_encryption_not_set_up(self):
+        # No active key, no public key: the numeric usage collapse still needs
+        # to show up in request_finished, but full prompt capture must not run.
         proxy._set_trace_prompt_active_key(None, None)
         body = {
             "model": "gpt-5.5",
@@ -845,7 +844,243 @@ class ProxyTracingTests(unittest.TestCase):
             usage={"input_tokens": 88000, "cached_input_tokens": 22000},
         )
         self.assertIsNone(first)
-        self.assertIsNone(second)
+        self.assertIsNotNone(second)
+        session_key, diagnostics = second
+        self.assertEqual(session_key, "prompt_cache:gpt-5.5:lineage-locked")
+        self.assertEqual(diagnostics["cache_drop"], 63000)
+        self.assertEqual(diagnostics["previous_request_id"], "req_first")
+        self.assertEqual(diagnostics["previous_cached_input_tokens"], 85000)
+        self.assertEqual(diagnostics["current_cached_input_tokens"], 22000)
+        self.assertEqual(
+            proxy._register_post_response_cache_bust_capture("req_bust", session_key, diagnostics),
+            [],
+        )
+
+    def test_post_response_cache_bust_tracks_lineages_inside_same_session(self):
+        outbound_headers = {"X-Initiator": "agent"}
+
+        def body_for(lineage: str) -> dict:
+            return {
+                "model": "gpt-5.5",
+                "session_id": "shared-session",
+                "prompt_cache_key": lineage,
+                "input": [{"type": "message", "role": "user", "content": lineage}],
+            }
+
+        proxy._post_response_cache_bust_diagnostics(
+            request_id="req_a_first",
+            upstream_body=body_for("lineage-a"),
+            resolved_model="gpt-5.5",
+            outbound_headers=outbound_headers,
+            usage={"input_tokens": 145000, "cached_input_tokens": 144000},
+        )
+        interleaved = proxy._post_response_cache_bust_diagnostics(
+            request_id="req_b_first",
+            upstream_body=body_for("lineage-b"),
+            resolved_model="gpt-5.5",
+            outbound_headers=outbound_headers,
+            usage={"input_tokens": 900, "cached_input_tokens": 0},
+        )
+        bust = proxy._post_response_cache_bust_diagnostics(
+            request_id="req_a_bust",
+            upstream_body=body_for("lineage-a"),
+            resolved_model="gpt-5.5",
+            outbound_headers=outbound_headers,
+            usage={"input_tokens": 146000, "cached_input_tokens": 0},
+        )
+
+        self.assertIsNone(interleaved)
+        self.assertIsNotNone(bust)
+        session_key, diagnostics = bust
+        self.assertEqual(session_key, "session:shared-session")
+        self.assertEqual(diagnostics["detection_key"], "lineage:gpt-5.5:lineage-a")
+        self.assertEqual(diagnostics["previous_request_id"], "req_a_first")
+        self.assertEqual(diagnostics["previous_cached_input_tokens"], 144000)
+        self.assertEqual(diagnostics["current_cached_input_tokens"], 0)
+
+    def test_finish_usage_and_trace_detects_cache_bust_from_response_payload_usage(self):
+        source_body = {
+            "model": "gpt-5.5",
+            "prompt_cache_key": "payload-lineage",
+            "input": [{"type": "message", "role": "user", "content": "hi"}],
+        }
+        upstream_body = {
+            "model": "gpt-5.5",
+            "input": [{"type": "message", "role": "user", "content": "hi"}],
+        }
+
+        def plan_for(request_id: str) -> proxy.UpstreamRequestPlan:
+            return proxy.UpstreamRequestPlan(
+                request_id=request_id,
+                upstream_url="https://example.invalid/responses",
+                headers={"X-Initiator": "agent"},
+                body=dict(upstream_body),
+                source_body=dict(source_body),
+                usage_event={"request_id": request_id},
+                requested_model="gpt-5.5",
+                resolved_model="gpt-5.5",
+                trace_context={"request_id": request_id},
+            )
+
+        with (
+            mock.patch.object(proxy, "request_tracing_enabled", return_value=True),
+            mock.patch.object(proxy.usage_tracker, "finish_event"),
+            mock.patch.object(proxy, "_append_request_trace") as append_trace,
+            mock.patch.object(proxy, "_remember_responses_cache_settle_finish"),
+            mock.patch.object(proxy, "_remember_parent_for_keepalive"),
+            mock.patch.object(proxy, "_maybe_fire_parent_keepalive"),
+        ):
+            proxy._finish_usage_and_trace(
+                plan_for("req_payload_first"),
+                200,
+                response_payload={"usage": {"input_tokens": 145000, "cached_input_tokens": 144000}},
+                usage=None,
+            )
+            proxy._finish_usage_and_trace(
+                plan_for("req_payload_bust"),
+                200,
+                response_payload={"usage": {"input_tokens": 146000, "cached_input_tokens": 0}},
+                usage=None,
+            )
+
+        finished_events = [call.args[0] for call in append_trace.call_args_list if call.args[0]["event"] == "request_finished"]
+        self.assertEqual(len(finished_events), 2)
+        self.assertNotIn("cache_bust_usage", finished_events[0])
+        self.assertEqual(finished_events[1]["response"]["usage"]["cached_input_tokens"], 0)
+        self.assertEqual(finished_events[1]["cache_bust_usage"]["previous_request_id"], "req_payload_first")
+        self.assertEqual(finished_events[1]["cache_bust_usage"]["previous_cached_input_tokens"], 144000)
+        self.assertEqual(finished_events[1]["cache_bust_usage"]["current_cached_input_tokens"], 0)
+
+    def test_cache_tripwire_streak_isolated_by_lineage(self):
+        proxy._reset_cache_tripwire_consecutive_hits()
+        bad_usage = {"input_tokens": 145000, "cached_input_tokens": 0}
+        fine_usage = {"input_tokens": 145000, "cached_input_tokens": 144000}
+
+        def plan_for(lineage: str) -> proxy.UpstreamRequestPlan:
+            return proxy.UpstreamRequestPlan(
+                request_id=f"req_{lineage}",
+                upstream_url="https://example.invalid/responses",
+                headers={"X-Initiator": "agent"},
+                body={"model": "gpt-5.5", "input": "hello"},
+                source_body={"model": "gpt-5.5", "prompt_cache_key": lineage, "input": "hello"},
+                usage_event=None,
+                requested_model="gpt-5.5",
+                resolved_model="gpt-5.5",
+            )
+
+        plan_a = plan_for("lineage-a")
+        plan_b = plan_for("lineage-b")
+
+        self.assertIsNone(proxy._cache_tripwire_usage(bad_usage, plan=plan_a))
+        self.assertIsNone(proxy._cache_tripwire_usage(fine_usage, plan=plan_b))
+        self.assertIsNone(proxy._cache_tripwire_usage(bad_usage, plan=plan_a))
+        self.assertIsNotNone(proxy._cache_tripwire_usage(bad_usage, plan=plan_a))
+
+    def test_user_debug_detail_does_not_consume_cache_bust_usage_capture_budget(self):
+        try:
+            trace_prompt_security._crypto_primitives()
+        except RuntimeError as exc:
+            self.skipTest(str(exc))
+        salt = trace_prompt_security.new_salt()
+        key = trace_prompt_security.derive_key("pw", salt)
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/responses"),
+            method="POST",
+            headers={},
+        )
+
+        def body_for(content: str) -> dict:
+            return {
+                "model": "gpt-5.5",
+                "session_id": "budget-session",
+                "input": [{"type": "message", "role": "user", "content": content}],
+            }
+
+        def emit(request_id: str, initiator: str, content: str) -> None:
+            body = body_for(content)
+            proxy._emit_request_trace_start(
+                request_id=request_id,
+                request=request,
+                upstream_url="https://example.invalid/responses",
+                upstream_path="/v1/responses",
+                requested_model="gpt-5.5",
+                resolved_model="gpt-5.5",
+                request_body=body,
+                upstream_body=body,
+                outbound_headers={"X-Initiator": initiator},
+            )
+
+        proxy._set_trace_prompt_active_key(key, salt)
+        try:
+            with (
+                mock.patch.object(proxy, "_append_request_trace"),
+                mock.patch.object(proxy, "_dump_outbound_request_body"),
+            ):
+                for index in range(proxy.DEBUG_DETAIL_SESSION_DETAIL_LIMIT):
+                    emit(f"req_user_{index}", "user", f"user {index}")
+                emit("req_bust", "agent", "buster")
+
+            diagnostics = {
+                "session_key": "session:budget-session",
+                "previous_request_id": "req_previous_usage",
+                "previous_cached_input_tokens": 144000,
+                "current_cached_input_tokens": 0,
+                "cache_drop": 144000,
+            }
+            detail_events = proxy._register_post_response_cache_bust_capture(
+                "req_bust",
+                "session:budget-session",
+                diagnostics,
+            )
+        finally:
+            proxy._set_trace_prompt_active_key(None, None)
+
+        phases = [event["debug_detail_capture"]["phase"] for event in detail_events]
+        self.assertEqual(len(detail_events), proxy.DEBUG_DETAIL_SESSION_DETAIL_LIMIT)
+        self.assertEqual(phases.count("before"), proxy.DEBUG_DETAIL_SESSION_DETAIL_LIMIT - 1)
+        self.assertEqual(phases.count("trigger"), 1)
+        trigger_event = next(event for event in detail_events if event["debug_detail_capture"]["phase"] == "trigger")
+        self.assertEqual(trigger_event["request_id"], "req_bust")
+        self.assertIn("cache_bust_usage_drift", trigger_event["debug_detail_capture"]["reasons"])
+
+    def test_retroactive_debug_detail_event_writes_body_artifact(self):
+        class InlineExecutor:
+            def submit(self, fn, *args, **kwargs):
+                fn(*args, **kwargs)
+                return None
+
+        event = {
+            "event": "request_debug_detail",
+            "time": "2026-01-01T00:00:00+00:00",
+            "request_id": "req-retro",
+            "method": "POST",
+            "client_path": "/v1/responses",
+            "upstream_host": "example.invalid",
+            "upstream_path": "/responses",
+            "requested_model": "gpt-5.5",
+            "resolved_model": "gpt-5.5",
+            "outbound_headers": {"x-initiator": "agent"},
+            "source_body": {"model": "gpt-5.5", "input": "secret source"},
+            "upstream_body": {"model": "gpt-5.5", "input": "secret upstream"},
+            "upstream_body_wire_size": 42,
+            "upstream_body_wire_sha256": "abc123",
+        }
+
+        with (
+            mock.patch.object(proxy, "request_body_dump_enabled", return_value=True),
+            mock.patch.object(proxy, "request_body_dump_dir", return_value="/tmp/ghcp-body-dumps"),
+            mock.patch.object(proxy, "_get_request_body_dump_executor", return_value=InlineExecutor()),
+            mock.patch.object(proxy, "_write_request_body_dump") as write_dump,
+        ):
+            proxy._dump_debug_detail_event_body_artifact(event)
+
+        write_dump.assert_called_once()
+        out_path, dump_dir, snapshot = write_dump.call_args.args
+        self.assertEqual(out_path, os.path.join("/tmp/ghcp-body-dumps", "req-retro.json"))
+        self.assertEqual(dump_dir, "/tmp/ghcp-body-dumps")
+        self.assertEqual(snapshot["request_body"], event["source_body"])
+        self.assertEqual(snapshot["upstream_body"], event["upstream_body"])
+        self.assertEqual(snapshot["upstream_body_wire_size"], 42)
 
     def test_user_initiated_capture_skips_when_encryption_not_set_up(self):
         # Without a key, an X-Initiator: user request must not produce a
