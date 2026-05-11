@@ -57,7 +57,7 @@ class DashboardDependencies:
     snapshot_all_usage_events: Callable[[], list[dict]] = lambda: []
     snapshot_usage_events: Callable[[], list[dict]] = lambda: []
     load_safeguard_trigger_stats: Callable[[datetime], dict] = lambda _now: {}
-    decrypt_prompt_payload: Callable[[object], object] = lambda value: value
+    prompt_payload: Callable[[object], object] = lambda value: value
 
 
 # ─── SQLite cache functions ──────────────────────────────────────────────────
@@ -1965,8 +1965,8 @@ class DashboardService:
         }
 
     def _dashboard_request_event(self, event: dict) -> dict:
-        # Strip the prompt from the bulk payload — decrypting up to
-        # DETAILED_REQUEST_HISTORY_LIMIT prompts per refresh dominated server
+        # Strip the prompt from the bulk payload. Returning up to
+        # DETAILED_REQUEST_HISTORY_LIMIT full prompts per refresh dominated server
         # CPU and inflated the response by tens of MB. The UI only renders the
         # prompt for the currently-selected row, so it lazy-fetches via
         # /api/request-prompt/{request_id} when the user opens a row.

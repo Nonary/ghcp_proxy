@@ -43,9 +43,9 @@ REQUEST_TRACE_LOG_FILE = os.path.join(TOKEN_DIR, "request-trace.jsonl")
 PROXY_PID_FILE = os.path.join(TOKEN_DIR, "ghcp-proxy.pid")
 PROXY_STDOUT_LOG_FILE = os.path.join(TOKEN_DIR, "ghcp-proxy.stdout.log")
 PROXY_STDERR_LOG_FILE = os.path.join(TOKEN_DIR, "ghcp-proxy.stderr.log")
-PROXY_BASE_URL    = "http://localhost:8000"
+PROXY_BASE_URL    = "http://127.0.0.1:8000"
 CODEX_PROXY_BASE_URL = f"{PROXY_BASE_URL}/v1"
-DASHBOARD_BASE_URL = "http://localhost:8000"
+DASHBOARD_BASE_URL = PROXY_BASE_URL
 DASHBOARD_FILE    = os.path.join(os.path.dirname(__file__), "dashboard.html")
 SQLITE_CACHE_FILE = os.path.join(
     os.path.expanduser(os.environ.get("GHCP_CACHE_DB_PATH", os.path.join(CACHE_DIR, ".ghcp_proxy-cache-v2.sqlite3")))
@@ -79,12 +79,12 @@ approvals_reviewer = "user"
 
 [model_providers.custom]
 name = "OpenAI"
-base_url = "http://localhost:8000/v1"
+base_url = "http://127.0.0.1:8000/v1"
 wire_api = "responses"
 """
 CLAUDE_PROXY_SETTINGS = {
     "env": {
-        "ANTHROPIC_BASE_URL": "http://localhost:8000",
+        "ANTHROPIC_BASE_URL": PROXY_BASE_URL,
         "ANTHROPIC_AUTH_TOKEN": "sk-dummy",
         "CLAUDE_CODE_DISABLE_1M_CONTEXT": "1",
         "CLAUDE_CODE_MAX_CONTEXT_TOKENS": CLAUDE_MAX_CONTEXT_TOKENS,

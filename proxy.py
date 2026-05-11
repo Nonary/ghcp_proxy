@@ -6,10 +6,10 @@ requires the Responses API instead of Chat Completions.
 Usage:
   python ghcp_proxy.py
   → If no token exists, prompts you to authorize via GitHub device flow
-  → Then starts serving on http://localhost:8000
+  → Then starts serving on http://127.0.0.1:8000
 
 Configure Codex:
-  export OPENAI_BASE_URL=http://localhost:8000/v1
+  export OPENAI_BASE_URL=http://127.0.0.1:8000/v1
   export OPENAI_API_KEY=anything
 """
 
@@ -68,7 +68,6 @@ import time
 import threading
 import safeguard_config as safeguard_config_module
 import protocol_replies
-import trace_prompt_security
 import upstream_errors
 import update_notice
 import usage_reminder
@@ -187,72 +186,26 @@ _TRACE_HEADER_ALLOWLIST = {
 }
 AUTH_FAILURE_MESSAGE = "GitHub Copilot authorization required. Open /ui to sign in."
 INVALID_BRIDGE_REQUEST_MESSAGE = "Invalid request"
-CACHE_TRIPWIRE_INPUT_TOKEN_THRESHOLD = 30_000
-CACHE_TRIPWIRE_CACHED_INPUT_TOKEN_THRESHOLD = 30_000
-CACHE_TRIPWIRE_FRESH_CACHED_GAP_THRESHOLD = 50_000
-CACHE_TRIPWIRE_CONSECUTIVE_HIT_THRESHOLD = 3
-CACHE_TRIPWIRE_STREAK_KEY_LIMIT = 256
-CACHE_TRIPWIRE_REASON = "token_tripwire"
-CACHE_SETTLE_DELAY_SECONDS = 2.0
-PROMPT_DRIFT_SNAPSHOT_LIMIT = 32
-PROMPT_CACHE_USAGE_SNAPSHOT_LIMIT = 256
 DEBUG_DETAIL_CONTEXT_REQUESTS = 10
-CACHE_BUST_DRIFT_PREVIOUS_TOKEN_THRESHOLD = 500
-CACHE_BUST_DRIFT_DROP_TOKEN_THRESHOLD = 1
-CACHE_BUST_DRIFT_CURRENT_RATIO_THRESHOLD = 1.0
-CACHE_BUST_DRIFT_ESTIMATED_CHARS_PER_TOKEN = 4
-# Post-response detector: catches upstream cache evictions where the local
-# prompt projection still grows monotonically but ``cached_input_tokens`` drops
-# between consecutive completed requests in the same debug session. The
-# local-shrink detector above can't see this because the request body is
-# unchanged from our side.
 
 safeguard_event_store = dashboard_module.create_safeguard_event_store()
-_CACHE_TRIPWIRE_LOCK = threading.Lock()
-_CACHE_TRIPWIRE_CONSECUTIVE_HITS = 0
-_CACHE_TRIPWIRE_CONSECUTIVE_HITS_BY_KEY: OrderedDict[str, int] = OrderedDict()
-_PROMPT_CACHE_SETTLE_LOCK = threading.Lock()
-_PROMPT_CACHE_LAST_FINISH_BY_LINEAGE: dict[tuple[str, str], float] = {}
-_PROMPT_CACHE_TRACE_LOCK = threading.Lock()
-_PROMPT_CACHE_LAST_PROMPT_BY_LINEAGE: dict[tuple[str, str], dict] = {}
-_PROMPT_CACHE_AFFINITY_TRACE_LOCK = threading.Lock()
-_PROMPT_CACHE_LAST_AFFINITY_BY_LINEAGE: dict[tuple[str, str], dict] = {}
-_PROMPT_CACHE_USAGE_TRACE_LOCK = threading.Lock()
-_PROMPT_CACHE_LAST_USAGE_BY_DETECTION_KEY: OrderedDict[str, dict] = OrderedDict()
-_TRACE_PROMPT_KEY_LOCK = threading.Lock()
-_TRACE_PROMPT_AES_KEY: bytes | None = None
-_TRACE_PROMPT_SALT: str | None = None
-_TRACE_PROMPT_PRIVATE_KEY_PEM: str | None = None
-_TRACE_PROMPT_ENABLE_PENDING = False
 _DEBUG_DETAIL_CAPTURE_LOCK = threading.Lock()
 DEBUG_DETAIL_SESSION_BUFFER_LIMIT = 64
-_DEBUG_DETAIL_REQUEST_SNAPSHOT_INDEX_MAXLEN = (
-    DEBUG_DETAIL_SESSION_BUFFER_LIMIT * ((DEBUG_DETAIL_CONTEXT_REQUESTS * 2) + 1)
-)
+_DEBUG_DETAIL_REQUEST_SNAPSHOT_INDEX_MAXLEN = DEBUG_DETAIL_SESSION_BUFFER_LIMIT
 DEBUG_DETAIL_SESSION_DETAIL_LIMIT = DEBUG_DETAIL_CONTEXT_REQUESTS
-# Per-session start snapshots used for debug detail capture.  Each session keeps
-# only its previous-context window; post-response cache-bust triggers use the
-# buster request's frozen copy of this deque so later same-session starts cannot
-# evict the pre-bust context before the buster response finishes.
 _DEBUG_DETAIL_SESSION_RECENT_REQUESTS: OrderedDict[str, deque[dict]] = OrderedDict()
-_DEBUG_DETAIL_SESSION_FUTURE_CAPTURES: dict[str, dict] = {}
 _DEBUG_DETAIL_REQUEST_SNAPSHOTS_BY_ID: OrderedDict[str, dict] = OrderedDict()
 _DEBUG_DETAIL_SESSION_CAPTURED_REQUEST_IDS: OrderedDict[str, set[str]] = OrderedDict()
-_DEBUG_DETAIL_INCIDENT_COUNTER = 0
 _DEBUG_DETAIL_SNAPSHOT_SEQUENCE = 0
 
 
 def _reset_debug_detail_capture_state() -> None:
-    global _DEBUG_DETAIL_INCIDENT_COUNTER, _DEBUG_DETAIL_SNAPSHOT_SEQUENCE
+    global _DEBUG_DETAIL_SNAPSHOT_SEQUENCE
     with _DEBUG_DETAIL_CAPTURE_LOCK:
         _DEBUG_DETAIL_SESSION_RECENT_REQUESTS.clear()
-        _DEBUG_DETAIL_SESSION_FUTURE_CAPTURES.clear()
         _DEBUG_DETAIL_REQUEST_SNAPSHOTS_BY_ID.clear()
         _DEBUG_DETAIL_SESSION_CAPTURED_REQUEST_IDS.clear()
-        _DEBUG_DETAIL_INCIDENT_COUNTER = 0
         _DEBUG_DETAIL_SNAPSHOT_SEQUENCE = 0
-    with _PROMPT_CACHE_USAGE_TRACE_LOCK:
-        _PROMPT_CACHE_LAST_USAGE_BY_DETECTION_KEY.clear()
 
 
 def _stream_with_update_notice(byte_iter, protocol: str, upstream_headers=None):
@@ -349,7 +302,7 @@ bridge_planner = ProtocolBridgePlanner(
 )
 
 
-def _trace_prompt_logging_settings() -> dict[str, object]:
+def _debug_prompt_logging_settings() -> dict[str, object]:
     try:
         settings = client_proxy_config_service.load_client_proxy_settings()
     except Exception:
@@ -357,146 +310,38 @@ def _trace_prompt_logging_settings() -> dict[str, object]:
     return settings if isinstance(settings, dict) else {}
 
 
-def _trace_prompt_logging_enabled() -> bool:
-    with _TRACE_PROMPT_KEY_LOCK:
-        if _TRACE_PROMPT_ENABLE_PENDING:
-            return True
-    return bool(_trace_prompt_logging_settings().get("trace_prompt_logging_enabled"))
-
-
-def _trace_prompt_logging_unlocked() -> bool:
-    if not _trace_prompt_logging_enabled():
-        return False
-    with _TRACE_PROMPT_KEY_LOCK:
-        return _TRACE_PROMPT_AES_KEY is not None
+def _debug_prompt_logging_enabled() -> bool:
+    return bool(_debug_prompt_logging_settings().get("debug_prompt_logging_enabled", False))
 
 
 def _prompt_logging_permitted() -> bool:
-    """Encryption setup is the gate for capturing prompt-bearing trace data.
-
-    Returns True iff we have a way to encrypt prompts at write time —
-    either an envelope public key configured in settings, or an unlocked AES
-    key in memory. With no key available, no prompt-bearing detail is logged
-    (no user prompts, no safeguarded prompts, no cache-bust detail events).
-    """
-    if _trace_prompt_public_key():
-        return True
-    with _TRACE_PROMPT_KEY_LOCK:
-        return _TRACE_PROMPT_AES_KEY is not None
+    return _debug_prompt_logging_enabled()
 
 
-def _settings_trace_prompt_password_configured(settings: dict[str, object] | None) -> bool:
-    if not isinstance(settings, dict):
-        return False
-    return bool(
-        settings.get("trace_prompt_logging_salt")
-        and isinstance(settings.get("trace_prompt_logging_verifier"), dict)
-    )
+def _prompt_trace_value(value):
+    return value
 
 
-def _trace_prompt_public_key(settings: dict[str, object] | None = None) -> str | None:
-    settings = settings if isinstance(settings, dict) else _trace_prompt_logging_settings()
-    public_key = settings.get("trace_prompt_logging_public_key") if isinstance(settings, dict) else None
-    if isinstance(public_key, str) and public_key.strip():
-        return public_key
-    return None
+def _prompt_payload_for_dashboard(value):
+    return value
 
 
-def _decrypt_trace_prompt_private_key_payload(
-    private_key_payload: object,
-    *,
-    password: str | None = None,
-    key: bytes | None = None,
-) -> str | None:
-    if not isinstance(private_key_payload, dict):
-        return None
+def _client_proxy_settings_with_trace_status(payload: dict[str, object]) -> dict[str, object]:
+    return dict(payload)
+
+
+def _save_client_proxy_settings(payload: dict) -> dict[str, object]:
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Request body must be an object")
+    result = client_proxy_config_service.save_client_proxy_settings({
+        "revert_on_shutdown": bool(payload.get("revert_on_shutdown", True)),
+        "debug_prompt_logging_enabled": bool(payload.get("debug_prompt_logging_enabled", False)),
+    })
     try:
-        private_key = trace_prompt_security.decrypt_payload(private_key_payload, password=password, key=key)
-    except Exception:
-        return None
-    if isinstance(private_key, str) and private_key.strip():
-        return private_key
-    return None
-
-
-def _trace_prompt_active_key() -> tuple[bytes, str] | None:
-    if not _trace_prompt_logging_enabled():
-        return None
-    with _TRACE_PROMPT_KEY_LOCK:
-        if _TRACE_PROMPT_AES_KEY is None or not _TRACE_PROMPT_SALT:
-            return None
-        return _TRACE_PROMPT_AES_KEY, _TRACE_PROMPT_SALT
-
-
-def _set_trace_prompt_active_key(
-    key: bytes | None,
-    salt: str | None,
-    private_key_pem: str | None = None,
-) -> None:
-    global _TRACE_PROMPT_AES_KEY, _TRACE_PROMPT_SALT, _TRACE_PROMPT_PRIVATE_KEY_PEM
-    with _TRACE_PROMPT_KEY_LOCK:
-        _TRACE_PROMPT_AES_KEY = key
-        _TRACE_PROMPT_SALT = salt
-        _TRACE_PROMPT_PRIVATE_KEY_PEM = private_key_pem
-
-
-def _set_trace_prompt_enable_pending(enabled: bool) -> None:
-    global _TRACE_PROMPT_ENABLE_PENDING
-    with _TRACE_PROMPT_KEY_LOCK:
-        _TRACE_PROMPT_ENABLE_PENDING = bool(enabled)
-
-
-def _protect_prompt_trace_value(value, *, require_encryption: bool = False):
-    if trace_prompt_security.is_encrypted_payload(value):
-        return value
-    encryption_enabled = _trace_prompt_logging_enabled()
-    if not require_encryption and not encryption_enabled:
-        return value
-    public_key = _trace_prompt_public_key()
-    if public_key:
-        try:
-            return trace_prompt_security.encrypt_payload_with_public_key(value, public_key)
-        except Exception as exc:
-            print(f"Warning: failed to envelope-encrypt prompt trace payload: {exc}", file=sys.stderr, flush=True)
-    with _TRACE_PROMPT_KEY_LOCK:
-        active_key = _TRACE_PROMPT_AES_KEY
-        active_salt = _TRACE_PROMPT_SALT
-    if active_key is not None and active_salt:
-        return trace_prompt_security.encrypt_payload(value, active_key, active_salt)
-    if require_encryption:
-        return trace_prompt_security.locked_payload()
-    return trace_prompt_security.locked_payload()
-
-
-def _decrypt_prompt_payload_for_dashboard(value):
-    if not trace_prompt_security.is_encrypted_payload(value):
-        return value
-    if trace_prompt_security.is_envelope_payload(value):
-        _trace_prompt_active_key()
-        with _TRACE_PROMPT_KEY_LOCK:
-            private_key_pem = _TRACE_PROMPT_PRIVATE_KEY_PEM
-        if not private_key_pem:
-            return {
-                "system": "[Encrypted prompt trace locked. Enter the AES password in Settings to unlock the private key.]",
-            }
-        try:
-            return trace_prompt_security.decrypt_payload(value, private_key_pem=private_key_pem)
-        except Exception:
-            return {
-                "system": "[Encrypted prompt trace could not be decrypted with the loaded private key.]",
-            }
-    active = _trace_prompt_active_key()
-    if active is None:
-        return {
-            "system": "[Encrypted prompt trace locked. Enter the AES password in Settings to view prompt text.]",
-        }
-    key, _salt = active
-    try:
-        return trace_prompt_security.decrypt_payload(value, key=key)
-    except Exception:
-        return {
-            "system": "[Encrypted prompt trace could not be decrypted with the loaded AES password.]",
-        }
+        dashboard_service.notify_dashboard_stream_listeners()
+    except NameError:
+        pass
+    return _client_proxy_settings_with_trace_status(result)
 
 
 dashboard_service = dashboard_module.create_dashboard_service(
@@ -505,7 +350,7 @@ dashboard_service = dashboard_module.create_dashboard_service(
         snapshot_all_usage_events=usage_tracker.snapshot_all_usage_events,
         snapshot_usage_events=usage_tracker.snapshot_usage_events,
         load_safeguard_trigger_stats=safeguard_event_store.load_stats,
-        decrypt_prompt_payload=_decrypt_prompt_payload_for_dashboard,
+        prompt_payload=_prompt_payload_for_dashboard,
     ),
     utc_now=util.utc_now,
     utc_now_iso=util.utc_now_iso,
@@ -513,15 +358,8 @@ dashboard_service = dashboard_module.create_dashboard_service(
 )
 
 
-
-
-# ─── Module-level parse_json_request wrapper ──────────────────────────────────
-# Wraps the util implementation to inject the error callback for recording
-# request parsing errors.
-
 async def parse_json_request(request: Request) -> dict:
     return await util.parse_json_request(request, error_callback=usage_tracker.record_request_error)
-
 
 
 def configured_upstream_timeout_seconds() -> int:
@@ -547,18 +385,6 @@ def configured_upstream_timeout_seconds() -> int:
     return value
 
 
-# ---------------------------------------------------------------------------
-# Shared upstream HTTP client.
-#
-# Copilot's /responses backend pins its KV (prompt) cache to the connection:
-# each new TCP connection lands on a randomly-chosen pod whose cache may be
-# cold for the prefix, while a long-lived HTTP/2 connection multiplexes every
-# request onto the same pod and lets the cache grow monotonically — the same
-# behavior the official Copilot CLI gets out of the box. Multiple keep-alive
-# connections can still create multiple cache lanes, visible as cached tokens
-# oscillating between a warm prefix and the small baseline prefix. Keep one
-# upstream connection and rely on HTTP/2 multiplexing for concurrent requests.
-# ---------------------------------------------------------------------------
 _UPSTREAM_CLIENT: "httpx.AsyncClient | None" = None
 _UPSTREAM_CLIENT_LOCK = threading.Lock()
 
@@ -577,18 +403,9 @@ def _get_upstream_client() -> "httpx.AsyncClient":
             keepalive_expiry=300.0,
         )
         try:
-            _UPSTREAM_CLIENT = httpx.AsyncClient(
-                http2=True,
-                timeout=timeout,
-                limits=limits,
-            )
+            _UPSTREAM_CLIENT = httpx.AsyncClient(http2=True, timeout=timeout, limits=limits)
         except (ImportError, RuntimeError):
-            # h2 package not installed; fall back to HTTP/1.1 with persistent
-            # keep-alive. Still better than per-request clients.
-            _UPSTREAM_CLIENT = httpx.AsyncClient(
-                timeout=timeout,
-                limits=limits,
-            )
+            _UPSTREAM_CLIENT = httpx.AsyncClient(timeout=timeout, limits=limits)
         atexit.register(_shutdown_upstream_client)
     return _UPSTREAM_CLIENT
 
@@ -633,17 +450,14 @@ def _remove_proxy_pid_file() -> None:
         pass
 
 
-# ─── Initialization ──────────────────────────────────────────────────────────
-
 usage_tracker.load_archived_history()
 usage_tracker.load_history()
 _initiator_policy.seed_from_usage_events(usage_tracker.snapshot_usage_events())
 dashboard_module.initialize()
 
-# Ingest native Codex CLI traffic (sessions/*/rollout-*.jsonl) so it shows
-# up in the dashboard alongside proxied traffic, tagged as `codex_native`.
 try:
     import codex_native_ingest
+
     _codex_native_interval = float(os.environ.get("GHCP_CODEX_NATIVE_INGEST_INTERVAL", "5") or 5)
     if _codex_native_interval > 0:
         codex_native_ingest.start_background_scanner(
@@ -665,8 +479,6 @@ async def _app_shutdown_revert_client_proxy_configs():
     await auto_update_runtime_controller.stop_periodic_checks()
     revert_client_proxy_configs_on_shutdown()
 
-
-# ─── Upstream response helpers ────────────────────────────────────────────────
 
 def _extract_upstream_json_payload(upstream: httpx.Response) -> dict | None:
     content_type = upstream.headers.get("content-type", "").lower()
@@ -712,844 +524,6 @@ def _synthetic_reply_for_message(message: str) -> upstream_errors.SyntheticReply
         reason="compat",
         usage_shape="zero",
     )
-
-
-def _reset_cache_tripwire_consecutive_hits() -> None:
-    global _CACHE_TRIPWIRE_CONSECUTIVE_HITS
-    with _CACHE_TRIPWIRE_LOCK:
-        _CACHE_TRIPWIRE_CONSECUTIVE_HITS = 0
-        _CACHE_TRIPWIRE_CONSECUTIVE_HITS_BY_KEY.clear()
-
-
-def _cache_tripwire_candidate_usage(usage: dict | None) -> dict | None:
-    normalized = util.normalize_usage_payload(usage)
-    if not isinstance(normalized, dict):
-        return None
-    input_tokens = util._coerce_int(normalized.get("input_tokens"), default=0)
-    cached_tokens = util._coerce_int(normalized.get("cached_input_tokens"), default=0)
-    fresh_tokens = max(0, input_tokens - cached_tokens)
-    fresh_cached_gap = max(0, fresh_tokens - cached_tokens)
-    if (
-        input_tokens > CACHE_TRIPWIRE_INPUT_TOKEN_THRESHOLD
-        and cached_tokens < CACHE_TRIPWIRE_CACHED_INPUT_TOKEN_THRESHOLD
-        and fresh_cached_gap >= CACHE_TRIPWIRE_FRESH_CACHED_GAP_THRESHOLD
-    ):
-        return normalized
-    return None
-
-
-def _cache_tripwire_streak_key(plan=None) -> str:
-    if isinstance(plan, UpstreamRequestPlan):
-        lineage = _prompt_cache_trace_lineage(plan.source_body, plan.resolved_model, plan.headers)
-        if lineage is None:
-            lineage = _prompt_cache_trace_lineage(plan.body, plan.resolved_model, plan.headers)
-        if lineage is not None:
-            return f"lineage:{lineage[0]}:{lineage[1]}"
-        session_key_pair = _debug_detail_session_key(
-            request_body=plan.source_body if isinstance(plan.source_body, dict) else plan.body,
-            upstream_body=plan.body,
-            resolved_model=plan.resolved_model,
-            outbound_headers=plan.headers,
-        )
-        if session_key_pair is not None:
-            return session_key_pair[0]
-    return "global"
-
-
-def _cache_tripwire_usage(usage: dict | None, *, plan=None) -> dict | None:
-    global _CACHE_TRIPWIRE_CONSECUTIVE_HITS
-    if not _cache_tripwire_enabled():
-        _reset_cache_tripwire_consecutive_hits()
-        return None
-    normalized = _cache_tripwire_candidate_usage(usage)
-    streak_key = _cache_tripwire_streak_key(plan)
-    with _CACHE_TRIPWIRE_LOCK:
-        if not isinstance(normalized, dict):
-            _CACHE_TRIPWIRE_CONSECUTIVE_HITS_BY_KEY.pop(streak_key, None)
-            if streak_key == "global":
-                _CACHE_TRIPWIRE_CONSECUTIVE_HITS = 0
-            return None
-        streak = _CACHE_TRIPWIRE_CONSECUTIVE_HITS_BY_KEY.pop(streak_key, 0) + 1
-        _CACHE_TRIPWIRE_CONSECUTIVE_HITS_BY_KEY[streak_key] = streak
-        while len(_CACHE_TRIPWIRE_CONSECUTIVE_HITS_BY_KEY) > CACHE_TRIPWIRE_STREAK_KEY_LIMIT:
-            _CACHE_TRIPWIRE_CONSECUTIVE_HITS_BY_KEY.popitem(last=False)
-        if streak_key == "global":
-            _CACHE_TRIPWIRE_CONSECUTIVE_HITS = streak
-        if streak < CACHE_TRIPWIRE_CONSECUTIVE_HIT_THRESHOLD:
-            return None
-        return normalized
-
-
-def _cache_tripwire_enabled() -> bool:
-    try:
-        settings = client_proxy_config_service.load_client_proxy_settings()
-    except Exception:
-        return True
-    if not isinstance(settings, dict):
-        return True
-    return bool(settings.get("token_tripwire_enabled", True))
-
-
-def _client_proxy_settings_with_trace_status(payload: dict[str, object]) -> dict[str, object]:
-    result = dict(payload)
-    result["trace_prompt_logging_unlocked"] = _trace_prompt_logging_unlocked()
-    return result
-
-
-def _trace_prompt_settings_configured(settings: dict[str, object] | None = None) -> bool:
-    settings = settings if isinstance(settings, dict) else _trace_prompt_logging_settings()
-    return _settings_trace_prompt_password_configured(settings)
-
-
-def _unlock_trace_prompt_logging(password: str) -> dict[str, object]:
-    if not isinstance(password, str) or not password:
-        raise HTTPException(status_code=400, detail="AES password is required.")
-    settings = _trace_prompt_logging_settings()
-    if not bool(settings.get("trace_prompt_logging_enabled")):
-        raise HTTPException(status_code=400, detail="Encrypted prompt trace logging is not enabled.")
-    salt = settings.get("trace_prompt_logging_salt")
-    verifier = settings.get("trace_prompt_logging_verifier")
-    if not isinstance(salt, str) or not salt or not isinstance(verifier, dict):
-        raise HTTPException(status_code=400, detail="Encrypted prompt trace logging has not been configured with a password.")
-    try:
-        key = trace_prompt_security.derive_key(password, salt)
-    except (RuntimeError, ValueError) as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    if not trace_prompt_security.verify_password_payload(verifier, key):
-        raise HTTPException(status_code=403, detail="AES password did not match encrypted prompt trace settings.")
-    public_key = settings.get("trace_prompt_logging_public_key")
-    private_key_pem = _decrypt_trace_prompt_private_key_payload(settings.get("trace_prompt_logging_private_key"), key=key)
-    if not isinstance(public_key, str) or not public_key.strip() or not private_key_pem:
-        key_pair = trace_prompt_security.generate_envelope_key_pair()
-        public_key = key_pair["public_key"]
-        private_key_pem = key_pair["private_key"]
-        client_proxy_config_service.save_client_proxy_settings(
-            {
-                "trace_prompt_logging_enabled": True,
-                "trace_prompt_logging_salt": salt,
-                "trace_prompt_logging_verifier": verifier,
-                "trace_prompt_logging_public_key": public_key,
-                "trace_prompt_logging_private_key": trace_prompt_security.encrypt_payload(private_key_pem, key, salt),
-            }
-        )
-    _set_trace_prompt_active_key(key, salt, private_key_pem)
-    try:
-        dashboard_service.notify_dashboard_stream_listeners()
-    except NameError:
-        pass
-    return _client_proxy_settings_with_trace_status(client_proxy_config_service.client_proxy_settings_payload())
-
-
-def _reset_trace_prompt_logging_password(password: str) -> dict[str, object]:
-    if not isinstance(password, str) or not password:
-        raise HTTPException(status_code=400, detail="New AES password is required.")
-    settings = _trace_prompt_logging_settings()
-    if not _trace_prompt_settings_configured(settings):
-        raise HTTPException(status_code=400, detail="Encrypted prompt trace logging has not been configured with a password.")
-    salt = trace_prompt_security.new_salt()
-    try:
-        key = trace_prompt_security.derive_key(password, salt)
-    except (RuntimeError, ValueError) as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    verifier = trace_prompt_security.make_password_verifier(key, salt)
-    private_key_payload = settings.get("trace_prompt_logging_private_key")
-    with _TRACE_PROMPT_KEY_LOCK:
-        current_private_key_pem = _TRACE_PROMPT_PRIVATE_KEY_PEM
-        current_aes_key = _TRACE_PROMPT_AES_KEY
-    private_key_pem = current_private_key_pem or _decrypt_trace_prompt_private_key_payload(private_key_payload, key=current_aes_key)
-    public_key = settings.get("trace_prompt_logging_public_key") if isinstance(settings.get("trace_prompt_logging_public_key"), str) else ""
-    if not private_key_pem:
-        key_pair = trace_prompt_security.generate_envelope_key_pair()
-        public_key = key_pair["public_key"]
-        private_key_pem = key_pair["private_key"]
-    result = client_proxy_config_service.save_client_proxy_settings(
-        {
-            "trace_prompt_logging_enabled": bool(settings.get("trace_prompt_logging_enabled")),
-            "trace_prompt_logging_salt": salt,
-            "trace_prompt_logging_verifier": verifier,
-            "trace_prompt_logging_public_key": public_key,
-            "trace_prompt_logging_private_key": trace_prompt_security.encrypt_payload(private_key_pem, key, salt),
-        }
-    )
-    _set_trace_prompt_active_key(key, salt, private_key_pem)
-    try:
-        dashboard_service.notify_dashboard_stream_listeners()
-    except NameError:
-        pass
-    return _client_proxy_settings_with_trace_status(result)
-
-
-def _save_client_proxy_settings_with_trace_prompt_logging(payload: dict) -> dict[str, object]:
-    if not isinstance(payload, dict):
-        raise HTTPException(status_code=400, detail="Request body must be an object")
-
-    existing = _trace_prompt_logging_settings()
-    requested_enabled = bool(payload.get("trace_prompt_logging_enabled", existing.get("trace_prompt_logging_enabled", False)))
-    password = payload.get("trace_prompt_logging_password")
-    password = password if isinstance(password, str) else ""
-    save_payload = {
-        key: value
-        for key, value in payload.items()
-        if key != "trace_prompt_logging_password"
-    }
-
-    migration: dict[str, object] | None = None
-    pending_key: bytes | None = None
-    pending_salt: str | None = None
-    pending_private_key_pem: str | None = None
-    clear_key_after_save = False
-    if requested_enabled:
-        salt = existing.get("trace_prompt_logging_salt")
-        verifier = existing.get("trace_prompt_logging_verifier")
-        public_key = existing.get("trace_prompt_logging_public_key")
-        private_key_payload = existing.get("trace_prompt_logging_private_key")
-        has_configured_password = _trace_prompt_settings_configured(existing)
-        if not password and not has_configured_password:
-            raise HTTPException(
-                status_code=400,
-                detail="AES password is required to enable encrypted prompt trace logging.",
-            )
-        if password:
-            if not isinstance(salt, str) or not salt:
-                salt = trace_prompt_security.new_salt()
-            try:
-                key = trace_prompt_security.derive_key(password, salt)
-            except (RuntimeError, ValueError) as exc:
-                raise HTTPException(status_code=400, detail=str(exc)) from exc
-            if has_configured_password and not trace_prompt_security.verify_password_payload(verifier, key):
-                raise HTTPException(status_code=403, detail="AES password did not match encrypted prompt trace settings.")
-            if not has_configured_password:
-                verifier = trace_prompt_security.make_password_verifier(key, salt)
-            private_key_pem = _decrypt_trace_prompt_private_key_payload(private_key_payload, key=key)
-            if not isinstance(public_key, str) or not public_key.strip() or not private_key_pem:
-                key_pair = trace_prompt_security.generate_envelope_key_pair()
-                public_key = key_pair["public_key"]
-                private_key_pem = key_pair["private_key"]
-            save_payload["trace_prompt_logging_salt"] = salt
-            save_payload["trace_prompt_logging_verifier"] = verifier
-            save_payload["trace_prompt_logging_public_key"] = public_key
-            save_payload["trace_prompt_logging_private_key"] = trace_prompt_security.encrypt_payload(private_key_pem, key, salt)
-            pending_key = key
-            pending_salt = salt
-            pending_private_key_pem = private_key_pem
-        else:
-            save_payload["trace_prompt_logging_salt"] = existing.get("trace_prompt_logging_salt", "")
-            save_payload["trace_prompt_logging_verifier"] = existing.get("trace_prompt_logging_verifier")
-            save_payload["trace_prompt_logging_public_key"] = existing.get("trace_prompt_logging_public_key", "")
-            save_payload["trace_prompt_logging_private_key"] = existing.get("trace_prompt_logging_private_key")
-    else:
-        save_payload["trace_prompt_logging_salt"] = existing.get("trace_prompt_logging_salt", "")
-        save_payload["trace_prompt_logging_verifier"] = existing.get("trace_prompt_logging_verifier")
-        save_payload["trace_prompt_logging_public_key"] = existing.get("trace_prompt_logging_public_key", "")
-        save_payload["trace_prompt_logging_private_key"] = existing.get("trace_prompt_logging_private_key")
-        clear_key_after_save = True
-
-    if pending_key is not None and pending_salt:
-        _set_trace_prompt_active_key(pending_key, pending_salt, pending_private_key_pem)
-        _set_trace_prompt_enable_pending(True)
-    try:
-        result = client_proxy_config_service.save_client_proxy_settings(save_payload)
-        if pending_key is not None and pending_salt:
-            migration = _migrate_existing_prompt_trace_logs(pending_key, pending_salt)
-        elif clear_key_after_save:
-            _set_trace_prompt_active_key(None, None)
-    finally:
-        if pending_key is not None:
-            _set_trace_prompt_enable_pending(False)
-    result = _client_proxy_settings_with_trace_status(result)
-    if migration is not None:
-        result["trace_prompt_logging_migration"] = migration
-        try:
-            dashboard_service.notify_dashboard_stream_listeners()
-        except NameError:
-            pass
-    return result
-
-
-def _prompt_cache_settle_delay_seconds() -> float:
-    raw_value = os.environ.get("GHCP_PROXY_RESPONSES_CACHE_SETTLE_DELAY_SECONDS")
-    if raw_value is None:
-        return CACHE_SETTLE_DELAY_SECONDS
-    try:
-        return max(0.0, float(str(raw_value).strip()))
-    except (TypeError, ValueError):
-        return CACHE_SETTLE_DELAY_SECONDS
-
-
-def _responses_cache_settle_lineage(plan: "UpstreamRequestPlan | None") -> tuple[str, str] | None:
-    """Per-(agent-task) settle key. Kept for callers that only need the own-lineage key."""
-    keys = _responses_cache_settle_keys(plan)
-    return keys[0] if keys else None
-
-
-def _responses_cache_settle_keys(plan: "UpstreamRequestPlan | None") -> list[tuple[str, str]]:
-    """All settle keys a plan should wait/remember under.
-
-    Always includes a per-agent-task key. Also includes a per-family key
-    derived from x-parent-agent-id (subagents) or x-agent-task-id (parents)
-    so that subagent + parent activity in the same parent-task family
-    settle each other. Empirically the upstream prompt cache evicts a
-    cached prefix when a sibling (parent or sister subagent) writes to the
-    same family namespace, so back-to-back cross-family turns regress to
-    near-zero cache hits even though our own outbound prefix is byte-stable.
-    """
-    if not isinstance(plan, UpstreamRequestPlan) or not isinstance(plan.body, dict):
-        return []
-    model = str(plan.resolved_model or plan.requested_model or plan.body.get("model") or "").strip().lower()
-    if model != "gpt-5.5":
-        return []
-    keys: list[tuple[str, str]] = []
-    own_task = _responses_plan_header_value(plan, "x-agent-task-id") or _responses_plan_task_prefix(plan)
-    if own_task:
-        keys.append((model, own_task))
-    parent_task = _responses_plan_header_value(plan, "x-parent-agent-id")
-    family_root = parent_task or own_task
-    if family_root:
-        family_key = (model, f"family:{family_root}")
-        if family_key not in keys:
-            keys.append(family_key)
-    return keys
-
-
-async def _wait_for_responses_cache_settle(plan: "UpstreamRequestPlan | None") -> None:
-    keys = _responses_cache_settle_keys(plan)
-    if not keys:
-        return
-    delay_seconds = _prompt_cache_settle_delay_seconds()
-    if delay_seconds <= 0:
-        return
-    with _PROMPT_CACHE_SETTLE_LOCK:
-        last_finished_at = max(
-            (
-                t
-                for t in (_PROMPT_CACHE_LAST_FINISH_BY_LINEAGE.get(k) for k in keys)
-                if isinstance(t, (int, float))
-            ),
-            default=None,
-        )
-    if last_finished_at is None:
-        return
-    wait_seconds = delay_seconds - (time.monotonic() - float(last_finished_at))
-    if wait_seconds > 0:
-        await asyncio.sleep(wait_seconds)
-
-
-def _remember_responses_cache_settle_finish(plan: "UpstreamRequestPlan | None", status_code: int) -> None:
-    if status_code >= 400:
-        return
-    keys = _responses_cache_settle_keys(plan)
-    if not keys:
-        return
-    now = time.monotonic()
-    with _PROMPT_CACHE_SETTLE_LOCK:
-        for key in keys:
-            _PROMPT_CACHE_LAST_FINISH_BY_LINEAGE[key] = now
-
-
-# ─── Parent prompt-cache LRU keepalive ───────────────────────────────────────
-# Subagent activity on the same Codex task evicts the parent's idle prefix from
-# upstream cache after ~10s of cumulative writes. Snapshot the parent's last
-# successful upstream body per task prefix; when a subagent finishes for the
-# same task and the parent has been idle past a small threshold, fire a small
-# warmer POST on the parent's lineage so upstream's LRU keeps the prefix hot.
-_PARENT_KEEPALIVE_LOCK = threading.Lock()
-_PARENT_KEEPALIVE_SNAPSHOTS: dict[str, dict] = {}
-_PARENT_KEEPALIVE_MAX_SNAPSHOTS = 64
-
-
-def _parent_keepalive_enabled() -> bool:
-    raw = str(os.environ.get("GHCP_PROXY_PARENT_KEEPALIVE_ENABLED", "0")).strip().lower()
-    return raw not in {"0", "false", "no", "off"}
-
-
-def _parent_keepalive_min_idle_seconds() -> float:
-    raw = os.environ.get("GHCP_PROXY_PARENT_KEEPALIVE_MIN_IDLE_SECONDS")
-    if raw is None:
-        return 6.0
-    try:
-        return max(0.0, float(str(raw).strip()))
-    except (TypeError, ValueError):
-        return 6.0
-
-
-def _parent_keepalive_min_interval_seconds() -> float:
-    raw = os.environ.get("GHCP_PROXY_PARENT_KEEPALIVE_MIN_INTERVAL_SECONDS")
-    if raw is None:
-        return 5.0
-    try:
-        return max(0.0, float(str(raw).strip()))
-    except (TypeError, ValueError):
-        return 5.0
-
-
-def _parent_keepalive_max_output_tokens() -> int:
-    raw = os.environ.get("GHCP_PROXY_PARENT_KEEPALIVE_MAX_OUTPUT_TOKENS")
-    if raw is None:
-        return 16
-    try:
-        return max(1, int(str(raw).strip()))
-    except (TypeError, ValueError):
-        return 16
-
-
-def _parent_keepalive_snapshot_ttl_seconds() -> float:
-    raw = os.environ.get("GHCP_PROXY_PARENT_KEEPALIVE_SNAPSHOT_TTL_SECONDS")
-    if raw is None:
-        return 300.0
-    try:
-        return max(0.0, float(str(raw).strip()))
-    except (TypeError, ValueError):
-        return 300.0
-
-
-def _responses_plan_task_prefix(plan: "UpstreamRequestPlan | None") -> str | None:
-    """Copilot parent task key, with prompt-cache-key fallback for old plans."""
-    if not isinstance(plan, UpstreamRequestPlan):
-        return None
-    parent_agent_id = _responses_plan_header_value(plan, "x-parent-agent-id")
-    if parent_agent_id:
-        return parent_agent_id
-    agent_task_id = _responses_plan_header_value(plan, "x-agent-task-id")
-    if agent_task_id:
-        return agent_task_id
-    body = plan.body if isinstance(plan.body, dict) else None
-    if not isinstance(body, dict):
-        return None
-    pck = body.get("prompt_cache_key") or body.get("promptCacheKey")
-    if not isinstance(pck, str):
-        return None
-    normalized = pck.strip()
-    if len(normalized) >= 36 and normalized[8:9] == "-":
-        return normalized[:8]
-    return None
-
-
-def _responses_plan_header_value(
-    plan: "UpstreamRequestPlan | None",
-    header_name: str,
-) -> str | None:
-    if not isinstance(plan, UpstreamRequestPlan):
-        return None
-    headers = plan.headers if isinstance(plan.headers, dict) else None
-    if not headers:
-        return None
-    wanted = header_name.lower()
-    for key, value in headers.items():
-        if isinstance(key, str) and key.lower() == wanted:
-            if isinstance(value, str) and value.strip():
-                return value.strip()
-    return None
-
-
-def _responses_plan_role(plan: "UpstreamRequestPlan | None") -> str | None:
-    """Classify a /responses gpt-5.5 plan as ``parent`` or ``subagent``.
-
-    Copilot keeps parent and subagents on one client session and separates
-    subagent lineage with ``conversation-subagent`` plus ``x-parent-agent-id``.
-    """
-    if not isinstance(plan, UpstreamRequestPlan):
-        return None
-    if "/responses" not in (plan.upstream_url or ""):
-        return None
-    model = str(plan.resolved_model or plan.requested_model or "").strip().lower()
-    if model != "gpt-5.5":
-        return None
-    interaction_type = _responses_plan_header_value(plan, "x-interaction-type")
-    parent_agent_id = _responses_plan_header_value(plan, "x-parent-agent-id")
-    if parent_agent_id or interaction_type == "conversation-subagent":
-        return "subagent"
-    cs_id = _responses_plan_header_value(plan, "x-client-session-id")
-    if not cs_id:
-        return None
-    return "parent"
-
-
-def _evict_oldest_parent_keepalive_snapshot_locked() -> None:
-    """Caller must hold ``_PARENT_KEEPALIVE_LOCK``."""
-    if len(_PARENT_KEEPALIVE_SNAPSHOTS) <= _PARENT_KEEPALIVE_MAX_SNAPSHOTS:
-        return
-    oldest_key = None
-    oldest_at = float("inf")
-    for key, snap in _PARENT_KEEPALIVE_SNAPSHOTS.items():
-        ts = snap.get("finished_at", 0.0)
-        if ts < oldest_at:
-            oldest_at = ts
-            oldest_key = key
-    if oldest_key is not None:
-        _PARENT_KEEPALIVE_SNAPSHOTS.pop(oldest_key, None)
-
-
-def _remember_parent_for_keepalive(
-    plan: "UpstreamRequestPlan | None",
-    status_code: int,
-) -> None:
-    if status_code >= 400:
-        return
-    if not _parent_keepalive_enabled():
-        return
-    if _responses_plan_role(plan) != "parent":
-        return
-    task_prefix = _responses_plan_task_prefix(plan)
-    if not task_prefix:
-        return
-    if not isinstance(plan.body, dict) or not plan.upstream_url:
-        return
-    snapshot_body = dict(plan.body)
-    for key in (
-        "prompt_cache_key",
-        "promptCacheKey",
-        "prompt_cache_retention",
-        "previous_response_id",
-        "session_id",
-        "sessionId",
-    ):
-        snapshot_body.pop(key, None)
-    snapshot = {
-        "upstream_url": plan.upstream_url,
-        "headers": dict(plan.headers) if isinstance(plan.headers, dict) else {},
-        "body": snapshot_body,
-        "finished_at": time.monotonic(),
-    }
-    with _PARENT_KEEPALIVE_LOCK:
-        existing = _PARENT_KEEPALIVE_SNAPSHOTS.get(task_prefix)
-        if existing is not None:
-            snapshot["last_warmer_at"] = existing.get("last_warmer_at", 0.0)
-            snapshot["warmer_in_flight"] = existing.get("warmer_in_flight", False)
-        else:
-            snapshot["last_warmer_at"] = 0.0
-            snapshot["warmer_in_flight"] = False
-        _PARENT_KEEPALIVE_SNAPSHOTS[task_prefix] = snapshot
-        _evict_oldest_parent_keepalive_snapshot_locked()
-
-
-def _maybe_fire_parent_keepalive(
-    plan: "UpstreamRequestPlan | None",
-    status_code: int,
-) -> None:
-    if status_code >= 400:
-        return
-    if not _parent_keepalive_enabled():
-        return
-    if _responses_plan_role(plan) != "subagent":
-        return
-    task_prefix = _responses_plan_task_prefix(plan)
-    if not task_prefix:
-        return
-    now = time.monotonic()
-    fire = False
-    with _PARENT_KEEPALIVE_LOCK:
-        snap = _PARENT_KEEPALIVE_SNAPSHOTS.get(task_prefix)
-        if snap is None:
-            return
-        ttl = _parent_keepalive_snapshot_ttl_seconds()
-        if ttl > 0 and now - snap.get("finished_at", 0.0) > ttl:
-            _PARENT_KEEPALIVE_SNAPSHOTS.pop(task_prefix, None)
-            return
-        if snap.get("warmer_in_flight"):
-            return
-        if now - snap.get("finished_at", 0.0) < _parent_keepalive_min_idle_seconds():
-            return
-        if now - snap.get("last_warmer_at", 0.0) < _parent_keepalive_min_interval_seconds():
-            return
-        snap["warmer_in_flight"] = True
-        snap["last_warmer_at"] = now
-        fire = True
-    if not fire:
-        return
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        with _PARENT_KEEPALIVE_LOCK:
-            s = _PARENT_KEEPALIVE_SNAPSHOTS.get(task_prefix)
-            if s:
-                s["warmer_in_flight"] = False
-        return
-    loop.create_task(_fire_parent_keepalive(task_prefix))
-
-
-async def _fire_parent_keepalive(task_prefix: str) -> None:
-    with _PARENT_KEEPALIVE_LOCK:
-        snap = _PARENT_KEEPALIVE_SNAPSHOTS.get(task_prefix)
-        if snap is None:
-            return
-        upstream_url = snap.get("upstream_url")
-        headers = dict(snap.get("headers") or {})
-        body = dict(snap.get("body") or {})
-    if not isinstance(upstream_url, str) or not upstream_url:
-        with _PARENT_KEEPALIVE_LOCK:
-            s = _PARENT_KEEPALIVE_SNAPSHOTS.get(task_prefix)
-            if s:
-                s["warmer_in_flight"] = False
-        return
-    body["max_output_tokens"] = _parent_keepalive_max_output_tokens()
-    body["stream"] = False
-    for key in (
-        "prompt_cache_key",
-        "promptCacheKey",
-        "prompt_cache_retention",
-        "previous_response_id",
-        "session_id",
-        "sessionId",
-    ):
-        body.pop(key, None)
-    keepalive_id = uuid4().hex
-    started_at = util.utc_now_iso()
-    if request_tracing_enabled():
-        _append_request_trace(
-            {
-                "event": "parent_keepalive_started",
-                "time": started_at,
-                "request_id": keepalive_id,
-                "task_prefix": task_prefix,
-                "upstream_url": upstream_url,
-            }
-        )
-    status_code: int | None = None
-    error_message: str | None = None
-    try:
-        client = _get_upstream_client()
-        response = await client.post(upstream_url, headers=headers, json=body, timeout=30)
-        status_code = response.status_code
-    except httpx.RequestError as exc:
-        error_message = format_translation.upstream_request_error_status_and_message(exc)[1]
-    except Exception as exc:  # noqa: BLE001 - keepalive must never raise
-        error_message = str(exc)
-    finally:
-        with _PARENT_KEEPALIVE_LOCK:
-            s = _PARENT_KEEPALIVE_SNAPSHOTS.get(task_prefix)
-            if s:
-                s["warmer_in_flight"] = False
-        if request_tracing_enabled():
-            payload = {
-                "event": "parent_keepalive_finished",
-                "time": util.utc_now_iso(),
-                "request_id": keepalive_id,
-                "task_prefix": task_prefix,
-                "status_code": status_code,
-            }
-            if error_message:
-                payload["error"] = error_message
-            _append_request_trace(payload)
-
-
-def _cache_tripwire_reply(usage: dict) -> upstream_errors.SyntheticReply:
-    input_tokens = util._coerce_int(usage.get("input_tokens"), default=0)
-    cached_tokens = util._coerce_int(usage.get("cached_input_tokens"), default=0)
-    fresh_tokens = max(0, input_tokens - cached_tokens)
-    fresh_cached_gap = max(0, fresh_tokens - cached_tokens)
-    message = (
-        "Safety tripwire activated. The proxy stopped the request chain after this response "
-        "because it looked like the prompt cache was not being reused correctly, which "
-        "could burn through your Copilot session limit; this warning was appended so the "
-        "upstream message is still preserved. "
-        f"This request had {input_tokens} input tokens, {cached_tokens} cached "
-        f"tokens, and {fresh_tokens} fresh input tokens. "
-        f"The safety floor is {CACHE_TRIPWIRE_CACHED_INPUT_TOKEN_THRESHOLD} "
-        "cached input tokens for large requests, with a "
-        f"{CACHE_TRIPWIRE_FRESH_CACHED_GAP_THRESHOLD} token fresh/cache gap limit "
-        f"(this request's gap was {fresh_cached_gap}). "
-        "If you believe this is an error, you can disable the tripwire in Settings. "
-        "Before continuing, debug the cache lineage: compare prompt_cache_key, "
-        "promptCacheKey, previous_response_id, x-request-id, x-agent-task-id, "
-        "x-interaction-id, encrypted_content preservation, and any request-body "
-        "omissions or reordering."
-    )
-    return upstream_errors.SyntheticReply(
-        status_for_trace=200,
-        client_status=200,
-        message=message,
-        reason=CACHE_TRIPWIRE_REASON,
-        usage_shape="preserve",
-        event_name="cache_tripwire_activated",
-        event_payload={
-            "reason": CACHE_TRIPWIRE_REASON,
-            "threshold_input_tokens": CACHE_TRIPWIRE_INPUT_TOKEN_THRESHOLD,
-            "threshold_cached_input_tokens": CACHE_TRIPWIRE_CACHED_INPUT_TOKEN_THRESHOLD,
-            "threshold_fresh_cached_gap_tokens": CACHE_TRIPWIRE_FRESH_CACHED_GAP_THRESHOLD,
-            "input_tokens": input_tokens,
-            "cached_input_tokens": cached_tokens,
-            "fresh_input_tokens": fresh_tokens,
-            "fresh_cached_gap_tokens": fresh_cached_gap,
-        },
-    )
-
-
-def _cache_tripwire_response_payload(
-    reply: upstream_errors.SyntheticReply,
-    *,
-    protocol: str,
-    model: str | None,
-    is_compact: bool = False,
-) -> dict:
-    return protocol_replies.build_synthetic_payload(
-        reply,
-        protocol=protocol,
-        model=model,
-        is_compact=is_compact,
-    )
-
-
-def _cache_tripwire_appended_message(reply: upstream_errors.SyntheticReply) -> str:
-    return f"\n\n{reply.message}"
-
-
-def _append_to_responses_payload(payload: dict, suffix: str) -> bool:
-    appended = False
-    output_text = payload.get("output_text")
-    if isinstance(output_text, str):
-        payload["output_text"] = f"{output_text}{suffix}"
-        appended = True
-
-    output = payload.get("output")
-    if not isinstance(output, list):
-        return appended
-    for item in output:
-        if not isinstance(item, dict):
-            continue
-        if item.get("type") != "message" or str(item.get("role", "")).lower() != "assistant":
-            continue
-        content = item.get("content")
-        if not isinstance(content, list):
-            continue
-        for part in content:
-            if not isinstance(part, dict):
-                continue
-            if part.get("type") == "output_text" and isinstance(part.get("text"), str):
-                part["text"] = f"{part['text']}{suffix}"
-                return True
-    return appended
-
-
-def _append_to_chat_payload(payload: dict, suffix: str) -> bool:
-    choices = payload.get("choices")
-    if not isinstance(choices, list) or not choices:
-        return False
-    first = choices[0]
-    if not isinstance(first, dict):
-        return False
-    message = first.get("message")
-    if not isinstance(message, dict) or not isinstance(message.get("content"), str):
-        return False
-    message["content"] = f"{message['content']}{suffix}"
-    return True
-
-
-def _append_to_anthropic_payload(payload: dict, suffix: str) -> bool:
-    content = payload.get("content")
-    if not isinstance(content, list):
-        return False
-    for block in content:
-        if isinstance(block, dict) and block.get("type") == "text" and isinstance(block.get("text"), str):
-            block["text"] = f"{block['text']}{suffix}"
-            return True
-    return False
-
-
-def _append_cache_tripwire_reply_to_payload(
-    payload: dict,
-    reply: upstream_errors.SyntheticReply,
-    *,
-    protocol: str,
-    model: str | None,
-    is_compact: bool = False,
-) -> dict:
-    suffix = _cache_tripwire_appended_message(reply)
-    normalized = protocol_replies._normalize_protocol(protocol)
-    appended = False
-    if normalized == "anthropic":
-        appended = _append_to_anthropic_payload(payload, suffix)
-    elif normalized == "chat":
-        appended = _append_to_chat_payload(payload, suffix)
-    elif is_compact:
-        appended = _append_to_chat_payload(payload, suffix)
-    else:
-        appended = _append_to_responses_payload(payload, suffix)
-    if appended:
-        return payload
-    return _cache_tripwire_response_payload(reply, protocol=protocol, model=model, is_compact=is_compact)
-
-
-def _cache_tripwire_warning_delta(
-    reply: upstream_errors.SyntheticReply,
-    *,
-    output_index: int,
-    content_index: int,
-) -> bytes:
-    return format_translation.sse_encode(
-        "response.output_text.delta",
-        {
-            "type": "response.output_text.delta",
-            "output_index": output_index,
-            "content_index": content_index,
-            "delta": _cache_tripwire_appended_message(reply),
-        },
-    )
-
-
-def _is_response_completed_event(event_name: str | None, data: str | None) -> bool:
-    if str(event_name or "").strip().lower() == "response.completed":
-        return True
-    if not data or data == "[DONE]":
-        return False
-    try:
-        payload = json.loads(data)
-    except json.JSONDecodeError:
-        return False
-    return isinstance(payload, dict) and str(payload.get("type") or "").strip().lower() == "response.completed"
-
-
-def _cache_tripwire_appended_stream_chunks(
-    buffered_chunks: list[bytes],
-    reply: upstream_errors.SyntheticReply,
-) -> list[bytes]:
-    text = b"".join(buffered_chunks).decode("utf-8", errors="replace").replace("\r\n", "\n")
-    raw_blocks = text.split("\n\n")
-    output: list[bytes] = []
-    output_index = 0
-    content_index = 0
-    inserted = False
-
-    for raw_block in raw_blocks:
-        if not raw_block.strip():
-            continue
-        event_name, data = format_translation.parse_sse_block(raw_block)
-        if data == "[DONE]":
-            continue
-        if data:
-            try:
-                payload = json.loads(data)
-            except json.JSONDecodeError:
-                payload = None
-            if isinstance(payload, dict):
-                event_type = str(payload.get("type") or event_name or "").strip().lower()
-                if event_type == "response.output_text.delta":
-                    if isinstance(payload.get("output_index"), int):
-                        output_index = payload["output_index"]
-                    if isinstance(payload.get("content_index"), int):
-                        content_index = payload["content_index"]
-
-        if not inserted and _is_response_completed_event(event_name, data):
-            output.append(
-                _cache_tripwire_warning_delta(
-                    reply,
-                    output_index=output_index,
-                    content_index=content_index,
-                )
-            )
-            inserted = True
-
-        output.append(f"{raw_block}\n\n".encode("utf-8"))
-
-    if not inserted:
-        output.append(
-            _cache_tripwire_warning_delta(
-                reply,
-                output_index=output_index,
-                content_index=content_index,
-            )
-        )
-    output.append(b"data: [DONE]\n\n")
-    return output
 
 
 def _friendly_limit_chat_payload(message: str, model: str | None = None) -> dict:
@@ -1663,8 +637,8 @@ def request_trace_log_path() -> str:
 
 
 def request_body_dump_enabled() -> bool:
-    # Body dumps are still gated by the debug-detail privacy policy; this flag
-    # only controls whether approved encrypted full-detail captures are written.
+    # Body dumps are still gated by debug_prompt_logging_enabled; this flag only
+    # controls whether approved full-detail captures are written.
     return _env_flag_default("GHCP_DUMP_REQUEST_BODIES", default=True)
 
 
@@ -1839,42 +813,6 @@ def _trace_canonical(value) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
 
 
-def _prompt_drift_projection(upstream_body: dict) -> tuple[str, int] | None:
-    """Build an append-friendly projection of cache-sensitive prompt material."""
-    if not isinstance(upstream_body, dict):
-        return None
-
-    config_keys = (
-        "instructions",
-        "system",
-        "tools",
-        "tool_choice",
-        "parallel_tool_calls",
-        "reasoning",
-        "reasoning_effort",
-        "thinking",
-        "output_config",
-    )
-    config = {key: upstream_body.get(key) for key in config_keys if key in upstream_body}
-    lines = ["CONFIG\t" + _trace_canonical(config) + "\n"]
-    prompt_items = 0
-
-    def append_sequence(label: str, value) -> None:
-        nonlocal prompt_items
-        if isinstance(value, list):
-            for item in value:
-                lines.append(label + "\t" + _trace_canonical(item) + "\n")
-                prompt_items += 1
-            return
-        if value is not None:
-            lines.append(label + "_SCALAR\t" + _trace_canonical(value) + "\n")
-            prompt_items += 1
-
-    append_sequence("INPUT", upstream_body.get("input"))
-    append_sequence("MESSAGE", upstream_body.get("messages"))
-    return "".join(lines), prompt_items
-
-
 def _trace_text_chars(value) -> int:
     if isinstance(value, str):
         return len(value)
@@ -1972,9 +910,6 @@ def _trace_body_summary(body: dict | None) -> dict | None:
     for source_key, target_key in (
         ("session_id", "session_id"),
         ("sessionId", "session_id"),
-        ("prompt_cache_key", "prompt_cache_key"),
-        ("promptCacheKey", "prompt_cache_key"),
-        ("previous_response_id", "previous_response_id"),
     ):
         value = body.get(source_key)
         if isinstance(value, str) and value.strip():
@@ -2016,27 +951,6 @@ def _trace_body_summary(body: dict | None) -> dict | None:
     return summary
 
 
-def _prompt_cache_trace_lineage(
-    body: dict | None,
-    model: str | None,
-    outbound_headers: dict | None = None,
-) -> tuple[str, str] | None:
-    if not isinstance(body, dict):
-        return None
-    model_name = str(model or body.get("model") or "").strip().lower()
-    if not model_name:
-        return None
-    prompt_cache_key = body.get("prompt_cache_key") or body.get("promptCacheKey")
-    if isinstance(prompt_cache_key, str) and prompt_cache_key.strip():
-        return model_name, prompt_cache_key.strip()
-    if isinstance(outbound_headers, dict):
-        for header_name in ("x-agent-task-id", "x-parent-agent-id"):
-            header_value = outbound_headers.get(header_name)
-            if isinstance(header_value, str) and header_value.strip():
-                return model_name, f"{header_name}:{header_value.strip()}"
-    return None
-
-
 def _debug_detail_normalized_string(value) -> str | None:
     if isinstance(value, str):
         normalized = value.strip()
@@ -2053,22 +967,6 @@ def _debug_detail_header_value(headers: dict | None, header_name: str) -> str | 
     return _debug_detail_normalized_string(_header_value_case_insensitive(headers, header_name))
 
 
-def _debug_detail_prompt_cache_session_key(
-    body: dict | None,
-    model: str | None,
-) -> tuple[str, str] | None:
-    if not isinstance(body, dict):
-        return None
-    model_name = str(model or body.get("model") or "").strip().lower()
-    if not model_name:
-        return None
-    prompt_cache_key = body.get("prompt_cache_key") or body.get("promptCacheKey")
-    prompt_cache_key = _debug_detail_normalized_string(prompt_cache_key)
-    if prompt_cache_key:
-        return f"prompt_cache:{model_name}:{prompt_cache_key}", "prompt_cache_key"
-    return None
-
-
 def _debug_detail_session_key(
     *,
     request: Request | None = None,
@@ -2077,12 +975,7 @@ def _debug_detail_session_key(
     resolved_model: str | None = None,
     outbound_headers: dict | None = None,
 ) -> tuple[str, str] | None:
-    """Resolve the session bucket used for cache-bust debug capture.
-
-    Prefer the caller's explicit session identity (request/body), then session
-    identities that have already been forwarded into outbound headers.  Only
-    fall back to prompt-cache lineage when no session-like identifier exists.
-    """
+    """Resolve the session bucket used for debug prompt logging."""
 
     if request is not None:
         session_id = usage_tracking.request_session_id(
@@ -2113,11 +1006,6 @@ def _debug_detail_session_key(
         if value:
             return f"{source}:{value}", source
 
-    for body in (request_body, upstream_body):
-        prompt_cache_key = _debug_detail_prompt_cache_session_key(body, resolved_model)
-        if prompt_cache_key is not None:
-            return prompt_cache_key
-
     return None
 
 
@@ -2134,7 +1022,6 @@ def _debug_detail_session_buffer_locked(session_key: str) -> deque[dict]:
 def _evict_debug_detail_sessions_locked() -> None:
     while len(_DEBUG_DETAIL_SESSION_RECENT_REQUESTS) > DEBUG_DETAIL_SESSION_BUFFER_LIMIT:
         evicted_session_key, _ = _DEBUG_DETAIL_SESSION_RECENT_REQUESTS.popitem(last=False)
-        _DEBUG_DETAIL_SESSION_FUTURE_CAPTURES.pop(evicted_session_key, None)
         _DEBUG_DETAIL_SESSION_CAPTURED_REQUEST_IDS.pop(evicted_session_key, None)
         for request_id, snapshot in list(_DEBUG_DETAIL_REQUEST_SNAPSHOTS_BY_ID.items()):
             if snapshot.get("_session_key") == evicted_session_key:
@@ -2194,130 +1081,6 @@ def _claim_debug_detail_capture_locked(session_key: str, snapshot: dict) -> bool
     return True
 
 
-def _prompt_projection_token_estimate(chars) -> int | None:
-    try:
-        char_count = int(chars)
-    except (TypeError, ValueError):
-        return None
-    if char_count <= 0:
-        return 0
-    return max(1, int(round(char_count / CACHE_BUST_DRIFT_ESTIMATED_CHARS_PER_TOKEN)))
-
-
-def _prompt_drift_diagnostics(
-    *,
-    request_id: str,
-    upstream_body: dict | None,
-    resolved_model: str | None,
-    outbound_headers: dict | None = None,
-) -> dict | None:
-    lineage = _prompt_cache_trace_lineage(upstream_body, resolved_model, outbound_headers)
-    if lineage is None or not isinstance(upstream_body, dict):
-        return None
-    projection = _prompt_drift_projection(upstream_body)
-    if projection is None:
-        return None
-    prompt_projection, prompt_item_count = projection
-
-    snapshot = {
-        "request_id": request_id,
-        "prompt_projection": prompt_projection,
-        "prompt_projection_fingerprint": _trace_hash(prompt_projection),
-        "prompt_projection_chars": len(prompt_projection),
-        "prompt_item_count": prompt_item_count,
-        "body_fingerprint": _trace_hash(upstream_body),
-    }
-    with _PROMPT_CACHE_TRACE_LOCK:
-        previous = _PROMPT_CACHE_LAST_PROMPT_BY_LINEAGE.pop(lineage, None)
-        _PROMPT_CACHE_LAST_PROMPT_BY_LINEAGE[lineage] = snapshot
-        while len(_PROMPT_CACHE_LAST_PROMPT_BY_LINEAGE) > PROMPT_DRIFT_SNAPSHOT_LIMIT:
-            _PROMPT_CACHE_LAST_PROMPT_BY_LINEAGE.pop(next(iter(_PROMPT_CACHE_LAST_PROMPT_BY_LINEAGE)))
-
-    if not isinstance(previous, dict):
-        return {
-            "lineage_model": lineage[0],
-            "previous_request_id": None,
-            "prompt_drifted": None,
-            "current_prompt_item_count": prompt_item_count,
-            "current_prompt_projection_fingerprint": snapshot["prompt_projection_fingerprint"],
-            "current_prompt_projection_chars": snapshot["prompt_projection_chars"],
-            "current_prompt_token_estimate": _prompt_projection_token_estimate(snapshot["prompt_projection_chars"]),
-            "current_body_fingerprint": snapshot["body_fingerprint"],
-        }
-
-    previous_projection = previous.get("prompt_projection")
-    if not isinstance(previous_projection, str):
-        return None
-    prompt_drifted = not prompt_projection.startswith(previous_projection)
-    diagnostics = {
-        "lineage_model": lineage[0],
-        "previous_request_id": previous.get("request_id"),
-        "prompt_drifted": prompt_drifted,
-        "previous_prompt_item_count": previous.get("prompt_item_count"),
-        "current_prompt_item_count": prompt_item_count,
-        "previous_prompt_projection_fingerprint": previous.get("prompt_projection_fingerprint"),
-        "current_prompt_projection_fingerprint": snapshot["prompt_projection_fingerprint"],
-        "previous_prompt_projection_chars": previous.get("prompt_projection_chars"),
-        "current_prompt_projection_chars": snapshot["prompt_projection_chars"],
-        "previous_prompt_token_estimate": _prompt_projection_token_estimate(previous.get("prompt_projection_chars")),
-        "current_prompt_token_estimate": _prompt_projection_token_estimate(snapshot["prompt_projection_chars"]),
-        "previous_body_fingerprint": previous.get("body_fingerprint"),
-        "current_body_fingerprint": snapshot["body_fingerprint"],
-    }
-    return diagnostics
-
-
-def _prompt_cache_affinity_diagnostics(
-    *,
-    request_id: str,
-    upstream_body: dict | None,
-    resolved_model: str | None,
-    outbound_headers: dict | None,
-) -> dict | None:
-    lineage = _prompt_cache_trace_lineage(upstream_body, resolved_model, outbound_headers)
-    if lineage is None or not isinstance(outbound_headers, dict):
-        return None
-
-    def header_value(name: str) -> str | None:
-        value = outbound_headers.get(name)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-        target = name.lower()
-        for key, candidate in outbound_headers.items():
-            if isinstance(key, str) and key.lower() == target and isinstance(candidate, str) and candidate.strip():
-                return candidate.strip()
-        return None
-
-    snapshot = {
-        "request_id": request_id,
-        "x_agent_task_id": header_value("x-agent-task-id"),
-        "x_interaction_id": header_value("x-interaction-id"),
-        "x_client_session_id": header_value("x-client-session-id"),
-    }
-    with _PROMPT_CACHE_AFFINITY_TRACE_LOCK:
-        previous = _PROMPT_CACHE_LAST_AFFINITY_BY_LINEAGE.get(lineage)
-        _PROMPT_CACHE_LAST_AFFINITY_BY_LINEAGE[lineage] = snapshot
-
-    if not isinstance(previous, dict):
-        return None
-
-    changed_fields = []
-    for field in ("x_agent_task_id", "x_interaction_id", "x_client_session_id"):
-        if previous.get(field) != snapshot.get(field):
-            changed_fields.append(field)
-
-    if not changed_fields:
-        return None
-
-    return {
-        "lineage_model": lineage[0],
-        "previous_request_id": previous.get("request_id"),
-        "changed_fields": changed_fields,
-        "previous": {field: previous.get(field) for field in changed_fields},
-        "current": {field: snapshot.get(field) for field in changed_fields},
-    }
-
-
 def _header_value_case_insensitive(headers: dict | None, name: str) -> str | None:
     if not isinstance(headers, dict):
         return None
@@ -2353,20 +1116,6 @@ def _debug_detail_always_capture_reasons(
     return reasons
 
 
-def _is_cache_bust_prompt_drift(diagnostics: dict | None) -> bool:
-    if not isinstance(diagnostics, dict) or diagnostics.get("prompt_drifted") is not True:
-        return False
-    previous_tokens = diagnostics.get("previous_prompt_token_estimate")
-    current_tokens = diagnostics.get("current_prompt_token_estimate")
-    if not isinstance(previous_tokens, int) or not isinstance(current_tokens, int):
-        return False
-    if previous_tokens < CACHE_BUST_DRIFT_PREVIOUS_TOKEN_THRESHOLD:
-        return False
-    if previous_tokens - current_tokens < CACHE_BUST_DRIFT_DROP_TOKEN_THRESHOLD:
-        return False
-    return current_tokens <= int(previous_tokens * CACHE_BUST_DRIFT_CURRENT_RATIO_THRESHOLD)
-
-
 def _debug_detail_capture_info(
     *,
     reasons: list[str],
@@ -2377,7 +1126,6 @@ def _debug_detail_capture_info(
     info = {
         "enabled": True,
         "reasons": list(dict.fromkeys(reason for reason in reasons if reason)),
-        "encrypted": True,
         "context_window": context_window,
     }
     if phase:
@@ -2421,7 +1169,6 @@ def _build_debug_detail_snapshot(
         request_body if isinstance(request_body, dict) else upstream_body,
         truncate=False,
     )
-    lineage = _prompt_cache_trace_lineage(upstream_body, resolved_model, outbound_headers)
     session_key_pair = _debug_detail_session_key(
         request=request,
         request_body=request_body,
@@ -2443,342 +1190,31 @@ def _build_debug_detail_snapshot(
         "upstream_body_summary": _trace_body_summary(upstream_body),
         "outbound_headers": _header_trace_subset(outbound_headers),
     }
-    if lineage is not None:
-        snapshot["_lineage"] = lineage
     if session_key_pair is not None:
         snapshot["_session_key"], snapshot["_session_key_source"] = session_key_pair
     if full_prompt_preview:
-        snapshot["request_prompt"] = _protect_prompt_trace_value(
-            full_prompt_preview,
-            require_encryption=True,
-        )
+        snapshot["request_prompt"] = _prompt_trace_value(full_prompt_preview)
     if isinstance(request_body, dict):
-        snapshot["source_body"] = _protect_prompt_trace_value(request_body, require_encryption=True)
+        snapshot["source_body"] = _prompt_trace_value(request_body)
     if isinstance(upstream_body, dict):
-        snapshot["upstream_body"] = _protect_prompt_trace_value(upstream_body, require_encryption=True)
+        snapshot["upstream_body"] = _prompt_trace_value(upstream_body)
         try:
             upstream_wire = json.dumps(upstream_body, default=util._json_default)
         except (TypeError, ValueError):
             upstream_wire = None
         if upstream_wire is not None:
             upstream_wire_bytes = upstream_wire.encode("utf-8", errors="replace")
-            snapshot["upstream_body_wire"] = _protect_prompt_trace_value(
-                upstream_wire,
-                require_encryption=True,
-            )
+            snapshot["upstream_body_wire"] = _prompt_trace_value(upstream_wire)
             snapshot["upstream_body_wire_size"] = len(upstream_wire_bytes)
             snapshot["upstream_body_wire_sha256"] = hashlib.sha256(upstream_wire_bytes).hexdigest()
     return snapshot
 
 
-def _register_debug_detail_snapshot(
-    snapshot: dict,
-    *,
-    always_reasons: list[str],
-    cache_bust_drift: bool,
-) -> tuple[dict | None, list[dict]]:
-    """Register a protected full-detail snapshot and choose what to persist.
-
-    Normal trace rows retain only summaries. Full prompt/body detail is written
-    only for user/safeguarded requests, cache-bust trigger requests, and the
-    +/- DEBUG_DETAIL_CONTEXT_REQUESTS window around any in-chain prompt shrink
-    (within the same debug session, current tokens < previous tokens). Within a
-    normally cached chain the prompt grows turn over turn; a shrink means the
-    cache lineage broke, so we capture surrounding requests for postmortem
-    decryption.
-    """
-    global _DEBUG_DETAIL_INCIDENT_COUNTER, _DEBUG_DETAIL_SNAPSHOT_SEQUENCE
-    always_reasons = list(dict.fromkeys(always_reasons))
-    detail_events: list[dict] = []
-    current_capture: dict | None = None
-
-    if not _prompt_logging_permitted():
-        return current_capture, detail_events
-
-    with _DEBUG_DETAIL_CAPTURE_LOCK:
-        session_key = _debug_detail_normalized_string(snapshot.get("_session_key"))
-        previous_snapshots: list[dict] = []
-        if session_key:
-            session_buffer = _debug_detail_session_buffer_locked(session_key)
-            previous_snapshots = [dict(previous) for previous in session_buffer]
-            snapshot["_previous_session_snapshots"] = previous_snapshots
-            _DEBUG_DETAIL_SNAPSHOT_SEQUENCE += 1
-            snapshot["_debug_detail_sequence"] = _DEBUG_DETAIL_SNAPSHOT_SEQUENCE
-        else:
-            session_buffer = None
-
-        incident_id = None
-        if cache_bust_drift:
-            _DEBUG_DETAIL_INCIDENT_COUNTER += 1
-            incident_id = f"cache-bust-{_DEBUG_DETAIL_INCIDENT_COUNTER}"
-            trigger_claimed = session_key is not None and _claim_debug_detail_capture_locked(session_key, snapshot)
-            remaining_slots = _debug_detail_capture_slots_remaining_locked(session_key) if session_key else 0
-            selected_previous = previous_snapshots[-remaining_slots:] if remaining_slots > 0 else []
-            for previous_snapshot in selected_previous:
-                if not _claim_debug_detail_capture_locked(session_key, previous_snapshot):
-                    continue
-                detail_events.append(
-                    _with_debug_detail_capture_info(
-                        previous_snapshot,
-                        reasons=["cache_bust_context"],
-                        phase="before",
-                        incident_id=incident_id,
-                    )
-                )
-            remaining_slots = _debug_detail_capture_slots_remaining_locked(session_key) if session_key else 0
-            if session_key and remaining_slots > 0:
-                _DEBUG_DETAIL_SESSION_FUTURE_CAPTURES[session_key] = {
-                    "remaining": min(DEBUG_DETAIL_CONTEXT_REQUESTS, remaining_slots),
-                    "incident_id": incident_id,
-                    "context_reason": "cache_bust_context",
-                }
-            current_reasons = [*always_reasons, "cache_bust_drift"]
-            if trigger_claimed:
-                current_capture = _debug_detail_capture_info(
-                    reasons=current_reasons,
-                    phase="trigger",
-                    incident_id=incident_id,
-                )
-                detail_events.append(
-                    _with_debug_detail_capture_info(
-                        snapshot,
-                        reasons=current_reasons,
-                        phase="trigger",
-                        incident_id=incident_id,
-                    )
-                )
-        elif session_key and isinstance(
-            future_capture := _DEBUG_DETAIL_SESSION_FUTURE_CAPTURES.get(session_key),
-            dict,
-        ) and util._coerce_int(future_capture.get("remaining"), default=0) > 0:
-            future_capture["remaining"] = util._coerce_int(future_capture.get("remaining"), default=0) - 1
-            context_reason = str(future_capture.get("context_reason") or "cache_bust_context")
-            current_reasons = [*always_reasons, "cache_bust_context"]
-            if context_reason not in current_reasons:
-                current_reasons[-1] = context_reason
-            incident_id = _debug_detail_normalized_string(future_capture.get("incident_id"))
-            if _claim_debug_detail_capture_locked(session_key, snapshot):
-                current_capture = _debug_detail_capture_info(
-                    reasons=current_reasons,
-                    phase="after",
-                    incident_id=incident_id,
-                )
-                after_event = _with_debug_detail_capture_info(
-                    snapshot,
-                    reasons=current_reasons,
-                    phase="after",
-                    incident_id=incident_id,
-                )
-                diagnostics = future_capture.get("diagnostics")
-                if isinstance(diagnostics, dict):
-                    after_event.setdefault("debug_detail_capture", {})["cache_bust_usage_diagnostics"] = diagnostics
-                detail_events.append(after_event)
-            if future_capture["remaining"] <= 0:
-                _DEBUG_DETAIL_SESSION_FUTURE_CAPTURES.pop(session_key, None)
-        elif always_reasons:
-            current_capture = _debug_detail_capture_info(reasons=always_reasons)
-            detail_events.append(
-                _with_debug_detail_capture_info(
-                    snapshot,
-                    reasons=always_reasons,
-                )
-            )
-
-        if session_key and session_buffer is not None:
-            session_buffer.append(snapshot)
-            _remember_debug_detail_snapshot_locked(snapshot)
-            _evict_debug_detail_sessions_locked()
-
-    return current_capture, detail_events
-
-
-def _post_response_cache_bust_diagnostics(
-    *,
-    request_id: str,
-    upstream_body: dict | None,
-    source_body: dict | None = None,
-    resolved_model: str | None,
-    outbound_headers: dict | None,
-    usage: dict | None,
-    session_key: str | None = None,
-) -> tuple[str, dict] | None:
-    """Detect upstream cache eviction visible only in response usage.
-
-    The local prompt-shrink detector (``_is_cache_bust_prompt_drift``) only
-    fires when the request body itself shrinks. Some chains keep growing
-    monotonically while the upstream evicts the prompt cache — visible only
-    as a drop in ``cached_input_tokens`` between consecutive completed
-    requests in the same debug session. This runs at request_finished time, so
-    the trigger happens after the request that took the cache miss.
-    """
-    normalized_session_key = _debug_detail_normalized_string(session_key)
-    if normalized_session_key:
-        session_key_source = "request_start"
-    else:
-        session_key_pair = _debug_detail_session_key(
-            request_body=source_body if isinstance(source_body, dict) else upstream_body,
-            upstream_body=upstream_body,
-            resolved_model=resolved_model,
-            outbound_headers=outbound_headers,
-        )
-        if session_key_pair is not None:
-            normalized_session_key, session_key_source = session_key_pair
-        else:
-            prompt_lineage = _prompt_cache_trace_lineage(source_body, resolved_model, outbound_headers)
-            if prompt_lineage is None:
-                prompt_lineage = _prompt_cache_trace_lineage(upstream_body, resolved_model, outbound_headers)
-            if prompt_lineage is None:
-                return None
-            normalized_session_key = f"lineage:{prompt_lineage[0]}:{prompt_lineage[1]}"
-            session_key_source = "prompt_cache_lineage"
-    session_key = normalized_session_key
-    normalized = util.normalize_usage_payload(usage)
-    if not isinstance(normalized, dict):
-        return None
-    cached = util._coerce_int(normalized.get("cached_input_tokens"), default=None)
-    input_tokens = util._coerce_int(normalized.get("input_tokens"), default=None)
-    if cached is None:
-        return None
-    snapshot = {
-        "request_id": request_id,
-        "cached_input_tokens": cached,
-        "session_key": session_key,
-        "session_key_source": session_key_source,
-    }
-    if input_tokens is not None:
-        snapshot["input_tokens"] = input_tokens
-    prompt_lineage = _prompt_cache_trace_lineage(source_body, resolved_model, outbound_headers)
-    if prompt_lineage is None:
-        prompt_lineage = _prompt_cache_trace_lineage(upstream_body, resolved_model, outbound_headers)
-    if prompt_lineage is not None:
-        detection_key = f"lineage:{prompt_lineage[0]}:{prompt_lineage[1]}"
-        detection_key_source = "prompt_cache_lineage"
-    else:
-        detection_key = session_key
-        detection_key_source = session_key_source
-    snapshot["detection_key"] = detection_key
-    snapshot["detection_key_source"] = detection_key_source
-    with _PROMPT_CACHE_USAGE_TRACE_LOCK:
-        previous = _PROMPT_CACHE_LAST_USAGE_BY_DETECTION_KEY.pop(detection_key, None)
-        _PROMPT_CACHE_LAST_USAGE_BY_DETECTION_KEY[detection_key] = snapshot
-        while len(_PROMPT_CACHE_LAST_USAGE_BY_DETECTION_KEY) > PROMPT_CACHE_USAGE_SNAPSHOT_LIMIT:
-            _PROMPT_CACHE_LAST_USAGE_BY_DETECTION_KEY.popitem(last=False)
-    if not isinstance(previous, dict):
-        return None
-    prev_cached = previous.get("cached_input_tokens")
-    if not isinstance(prev_cached, int):
-        return None
-    if cached >= prev_cached:
-        return None
-    diagnostics = {
-        "session_key": session_key,
-        "session_key_source": session_key_source,
-        "detection_key": detection_key,
-        "detection_key_source": detection_key_source,
-        "previous_request_id": previous.get("request_id"),
-        "previous_cached_input_tokens": prev_cached,
-        "current_cached_input_tokens": cached,
-        "previous_input_tokens": previous.get("input_tokens"),
-        "current_input_tokens": input_tokens,
-        "cache_drop": prev_cached - cached,
-    }
-    if prompt_lineage is not None:
-        diagnostics["lineage_model"] = prompt_lineage[0]
-        diagnostics["lineage_key"] = prompt_lineage[1]
-    return session_key, diagnostics
-
-
-def _register_post_response_cache_bust_capture(
-    buster_request_id: str,
-    session_key: str,
-    diagnostics: dict,
-) -> list[dict]:
-    """Emit retroactive debug-detail events for an in-flight cache eviction.
-
-    Locates the buster in its debug session and emits the session-local window:
-    the buster's frozen previous 10 snapshots as ``before``, the buster as
-    ``trigger``, and up to 10 same-session snapshots that already started after
-    the buster as ``after``.  If fewer than 10 later snapshots exist yet, a
-    session-local future capture state records subsequent starts from that same
-    session only.
-    """
-    global _DEBUG_DETAIL_INCIDENT_COUNTER
-    detail_events: list[dict] = []
-    if not _prompt_logging_permitted():
-        return detail_events
-    with _DEBUG_DETAIL_CAPTURE_LOCK:
-        session_key = _debug_detail_normalized_string(session_key)
-        if not session_key:
-            return detail_events
-        buster_snapshot = _DEBUG_DETAIL_REQUEST_SNAPSHOTS_BY_ID.get(buster_request_id)
-        if not isinstance(buster_snapshot, dict) or buster_snapshot.get("_session_key") != session_key:
-            for snapshot in _DEBUG_DETAIL_SESSION_RECENT_REQUESTS.get(session_key, []):
-                if snapshot.get("request_id") == buster_request_id:
-                    buster_snapshot = snapshot
-                    break
-        if not isinstance(buster_snapshot, dict) or buster_snapshot.get("_session_key") != session_key:
-            return detail_events
-
-        _DEBUG_DETAIL_INCIDENT_COUNTER += 1
-        incident_id = f"cache-bust-usage-{_DEBUG_DETAIL_INCIDENT_COUNTER}"
-        trigger_claimed = _claim_debug_detail_capture_locked(session_key, buster_snapshot)
-        before_snapshots = buster_snapshot.get("_previous_session_snapshots")
-        if not isinstance(before_snapshots, list):
-            before_snapshots = []
-        remaining_slots = _debug_detail_capture_slots_remaining_locked(session_key)
-        selected_before = before_snapshots[-remaining_slots:] if remaining_slots > 0 else []
-        for snapshot in selected_before:
-            if not isinstance(snapshot, dict):
-                continue
-            if not _claim_debug_detail_capture_locked(session_key, snapshot):
-                continue
-            detail_events.append(
-                _with_debug_detail_capture_info(
-                    snapshot,
-                    reasons=["cache_bust_usage_context"],
-                    phase="before",
-                    incident_id=incident_id,
-                )
-            )
-        if trigger_claimed:
-            detail_events.append(
-                _with_debug_detail_capture_info(
-                    buster_snapshot,
-                    reasons=["cache_bust_usage_drift"],
-                    phase="trigger",
-                    incident_id=incident_id,
-                )
-            )
-        after_snapshots = _debug_detail_after_snapshots_locked(session_key, buster_snapshot)
-        after_captured = 0
-        for snapshot in after_snapshots:
-            if not _claim_debug_detail_capture_locked(session_key, snapshot):
-                continue
-            after_captured += 1
-            detail_events.append(
-                _with_debug_detail_capture_info(
-                    snapshot,
-                    reasons=["cache_bust_usage_context"],
-                    phase="after",
-                    incident_id=incident_id,
-                )
-            )
-        for event in detail_events:
-            event.setdefault("debug_detail_capture", {})["cache_bust_usage_diagnostics"] = diagnostics
-        future_remaining = min(
-            max(0, DEBUG_DETAIL_CONTEXT_REQUESTS - after_captured),
-            _debug_detail_capture_slots_remaining_locked(session_key),
-        )
-        if future_remaining > 0:
-            _DEBUG_DETAIL_SESSION_FUTURE_CAPTURES[session_key] = {
-                "remaining": future_remaining,
-                "incident_id": incident_id,
-                "context_reason": "cache_bust_usage_context",
-                "diagnostics": diagnostics,
-            }
-        else:
-            _DEBUG_DETAIL_SESSION_FUTURE_CAPTURES.pop(session_key, None)
-    return detail_events
+def _register_debug_detail_snapshot(snapshot: dict) -> tuple[dict | None, list[dict]]:
+    """Persist full prompt/body detail for every request when debug prompt logging is enabled."""
+    if not _debug_prompt_logging_enabled():
+        return None, []
+    return _debug_detail_capture_info(reasons=["debug_prompt_logging"], phase="current"), []
 
 
 def _trace_context_allows_full_debug_detail(trace_context: dict | None) -> bool:
@@ -2861,7 +1297,7 @@ def _trace_response_summary(
 
 
 def _append_request_trace(payload: dict, *, force: bool = False) -> None:
-    if not force and not request_tracing_enabled():
+    if not force and not (request_tracing_enabled() or _debug_prompt_logging_enabled()):
         return
     trace_path = request_trace_log_path()
     try:
@@ -2882,6 +1318,156 @@ def _write_request_trace_line(trace_path: str, line: str) -> None:
             _enforce_trace_retention_locked(trace_path)
     except OSError as exc:
         print(f"Warning: failed to write request trace log: {exc}", file=sys.stderr, flush=True)
+
+
+def _trim_trace_field(value, *, max_bytes: int = REQUEST_TRACE_BODY_MAX_BYTES):
+    """Cap body-ish trace fields so retained rows stay bounded in size."""
+    if value is None or max_bytes <= 0:
+        return value
+    try:
+        serialized = json.dumps(value, separators=(",", ":"), default=util._json_default)
+    except (TypeError, ValueError):
+        return value
+    encoded = serialized.encode("utf-8", errors="replace")
+    if len(encoded) <= max_bytes:
+        return value
+    return {
+        "_truncated": True,
+        "original_bytes": len(encoded),
+        "preview": encoded[:max_bytes].decode("utf-8", errors="replace"),
+        "original_type": type(value).__name__,
+    }
+
+
+def _trim_trace_text(value, *, max_chars: int = REQUEST_TRACE_BODY_MAX_BYTES):
+    if not isinstance(value, str) or max_chars <= 0 or len(value) <= max_chars:
+        return value
+    return value[:max_chars] + f"\n...[truncated; original {len(value)} chars]"
+
+
+def _is_response_completed_event(event_name: str | None, data: str | None) -> bool:
+    if str(event_name or "").strip().lower() == "response.completed":
+        return True
+    if not data or data == "[DONE]":
+        return False
+    try:
+        payload = json.loads(data)
+    except json.JSONDecodeError:
+        return False
+    return isinstance(payload, dict) and str(payload.get("type") or "").strip().lower() == "response.completed"
+
+
+def _enforce_body_dump_retention_locked(dump_dir: str) -> None:
+    """Cap body-dump directory at REQUEST_TRACE_HISTORY_LIMIT files."""
+    limit = REQUEST_TRACE_HISTORY_LIMIT
+    if limit <= 0:
+        return
+    try:
+        entries = os.listdir(dump_dir)
+    except OSError:
+        return
+    if len(entries) <= limit + max(REQUEST_TRACE_RETENTION_SLACK, 0):
+        return
+    paths = []
+    for name in entries:
+        full = os.path.join(dump_dir, name)
+        try:
+            mtime = os.path.getmtime(full)
+        except OSError:
+            continue
+        paths.append((mtime, full))
+    paths.sort()
+    for _, path in paths[: max(0, len(paths) - limit)]:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def _enforce_trace_retention_locked(trace_path: str) -> None:
+    """Keep the trace log bounded at REQUEST_TRACE_HISTORY_LIMIT rows."""
+    limit = REQUEST_TRACE_HISTORY_LIMIT
+    if limit <= 0:
+        return
+    threshold = limit + max(REQUEST_TRACE_RETENTION_SLACK, 0)
+    try:
+        size = os.path.getsize(trace_path)
+    except OSError:
+        return
+    if size < threshold * 256:
+        return
+    try:
+        with open(trace_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except OSError:
+        return
+    if len(lines) <= threshold:
+        return
+    try:
+        with open(trace_path, "w", encoding="utf-8") as f:
+            f.writelines(lines[-limit:])
+    except OSError as exc:
+        print(f"Warning: trace retention rewrite failed: {exc}", file=sys.stderr, flush=True)
+
+
+def _anthropic_messages_usage_for_tracking(usage: dict | None) -> dict | None:
+    if not isinstance(usage, dict):
+        return None
+    raw_input = util._coerce_int(usage.get("input_tokens"), default=0)
+    cache_read = util._coerce_int(usage.get("cache_read_input_tokens"), default=None)
+    if cache_read is None:
+        cache_read = util._coerce_int(usage.get("cached_input_tokens"), default=0)
+    cache_creation = util._coerce_int(usage.get("cache_creation_input_tokens"), default=0)
+    non_cache_read_input = raw_input + cache_creation
+    tracked = dict(usage)
+    tracked["input_tokens"] = non_cache_read_input
+    tracked["cached_input_tokens"] = cache_read
+    tracked["cache_read_input_tokens"] = cache_read
+    tracked["cache_creation_input_tokens"] = cache_creation
+    tracked.pop("fresh_input_tokens", None)
+    tracked["pricing_fresh_input_tokens"] = raw_input
+    tracked["pricing_cached_input_tokens"] = cache_read
+    tracked["pricing_cache_creation_input_tokens"] = cache_creation
+    cache_creation_detail = tracked.get("cache_creation")
+    if isinstance(cache_creation_detail, dict):
+        tracked["cache_creation"] = dict(cache_creation_detail)
+    output_tokens = util._coerce_int(usage.get("output_tokens"), default=None)
+    if output_tokens is not None:
+        tracked["total_tokens"] = non_cache_read_input + output_tokens
+    return tracked
+
+
+def _anthropic_messages_usage_for_client(usage: dict | None) -> tuple[dict | None, bool]:
+    if not isinstance(usage, dict):
+        return None, False
+    raw_input = util._coerce_int(usage.get("input_tokens"), default=0)
+    cache_read = util._coerce_int(usage.get("cache_read_input_tokens"), default=None)
+    if cache_read is None:
+        cache_read = util._coerce_int(usage.get("cached_input_tokens"), default=0)
+    cache_creation = util._coerce_int(usage.get("cache_creation_input_tokens"), default=0)
+    non_cache_read_input = raw_input + cache_creation
+    if non_cache_read_input == raw_input and cache_read == 0:
+        return usage, False
+    client_usage = dict(usage)
+    client_usage["input_tokens"] = non_cache_read_input
+    client_usage["cache_read_input_tokens"] = cache_read
+    client_usage["cache_creation_input_tokens"] = cache_creation
+    client_usage["cached_input_tokens"] = cache_read
+    output_tokens = util._coerce_int(usage.get("output_tokens"), default=None)
+    if output_tokens is not None:
+        client_usage["total_tokens"] = client_usage["input_tokens"] + output_tokens
+    return client_usage, True
+
+
+def _anthropic_messages_payload_for_client(payload: dict | None) -> tuple[dict | None, bool]:
+    if not isinstance(payload, dict):
+        return payload, False
+    client_usage, changed = _anthropic_messages_usage_for_client(payload.get("usage"))
+    if not changed:
+        return payload, False
+    client_payload = dict(payload)
+    client_payload["usage"] = client_usage
+    return client_payload, True
 
 
 _REQUEST_BODY_DUMP_LOCK = threading.Lock()
@@ -2927,17 +1513,8 @@ def _dump_outbound_request_body(
     request_body: dict | None,
     upstream_body: dict | None,
     outbound_headers: dict | None,
-    require_encryption: bool = True,
 ) -> None:
-    """Persist the exact outbound body and full headers for an approved capture.
-
-    Callers only invoke this for user/safeguarded requests or cache-bust debug
-    windows. Prompt-bearing fields are encrypted (or stored as locked payloads
-    if no key is available). The actual file write runs on a background thread
-    so it never blocks the event loop, and any failure is swallowed so a
-    serialization issue cannot fail the upstream request itself. Files are
-    bounded by REQUEST_TRACE_HISTORY_LIMIT.
-    """
+    """Persist the exact outbound body and full headers for an approved capture."""
     if not request_body_dump_enabled():
         return
     try:
@@ -2959,59 +1536,15 @@ def _dump_outbound_request_body(
             "requested_model": requested_model,
             "resolved_model": resolved_model,
             "outbound_headers": dict(outbound_headers) if isinstance(outbound_headers, dict) else None,
-            "request_body": _protect_prompt_trace_value(request_body, require_encryption=require_encryption),
-            "upstream_body": _protect_prompt_trace_value(upstream_body, require_encryption=require_encryption),
+            "request_body": _prompt_trace_value(request_body),
+            "upstream_body": _prompt_trace_value(upstream_body),
         }
         if upstream_wire_bytes is not None:
-            snapshot["upstream_body_wire"] = _protect_prompt_trace_value(
-                upstream_wire_bytes.decode("utf-8", errors="replace"),
-                require_encryption=require_encryption,
+            snapshot["upstream_body_wire"] = _prompt_trace_value(
+                upstream_wire_bytes.decode("utf-8", errors="replace")
             )
             snapshot["upstream_body_wire_size"] = len(upstream_wire_bytes)
             snapshot["upstream_body_wire_sha256"] = hashlib.sha256(upstream_wire_bytes).hexdigest()
-        safe_rid = "".join(ch for ch in str(request_id) if ch.isalnum() or ch in ("-", "_")) or "request"
-        out_path = os.path.join(dump_dir, f"{safe_rid}.json")
-        executor = _get_request_body_dump_executor()
-        executor.submit(_write_request_body_dump, out_path, dump_dir, snapshot)
-    except Exception as exc:  # pragma: no cover - never let dump errors fail upstream
-        print(f"Warning: failed to schedule request body dump: {exc}", file=sys.stderr, flush=True)
-
-
-def _dump_debug_detail_event_body_artifact(event: dict) -> None:
-    """Persist body artifacts for retroactive debug-detail events.
-
-    Post-response cache-bust capture emits debug-detail rows after the
-    original request start has already passed. Those rows still contain the
-    approved encrypted prompt/body payloads, so mirror them into the same
-    request-bodies artifact directory used by in-line captures.
-    """
-    if not request_body_dump_enabled() or not isinstance(event, dict):
-        return
-    if event.get("event") != "request_debug_detail":
-        return
-    if not any(key in event for key in ("source_body", "upstream_body", "upstream_body_wire")):
-        return
-    request_id = _debug_detail_normalized_string(event.get("request_id"))
-    if not request_id:
-        return
-    try:
-        dump_dir = request_body_dump_dir()
-        snapshot = {
-            "request_id": request_id,
-            "time": event.get("time") or util.utc_now_iso(),
-            "method": event.get("method"),
-            "client_path": event.get("client_path"),
-            "upstream_host": event.get("upstream_host"),
-            "upstream_path": event.get("upstream_path"),
-            "requested_model": event.get("requested_model"),
-            "resolved_model": event.get("resolved_model"),
-            "outbound_headers": event.get("outbound_headers") if isinstance(event.get("outbound_headers"), dict) else None,
-            "request_body": event.get("source_body") if "source_body" in event else None,
-            "upstream_body": event.get("upstream_body") if "upstream_body" in event else None,
-        }
-        for key in ("upstream_body_wire", "upstream_body_wire_size", "upstream_body_wire_sha256"):
-            if key in event:
-                snapshot[key] = event[key]
         safe_rid = "".join(ch for ch in str(request_id) if ch.isalnum() or ch in ("-", "_")) or "request"
         out_path = os.path.join(dump_dir, f"{safe_rid}.json")
         executor = _get_request_body_dump_executor()
@@ -3029,14 +1562,6 @@ def _write_request_body_dump(out_path: str, dump_dir: str, snapshot: dict) -> No
     """
     try:
         with _REQUEST_BODY_DUMP_LOCK:
-            if isinstance(snapshot, dict):
-                for field in ("request_body", "upstream_body", "upstream_body_wire"):
-                    if field not in snapshot:
-                        continue
-                    value = snapshot.get(field)
-                    if value is None or trace_prompt_security.is_encrypted_payload(value):
-                        continue
-                    snapshot[field] = _protect_prompt_trace_value(value, require_encryption=True)
             os.makedirs(dump_dir, exist_ok=True)
             with open(out_path, "w", encoding="utf-8") as f:
                 json.dump(snapshot, f, default=util._json_default)
@@ -3045,363 +1570,8 @@ def _write_request_body_dump(out_path: str, dump_dir: str, snapshot: dict) -> No
         print(f"Warning: failed to write request body dump: {exc}", file=sys.stderr, flush=True)
 
 
-def _encrypt_prompt_fields_for_storage(payload: dict, fields: tuple[str, ...], key: bytes, salt: str) -> int:
-    changed = 0
-    for field in fields:
-        if field not in payload:
-            continue
-        value = payload.get(field)
-        if value is None or trace_prompt_security.is_encrypted_payload(value):
-            continue
-        payload[field] = trace_prompt_security.encrypt_payload(value, key, salt)
-        changed += 1
-    return changed
-
-
-def _migrate_prompt_jsonl_file(
-    path: str,
-    fields: tuple[str, ...],
-    key: bytes,
-    salt: str,
-    *,
-    lock=None,
-) -> dict[str, int | str]:
-    if lock is not None:
-        with lock:
-            return _migrate_prompt_jsonl_file(path, fields, key, salt)
-    stats: dict[str, int | str] = {"path": path, "rows": 0, "encrypted_fields": 0}
-    if not os.path.exists(path):
-        return stats
-    log_dir = os.path.dirname(path) or TOKEN_DIR
-    os.makedirs(log_dir, exist_ok=True)
-    changed_any = False
-    try:
-        fd, temp_path = tempfile.mkstemp(prefix="trace-prompt-migrate-", suffix=".jsonl", dir=log_dir)
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as out_f, open(path, encoding="utf-8") as in_f:
-                for line in in_f:
-                    raw_line = line.rstrip("\n")
-                    if not raw_line:
-                        out_f.write(line)
-                        continue
-                    try:
-                        row = json.loads(raw_line)
-                    except json.JSONDecodeError:
-                        out_f.write(line)
-                        continue
-                    if not isinstance(row, dict):
-                        out_f.write(line)
-                        continue
-                    stats["rows"] = int(stats["rows"]) + 1
-                    changed_fields = _encrypt_prompt_fields_for_storage(row, fields, key, salt)
-                    if changed_fields:
-                        changed_any = True
-                        stats["encrypted_fields"] = int(stats["encrypted_fields"]) + changed_fields
-                    out_f.write(json.dumps(row, separators=(",", ":"), default=util._json_default))
-                    out_f.write("\n")
-            if changed_any:
-                os.replace(temp_path, path)
-            else:
-                os.unlink(temp_path)
-        finally:
-            if os.path.exists(temp_path):
-                try:
-                    os.unlink(temp_path)
-                except OSError:
-                    pass
-    except OSError as exc:
-        stats["error"] = str(exc)
-    return stats
-
-
-def _migrate_prompt_body_dump_dir(dump_dir: str, key: bytes, salt: str, *, lock=None) -> dict[str, int | str]:
-    if lock is not None:
-        with lock:
-            return _migrate_prompt_body_dump_dir(dump_dir, key, salt)
-    stats: dict[str, int | str] = {"path": dump_dir, "files": 0, "encrypted_fields": 0}
-    if not os.path.isdir(dump_dir):
-        return stats
-    for name in os.listdir(dump_dir):
-        if not name.endswith(".json"):
-            continue
-        path = os.path.join(dump_dir, name)
-        if not os.path.isfile(path):
-            continue
-        try:
-            with open(path, encoding="utf-8") as f:
-                payload = json.load(f)
-        except (OSError, json.JSONDecodeError):
-            continue
-        if not isinstance(payload, dict):
-            continue
-        changed_fields = 0
-        for field in ("request_body", "upstream_body", "upstream_body_wire"):
-            if field not in payload:
-                continue
-            value = payload.get(field)
-            if value is None or trace_prompt_security.is_encrypted_payload(value):
-                continue
-            payload[field] = trace_prompt_security.encrypt_payload(value, key, salt)
-            changed_fields += 1
-        if not changed_fields:
-            continue
-        try:
-            fd, temp_path = tempfile.mkstemp(prefix="trace-prompt-body-", suffix=".json", dir=os.path.dirname(path))
-            try:
-                with os.fdopen(fd, "w", encoding="utf-8") as out_f:
-                    json.dump(payload, out_f, separators=(",", ":"), default=util._json_default)
-                os.replace(temp_path, path)
-            finally:
-                if os.path.exists(temp_path):
-                    try:
-                        os.unlink(temp_path)
-                    except OSError:
-                        pass
-        except OSError:
-            continue
-        stats["files"] = int(stats["files"]) + 1
-        stats["encrypted_fields"] = int(stats["encrypted_fields"]) + changed_fields
-    return stats
-
-
-def _migrate_in_memory_prompt_usage_events(key: bytes, salt: str, *, lock=None) -> int:
-    if lock is not None:
-        with lock:
-            return _migrate_in_memory_prompt_usage_events(key, salt)
-    migrated = 0
-    for event in usage_tracker.state.recent_usage_events:
-        if not isinstance(event, dict) or "request_prompt" not in event:
-            continue
-        value = event.get("request_prompt")
-        if value is None or trace_prompt_security.is_encrypted_payload(value):
-            continue
-        event["request_prompt"] = trace_prompt_security.encrypt_payload(value, key, salt)
-        migrated += 1
-    return migrated
-
-
 def _protect_plan_prompt_trace_state(plan: UpstreamRequestPlan) -> None:
-    for payload in (plan.usage_event, plan.trace_context):
-        if not isinstance(payload, dict) or "request_prompt" not in payload:
-            continue
-        value = payload.get("request_prompt")
-        if value is None or trace_prompt_security.is_encrypted_payload(value):
-            continue
-        payload["request_prompt"] = _protect_prompt_trace_value(value, require_encryption=True)
-
-
-def _migrate_existing_prompt_trace_logs(key: bytes, salt: str) -> dict[str, object]:
-    with usage_tracker.state.usage_log_lock:
-        usage_log_stats = _migrate_prompt_jsonl_file(
-            usage_tracker.usage_log_file,
-            ("request_prompt",),
-            key,
-            salt,
-        )
-        memory_usage_events = _migrate_in_memory_prompt_usage_events(key, salt)
-    return {
-        "usage_log": usage_log_stats,
-        "request_trace": _migrate_prompt_jsonl_file(
-            request_trace_log_path(),
-            ("request_prompt", "source_body", "upstream_body"),
-            key,
-            salt,
-            lock=_REQUEST_TRACE_LOCK,
-        ),
-        "request_bodies": _migrate_prompt_body_dump_dir(request_body_dump_dir(), key, salt, lock=_REQUEST_BODY_DUMP_LOCK),
-        "memory_usage_events": memory_usage_events,
-    }
-
-
-def _enforce_body_dump_retention_locked(dump_dir: str) -> None:
-    """Cap body-dump directory at REQUEST_TRACE_HISTORY_LIMIT files.
-
-    Caller must hold ``_REQUEST_BODY_DUMP_LOCK``. Bodies can be 10-100KB
-    each; without retention the directory grows unbounded.
-    """
-    limit = REQUEST_TRACE_HISTORY_LIMIT
-    if limit <= 0:
-        return
-    try:
-        entries = os.listdir(dump_dir)
-    except OSError:
-        return
-    if len(entries) <= limit + max(REQUEST_TRACE_RETENTION_SLACK, 0):
-        return
-    paths = []
-    for name in entries:
-        full = os.path.join(dump_dir, name)
-        try:
-            mtime = os.path.getmtime(full)
-        except OSError:
-            continue
-        paths.append((mtime, full))
-    paths.sort()
-    drop = len(paths) - limit
-    for _, path in paths[:drop]:
-        try:
-            os.unlink(path)
-        except OSError:
-            pass
-
-
-def _anthropic_messages_usage_for_tracking(usage: dict | None) -> dict | None:
-    """Internal accounting shape for Anthropic Messages prompt-cache usage.
-
-    Anthropic reports ``input_tokens`` as fresh non-cache-read input, then
-    reports cache reads/writes separately. Persist non-cache-read input while
-    preserving visible cache buckets, and keep pricing-only counters for cost
-    calculation so the display shape cannot double-charge cache usage.
-    """
-    if not isinstance(usage, dict):
-        return None
-    raw_input = util._coerce_int(usage.get("input_tokens"), default=0)
-    cache_read = util._coerce_int(usage.get("cache_read_input_tokens"), default=None)
-    if cache_read is None:
-        cache_read = util._coerce_int(usage.get("cached_input_tokens"), default=0)
-    cache_creation = util._coerce_int(usage.get("cache_creation_input_tokens"), default=0)
-    non_cache_read_input = raw_input + cache_creation
-    tracked = dict(usage)
-    tracked["input_tokens"] = non_cache_read_input
-    tracked["cached_input_tokens"] = cache_read
-    tracked["cache_read_input_tokens"] = cache_read
-    tracked["cache_creation_input_tokens"] = cache_creation
-    tracked.pop("fresh_input_tokens", None)
-    tracked["pricing_fresh_input_tokens"] = raw_input
-    tracked["pricing_cached_input_tokens"] = cache_read
-    tracked["pricing_cache_creation_input_tokens"] = cache_creation
-    cache_creation_detail = tracked.get("cache_creation")
-    if isinstance(cache_creation_detail, dict):
-        tracked["cache_creation"] = dict(cache_creation_detail)
-    output_tokens = util._coerce_int(usage.get("output_tokens"), default=None)
-    if output_tokens is not None:
-        tracked["total_tokens"] = non_cache_read_input + output_tokens
-    return tracked
-
-
-def _anthropic_messages_usage_for_client(usage: dict | None) -> tuple[dict | None, bool]:
-    """Return client-visible Anthropic usage with cache reads kept separate.
-
-    Anthropic's raw Messages usage reports cache writes separately from
-    ``input_tokens`` and cache reads under ``cache_read_input_tokens``. Claude
-    Code's aggregate usage display treats cache fields as separate buckets, so
-    ``input_tokens`` should exclude cache reads while still including cache
-    writes. Internal tracking keeps separate ``pricing_*`` counters for cost.
-    """
-    if not isinstance(usage, dict):
-        return None, False
-    raw_input = util._coerce_int(usage.get("input_tokens"), default=0)
-    cache_read = util._coerce_int(usage.get("cache_read_input_tokens"), default=None)
-    if cache_read is None:
-        cache_read = util._coerce_int(usage.get("cached_input_tokens"), default=0)
-    cache_creation = util._coerce_int(usage.get("cache_creation_input_tokens"), default=0)
-    non_cache_read_input = raw_input + cache_creation
-    if non_cache_read_input == raw_input and cache_read == 0:
-        return usage, False
-    client_usage = dict(usage)
-    client_usage["input_tokens"] = non_cache_read_input
-    client_usage["cache_read_input_tokens"] = cache_read
-    client_usage["cache_creation_input_tokens"] = cache_creation
-    client_usage["cached_input_tokens"] = cache_read
-    output_tokens = util._coerce_int(usage.get("output_tokens"), default=None)
-    if output_tokens is not None:
-        client_usage["total_tokens"] = client_usage["input_tokens"] + output_tokens
-    return client_usage, True
-
-
-def _anthropic_messages_payload_for_client(payload: dict | None) -> tuple[dict | None, bool]:
-    if not isinstance(payload, dict):
-        return payload, False
-    usage = payload.get("usage")
-    client_usage, changed = _anthropic_messages_usage_for_client(usage)
-    if not changed:
-        return payload, False
-    client_payload = dict(payload)
-    client_payload["usage"] = client_usage
-    return client_payload, True
-
-
-def _enforce_trace_retention_locked(trace_path: str) -> None:
-    """Keep the trace log bounded at ``REQUEST_TRACE_HISTORY_LIMIT`` rows.
-
-    Only rewrites the file once it has drifted ``REQUEST_TRACE_RETENTION_SLACK``
-    entries past the limit, so the rewrite cost is amortized across many
-    appends. Caller must hold ``_REQUEST_TRACE_LOCK``.
-    """
-    limit = REQUEST_TRACE_HISTORY_LIMIT
-    if limit <= 0:
-        return
-    threshold = limit + max(REQUEST_TRACE_RETENTION_SLACK, 0)
-    try:
-        # Fast pre-check: only count lines when the file is large enough that
-        # it *might* be over-limit. Short bodies are ~200-500B; long ones are
-        # multi-KB. Assume worst-case 256B/line to decide whether to scan.
-        size = os.path.getsize(trace_path)
-    except OSError:
-        return
-    if size < threshold * 256:
-        return
-
-    try:
-        with open(trace_path, "rb") as f:
-            line_count = sum(1 for _ in f)
-    except OSError as exc:
-        print(f"Warning: trace retention scan failed: {exc}", file=sys.stderr, flush=True)
-        return
-    if line_count <= threshold:
-        return
-
-    keep = limit
-    drop = line_count - keep
-    log_dir = os.path.dirname(trace_path) or TOKEN_DIR
-    try:
-        fd, temp_path = tempfile.mkstemp(prefix="request-trace-", suffix=".jsonl", dir=log_dir)
-        try:
-            with os.fdopen(fd, "wb") as out_f, open(trace_path, "rb") as in_f:
-                for idx, line in enumerate(in_f):
-                    if idx < drop:
-                        continue
-                    out_f.write(line)
-            os.replace(temp_path, trace_path)
-        finally:
-            if os.path.exists(temp_path):
-                try:
-                    os.unlink(temp_path)
-                except OSError:
-                    pass
-    except OSError as exc:
-        print(f"Warning: trace retention rewrite failed: {exc}", file=sys.stderr, flush=True)
-
-
-def _trim_trace_field(value, *, max_bytes: int = REQUEST_TRACE_BODY_MAX_BYTES):
-    """Cap a body-ish trace field so retained rows stay bounded in size.
-
-    If the serialized form is under ``max_bytes`` the value is returned
-    unchanged. Otherwise we return a wrapper dict that preserves type info
-    plus a truncated prefix, so the row remains self-describing.
-    """
-    if value is None or max_bytes <= 0:
-        return value
-    try:
-        serialized = json.dumps(value, separators=(",", ":"), default=util._json_default)
-    except (TypeError, ValueError):
-        return value
-    encoded = serialized.encode("utf-8", errors="replace")
-    if len(encoded) <= max_bytes:
-        return value
-    truncated = encoded[:max_bytes].decode("utf-8", errors="replace")
-    return {
-        "_truncated": True,
-        "original_bytes": len(encoded),
-        "preview": truncated,
-        "original_type": type(value).__name__,
-    }
-
-
-def _trim_trace_text(value, *, max_chars: int = REQUEST_TRACE_BODY_MAX_BYTES):
-    if not isinstance(value, str) or max_chars <= 0 or len(value) <= max_chars:
-        return value
-    return value[:max_chars] + f"\n…[truncated; original {len(value)} chars]"
+    return None
 
 
 def _extract_prompt_preview(
@@ -3520,27 +1690,7 @@ def _emit_request_trace_start(
         raw_verdict = trace_metadata.get("initiator_verdict")
         if isinstance(raw_verdict, dict):
             initiator_verdict = dict(raw_verdict)
-    trace_details = trace_metadata if isinstance(trace_metadata, dict) else {}
-    prompt_drift_diagnostics = _prompt_drift_diagnostics(
-        request_id=request_id,
-        upstream_body=upstream_body,
-        resolved_model=resolved_model,
-        outbound_headers=outbound_headers,
-    )
-    if prompt_drift_diagnostics is not None:
-        trace_details = dict(trace_details)
-        trace_details["prompt_drift"] = prompt_drift_diagnostics
-    cache_affinity_diagnostics = _prompt_cache_affinity_diagnostics(
-        request_id=request_id,
-        upstream_body=upstream_body,
-        resolved_model=resolved_model,
-        outbound_headers=outbound_headers,
-    )
-    if cache_affinity_diagnostics is not None:
-        trace_details = dict(trace_details)
-        trace_details["prompt_cache_affinity_drift"] = cache_affinity_diagnostics
-    always_capture_reasons = _debug_detail_always_capture_reasons(outbound_headers, trace_metadata)
-    cache_bust_drift = _is_cache_bust_prompt_drift(prompt_drift_diagnostics)
+    trace_details = dict(trace_metadata) if isinstance(trace_metadata, dict) else {}
     debug_detail_snapshot = _build_debug_detail_snapshot(
         request_id=request_id,
         context=context,
@@ -3552,11 +1702,7 @@ def _emit_request_trace_start(
         outbound_headers=outbound_headers,
     )
     debug_detail_session_key = _debug_detail_normalized_string(debug_detail_snapshot.get("_session_key"))
-    debug_detail_capture, debug_detail_events = _register_debug_detail_snapshot(
-        debug_detail_snapshot,
-        always_reasons=always_capture_reasons,
-        cache_bust_drift=cache_bust_drift,
-    )
+    debug_detail_capture, debug_detail_events = _register_debug_detail_snapshot(debug_detail_snapshot)
     if debug_detail_capture is not None:
         context["debug_detail_capture"] = debug_detail_capture
         if "request_prompt" in debug_detail_snapshot:
@@ -3579,17 +1725,20 @@ def _emit_request_trace_start(
             truncate=False,
         )
     if debug_detail_capture is not None and prompt_preview:
-        protected_prompt_preview = _protect_prompt_trace_value(prompt_preview, require_encryption=True)
+        protected_prompt_preview = _prompt_trace_value(prompt_preview)
         payload["request_prompt"] = protected_prompt_preview
         context["request_prompt"] = protected_prompt_preview
+    if debug_detail_capture is not None:
+        if isinstance(request_body, dict):
+            payload["source_body"] = _prompt_trace_value(_trim_trace_field(request_body))
+        if isinstance(upstream_body, dict):
+            payload["upstream_body"] = _prompt_trace_value(_trim_trace_field(upstream_body))
     if initiator_verdict is not None:
         payload["initiator_verdict"] = initiator_verdict
         context["initiator_verdict"] = initiator_verdict
     _append_request_trace(payload)
     for debug_detail_event in debug_detail_events:
         _append_request_trace(debug_detail_event)
-        if debug_detail_event.get("request_id") != request_id:
-            _dump_debug_detail_event_body_artifact(debug_detail_event)
     if debug_detail_capture is not None:
         _dump_outbound_request_body(
             request_id=request_id,
@@ -3600,7 +1749,6 @@ def _emit_request_trace_start(
             request_body=request_body,
             upstream_body=upstream_body,
             outbound_headers=outbound_headers,
-            require_encryption=True,
         )
     if debug_detail_session_key:
         context["_debug_detail_session_key"] = debug_detail_session_key
@@ -3638,7 +1786,7 @@ def _finish_usage_and_trace(
             )
             effective_usage = _effective_trace_usage(response_payload=response_payload, usage=usage)
             force_trace = _should_force_failure_trace(plan, status_code)
-            if request_tracing_enabled() or force_trace:
+            if request_tracing_enabled() or _debug_prompt_logging_enabled() or force_trace:
                 trace_context = dict(plan.trace_context or {"request_id": plan.request_id})
                 trace_context.pop("_debug_detail_session_key", None)
                 trace_payload = {
@@ -3659,14 +1807,10 @@ def _finish_usage_and_trace(
                     trace_payload["reasoning_text"] = _trim_trace_text(reasoning_text)
                 if status_code >= 400:
                     if _plan_allows_full_debug_detail(plan):
-                        trace_payload["source_body"] = _protect_prompt_trace_value(
-                            _trim_trace_field(plan.source_body if isinstance(plan.source_body, dict) else plan.body),
-                            require_encryption=True,
+                        trace_payload["source_body"] = _prompt_trace_value(
+                            _trim_trace_field(plan.source_body if isinstance(plan.source_body, dict) else plan.body)
                         )
-                        trace_payload["upstream_body"] = _protect_prompt_trace_value(
-                            _trim_trace_field(plan.body),
-                            require_encryption=True,
-                        )
+                        trace_payload["upstream_body"] = _prompt_trace_value(_trim_trace_field(plan.body))
                     else:
                         trace_payload["source_body"] = _trace_body_summary(
                             plan.source_body if isinstance(plan.source_body, dict) else plan.body
@@ -3677,30 +1821,8 @@ def _finish_usage_and_trace(
                         trace_payload["response_payload"] = _trim_trace_field(response_payload)
                     if isinstance(response_text, str) and response_text:
                         trace_payload["response_text"] = _trim_trace_text(response_text)
-                bust_diagnostics_pair = _post_response_cache_bust_diagnostics(
-                    request_id=plan.request_id,
-                    upstream_body=plan.body,
-                    source_body=plan.source_body,
-                    resolved_model=plan.resolved_model,
-                    outbound_headers=plan.headers,
-                    usage=effective_usage,
-                    session_key=plan.debug_detail_session_key,
-                )
-                if bust_diagnostics_pair is not None:
-                    trace_payload["cache_bust_usage"] = bust_diagnostics_pair[1]
                 _append_request_trace(trace_payload, force=force_trace)
-                if bust_diagnostics_pair is not None:
-                    bust_lineage, bust_diagnostics = bust_diagnostics_pair
-                    bust_events = _register_post_response_cache_bust_capture(
-                        plan.request_id, bust_lineage, bust_diagnostics
-                    )
-                    for event in bust_events:
-                        _append_request_trace(event, force=force_trace)
-                        _dump_debug_detail_event_body_artifact(event)
         finally:
-            _remember_responses_cache_settle_finish(plan, status_code)
-            _remember_parent_for_keepalive(plan, status_code)
-            _maybe_fire_parent_keepalive(plan, status_code)
             if plan.auto_update_request_tracked:
                 auto_update_runtime_controller.note_request_finished(plan.request_id)
         return
@@ -3766,7 +1888,7 @@ def _prepare_upstream_request(
             truncate=False,
         )
         stored_prompt_preview = (
-            _protect_prompt_trace_value(prompt_preview, require_encryption=True)
+            _prompt_trace_value(prompt_preview)
             if prompt_preview
             else None
         )
@@ -3792,7 +1914,7 @@ def _prepare_upstream_request(
     if initiator_verdict is not None:
         trace_context["initiator_verdict"] = initiator_verdict
     debug_detail_session_key = None
-    if request_tracing_enabled():
+    if request_tracing_enabled() or _debug_prompt_logging_enabled():
         trace_context = _emit_request_trace_start(
             request_id=request_id,
             request=request,
@@ -3844,6 +1966,7 @@ def _bridge_error_response(plan: BridgeExecutionPlan):
 
 import request_headers as _request_headers_module
 import responses_replay_ids
+
 
 def _build_anthropic_messages_passthrough_headers(
     request: Request,
@@ -3944,12 +2067,10 @@ def _build_bridge_headers(
     verdict_sink: dict | None = None,
 ) -> dict:
     if bridge_plan.header_kind == "responses":
-        # Stable affinity when the caller supplies a durable cache/session
-        # lineage hint. Without that hint we keep rotate-on-user behavior so
-        # unrelated one-off requests do not silently merge into one bucket.
+        # Stable affinity when the caller supplies a durable session hint.
         stable_affinity_hint = isinstance(original_body, dict) and any(
             isinstance(original_body.get(k), str) and original_body.get(k).strip()
-            for k in ("prompt_cache_key", "promptCacheKey", "sessionId", "session_id")
+            for k in ("sessionId", "session_id")
         )
         headers = format_translation.build_responses_headers_for_request(
             request,
@@ -4085,7 +2206,6 @@ def _bridge_error_response_from_upstream(bridge_plan: BridgeExecutionPlan, upstr
 
 async def _post_non_streaming_request(plan: UpstreamRequestPlan, *, error_response) -> Response:
     try:
-        await _wait_for_responses_cache_settle(plan)
         client = _get_upstream_client()
         upstream = await throttled_client_post(
             client,
@@ -4093,14 +2213,6 @@ async def _post_non_streaming_request(plan: UpstreamRequestPlan, *, error_respon
             headers=plan.headers,
             json=plan.body,
         )
-        if _should_retry_without_prompt_cache_retention(upstream, plan):
-            _drop_prompt_cache_retention_for_retry(plan)
-            upstream = await throttled_client_post(
-                client,
-                plan.upstream_url,
-                headers=plan.headers,
-                json=plan.body,
-            )
         if upstream.status_code >= 400:
             return _handle_upstream_error(
                 upstream,
@@ -4130,7 +2242,6 @@ async def _post_non_streaming_request(plan: UpstreamRequestPlan, *, error_respon
 async def _post_bridge_non_streaming_request(plan: UpstreamRequestPlan, bridge_plan: BridgeExecutionPlan) -> Response:
     error_response = _bridge_error_response(bridge_plan)
     try:
-        await _wait_for_responses_cache_settle(plan)
         client = _get_upstream_client()
         upstream = await throttled_client_post(
             client,
@@ -4138,14 +2249,6 @@ async def _post_bridge_non_streaming_request(plan: UpstreamRequestPlan, bridge_p
             headers=plan.headers,
             json=plan.body,
         )
-        if _should_retry_without_prompt_cache_retention(upstream, plan):
-            _drop_prompt_cache_retention_for_retry(plan)
-            upstream = await throttled_client_post(
-                client,
-                plan.upstream_url,
-                headers=plan.headers,
-                json=plan.body,
-            )
     except httpx.RequestError as exc:
         status_code, message = format_translation.upstream_request_error_status_and_message(exc)
         _finish_usage_and_trace(plan, status_code, response_text=message)
@@ -4196,40 +2299,6 @@ async def _post_bridge_non_streaming_request(plan: UpstreamRequestPlan, bridge_p
         and isinstance(upstream_payload.get("usage"), dict)
         else None
     )
-    tripwire_usage = (
-        _cache_tripwire_usage(
-            translated_payload.get("usage") if isinstance(translated_payload, dict) else None,
-            plan=plan,
-        )
-        if bridge_plan.upstream_protocol == "responses"
-        else None
-    )
-    if isinstance(tripwire_usage, dict):
-        reply = _cache_tripwire_reply(tripwire_usage)
-        response_payload = _append_cache_tripwire_reply_to_payload(
-            translated_payload,
-            reply,
-            protocol=bridge_plan.caller_protocol,
-            model=bridge_plan.resolved_model or bridge_plan.requested_model,
-            is_compact=bridge_plan.is_compact,
-        )
-        _finish_usage_and_trace(
-            plan,
-            reply.status_for_trace,
-            upstream=upstream,
-            response_payload=response_payload,
-            response_text=(
-                format_translation.extract_response_output_text(response_payload)
-                if bridge_plan.caller_protocol == "responses"
-                else util.extract_item_text(response_payload.get("content", [{}])[0])
-                if isinstance(response_payload.get("content"), list)
-                else None
-            )
-            or reply.message,
-            usage=tracking_usage if isinstance(tracking_usage, dict) else tripwire_usage,
-        )
-        _publish_synthetic_reply_event(reply, plan)
-        return JSONResponse(content=response_payload, status_code=reply.client_status)
     _finish_usage_and_trace(
         plan,
         upstream.status_code,
@@ -4335,54 +2404,6 @@ def _openai_error_response_from_anthropic(upstream: httpx.Response) -> Response:
     )
 
 
-def _plan_uses_prompt_cache_retention(plan: UpstreamRequestPlan | None) -> bool:
-    return (
-        isinstance(plan, UpstreamRequestPlan)
-        and isinstance(plan.body, dict)
-        and "prompt_cache_retention" in plan.body
-    )
-
-
-def _upstream_rejected_prompt_cache_retention(upstream: httpx.Response) -> bool:
-    if upstream.status_code not in {400, 422}:
-        return False
-    payload = _extract_upstream_json_payload(upstream)
-    if isinstance(payload, dict):
-        error = payload.get("error")
-        if isinstance(error, dict):
-            param = error.get("param")
-            if isinstance(param, str) and param == "prompt_cache_retention":
-                return True
-            message = error.get("message")
-            if isinstance(message, str) and "prompt_cache_retention" in message:
-                return True
-        message = payload.get("message")
-        if isinstance(message, str) and "prompt_cache_retention" in message:
-            return True
-    text = _extract_upstream_text(upstream)
-    return isinstance(text, str) and "prompt_cache_retention" in text
-
-
-def _drop_prompt_cache_retention_for_retry(plan: UpstreamRequestPlan) -> None:
-    if not isinstance(plan.body, dict):
-        return
-    if "prompt_cache_retention" not in plan.body:
-        return
-    plan.body = {key: value for key, value in plan.body.items() if key != "prompt_cache_retention"}
-    if isinstance(plan.trace_context, dict):
-        plan.trace_context["prompt_cache_retention_retry"] = {
-            "action": "drop_unsupported_field",
-            "field": "prompt_cache_retention",
-        }
-
-
-def _should_retry_without_prompt_cache_retention(
-    upstream: httpx.Response,
-    plan: UpstreamRequestPlan | None,
-) -> bool:
-    return _plan_uses_prompt_cache_retention(plan) and _upstream_rejected_prompt_cache_retention(upstream)
-
-
 def _handle_upstream_error(
     upstream: httpx.Response,
     *,
@@ -4455,7 +2476,6 @@ async def proxy_streaming_response(
     client = _get_upstream_client()
     request = client.build_request("POST", upstream_url, headers=headers, json=body)
     try:
-        await _wait_for_responses_cache_settle(trace_plan)
         upstream = await throttled_client_send(client, request, stream=True)
     except httpx.RequestError as exc:
         status_code, message = format_translation.upstream_request_error_status_and_message(exc)
@@ -4467,18 +2487,6 @@ async def proxy_streaming_response(
 
     if upstream.status_code >= 400:
         await upstream.aread()
-        if _should_retry_without_prompt_cache_retention(upstream, trace_plan):
-            await upstream.aclose()
-            _drop_prompt_cache_retention_for_retry(trace_plan)
-            client = _get_upstream_client()
-            retry_body = trace_plan.body if isinstance(trace_plan, UpstreamRequestPlan) else body
-            request = client.build_request("POST", upstream_url, headers=headers, json=retry_body)
-            try:
-                upstream = await throttled_client_send(client, request, stream=True)
-            except httpx.RequestError as exc:
-                status_code, message = format_translation.upstream_request_error_status_and_message(exc)
-                _finish_usage_and_trace(trace_plan, status_code, response_text=message)
-                return format_translation.openai_error_response(status_code, message)
         if upstream.status_code >= 400:
             try:
                 await upstream.aread()
@@ -4519,8 +2527,6 @@ async def proxy_streaming_response(
         source_iter = _stream_with_update_notice(upstream.aiter_bytes(), stream_type, getattr(upstream, "headers", None))
         if stream_type == "responses":
             source_iter = ResponsesStreamIdSyncer(replay_id_state).sync(source_iter)
-        tripwire_reply: upstream_errors.SyntheticReply | None = None
-        tripwire_usage: dict | None = None
         response_payload: dict | None = None
         finish_called = False
         try:
@@ -4572,46 +2578,14 @@ async def proxy_streaming_response(
                     else:
                         yield trailing
 
-                tripwire_usage = _cache_tripwire_usage(
-                    capture.usage if isinstance(capture.usage, dict) else None,
-                    plan=trace_plan,
-                )
-                if isinstance(tripwire_usage, dict):
-                    tripwire_reply = _cache_tripwire_reply(tripwire_usage)
-                    yield _cache_tripwire_warning_delta(
-                        tripwire_reply,
-                        output_index=output_index,
-                        content_index=content_index,
-                    )
                 for block in terminal_blocks:
                     yield block
-                if isinstance(tripwire_usage, dict) and not any(b"data: [DONE]" in block for block in terminal_blocks):
-                    yield b"data: [DONE]\n\n"
             else:
                 async for chunk in source_iter:
                     if capture.feed(chunk):
                         usage_tracker.mark_first_output(usage_event)
                     yield chunk
 
-            if isinstance(tripwire_usage, dict) and tripwire_reply is not None:
-                reply = tripwire_reply
-                model = trace_plan.resolved_model if isinstance(trace_plan, UpstreamRequestPlan) else None
-                response_payload = _cache_tripwire_response_payload(
-                    reply,
-                    protocol=stream_type,
-                    model=model,
-                )
-                _finish_usage_and_trace(
-                    trace_plan,
-                    reply.status_for_trace,
-                    upstream=upstream,
-                    response_payload=response_payload,
-                    response_text=reply.message,
-                    usage=tripwire_usage,
-                )
-                finish_called = True
-                _publish_synthetic_reply_event(reply, trace_plan)
-                return
             _finish_usage_and_trace(
                 trace_plan,
                 upstream.status_code,
@@ -5491,9 +3465,9 @@ def _load_request_prompt_payload(request_id: str) -> dict:
     raw_prompt = target.get("request_prompt")
     if not isinstance(raw_prompt, dict):
         return {"available": False}
-    decrypted = _decrypt_prompt_payload_for_dashboard(raw_prompt)
-    if isinstance(decrypted, dict):
-        return {"available": True, "request_prompt": decrypted}
+    prompt = _prompt_payload_for_dashboard(raw_prompt)
+    if isinstance(prompt, dict):
+        return {"available": True, "request_prompt": prompt}
     return {"available": True, "locked": True}
 
 
@@ -5557,26 +3531,8 @@ async def client_proxy_status_api():
 @app.post("/api/config/client-proxy/settings")
 async def client_proxy_settings_api(request: Request):
     payload = await parse_json_request(request)
-    result = _save_client_proxy_settings_with_trace_prompt_logging(payload)
+    result = _save_client_proxy_settings(payload)
     return JSONResponse(content=result)
-
-
-@app.post("/api/trace-prompts/unlock")
-async def trace_prompts_unlock_api(request: Request):
-    payload = await parse_json_request(request)
-    if not isinstance(payload, dict):
-        raise HTTPException(status_code=400, detail="Request body must be an object")
-    result = _unlock_trace_prompt_logging(payload.get("password") if isinstance(payload.get("password"), str) else "")
-    return JSONResponse(content=result, headers={"Cache-Control": "no-store"})
-
-
-@app.post("/api/trace-prompts/reset-password")
-async def trace_prompts_reset_password_api(request: Request):
-    payload = await parse_json_request(request)
-    if not isinstance(payload, dict):
-        raise HTTPException(status_code=400, detail="Request body must be an object")
-    result = _reset_trace_prompt_logging_password(payload.get("password") if isinstance(payload.get("password"), str) else "")
-    return JSONResponse(content=result, headers={"Cache-Control": "no-store"})
 
 
 @app.get("/api/config/model-remapping")
@@ -5645,6 +3601,12 @@ async def client_proxy_install_api(request: Request):
 
 
 
+def _responses_route_uses_native_responses_passthrough(body: dict) -> bool:
+    requested_model = body.get("model") if isinstance(body, dict) else None
+    resolved_target = model_routing_config_service.resolve_target_model(requested_model)
+    return model_provider_family(resolved_target or requested_model) == "codex"
+
+
 def _responses_message_role(item) -> str | None:
     if not isinstance(item, dict):
         return None
@@ -5678,17 +3640,8 @@ def _encrypted_reasoning_strip_reason_for_responses_context(
     input_value,
     request_body: dict | None = None,
 ) -> str | None:
-    """Classify contexts where replayed encrypted reasoning is not worth forwarding.
+    """Drop replayed reasoning ciphertext only when Codex is starting a new lineage."""
 
-    Codex subagent/fork starts can replay the parent transcript, including
-    encrypted reasoning blobs, under a fresh prompt-cache key. Copilot/OpenAI
-    validates those blobs against the active lineage and rejects foreign ones
-    with ``invalid_request_body``. Copilot CLI also replays tool history with
-    encrypted reasoning and no body cache-lineage fields, so tool history alone
-    is not a fork signal. Strip ciphertext only when we have an explicit
-    subagent marker or the input has a fork shape Codex has emitted before.
-    Summaries remain available, so the visible transcript is preserved.
-    """
     if _responses_body_has_cache_lineage(request_body):
         return None
     subagent = request.headers.get("x-openai-subagent") if hasattr(request, "headers") else None
@@ -5697,16 +3650,6 @@ def _encrypted_reasoning_strip_reason_for_responses_context(
     if _responses_input_developer_message_count(input_value) > 1:
         return "multiple_developer_messages_without_cache_lineage"
     return None
-
-
-def _should_drop_reasoning_items_for_responses_context(strip_reason: str | None) -> bool:
-    return strip_reason is not None
-
-
-def _responses_route_uses_native_responses_passthrough(body: dict) -> bool:
-    requested_model = body.get("model") if isinstance(body, dict) else None
-    resolved_target = model_routing_config_service.resolve_target_model(requested_model)
-    return model_provider_family(resolved_target or requested_model) == "codex"
 
 
 def _responses_input_encrypted_content_count(input_value) -> int:
@@ -5742,11 +3685,7 @@ def _responses_input_sanitization_trace(
     ):
         return None
 
-    if encrypted_reasoning_strip_reason is not None:
-        preservation = "disabled"
-    else:
-        preservation = "preserved"
-
+    preservation = "disabled" if encrypted_reasoning_strip_reason is not None else "preserved"
     return {
         "input_items_before": len(raw_input),
         "input_items_after": len(sanitized_input) if isinstance(sanitized_input, list) else None,
@@ -5836,18 +3775,13 @@ async def responses(request: Request):
             format_translation.http_exception_detail_to_message(exc.detail),
         )
 
-    # Sanitize input (multi-turn encrypted_content passthrough). Forked
-    # subagent contexts replay parent reasoning under a new lineage, so do not
-    # forward unverifiable encrypted reasoning blobs in that shape.
     raw_input = body.get("input")
     has_compaction_input = format_translation.input_contains_compaction(raw_input)
     native_responses_passthrough = _responses_route_uses_native_responses_passthrough(body)
     encrypted_reasoning_strip_reason = _encrypted_reasoning_strip_reason_for_responses_context(
         request, raw_input, body
     )
-    drop_reasoning_items = _should_drop_reasoning_items_for_responses_context(
-        encrypted_reasoning_strip_reason
-    )
+    drop_reasoning_items = encrypted_reasoning_strip_reason is not None
     input_sanitization_trace = None
     if raw_input is not None:
         body["input"] = format_translation.sanitize_input(
@@ -6095,7 +4029,7 @@ if __name__ == "__main__":
 
     # Start the server immediately so first-run setup can complete from the
     # browser dashboard instead of blocking on a terminal prompt.
-    print("Starting GHCP proxy on http://localhost:8000 (loopback only)", flush=True)
+    print("Starting GHCP proxy on http://127.0.0.1:8000 (loopback only)", flush=True)
     print("  Responses API : POST /v1/responses", flush=True)
     print("  Compaction    : POST /v1/responses/compact", flush=True)
     print("  Chat API      : POST /v1/chat/completions", flush=True)
@@ -6104,7 +4038,7 @@ if __name__ == "__main__":
     print("  If this is a fresh setup, open /ui and complete GitHub sign-in there.", flush=True)
     print("", flush=True)
     print("  Set in your shell:", flush=True)
-    print("    export OPENAI_BASE_URL=http://localhost:8000/v1", flush=True)
+    print("    export OPENAI_BASE_URL=http://127.0.0.1:8000/v1", flush=True)
     print("    export OPENAI_API_KEY=anything", flush=True)
     print("", flush=True)
 

@@ -16,6 +16,9 @@ from fastapi import HTTPException
 
 from constants import CODEX_PROXY_BASE_URL, DASHBOARD_BASE_URL, MODEL_PRICING, PREMIUM_REQUEST_MULTIPLIERS
 
+LEGACY_CODEX_PROXY_BASE_URL = "http://localhost:8000/v1"
+LEGACY_DASHBOARD_BASE_URL = "http://localhost:8000"
+
 
 _DEFAULT_CODEX_BASE_INSTRUCTIONS = (
     "You are Codex, a coding agent based on GPT-5. You share the user's workspace and "
@@ -35,6 +38,14 @@ _DEFAULT_PREFERRED_REASONING = ("medium", "low", "high", "xhigh", "minimal")
 
 def _toml_basic_string(value: str) -> str:
     return json.dumps(value)
+
+
+def _is_codex_proxy_base_url(value: object) -> bool:
+    return value in {CODEX_PROXY_BASE_URL, LEGACY_CODEX_PROXY_BASE_URL}
+
+
+def _is_dashboard_proxy_base_url(value: object) -> bool:
+    return value in {DASHBOARD_BASE_URL, LEGACY_DASHBOARD_BASE_URL}
 
 
 @dataclass(frozen=True)
@@ -148,7 +159,7 @@ class ProxyClientConfigService:
             parsed.get("model_provider") == "custom"
             and isinstance(provider_cfg, dict)
             and provider_cfg.get("name") == "OpenAI"
-            and provider_cfg.get("base_url") == CODEX_PROXY_BASE_URL
+            and _is_codex_proxy_base_url(provider_cfg.get("base_url"))
             and provider_cfg.get("wire_api") == "responses"
             and parsed.get("model_catalog_json") == self._config.codex_model_catalog_file
             and parsed.get("model_context_window") == self._config.codex_model_context_window
@@ -192,7 +203,7 @@ class ProxyClientConfigService:
         env = payload.get("env") if isinstance(payload, dict) else None
         has_proxy_env = (
             isinstance(env, dict)
-            and env.get("ANTHROPIC_BASE_URL") == DASHBOARD_BASE_URL
+            and _is_dashboard_proxy_base_url(env.get("ANTHROPIC_BASE_URL"))
             and env.get("CLAUDE_CODE_DISABLE_1M_CONTEXT") == "1"
             and isinstance(env.get("ANTHROPIC_AUTH_TOKEN"), str)
             and env.get("ANTHROPIC_AUTH_TOKEN") != ""
@@ -221,12 +232,7 @@ class ProxyClientConfigService:
     def default_client_proxy_settings(self) -> dict[str, object]:
         return {
             "revert_on_shutdown": True,
-            "token_tripwire_enabled": True,
-            "trace_prompt_logging_enabled": False,
-            "trace_prompt_logging_salt": "",
-            "trace_prompt_logging_verifier": None,
-            "trace_prompt_logging_public_key": "",
-            "trace_prompt_logging_private_key": None,
+            "debug_prompt_logging_enabled": False,
             "pending_restore_targets": [],
         }
 
@@ -234,43 +240,9 @@ class ProxyClientConfigService:
         payload = self._raw_client_proxy_settings()
         defaults = self.default_client_proxy_settings()
         return {
-            "revert_on_shutdown": bool(
-                payload.get(
-                    "revert_on_shutdown",
-                    defaults["revert_on_shutdown"],
-                )
-            ),
-            "token_tripwire_enabled": bool(
-                payload.get(
-                    "token_tripwire_enabled",
-                    defaults["token_tripwire_enabled"],
-                )
-            ),
-            "trace_prompt_logging_enabled": bool(
-                payload.get(
-                    "trace_prompt_logging_enabled",
-                    defaults["trace_prompt_logging_enabled"],
-                )
-            ),
-            "trace_prompt_logging_salt": (
-                payload.get("trace_prompt_logging_salt")
-                if isinstance(payload.get("trace_prompt_logging_salt"), str)
-                else ""
-            ),
-            "trace_prompt_logging_verifier": (
-                payload.get("trace_prompt_logging_verifier")
-                if isinstance(payload.get("trace_prompt_logging_verifier"), dict)
-                else None
-            ),
-            "trace_prompt_logging_public_key": (
-                payload.get("trace_prompt_logging_public_key")
-                if isinstance(payload.get("trace_prompt_logging_public_key"), str)
-                else ""
-            ),
-            "trace_prompt_logging_private_key": (
-                payload.get("trace_prompt_logging_private_key")
-                if isinstance(payload.get("trace_prompt_logging_private_key"), dict)
-                else None
+            "revert_on_shutdown": bool(payload.get("revert_on_shutdown", defaults["revert_on_shutdown"])),
+            "debug_prompt_logging_enabled": bool(
+                payload.get("debug_prompt_logging_enabled", defaults["debug_prompt_logging_enabled"])
             ),
             "pending_restore_targets": self._normalize_restore_targets(
                 payload.get("pending_restore_targets"),
@@ -281,16 +253,7 @@ class ProxyClientConfigService:
         settings = self.load_client_proxy_settings()
         return {
             "revert_on_shutdown": settings["revert_on_shutdown"],
-            "token_tripwire_enabled": settings["token_tripwire_enabled"],
-            "trace_prompt_logging_enabled": settings["trace_prompt_logging_enabled"],
-            "trace_prompt_logging_configured": bool(
-                settings.get("trace_prompt_logging_salt")
-                and isinstance(settings.get("trace_prompt_logging_verifier"), dict)
-            ),
-            "trace_prompt_logging_public_key_configured": bool(
-                settings.get("trace_prompt_logging_public_key")
-                and isinstance(settings.get("trace_prompt_logging_private_key"), dict)
-            ),
+            "debug_prompt_logging_enabled": settings["debug_prompt_logging_enabled"],
             "pending_restore_targets": settings["pending_restore_targets"],
             "path": self._config.client_proxy_settings_file,
         }
@@ -300,12 +263,7 @@ class ProxyClientConfigService:
             raise HTTPException(status_code=400, detail="Request body must be an object")
         known_keys = {
             "revert_on_shutdown",
-            "token_tripwire_enabled",
-            "trace_prompt_logging_enabled",
-            "trace_prompt_logging_salt",
-            "trace_prompt_logging_verifier",
-            "trace_prompt_logging_public_key",
-            "trace_prompt_logging_private_key",
+            "debug_prompt_logging_enabled",
         }
         if not any(key in payload for key in known_keys):
             raise HTTPException(
@@ -314,53 +272,15 @@ class ProxyClientConfigService:
             )
         if "revert_on_shutdown" in payload and not isinstance(payload.get("revert_on_shutdown"), bool):
             raise HTTPException(status_code=400, detail="revert_on_shutdown must be true or false.")
-        if "token_tripwire_enabled" in payload and not isinstance(payload.get("token_tripwire_enabled"), bool):
-            raise HTTPException(status_code=400, detail="token_tripwire_enabled must be true or false.")
-        if "trace_prompt_logging_enabled" in payload and not isinstance(payload.get("trace_prompt_logging_enabled"), bool):
-            raise HTTPException(status_code=400, detail="trace_prompt_logging_enabled must be true or false.")
-        if "trace_prompt_logging_salt" in payload and not isinstance(payload.get("trace_prompt_logging_salt"), str):
-            raise HTTPException(status_code=400, detail="trace_prompt_logging_salt must be a string.")
-        if (
-            "trace_prompt_logging_verifier" in payload
-            and payload.get("trace_prompt_logging_verifier") is not None
-            and not isinstance(payload.get("trace_prompt_logging_verifier"), dict)
-        ):
-            raise HTTPException(status_code=400, detail="trace_prompt_logging_verifier must be an object.")
-        if "trace_prompt_logging_public_key" in payload and not isinstance(payload.get("trace_prompt_logging_public_key"), str):
-            raise HTTPException(status_code=400, detail="trace_prompt_logging_public_key must be a string.")
-        if (
-            "trace_prompt_logging_private_key" in payload
-            and payload.get("trace_prompt_logging_private_key") is not None
-            and not isinstance(payload.get("trace_prompt_logging_private_key"), dict)
-        ):
-            raise HTTPException(status_code=400, detail="trace_prompt_logging_private_key must be an object.")
+        if "debug_prompt_logging_enabled" in payload and not isinstance(payload.get("debug_prompt_logging_enabled"), bool):
+            raise HTTPException(status_code=400, detail="debug_prompt_logging_enabled must be true or false.")
 
         existing = self.load_client_proxy_settings()
         settings = {
             "revert_on_shutdown": payload.get("revert_on_shutdown", existing.get("revert_on_shutdown", True)),
-            "token_tripwire_enabled": payload.get(
-                "token_tripwire_enabled",
-                existing.get("token_tripwire_enabled", True),
-            ),
-            "trace_prompt_logging_enabled": payload.get(
-                "trace_prompt_logging_enabled",
-                existing.get("trace_prompt_logging_enabled", False),
-            ),
-            "trace_prompt_logging_salt": payload.get(
-                "trace_prompt_logging_salt",
-                existing.get("trace_prompt_logging_salt", ""),
-            ),
-            "trace_prompt_logging_verifier": payload.get(
-                "trace_prompt_logging_verifier",
-                existing.get("trace_prompt_logging_verifier"),
-            ),
-            "trace_prompt_logging_public_key": payload.get(
-                "trace_prompt_logging_public_key",
-                existing.get("trace_prompt_logging_public_key", ""),
-            ),
-            "trace_prompt_logging_private_key": payload.get(
-                "trace_prompt_logging_private_key",
-                existing.get("trace_prompt_logging_private_key"),
+            "debug_prompt_logging_enabled": payload.get(
+                "debug_prompt_logging_enabled",
+                existing.get("debug_prompt_logging_enabled", False),
             ),
             "pending_restore_targets": existing.get("pending_restore_targets", []),
         }
@@ -683,28 +603,7 @@ class ProxyClientConfigService:
         os.makedirs(os.path.dirname(self._config.client_proxy_settings_file) or ".", exist_ok=True)
         normalized = {
             "revert_on_shutdown": bool(payload.get("revert_on_shutdown", True)),
-            "token_tripwire_enabled": bool(payload.get("token_tripwire_enabled", True)),
-            "trace_prompt_logging_enabled": bool(payload.get("trace_prompt_logging_enabled", False)),
-            "trace_prompt_logging_salt": (
-                payload.get("trace_prompt_logging_salt")
-                if isinstance(payload.get("trace_prompt_logging_salt"), str)
-                else ""
-            ),
-            "trace_prompt_logging_verifier": (
-                payload.get("trace_prompt_logging_verifier")
-                if isinstance(payload.get("trace_prompt_logging_verifier"), dict)
-                else None
-            ),
-            "trace_prompt_logging_public_key": (
-                payload.get("trace_prompt_logging_public_key")
-                if isinstance(payload.get("trace_prompt_logging_public_key"), str)
-                else ""
-            ),
-            "trace_prompt_logging_private_key": (
-                payload.get("trace_prompt_logging_private_key")
-                if isinstance(payload.get("trace_prompt_logging_private_key"), dict)
-                else None
-            ),
+            "debug_prompt_logging_enabled": bool(payload.get("debug_prompt_logging_enabled", False)),
             "pending_restore_targets": self._normalize_restore_targets(payload.get("pending_restore_targets")),
         }
         self._write_json_atomic(self._config.client_proxy_settings_file, normalized)
@@ -841,7 +740,7 @@ class ProxyClientConfigService:
     def _codex_managed_config_targets_proxy(self, parsed: dict) -> bool:
         provider_cfg = self._codex_provider_config(parsed)
         return (
-            provider_cfg.get("base_url") == CODEX_PROXY_BASE_URL
+            _is_codex_proxy_base_url(provider_cfg.get("base_url"))
             or parsed.get("model_catalog_json") == self._config.codex_model_catalog_file
         )
 

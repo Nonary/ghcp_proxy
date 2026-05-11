@@ -629,15 +629,6 @@ def _responses_body_requests_prompt_cache(body: dict) -> bool:
     return False
 
 
-def _configured_responses_prompt_cache_retention() -> str | None:
-    raw = str(os.environ.get("GHCP_PROXY_RESPONSES_PROMPT_CACHE_RETENTION", "24h")).strip()
-    if not raw:
-        return "24h"
-    if raw.lower() in {"0", "false", "no", "off"}:
-        return None
-    return raw
-
-
 def apply_responses_prompt_cache_retention(body: dict) -> dict:
     """Compatibility no-op: Copilot CLI does not send this Responses field."""
     return body
