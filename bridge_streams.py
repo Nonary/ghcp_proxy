@@ -9,6 +9,7 @@ from typing import AsyncIterator, Callable
 from uuid import uuid4
 
 import format_translation
+import responses_replay_ids
 
 
 _CODEX_THINKING_SUMMARY_HEADER = "**Thinking**\n\n"
@@ -469,8 +470,10 @@ class ChatToResponsesStreamTranslator:
 class ResponsesStreamIdSyncer:
     """Keep native Responses stream item ids stable across added/done events."""
 
-    def __init__(self):
+    def __init__(self, replay_id_state: responses_replay_ids.ReplayIdState | None = None):
         self._output_items: dict[int, str] = {}
+        self._output_item_ids_are_synthetic: dict[int, bool] = {}
+        self._replay_id_state = replay_id_state
 
     @staticmethod
     def _encode(event_name: str | None, data: str) -> bytes:
@@ -497,6 +500,12 @@ class ResponsesStreamIdSyncer:
             return data
 
         event_type = event_name or payload.get("type")
+        if event_type == "response.completed":
+            response = payload.get("response")
+            if self._replay_id_state is not None and isinstance(response, dict):
+                self._replay_id_state.observe_response_payload(response)
+            return json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+
         output_index = payload.get("output_index")
         if not isinstance(output_index, int):
             return json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
@@ -505,14 +514,29 @@ class ResponsesStreamIdSyncer:
             item = payload.get("item")
             if isinstance(item, dict):
                 item_id = item.get("id")
+                synthetic = False
                 if not isinstance(item_id, str) or not item_id:
                     item_id = self._synthesized_item_id(output_index)
                     item["id"] = item_id
+                    synthetic = True
                 self._output_items[output_index] = item_id
+                self._output_item_ids_are_synthetic[output_index] = synthetic
+                if self._replay_id_state is not None and not synthetic:
+                    self._replay_id_state.observe_output_item(item)
         elif event_type == "response.output_item.done":
             item_id = self._output_items.get(output_index)
+            synthetic = self._output_item_ids_are_synthetic.get(output_index, False)
             item = payload.get("item")
             if item_id and isinstance(item, dict):
+                upstream_item_id = item.get("id")
+                if (
+                    self._replay_id_state is not None
+                    and isinstance(upstream_item_id, str)
+                    and upstream_item_id
+                ):
+                    self._replay_id_state.observe_output_item(item)
+                elif self._replay_id_state is not None and not synthetic:
+                    self._replay_id_state.observe_output_item({**item, "id": item_id})
                 item["id"] = item_id
         else:
             item_id = self._output_items.get(output_index)

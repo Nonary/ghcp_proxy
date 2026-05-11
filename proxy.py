@@ -3843,7 +3843,7 @@ def _bridge_error_response(plan: BridgeExecutionPlan):
 
 
 import request_headers as _request_headers_module
-
+import responses_replay_ids
 
 def _build_anthropic_messages_passthrough_headers(
     request: Request,
@@ -4179,6 +4179,14 @@ async def _post_bridge_non_streaming_request(plan: UpstreamRequestPlan, bridge_p
         _finish_usage_and_trace(plan, 502, upstream=upstream, response_text=message)
         return error_response(502, message)
 
+    if bridge_plan.caller_protocol == "responses" and bridge_plan.upstream_protocol == "responses":
+        _, replay_id_state = responses_replay_ids.state_for_body(
+            plan.source_body,
+            headers=plan.headers,
+        )
+        if replay_id_state is not None:
+            replay_id_state.observe_response_payload(upstream_payload)
+
     translated_payload = _translate_bridge_success_payload(bridge_plan, upstream_payload)
     if bridge_plan.caller_protocol == "anthropic" and bridge_plan.upstream_protocol == "messages":
         translated_payload, _ = _anthropic_messages_payload_for_client(translated_payload)
@@ -4492,9 +4500,25 @@ async def proxy_streaming_response(
 
     async def stream_upstream():
         capture = usage_tracker.create_sse_capture(stream_type)
+        replay_id_state = None
+        if stream_type == "responses":
+            replay_source_body = (
+                trace_plan.source_body
+                if isinstance(trace_plan, UpstreamRequestPlan)
+                else body
+            )
+            replay_headers = (
+                trace_plan.headers
+                if isinstance(trace_plan, UpstreamRequestPlan)
+                else headers
+            )
+            _, replay_id_state = responses_replay_ids.state_for_body(
+                replay_source_body,
+                headers=replay_headers,
+            )
         source_iter = _stream_with_update_notice(upstream.aiter_bytes(), stream_type, getattr(upstream, "headers", None))
         if stream_type == "responses":
-            source_iter = ResponsesStreamIdSyncer().sync(source_iter)
+            source_iter = ResponsesStreamIdSyncer(replay_id_state).sync(source_iter)
         tripwire_reply: upstream_errors.SyntheticReply | None = None
         tripwire_usage: dict | None = None
         response_payload: dict | None = None
@@ -5839,6 +5863,13 @@ async def responses(request: Request):
             dropped_reasoning_items=drop_reasoning_items,
         )
 
+    replay_id_repair_trace = None
+    if native_responses_passthrough:
+        body, replay_id_repair_trace = responses_replay_ids.repair_missing_replay_ids(
+            body,
+            headers=request.headers,
+        )
+
     try:
         api_key = auth.get_api_key()
     except Exception:
@@ -5856,6 +5887,12 @@ async def responses(request: Request):
     except ValueError:
         return format_translation.openai_error_response(400, INVALID_BRIDGE_REQUEST_MESSAGE)
 
+    trace_metadata_extra = {}
+    if input_sanitization_trace is not None:
+        trace_metadata_extra["responses_input_sanitization"] = input_sanitization_trace
+    if replay_id_repair_trace is not None:
+        trace_metadata_extra["responses_replay_id_repair"] = replay_id_repair_trace
+
     plan, error_response = _prepare_bridge_request(
         request,
         original_body=body,
@@ -5863,11 +5900,7 @@ async def responses(request: Request):
         api_base=api_base,
         api_key=api_key,
         force_initiator="agent" if has_compaction_input else None,
-        trace_metadata_extra=(
-            {"responses_input_sanitization": input_sanitization_trace}
-            if input_sanitization_trace is not None
-            else None
-        ),
+        trace_metadata_extra=trace_metadata_extra or None,
     )
     if error_response is not None:
         return error_response

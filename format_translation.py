@@ -2037,8 +2037,6 @@ def _message_with_merged_text(item: dict, text: str) -> dict:
 def normalize_responses_instructions_for_copilot(body: dict, *, diagnostics: list[dict] | None = None) -> dict:
     if not isinstance(body, dict):
         return body
-    if _responses_body_requests_prompt_cache(body):
-        return body
     input_items = body.get("input")
     if not isinstance(input_items, list):
         return body
@@ -2092,8 +2090,6 @@ def normalize_responses_instructions_for_copilot(body: dict, *, diagnostics: lis
 
 def normalize_responses_input_for_copilot(body: dict, *, diagnostics: list[dict] | None = None) -> dict:
     if not isinstance(body, dict):
-        return body
-    if _responses_body_requests_prompt_cache(body):
         return body
     input_items = body.get("input")
     if not isinstance(input_items, list):
