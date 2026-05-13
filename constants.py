@@ -19,7 +19,7 @@ GITHUB_COPILOT_API_BASE = "https://api.githubcopilot.com"
 
 OPENCODE_VERSION = "1.3.13"
 OPENCODE_INTEGRATION_ID = "vscode-chat"
-COPILOT_CLI_VERSION = "1.0.36"
+COPILOT_CLI_VERSION = "1.0.39"
 COPILOT_CLI_INTEGRATION_ID = "copilot-developer-cli"
 COPILOT_CLI_USER_AGENT = f"copilot/{COPILOT_CLI_VERSION} (client/github/cli win32 v25.6.0) term/unknown"
 GITHUB_API_VERSION = "2026-01-09"

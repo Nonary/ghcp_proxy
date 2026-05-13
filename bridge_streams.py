@@ -114,6 +114,7 @@ class ChatToResponsesStreamTranslator:
             output.append(
                 {
                     "type": "function_call",
+                    "id": f"fc_{tool.call_id}",
                     "call_id": tool.call_id,
                     "name": tool.name,
                     "arguments": tool.arguments,
@@ -260,6 +261,7 @@ class ChatToResponsesStreamTranslator:
                     "output_index": state.output_index,
                     "item": {
                         "type": "function_call",
+                        "id": f"fc_{state.call_id}",
                         "call_id": state.call_id,
                         "name": state.name,
                         "arguments": "",
@@ -451,6 +453,7 @@ class ChatToResponsesStreamTranslator:
                     "output_index": tool_state.output_index,
                     "item": {
                         "type": "function_call",
+                        "id": f"fc_{tool_state.call_id}",
                         "call_id": tool_state.call_id,
                         "name": tool_state.name,
                         "arguments": tool_state.arguments,
@@ -488,6 +491,18 @@ class ResponsesStreamIdSyncer:
     def _synthesized_item_id(output_index: int) -> str:
         return f"oi_{output_index}_{uuid4().hex[:16]}"
 
+    @staticmethod
+    def _function_item_id(item: dict) -> str | None:
+        if not isinstance(item, dict):
+            return None
+        item_type = str(item.get("type") or "").strip().lower()
+        if item_type not in {"function_call", "function_call_output"}:
+            return None
+        call_id = item.get("call_id")
+        if not isinstance(call_id, str) or not call_id.strip():
+            return None
+        return f"fc_{call_id.strip()}"
+
     def fix_event_data(self, event_name: str | None, data: str) -> str:
         if not data or data == "[DONE]":
             return data
@@ -502,6 +517,15 @@ class ResponsesStreamIdSyncer:
         event_type = event_name or payload.get("type")
         if event_type == "response.completed":
             response = payload.get("response")
+            if isinstance(response, dict):
+                output = response.get("output")
+                if isinstance(output, list):
+                    for item in output:
+                        if not isinstance(item, dict):
+                            continue
+                        function_item_id = self._function_item_id(item)
+                        if function_item_id:
+                            item["id"] = function_item_id
             if self._replay_id_state is not None and isinstance(response, dict):
                 self._replay_id_state.observe_response_payload(response)
             return json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
@@ -513,12 +537,14 @@ class ResponsesStreamIdSyncer:
         if event_type == "response.output_item.added":
             item = payload.get("item")
             if isinstance(item, dict):
-                item_id = item.get("id")
+                item_id = self._function_item_id(item) or item.get("id")
                 synthetic = False
                 if not isinstance(item_id, str) or not item_id:
                     item_id = self._synthesized_item_id(output_index)
                     item["id"] = item_id
                     synthetic = True
+                else:
+                    item["id"] = item_id
                 self._output_items[output_index] = item_id
                 self._output_item_ids_are_synthetic[output_index] = synthetic
                 if self._replay_id_state is not None and not synthetic:
@@ -528,6 +554,12 @@ class ResponsesStreamIdSyncer:
             synthetic = self._output_item_ids_are_synthetic.get(output_index, False)
             item = payload.get("item")
             if item_id and isinstance(item, dict):
+                function_item_id = self._function_item_id(item)
+                if function_item_id:
+                    item_id = function_item_id
+                    self._output_items[output_index] = item_id
+                    synthetic = False
+                    self._output_item_ids_are_synthetic[output_index] = False
                 upstream_item_id = item.get("id")
                 if (
                     self._replay_id_state is not None
@@ -1231,7 +1263,7 @@ class AnthropicToResponsesStreamTranslator:
         self._next_output_index += 1
         call_id = content_block.get("id") if isinstance(content_block.get("id"), str) else f"call_{uuid4().hex}"
         name = content_block.get("name") if isinstance(content_block.get("name"), str) else ""
-        item_id = f"fc_{uuid4().hex}"
+        item_id = f"fc_{call_id}"
         # Seed arguments from content_block.input when present so streams that
         # never emit input_json_delta still produce valid JSON arguments.
         seeded_input = content_block.get("input")

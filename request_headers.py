@@ -60,13 +60,12 @@ def _responses_client_session_id_for_affinity(affinity_value, model=None) -> str
     process/conversation, so mirror that by deriving the client session from the
     full explicit affinity key.
 
-    Also include the model in the derivation: same Codex conversation can fan
-    out to multiple models (e.g. gpt-5.5 main + gpt-5.4 memory_consolidation +
-    gpt-5.4-mini routing) and they have non-overlapping cache prefixes. Sharing
-    one upstream client_session across them lets each model's write evict
-    sister-model cache slots — observed live as 50% bust rate on gpt-5.5 main
-    when gpt-5.4 traffic shared the same affinity bucket.
+    Captured Copilot CLI traffic keeps one client session across related
+    Responses and Chat requests, including mixed models.  Model already
+    partitions the upstream cache payload; including it here creates extra
+    client-session buckets that the real client does not use.
     """
+    del model
     if os.environ.get("GHCP_COPILOT_CLIENT_SESSION_ID"):
         return None
     if not isinstance(affinity_value, str):
@@ -74,10 +73,7 @@ def _responses_client_session_id_for_affinity(affinity_value, model=None) -> str
     normalized = affinity_value.strip()
     if not normalized:
         return None
-    model_key = ""
-    if isinstance(model, str) and model.strip():
-        model_key = model.strip().lower()
-    return _copilot_uuid(f"responses-client-session:{normalized}:{model_key}")
+    return _copilot_uuid(f"responses-client-session:{normalized}")
 
 
 def _responses_subagent_task_id(parent_scope, subagent, affinity_value=None) -> str | None:
@@ -625,9 +621,22 @@ def build_chat_headers_for_request(
     initiator_policy=None,
     session_id_resolver=None,
     verdict_sink: dict | None = None,
+    affinity_body: dict | None = None,
 ) -> dict:
     headers = build_copilot_headers(api_key)
-    session_id = _apply_forwarded_request_headers(headers, request, session_id_resolver=session_id_resolver)
+    identity_source = affinity_body if isinstance(affinity_body, dict) else None
+    session_id = _apply_forwarded_request_headers(
+        headers,
+        request,
+        identity_source,
+        session_id_resolver=session_id_resolver,
+    )
+    affinity_value = _responses_affinity_value(identity_source, session_id)
+    affinity_client_session_id = _responses_client_session_id_for_affinity(
+        affinity_value, model=model_name
+    )
+    if affinity_client_session_id:
+        headers["x-client-session-id"] = affinity_client_session_id
 
     initiator = initiator_policy.resolve_chat_messages(
         messages,
@@ -640,6 +649,28 @@ def build_chat_headers_for_request(
     headers["x-interaction-type"] = _interaction_type_for_initiator(initiator)
     headers["x-interaction-id"] = _interaction_id_for_session(session_id)
     headers["x-agent-task-id"] = str(uuid.uuid4())
+    if affinity_value:
+        headers["x-interaction-id"] = _copilot_uuid(f"chat-interaction:{affinity_value}")
+        headers["x-agent-task-id"] = _copilot_uuid(f"chat-task:{affinity_value}")
+
+    subagent = request.headers.get("x-openai-subagent")
+    if isinstance(subagent, str) and subagent.strip():
+        normalized_subagent = subagent.strip()
+        headers["X-Initiator"] = "agent"
+        headers["x-interaction-type"] = "conversation-subagent"
+        parent_scope = (
+            affinity_value
+            or session_id
+            or headers.get("x-client-request-id")
+            or headers.get("x-client-session-id")
+            or _CLIENT_SESSION_ID
+        )
+        parent_task_id = _copilot_uuid(f"chat-task:{parent_scope}")
+        headers["x-parent-agent-id"] = parent_task_id
+        headers["x-agent-task-id"] = _copilot_uuid(
+            f"chat-subagent-task:{parent_task_id}:{normalized_subagent}"
+        )
+        headers["x-interaction-id"] = _copilot_uuid(f"chat-interaction:{parent_scope}")
 
     if isinstance(messages, list):
         for msg in messages:

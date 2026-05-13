@@ -1154,6 +1154,20 @@ def _with_debug_detail_capture_info(
     return event
 
 
+def _outbound_json_wire_bytes(body: dict | None) -> bytes | None:
+    if body is None:
+        return None
+    try:
+        return json.dumps(
+            body,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            default=util._json_default,
+        ).encode("utf-8")
+    except (TypeError, ValueError):
+        return None
+
+
 def _build_debug_detail_snapshot(
     *,
     request_id: str,
@@ -1198,13 +1212,11 @@ def _build_debug_detail_snapshot(
         snapshot["source_body"] = _prompt_trace_value(request_body)
     if isinstance(upstream_body, dict):
         snapshot["upstream_body"] = _prompt_trace_value(upstream_body)
-        try:
-            upstream_wire = json.dumps(upstream_body, default=util._json_default)
-        except (TypeError, ValueError):
-            upstream_wire = None
-        if upstream_wire is not None:
-            upstream_wire_bytes = upstream_wire.encode("utf-8", errors="replace")
-            snapshot["upstream_body_wire"] = _prompt_trace_value(upstream_wire)
+        upstream_wire_bytes = _outbound_json_wire_bytes(upstream_body)
+        if upstream_wire_bytes is not None:
+            snapshot["upstream_body_wire"] = _prompt_trace_value(
+                upstream_wire_bytes.decode("utf-8", errors="replace")
+            )
             snapshot["upstream_body_wire_size"] = len(upstream_wire_bytes)
             snapshot["upstream_body_wire_sha256"] = hashlib.sha256(upstream_wire_bytes).hexdigest()
     return snapshot
@@ -1522,10 +1534,7 @@ def _dump_outbound_request_body(
         # Build a snapshot on the caller's thread so we don't race the request
         # handler mutating the body after we hand off; serialization happens
         # in the background thread.
-        try:
-            upstream_wire_bytes = json.dumps(upstream_body, default=util._json_default).encode("utf-8")
-        except (TypeError, ValueError):
-            upstream_wire_bytes = None
+        upstream_wire_bytes = _outbound_json_wire_bytes(upstream_body)
         snapshot = {
             "request_id": request_id,
             "time": util.utc_now_iso(),
@@ -2098,6 +2107,7 @@ def _build_bridge_headers(
             initiator_policy=_initiator_policy,
             session_id_resolver=usage_tracking.request_session_id,
             verdict_sink=verdict_sink,
+            affinity_body=original_body,
         )
     if bridge_plan.header_kind == "anthropic":
         return format_translation.build_anthropic_headers_for_request(
@@ -3644,9 +3654,6 @@ def _encrypted_reasoning_strip_reason_for_responses_context(
 
     if _responses_body_has_cache_lineage(request_body):
         return None
-    subagent = request.headers.get("x-openai-subagent") if hasattr(request, "headers") else None
-    if isinstance(subagent, str) and subagent.strip():
-        return "subagent_header"
     if _responses_input_developer_message_count(input_value) > 1:
         return "multiple_developer_messages_without_cache_lineage"
     return None

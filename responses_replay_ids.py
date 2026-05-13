@@ -125,6 +125,10 @@ def _reasoning_fingerprint(item: dict) -> str | None:
     return _sha256_text(encrypted_content)
 
 
+def _function_item_id(call_id: str) -> str:
+    return f"fc_{call_id}"
+
+
 def _trim_ordered_map(mapping: OrderedDict) -> None:
     while len(mapping) > _MAX_IDS_PER_STATE:
         mapping.popitem(last=False)
@@ -145,8 +149,8 @@ class ReplayIdState:
     def _assistant_key(fingerprint: str, ordinal: int) -> str:
         return f"{fingerprint}:{ordinal}"
 
-    def _remember_function_id_locked(self, call_id: str, item_id: str) -> None:
-        self._function_item_ids[call_id] = item_id
+    def _remember_function_id_locked(self, call_id: str) -> None:
+        self._function_item_ids[call_id] = _function_item_id(call_id)
         self._function_item_ids.move_to_end(call_id)
         _trim_ordered_map(self._function_item_ids)
 
@@ -190,7 +194,7 @@ class ReplayIdState:
                 if item_type in {"function_call", "function_call_output"}:
                     call_id = _normalized_non_empty_string(item.get("call_id"))
                     if call_id:
-                        self._remember_function_id_locked(call_id, item_id)
+                        self._remember_function_id_locked(call_id)
                     continue
 
                 if item_type == "reasoning":
@@ -221,7 +225,7 @@ class ReplayIdState:
             if item_type in {"function_call", "function_call_output"}:
                 call_id = _normalized_non_empty_string(item.get("call_id"))
                 if call_id:
-                    self._remember_function_id_locked(call_id, item_id)
+                    self._remember_function_id_locked(call_id)
                 return
 
             if item_type == "reasoning":
@@ -260,7 +264,7 @@ class ReplayIdState:
             call_id = _normalized_non_empty_string(item.get("call_id"))
             if not call_id:
                 return None
-            return self._function_item_ids.get(call_id) or f"fc_{call_id}"
+            return _function_item_id(call_id)
 
         if item_type == "reasoning":
             fingerprint = _reasoning_fingerprint(item)
@@ -296,6 +300,20 @@ class ReplayIdState:
                     continue
 
                 item_id = _normalized_non_empty_string(item.get("id"))
+                item_type = str(item.get("type", "")).lower()
+                if item_type in {"function_call", "function_call_output"}:
+                    call_id = _normalized_non_empty_string(item.get("call_id"))
+                    if call_id:
+                        canonical_id = _function_item_id(call_id)
+                        if item_id != canonical_id:
+                            item = {**item, "id": canonical_id}
+                            item_id = canonical_id
+                            item_type_label = item_type or "unknown"
+                            repaired_counts[item_type_label] = repaired_counts.get(item_type_label, 0) + 1
+                            changed = True
+                        self._remember_function_id_locked(call_id)
+                        repaired_items.append(item)
+                        continue
                 if item_id:
                     fingerprint = _assistant_message_fingerprint(item)
                     if fingerprint is not None:

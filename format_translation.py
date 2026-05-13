@@ -963,6 +963,11 @@ def _response_replay_status(source: dict) -> str | None:
     return None
 
 
+def _response_function_item_id(source: dict, call_id: str) -> str:
+    del source
+    return f"fc_{call_id}"
+
+
 def _chat_content_item_to_response_content(item: dict, *, role: str = "user") -> dict | None:
     item_type_value = item.get("type")
     if not isinstance(item_type_value, str):
@@ -1085,14 +1090,12 @@ def anthropic_request_to_responses(body: dict) -> dict:
                     if not isinstance(tool_name, str) or not isinstance(tool_id, str):
                         raise ValueError("Anthropic tool_use blocks must include string id and name")
                     function_call = {
+                        "id": _response_function_item_id(item, tool_id),
                         "type": "function_call",
                         "call_id": tool_id,
                         "name": tool_name,
                         "arguments": _compact_json_dumps(item.get("input") or {}),
                     }
-                    item_id = _response_replay_id(item)
-                    if item_id and item_id != tool_id:
-                        function_call["id"] = item_id
                     status = _response_replay_status(item)
                     if status:
                         function_call["status"] = status
@@ -1128,6 +1131,7 @@ def anthropic_request_to_responses(body: dict) -> dict:
                     raise ValueError("Anthropic tool_result blocks must include tool_use_id")
                 response_input.append(
                     {
+                        "id": _response_function_item_id(item, tool_use_id),
                         "type": "function_call_output",
                         "call_id": tool_use_id,
                         "output": _anthropic_tool_result_content_to_text(item.get("content", "")),
@@ -1437,10 +1441,12 @@ def chat_completion_to_response(payload: dict, fallback_model=None) -> dict:
             if not isinstance(tool_call, dict):
                 continue
             function = tool_call.get("function") if isinstance(tool_call.get("function"), dict) else {}
+            call_id = tool_call.get("id") or f"call_{uuid4().hex}"
             output.append(
                 {
                     "type": "function_call",
-                    "call_id": tool_call.get("id") or f"call_{uuid4().hex}",
+                    "id": f"fc_{call_id}",
+                    "call_id": call_id,
                     "name": function.get("name", ""),
                     "arguments": function.get("arguments", "") if isinstance(function.get("arguments"), str) else json.dumps(function.get("arguments", {}), separators=(",", ":"), ensure_ascii=False),
                 }
@@ -2615,14 +2621,12 @@ def _anthropic_content_blocks_to_responses_output(content) -> list[dict]:
                 continue
             tool_input = block.get("input") if isinstance(block.get("input"), (dict, list)) else {}
             function_call = {
+                "id": _response_function_item_id(block, tool_id),
                 "type": "function_call",
                 "call_id": tool_id,
                 "name": name,
                 "arguments": _compact_json_dumps(tool_input),
             }
-            item_id = _response_replay_id(block)
-            if item_id and item_id != tool_id:
-                function_call["id"] = item_id
             status = _response_replay_status(block)
             if status:
                 function_call["status"] = status
