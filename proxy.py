@@ -198,6 +198,15 @@ _DEBUG_DETAIL_REQUEST_SNAPSHOTS_BY_ID: OrderedDict[str, dict] = OrderedDict()
 _DEBUG_DETAIL_SESSION_CAPTURED_REQUEST_IDS: OrderedDict[str, set[str]] = OrderedDict()
 _DEBUG_DETAIL_SNAPSHOT_SEQUENCE = 0
 
+# Upstream prompt-cache settle. This is deliberately a cross-lineage family
+# guard, not a same-lineage throttle: back-to-back turns in one append-only
+# conversation are exactly what prompt caching is meant to handle.  The only
+# case we delay is a different lineage entering the same Copilot parent-task
+# family immediately after a sibling/parent finished.
+CACHE_SETTLE_DELAY_SECONDS = 0.0
+_PROMPT_CACHE_SETTLE_LOCK = threading.Lock()
+_PROMPT_CACHE_LAST_FINISH_BY_FAMILY: dict[tuple[str, str], tuple[str, float]] = {}
+
 
 def _reset_debug_detail_capture_state() -> None:
     global _DEBUG_DETAIL_SNAPSHOT_SEQUENCE
@@ -601,6 +610,102 @@ class UpstreamRequestPlan:
     trace_context: dict | None = None
     debug_detail_session_key: str | None = None
     auto_update_request_tracked: bool = False
+
+
+def _prompt_cache_settle_delay_seconds() -> float:
+    raw_value = os.environ.get("GHCP_PROXY_RESPONSES_CACHE_SETTLE_DELAY_SECONDS")
+    if raw_value is None:
+        return CACHE_SETTLE_DELAY_SECONDS
+    try:
+        return max(0.0, float(str(raw_value).strip()))
+    except (TypeError, ValueError):
+        return CACHE_SETTLE_DELAY_SECONDS
+
+
+def _responses_plan_header_value(
+    plan: "UpstreamRequestPlan | None",
+    header_name: str,
+) -> str | None:
+    if not isinstance(plan, UpstreamRequestPlan):
+        return None
+    headers = plan.headers if isinstance(plan.headers, dict) else None
+    if not headers:
+        return None
+    wanted = header_name.lower()
+    for key, value in headers.items():
+        if isinstance(key, str) and key.lower() == wanted:
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return None
+
+
+def _responses_plan_lineage(plan: "UpstreamRequestPlan | None") -> str | None:
+    if not isinstance(plan, UpstreamRequestPlan):
+        return None
+    agent_task_id = _responses_plan_header_value(plan, "x-agent-task-id")
+    if agent_task_id:
+        return agent_task_id
+    body = plan.body if isinstance(plan.body, dict) else None
+    if isinstance(body, dict):
+        pck = body.get("prompt_cache_key") or body.get("promptCacheKey")
+        if isinstance(pck, str):
+            normalized = pck.strip()
+            if len(normalized) >= 36 and normalized[8:9] == "-":
+                return normalized
+    return None
+
+
+def _responses_cache_settle_identity(
+    plan: "UpstreamRequestPlan | None",
+) -> tuple[str, str, str] | None:
+    if not isinstance(plan, UpstreamRequestPlan) or not isinstance(plan.body, dict):
+        return None
+    model = str(
+        plan.resolved_model or plan.requested_model or plan.body.get("model") or ""
+    ).strip().lower()
+    if model != "gpt-5.5":
+        return None
+    lineage = _responses_plan_lineage(plan)
+    if not lineage:
+        return None
+    parent_task = _responses_plan_header_value(plan, "x-parent-agent-id")
+    family_root = parent_task or lineage
+    return model, lineage, f"family:{family_root}"
+
+
+async def _wait_for_responses_cache_settle(plan: "UpstreamRequestPlan | None") -> None:
+    identity = _responses_cache_settle_identity(plan)
+    if identity is None:
+        return
+    model, lineage, family = identity
+    delay_seconds = _prompt_cache_settle_delay_seconds()
+    if delay_seconds <= 0:
+        return
+    with _PROMPT_CACHE_SETTLE_LOCK:
+        last = _PROMPT_CACHE_LAST_FINISH_BY_FAMILY.get((model, family))
+    if not last:
+        return
+    last_lineage, last_finished_at = last
+    if last_lineage == lineage:
+        return
+    wait_seconds = delay_seconds - (time.monotonic() - float(last_finished_at))
+    if wait_seconds > 0:
+        await asyncio.sleep(wait_seconds)
+
+
+def _remember_responses_cache_settle_finish(
+    plan: "UpstreamRequestPlan | None",
+    status_code: int,
+) -> None:
+    if status_code >= 400:
+        return
+    identity = _responses_cache_settle_identity(plan)
+    if identity is None:
+        return
+    model, lineage, family = identity
+    now = time.monotonic()
+    with _PROMPT_CACHE_SETTLE_LOCK:
+        _PROMPT_CACHE_LAST_FINISH_BY_FAMILY[(model, family)] = (lineage, now)
 
 
 def _env_flag(name: str) -> bool:
@@ -1832,6 +1937,7 @@ def _finish_usage_and_trace(
                         trace_payload["response_text"] = _trim_trace_text(response_text)
                 _append_request_trace(trace_payload, force=force_trace)
         finally:
+            _remember_responses_cache_settle_finish(plan, status_code)
             if plan.auto_update_request_tracked:
                 auto_update_runtime_controller.note_request_finished(plan.request_id)
         return
@@ -2216,6 +2322,7 @@ def _bridge_error_response_from_upstream(bridge_plan: BridgeExecutionPlan, upstr
 
 async def _post_non_streaming_request(plan: UpstreamRequestPlan, *, error_response) -> Response:
     try:
+        await _wait_for_responses_cache_settle(plan)
         client = _get_upstream_client()
         upstream = await throttled_client_post(
             client,
@@ -2252,6 +2359,7 @@ async def _post_non_streaming_request(plan: UpstreamRequestPlan, *, error_respon
 async def _post_bridge_non_streaming_request(plan: UpstreamRequestPlan, bridge_plan: BridgeExecutionPlan) -> Response:
     error_response = _bridge_error_response(bridge_plan)
     try:
+        await _wait_for_responses_cache_settle(plan)
         client = _get_upstream_client()
         upstream = await throttled_client_post(
             client,
@@ -2486,6 +2594,7 @@ async def proxy_streaming_response(
     client = _get_upstream_client()
     request = client.build_request("POST", upstream_url, headers=headers, json=body)
     try:
+        await _wait_for_responses_cache_settle(trace_plan)
         upstream = await throttled_client_send(client, request, stream=True)
     except httpx.RequestError as exc:
         status_code, message = format_translation.upstream_request_error_status_and_message(exc)

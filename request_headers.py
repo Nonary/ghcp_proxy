@@ -3,6 +3,7 @@
 import hashlib
 import json
 import os
+import time
 import uuid
 
 from fastapi import Request
@@ -90,17 +91,109 @@ def _responses_subagent_task_id(parent_scope, subagent, affinity_value=None) -> 
     )
 
 
-_RESPONSES_CURRENT_PARENT_BY_CLIENT_SESSION: dict[str, tuple[str, str]] = {}
+_RESPONSES_CURRENT_PARENT_BY_CLIENT_SESSION: dict[str, tuple[str, str, str, float]] = {}
+_RESPONSES_CURRENT_PARENT_BY_AFFINITY_GROUP: dict[str, tuple[str, str, str, float]] = {}
+_RESPONSES_SUBAGENT_PARENT_BY_AFFINITY: dict[str, tuple[str, str, str, float]] = {}
+_RESPONSES_LAST_PARENT_CONTEXT: tuple[str, str, str, float] | None = None
+_RESPONSES_PARENT_CONTEXT_TTL_SECONDS = 10 * 60
+_RESPONSES_LAST_PARENT_FALLBACK_SECONDS = 2 * 60
+_RESPONSES_PARENT_CONTEXT_MAX_SUBAGENTS = 512
 
 
-def _responses_current_parent(headers: dict) -> tuple[str, str] | None:
-    client_session_id = headers.get("x-client-session-id")
-    if not isinstance(client_session_id, str) or not client_session_id.strip():
+def _responses_parent_context_is_fresh(context: tuple[str, str, str, float] | None) -> bool:
+    if not context:
+        return False
+    try:
+        return (time.monotonic() - float(context[3])) <= _RESPONSES_PARENT_CONTEXT_TTL_SECONDS
+    except (TypeError, ValueError):
+        return False
+
+
+def _responses_affinity_group(affinity_value: str | None) -> str | None:
+    """Return the coarse Codex rollout family carried by prompt_cache_key.
+
+    Codex gives subagents their own prompt_cache_key, so an exact affinity
+    lookup cannot find the already-active parent.  The keys are UUIDv7-like:
+    the first field is the high timestamp component and is shared by the
+    parent/subagents spawned together in the same rollout.  Captured real
+    Copilot traffic sends those subagents on the parent's client-session and
+    x-parent-agent-id; treating every subagent prompt_cache_key as a fresh
+    root is the drift that makes several large prompt-cache lineages fight
+    upstream as unrelated sessions.
+    """
+    if not isinstance(affinity_value, str):
         return None
-    return _RESPONSES_CURRENT_PARENT_BY_CLIENT_SESSION.get(client_session_id.strip())
+    normalized = affinity_value.strip().lower()
+    if not normalized:
+        return None
+    first, sep, _rest = normalized.partition("-")
+    if sep and len(first) == 8 and all(ch in "0123456789abcdef" for ch in first):
+        return f"uuidv7-window:{first}"
+    return None
 
 
-def _remember_responses_current_parent(headers: dict) -> None:
+def _responses_current_parent(
+    headers: dict,
+    affinity_value: str | None = None,
+) -> tuple[str, str, str] | None:
+    """Return the active Responses parent context.
+
+    Copilot CLI keeps subagents in the same client-session bucket as the parent
+    turn and sends the parent's x-agent-task-id as x-parent-agent-id.  Codex
+    gives each subagent its own prompt_cache_key, so a client-session lookup by
+    the subagent's freshly-derived affinity misses unless we also remember the
+    most recent parent and bind a subagent affinity to it on first use.
+    """
+    client_session_id = headers.get("x-client-session-id")
+    if isinstance(client_session_id, str) and client_session_id.strip():
+        context = _RESPONSES_CURRENT_PARENT_BY_CLIENT_SESSION.get(client_session_id.strip())
+        if _responses_parent_context_is_fresh(context):
+            return context[:3]
+
+    normalized_affinity = affinity_value.strip() if isinstance(affinity_value, str) and affinity_value.strip() else None
+    if normalized_affinity:
+        context = _RESPONSES_SUBAGENT_PARENT_BY_AFFINITY.get(normalized_affinity)
+        if _responses_parent_context_is_fresh(context):
+            return context[:3]
+
+        affinity_group = _responses_affinity_group(normalized_affinity)
+        if affinity_group:
+            context = _RESPONSES_CURRENT_PARENT_BY_AFFINITY_GROUP.get(affinity_group)
+            if _responses_parent_context_is_fresh(context):
+                return context[:3]
+
+    if _responses_last_parent_context_is_fresh_for_fallback(_RESPONSES_LAST_PARENT_CONTEXT):
+        return _RESPONSES_LAST_PARENT_CONTEXT[:3]
+    return None
+
+
+def _responses_last_parent_context_is_fresh_for_fallback(
+    context: tuple[str, str, str, float] | None,
+) -> bool:
+    if not context:
+        return False
+    try:
+        age = time.monotonic() - float(context[3])
+    except (TypeError, ValueError):
+        return False
+    return 0 <= age <= _RESPONSES_LAST_PARENT_FALLBACK_SECONDS
+
+
+def _remember_responses_subagent_parent(affinity_value: str | None, context: tuple[str, str, str]) -> None:
+    normalized_affinity = affinity_value.strip() if isinstance(affinity_value, str) and affinity_value.strip() else None
+    if not normalized_affinity:
+        return
+    _RESPONSES_SUBAGENT_PARENT_BY_AFFINITY[normalized_affinity] = (*context, time.monotonic())
+    while len(_RESPONSES_SUBAGENT_PARENT_BY_AFFINITY) > _RESPONSES_PARENT_CONTEXT_MAX_SUBAGENTS:
+        oldest_key = min(
+            _RESPONSES_SUBAGENT_PARENT_BY_AFFINITY,
+            key=lambda key: _RESPONSES_SUBAGENT_PARENT_BY_AFFINITY[key][3],
+        )
+        _RESPONSES_SUBAGENT_PARENT_BY_AFFINITY.pop(oldest_key, None)
+
+
+def _remember_responses_current_parent(headers: dict, affinity_value: str | None = None) -> None:
+    global _RESPONSES_LAST_PARENT_CONTEXT
     client_session_id = headers.get("x-client-session-id")
     agent_task_id = headers.get("x-agent-task-id")
     interaction_id = headers.get("x-interaction-id")
@@ -113,17 +206,20 @@ def _remember_responses_current_parent(headers: dict) -> None:
         and interaction_id.strip()
     ):
         return
-    _RESPONSES_CURRENT_PARENT_BY_CLIENT_SESSION[client_session_id.strip()] = (
-        agent_task_id.strip(),
-        interaction_id.strip(),
-    )
+    now = time.monotonic()
+    context = (client_session_id.strip(), agent_task_id.strip(), interaction_id.strip(), now)
+    _RESPONSES_CURRENT_PARENT_BY_CLIENT_SESSION[context[0]] = context
+    affinity_group = _responses_affinity_group(affinity_value)
+    if affinity_group:
+        _RESPONSES_CURRENT_PARENT_BY_AFFINITY_GROUP[affinity_group] = context
+    _RESPONSES_LAST_PARENT_CONTEXT = context
 
 
 def _apply_responses_current_parent(headers: dict) -> None:
     parent = _responses_current_parent(headers)
     if not parent:
         return
-    parent_task_id, interaction_id = parent
+    _, parent_task_id, interaction_id = parent
     headers["x-agent-task-id"] = parent_task_id
     headers["x-interaction-id"] = interaction_id
 
@@ -131,7 +227,11 @@ def _apply_responses_current_parent(headers: dict) -> None:
 _ISOLATED_RESPONSES_SUBAGENTS = {"guardian", "memory_consolidation"}
 
 
-def _apply_responses_current_subagent_parent(headers: dict, subagent: str | None) -> None:
+def _apply_responses_current_subagent_parent(
+    headers: dict,
+    subagent: str | None,
+    affinity_value: str | None = None,
+) -> None:
     if not isinstance(subagent, str) or not subagent.strip():
         return
     sub = subagent.strip()
@@ -161,11 +261,13 @@ def _apply_responses_current_subagent_parent(headers: dict, subagent: str | None
                 f"responses-{isolated_subagent}-task:{client_session_id}"
             )
         return
-    parent = _responses_current_parent(headers)
+    parent = _responses_current_parent(headers, affinity_value)
     if not parent:
         return
-    parent_task_id, interaction_id = parent
+    parent_client_session_id, parent_task_id, interaction_id = parent
+    _remember_responses_subagent_parent(affinity_value, parent)
     current_task_id = headers.get("x-agent-task-id")
+    headers["x-client-session-id"] = parent_client_session_id
     headers["x-parent-agent-id"] = parent_task_id
     headers["x-interaction-id"] = interaction_id
     if not isinstance(current_task_id, str) or not current_task_id.strip() or current_task_id == parent_task_id:
@@ -601,9 +703,9 @@ def build_responses_headers_for_request(
         )
     )
     if effective_subagent:
-        _apply_responses_current_subagent_parent(headers, effective_subagent)
+        _apply_responses_current_subagent_parent(headers, effective_subagent, affinity_value)
     else:
-        _remember_responses_current_parent(headers)
+        _remember_responses_current_parent(headers, affinity_value)
 
     if has_vision_input(effective_input):
         headers["Copilot-Vision-Request"] = "true"
