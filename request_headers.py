@@ -666,7 +666,7 @@ def build_responses_headers_for_request(
         body["input"] = effective_input
     if effective_subagent:
         initiator = "agent"
-    headers["X-Initiator"] = initiator
+    headers["x-initiator"] = initiator
     headers["x-interaction-type"] = (
         "conversation-subagent"
         if effective_subagent
@@ -734,7 +734,7 @@ def build_chat_headers_for_request(
         request_id=request_id,
         verdict_sink=verdict_sink,
     )
-    headers["X-Initiator"] = initiator
+    headers["x-initiator"] = initiator
     headers["x-interaction-type"] = _interaction_type_for_initiator(initiator)
     headers["x-interaction-id"] = _interaction_id_for_session(session_id)
     headers["x-agent-task-id"] = str(uuid.uuid4())
@@ -745,7 +745,7 @@ def build_chat_headers_for_request(
     subagent = request.headers.get("x-openai-subagent")
     if isinstance(subagent, str) and subagent.strip():
         normalized_subagent = subagent.strip()
-        headers["X-Initiator"] = "agent"
+        headers["x-initiator"] = "agent"
         headers["x-interaction-type"] = "conversation-subagent"
         parent_scope = (
             affinity_value
@@ -821,7 +821,7 @@ def build_anthropic_headers_for_request(
         request_id=request_id,
         verdict_sink=verdict_sink,
     )
-    headers["X-Initiator"] = initiator
+    headers["x-initiator"] = initiator
     headers["x-interaction-type"] = _interaction_type_for_initiator(initiator)
     headers["x-interaction-id"] = _interaction_id_for_session(session_id)
     headers["x-agent-task-id"] = str(uuid.uuid4())
