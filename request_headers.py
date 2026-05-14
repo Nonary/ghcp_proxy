@@ -50,31 +50,18 @@ def _responses_task_affinity_scope(affinity_value) -> str | None:
 
 
 def _responses_client_session_id_for_affinity(affinity_value, model=None) -> str | None:
-    """Return the Copilot client-session bucket for a Responses cache lineage.
+    """Return an override for the Copilot client-session bucket.
 
-    The proxy process can multiplex multiple Codex conversations.  A single
-    process-wide ``x-client-session-id`` lets unrelated ``prompt_cache_key``
-    lineages fight over the same upstream prompt-cache/LRU namespace; in live
-    traces, switching from one large prompt_cache_key to another for ~100s made
-    the first key come back with only the tiny initial prefix cached despite an
-    append-only body.  Copilot CLI normally gets a fresh client session per CLI
-    process/conversation, so mirror that by deriving the client session from the
-    full explicit affinity key.
-
-    Captured Copilot CLI traffic keeps one client session across related
-    Responses and Chat requests, including mixed models.  Model already
-    partitions the upstream cache payload; including it here creates extra
-    client-session buckets that the real client does not use.
+    Real Copilot CLI traffic keeps one ``x-client-session-id`` for the process
+    and separates simultaneous conversations with ``x-agent-task-id`` /
+    ``x-interaction-id``.  Deriving a fresh client session from every
+    ``prompt_cache_key`` creates many upstream client namespaces that do not
+    exist in captured traffic, and live traces show same-lineage cache busts
+    when several of those synthetic client sessions are active together.  Leave
+    the process-wide client session from ``build_copilot_headers`` in place.
     """
-    del model
-    if os.environ.get("GHCP_COPILOT_CLIENT_SESSION_ID"):
-        return None
-    if not isinstance(affinity_value, str):
-        return None
-    normalized = affinity_value.strip()
-    if not normalized:
-        return None
-    return _copilot_uuid(f"responses-client-session:{normalized}")
+    del affinity_value, model
+    return None
 
 
 def _responses_subagent_task_id(parent_scope, subagent, affinity_value=None) -> str | None:
