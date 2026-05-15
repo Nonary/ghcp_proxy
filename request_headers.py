@@ -138,9 +138,9 @@ def _responses_current_parent(
     Copilot CLI keeps subagents in the same client-session bucket as the parent
     turn and sends the parent's x-agent-task-id as x-parent-agent-id.  Codex
     gives each subagent its own prompt_cache_key, so an exact parent binding is
-    authoritative once learned. Weak fallback is allowed only when there is one
-    possible fresh root; with multiple active roots, guessing creates upstream
-    lineage drift.
+    authoritative once learned. Affinity-bearing subagents must not use weak
+    root fallback: an older root may have simply aged out, making an unrelated
+    root look like the only candidate.
     """
     normalized_affinity = affinity_value.strip() if isinstance(affinity_value, str) and affinity_value.strip() else None
     if normalized_affinity:
@@ -156,11 +156,16 @@ def _responses_current_parent(
         if _responses_parent_context_is_fresh(context):
             return context[:3]
 
+    if normalized_affinity:
+        return None
+
     # The first UUID field of Codex prompt_cache_key is only a coarse timestamp
     # window.  Live multi-session traces show unrelated roots and subagents
     # sharing it, so using that group or a global "last parent" lets one active
-    # session steal another subagent's upstream parent.  Only use the weak
-    # fallback when the process has exactly one fresh root context.
+    # session steal another subagent's upstream parent.  For requests with an
+    # explicit affinity, guessing is still unsafe even when only one fresh root
+    # remains, because earlier roots may have simply aged out.  Only affinity-
+    # less legacy callers get the weak fallback.
     return _responses_only_fresh_parent_context()
 
 
@@ -682,6 +687,16 @@ def build_responses_headers_for_request(
     )
     if affinity_client_session_id and not effective_subagent:
         headers["x-client-session-id"] = affinity_client_session_id
+    if effective_subagent and isinstance(session_id, str) and session_id.strip():
+        # Codex subagents carry their own prompt_cache_key, while the resolved
+        # session id still points at the parent conversation. Use that parent
+        # session bucket for exact parent lookup instead of a process-global
+        # "only fresh root" guess.
+        root_client_session_id = _responses_client_session_id_for_affinity(
+            session_id, model=body.get("model")
+        )
+        if root_client_session_id:
+            headers["x-client-session-id"] = root_client_session_id
     headers.update(
         _responses_copilot_identity_headers(
             identity_source,
