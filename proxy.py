@@ -142,6 +142,7 @@ app = FastAPI()
 _REQUEST_TRACE_LOCK = Lock()
 _REQUEST_PROMPT_LOCK = Lock()
 _REQUEST_PROMPT_ACTIVE_IDS: set[str] = set()
+_REQUEST_PROMPT_FILE_PREFIX = "request-prompt-"
 _CLIENT_PROXY_STARTUP_RESTORE_LOCK = Lock()
 _CLIENT_PROXY_STARTUP_RESTORE_COMPLETE = False
 _CLIENT_PROXY_SHUTDOWN_REVERT_LOCK = Lock()
@@ -293,7 +294,7 @@ def _request_prompt_file_name(request_id: str | None) -> str | None:
     )
     if not safe_request_id:
         return None
-    return f"{safe_request_id}.json"
+    return f"{_REQUEST_PROMPT_FILE_PREFIX}{safe_request_id}.json"
 
 
 def _request_prompt_file_path(request_id: str | None) -> str | None:
@@ -399,7 +400,7 @@ def _prune_request_prompt_archive(request_ids: set[str] | None = None) -> None:
     try:
         with _REQUEST_PROMPT_LOCK:
             for entry in os.listdir(archive_dir):
-                if not entry.endswith(".json"):
+                if not entry.startswith(_REQUEST_PROMPT_FILE_PREFIX) or not entry.endswith(".json"):
                     continue
                 if entry in keep_files:
                     continue

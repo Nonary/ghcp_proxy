@@ -68,9 +68,12 @@ class RequestPromptArchiveTests(unittest.TestCase):
     def test_prune_request_prompt_archive_keeps_only_recent_request_ids(self):
         proxy._save_request_prompt_record("keep-me", "/v1/responses", {"input": "keep"})
         proxy._save_request_prompt_record("drop-me", "/v1/responses", {"input": "drop"})
+        unrelated_json = os.path.join(self._temp_dir.name, "unrelated-settings.json")
+        with open(unrelated_json, "w", encoding="utf-8") as handle:
+            json.dump({"owner": "not request prompt archive"}, handle)
 
         proxy._prune_request_prompt_archive({"keep-me"})
 
         self.assertIsNotNone(proxy._load_request_prompt_record("keep-me"))
         self.assertIsNone(proxy._load_request_prompt_record("drop-me"))
-
+        self.assertTrue(os.path.exists(unrelated_json))
