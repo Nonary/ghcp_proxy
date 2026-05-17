@@ -268,6 +268,8 @@ before starting a manual copy.
 - Supports GitHub Copilot auth from the local dashboard on first run
 - Shows tracked GitHub premium request usage for traffic that passes through the proxy
 - Tracks session, token, and estimated cost data from the proxy's own request log
+- Saves recent request prompt transcripts for dashboard drill-downs; set
+  `GHCP_REQUEST_PROMPT_ARCHIVE_DIR` to override that local archive location
 
 ## Auto Update
 
