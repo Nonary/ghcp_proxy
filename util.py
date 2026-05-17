@@ -635,6 +635,145 @@ def extract_item_text(item) -> str:
     return ""
 
 
+def _normalize_prompt_label(value, fallback: str) -> str:
+    if isinstance(value, str):
+        normalized = value.strip().replace("_", " ").replace("-", " ")
+        if normalized:
+            return normalized.upper()
+    return fallback
+
+
+def _extract_text_chunks(value) -> list[str]:
+    if isinstance(value, str):
+        normalized = value.strip()
+        return [normalized] if normalized else []
+    if isinstance(value, list):
+        chunks: list[str] = []
+        for item in value:
+            chunks.extend(_extract_text_chunks(item))
+        return chunks
+    if not isinstance(value, dict):
+        return []
+
+    direct_chunks: list[str] = []
+    for key in ("text", "input_text", "output_text"):
+        text_value = value.get(key)
+        if isinstance(text_value, str):
+            normalized = text_value.strip()
+            if normalized:
+                direct_chunks.append(normalized)
+    if direct_chunks:
+        return direct_chunks
+
+    nested_chunks: list[str] = []
+    for key in ("content", "summary", "input", "output", "arguments"):
+        nested_chunks.extend(_extract_text_chunks(value.get(key)))
+    if nested_chunks:
+        return nested_chunks
+
+    for item in value.values():
+        if isinstance(item, str):
+            normalized = item.strip()
+            if normalized:
+                nested_chunks.append(normalized)
+    return nested_chunks
+
+
+def _render_prompt_section(label: str, text: str) -> str:
+    normalized_text = str(text).strip()
+    if not normalized_text:
+        return ""
+    return f"{label}:\n{normalized_text}"
+
+
+def _extract_message_sections(messages) -> list[str]:
+    if isinstance(messages, str):
+        rendered = _render_prompt_section("USER", messages)
+        return [rendered] if rendered else []
+    if not isinstance(messages, list):
+        return []
+
+    sections: list[str] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        role_label = _normalize_prompt_label(message.get("role"), "MESSAGE")
+        text = "\n".join(_extract_text_chunks(message.get("content"))).strip()
+        if not text:
+            text = "\n".join(_extract_text_chunks(message)).strip()
+        rendered = _render_prompt_section(role_label, text)
+        if rendered:
+            sections.append(rendered)
+    return sections
+
+
+def _extract_input_sections(input_value) -> list[str]:
+    if isinstance(input_value, str):
+        rendered = _render_prompt_section("USER", input_value)
+        return [rendered] if rendered else []
+    if not isinstance(input_value, list):
+        return []
+
+    sections: list[str] = []
+    for item in input_value:
+        if not isinstance(item, dict):
+            continue
+
+        item_type = str(item.get("type", "")).strip().lower()
+        text = ""
+        label = _normalize_prompt_label(item.get("role"), _normalize_prompt_label(item_type, "ITEM"))
+
+        if item_type == "message" or item.get("role"):
+            text = "\n".join(_extract_text_chunks(item.get("content"))).strip()
+            label = _normalize_prompt_label(item.get("role"), "MESSAGE")
+        elif item_type == "reasoning":
+            text = "\n".join(_extract_text_chunks(item.get("summary") or item.get("content"))).strip()
+            label = "REASONING"
+        elif item_type in {"custom_tool_call", "function_call", "tool_use"}:
+            tool_name = str(item.get("name") or item.get("call_id") or "").strip()
+            label = f"TOOL CALL {tool_name}".strip().upper() or "TOOL CALL"
+            text = "\n".join(_extract_text_chunks(item.get("input") or item.get("arguments"))).strip()
+        elif item_type in {"custom_tool_call_output", "function_call_output", "computer_call_output", "tool_result"}:
+            tool_name = str(item.get("name") or item.get("call_id") or "").strip()
+            label = f"TOOL OUTPUT {tool_name}".strip().upper() or "TOOL OUTPUT"
+            text = "\n".join(_extract_text_chunks(item.get("output") or item.get("content"))).strip()
+        else:
+            text = "\n".join(_extract_text_chunks(item.get("content") if "content" in item else item)).strip()
+
+        rendered = _render_prompt_section(label, text)
+        if rendered:
+            sections.append(rendered)
+    return sections
+
+
+def extract_request_prompt_text(body: dict | None) -> str:
+    if not isinstance(body, dict):
+        return ""
+
+    sections: list[str] = []
+    for key, label in (
+        ("instructions", "INSTRUCTIONS"),
+        ("system", "SYSTEM"),
+        ("developer", "DEVELOPER"),
+        ("prompt", "PROMPT"),
+    ):
+        text = "\n".join(_extract_text_chunks(body.get(key))).strip()
+        rendered = _render_prompt_section(label, text)
+        if rendered:
+            sections.append(rendered)
+
+    sections.extend(_extract_input_sections(body.get("input")))
+    sections.extend(_extract_message_sections(body.get("messages")))
+
+    if not sections:
+        text = "\n".join(_extract_text_chunks(body)).strip()
+        rendered = _render_prompt_section("REQUEST", text)
+        if rendered:
+            sections.append(rendered)
+
+    return "\n\n".join(section for section in sections if section).strip()
+
+
 def _extract_text_content(value) -> str:
     if isinstance(value, str):
         return value

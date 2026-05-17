@@ -32,3 +32,8 @@ Runtime request traces live under:
 Full prompt and request-body traces are only written when
 `debug_prompt_logging_enabled` is true in the client proxy settings. It defaults
 to false.
+
+For request prompt drill-down work, keep the scope narrow. Current `main`
+already lazy-loads prompts from recent usage events; file-backed prompt archives
+belong in `proxy.py`, `util.py`, constants/docs, and focused tests. Do not revive
+older UI2 or safeguard-telemetry stash chunks unless that is the explicit task.

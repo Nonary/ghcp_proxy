@@ -121,6 +121,7 @@ from constants import (
     LEGACY_PREMIUM_PLAN_CONFIG_FILE,
     PROXY_PID_FILE,
     REQUEST_TRACE_LOG_FILE,
+    REQUEST_PROMPT_ARCHIVE_DIR,
     REQUEST_TRACE_HISTORY_LIMIT,
     REQUEST_TRACE_RETENTION_SLACK,
     REQUEST_TRACE_BODY_MAX_BYTES,
@@ -139,6 +140,8 @@ from rate_limiting import (
 
 app = FastAPI()
 _REQUEST_TRACE_LOCK = Lock()
+_REQUEST_PROMPT_LOCK = Lock()
+_REQUEST_PROMPT_ACTIVE_IDS: set[str] = set()
 _CLIENT_PROXY_STARTUP_RESTORE_LOCK = Lock()
 _CLIENT_PROXY_STARTUP_RESTORE_COMPLETE = False
 _CLIENT_PROXY_SHUTDOWN_REVERT_LOCK = Lock()
@@ -273,12 +276,156 @@ def set_initiator_policy(policy: InitiatorPolicy):
     usage_tracker.on_request_finished = policy.note_request_finished
 
 
+def request_prompt_archive_dir() -> str:
+    configured = str(os.environ.get("GHCP_REQUEST_PROMPT_ARCHIVE_DIR", "")).strip()
+    return os.path.expanduser(configured or REQUEST_PROMPT_ARCHIVE_DIR)
+
+
+def _request_prompt_file_name(request_id: str | None) -> str | None:
+    if not isinstance(request_id, str):
+        return None
+    normalized_request_id = request_id.strip()
+    if not normalized_request_id:
+        return None
+    safe_request_id = "".join(
+        ch if ch.isalnum() or ch in {"-", "_", "."} else "_"
+        for ch in normalized_request_id
+    )
+    if not safe_request_id:
+        return None
+    return f"{safe_request_id}.json"
+
+
+def _request_prompt_file_path(request_id: str | None) -> str | None:
+    filename = _request_prompt_file_name(request_id)
+    if filename is None:
+        return None
+    return os.path.join(request_prompt_archive_dir(), filename)
+
+
+def _save_request_prompt_record(
+    request_id: str | None,
+    request_path: str | None,
+    request_body: dict | None,
+) -> None:
+    archive_path = _request_prompt_file_path(request_id)
+    if archive_path is None or not isinstance(request_body, dict):
+        return
+
+    prompt_text = util.extract_request_prompt_text(request_body)
+    if not prompt_text:
+        return
+
+    record = {
+        "request_id": request_id,
+        "path": request_path,
+        "stored_at": util.utc_now_iso(),
+        "char_count": len(prompt_text),
+        "prompt_text": prompt_text,
+    }
+    archive_dir = os.path.dirname(archive_path)
+    temp_path = None
+    try:
+        os.makedirs(archive_dir, exist_ok=True)
+        with _REQUEST_PROMPT_LOCK:
+            _REQUEST_PROMPT_ACTIVE_IDS.add(str(request_id))
+            fd, temp_path = tempfile.mkstemp(prefix="request-prompt-", suffix=".tmp", dir=archive_dir)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, separators=(",", ":"), default=util._json_default))
+            os.replace(temp_path, archive_path)
+    except OSError as exc:
+        with _REQUEST_PROMPT_LOCK:
+            _REQUEST_PROMPT_ACTIVE_IDS.discard(str(request_id))
+        if temp_path is not None:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+        print(f"Warning: failed to write request prompt archive: {exc}", file=sys.stderr, flush=True)
+
+
+def _load_request_prompt_record(request_id: str | None) -> dict | None:
+    archive_path = _request_prompt_file_path(request_id)
+    if archive_path is None or not os.path.exists(archive_path):
+        return None
+    try:
+        with open(archive_path, encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+
+    prompt_text = payload.get("prompt_text")
+    if not isinstance(prompt_text, str) or not prompt_text.strip():
+        return None
+
+    char_count = payload.get("char_count")
+    if not isinstance(char_count, int):
+        char_count = len(prompt_text)
+    return {
+        "request_id": payload.get("request_id") if isinstance(payload.get("request_id"), str) else request_id,
+        "path": payload.get("path") if isinstance(payload.get("path"), str) else None,
+        "stored_at": payload.get("stored_at") if isinstance(payload.get("stored_at"), str) else None,
+        "char_count": char_count,
+        "prompt_text": prompt_text,
+    }
+
+
+def _recent_request_prompt_ids() -> set[str]:
+    keep_ids = {
+        request_id
+        for event in usage_tracker.snapshot_usage_events()
+        if isinstance(event, dict)
+        for request_id in [event.get("request_id")]
+        if isinstance(request_id, str) and request_id
+    }
+    with _REQUEST_PROMPT_LOCK:
+        keep_ids.update(_REQUEST_PROMPT_ACTIVE_IDS)
+    return keep_ids
+
+
+def _prune_request_prompt_archive(request_ids: set[str] | None = None) -> None:
+    archive_dir = request_prompt_archive_dir()
+    if not os.path.isdir(archive_dir):
+        return
+
+    keep_ids = set(request_ids or _recent_request_prompt_ids())
+    keep_files = {
+        filename
+        for request_id in keep_ids
+        if (filename := _request_prompt_file_name(request_id)) is not None
+    }
+    try:
+        with _REQUEST_PROMPT_LOCK:
+            for entry in os.listdir(archive_dir):
+                if not entry.endswith(".json"):
+                    continue
+                if entry in keep_files:
+                    continue
+                try:
+                    os.unlink(os.path.join(archive_dir, entry))
+                except OSError:
+                    continue
+    except OSError as exc:
+        print(f"Warning: failed to prune request prompt archive: {exc}", file=sys.stderr, flush=True)
+
+
+def _handle_usage_event_recorded(event: dict | None) -> None:
+    request_id = event.get("request_id") if isinstance(event, dict) else None
+    if isinstance(request_id, str) and request_id:
+        with _REQUEST_PROMPT_LOCK:
+            _REQUEST_PROMPT_ACTIVE_IDS.discard(request_id)
+    _prune_request_prompt_archive()
+    dashboard_service.notify_dashboard_stream_listeners()
+
+
 usage_tracker = usage_tracking.UsageTracker(
     state=usage_tracking.UsageTrackingState(),
     archive_store=dashboard_module.create_usage_archive_store(),
     event_bus=usage_event_bus,
     on_request_finished=_initiator_policy.note_request_finished,
-    on_usage_event_recorded=lambda _event: dashboard_service.notify_dashboard_stream_listeners(),
+    on_usage_event_recorded=_handle_usage_event_recorded,
 )
 usage_reminder_controller = usage_reminder.UsageReminderController(
     usage_tracker.snapshot_all_usage_events,
@@ -2019,6 +2166,11 @@ def _prepare_upstream_request(
         prompt_preview=stored_prompt_preview,
         initiator_verdict=initiator_verdict if isinstance(initiator_verdict, dict) else None,
     )
+    _save_request_prompt_record(
+        request_id,
+        request.url.path,
+        source_body if isinstance(source_body, dict) else body,
+    )
     auto_update_runtime_controller.note_request_started(request_id)
     trace_context = {
         "request_id": request_id,
@@ -3574,20 +3726,36 @@ async def dashboard_stream(request: Request):
 def _load_request_prompt_payload(request_id: str) -> dict:
     if not isinstance(request_id, str) or not request_id:
         return {"available": False}
+    _prune_request_prompt_archive()
     target = None
     for event in reversed(usage_tracker.snapshot_usage_events()):
         if isinstance(event, dict) and event.get("request_id") == request_id:
             target = event
             break
+    if target is not None:
+        raw_prompt = target.get("request_prompt")
+        if isinstance(raw_prompt, dict):
+            prompt = _prompt_payload_for_dashboard(raw_prompt)
+            if isinstance(prompt, dict):
+                return {"available": True, "request_prompt": prompt}
+            return {"available": True, "locked": True}
+
+    archived_prompt = _load_request_prompt_record(request_id)
+    if isinstance(archived_prompt, dict):
+        prompt_text = archived_prompt.get("prompt_text")
+        if isinstance(prompt_text, str) and prompt_text.strip():
+            return {
+                "available": True,
+                "request_prompt": {"user": prompt_text},
+                "prompt_text": prompt_text,
+                "path": archived_prompt.get("path"),
+                "stored_at": archived_prompt.get("stored_at"),
+                "char_count": archived_prompt.get("char_count"),
+            }
+
     if target is None:
         return {"available": False, "not_found": True}
-    raw_prompt = target.get("request_prompt")
-    if not isinstance(raw_prompt, dict):
-        return {"available": False}
-    prompt = _prompt_payload_for_dashboard(raw_prompt)
-    if isinstance(prompt, dict):
-        return {"available": True, "request_prompt": prompt}
-    return {"available": True, "locked": True}
+    return {"available": False}
 
 
 @app.get("/api/request-prompt/{request_id}")
