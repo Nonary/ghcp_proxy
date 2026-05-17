@@ -226,7 +226,7 @@ Files updated:
 Work completed:
 - [x] [Task]
 - [x] [Task]
-- [ ] [Task in progress or incomplete]
+- [In progress] [Task in progress or incomplete]
 </work_done>
 <technical_details>
 - [Key technical concept or decision]

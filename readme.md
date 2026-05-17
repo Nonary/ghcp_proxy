@@ -181,6 +181,18 @@ python -m pip install -r requirements.txt
 python proxy.py
 ```
 
+### GitHub Auth Cannot Reach GitHub
+
+If sign-in fails with a name-lookup, DNS, timeout, VPN, or firewall message,
+first prove the terminal can reach GitHub:
+
+```bash
+curl -I https://github.com
+```
+
+If that fails, reconnect Wi-Fi or VPN and try again. If it works, start the
+proxy again with `start-ghproxy` or `python3 proxy.py`.
+
 Windows PowerShell without activation:
 
 ```powershell

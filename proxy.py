@@ -4,7 +4,7 @@ Designed for Codex / codex-mini / gpt-5.1-codex and any model that
 requires the Responses API instead of Chat Completions.
 
 Usage:
-  python ghcp_proxy.py
+  python proxy.py
   → If no token exists, prompts you to authorize via GitHub device flow
   → Then starts serving on http://127.0.0.1:8000
 

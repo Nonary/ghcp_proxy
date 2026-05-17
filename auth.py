@@ -16,6 +16,14 @@ from constants import (
     GITHUB_COPILOT_API_BASE,
 )
 
+_DNS_LOOKUP_ERROR_FRAGMENTS = (
+    "nodename nor servname provided, or not known",
+    "name or service not known",
+    "temporary failure in name resolution",
+    "failed to resolve",
+    "resolving timed out",
+)
+
 
 _AUTH_FLOW_LOCK = Lock()
 _AUTH_FLOW_STATE: dict[str, object] = {
@@ -436,6 +444,34 @@ def begin_device_flow() -> dict:
         return _flow_snapshot_unlocked()
 
 
+def _friendly_auth_failure_message(exc: Exception) -> str:
+    if isinstance(exc, httpx.TimeoutException):
+        return (
+            "GitHub authentication timed out before GitHub responded. "
+            "Check your internet, VPN, or firewall, then try `curl -I https://github.com` "
+            "and run `start-ghproxy` again."
+        )
+
+    if isinstance(exc, httpx.RequestError):
+        detail = str(exc).strip() or exc.__class__.__name__
+        lower_detail = detail.lower()
+        if any(fragment in lower_detail for fragment in _DNS_LOOKUP_ERROR_FRAGMENTS):
+            return (
+                "GitHub authentication could not start because this computer could not look up "
+                "GitHub's network name. Check your internet or VPN, try "
+                "`curl -I https://github.com`, then run `start-ghproxy` again."
+            )
+
+        request = getattr(exc, "request", None)
+        if request is not None:
+            return (
+                f"GitHub authentication could not reach {request.url}. "
+                "Check your internet, VPN, or firewall, then run `start-ghproxy` again."
+            )
+
+    return str(exc)
+
+
 def get_api_key(*, interactive: bool = False) -> str:
     """Returns a valid GHCP API key, refreshing transparently when expired."""
     key = load_api_key()
@@ -460,5 +496,9 @@ def ensure_authenticated():
         print("Authenticated. GHCP API key valid.", flush=True)
         return key
     except Exception as e:
-        print(f"\nAuthentication failed: {e}", file=sys.stderr, flush=True)
+        print(
+            f"\nAuthentication failed: {_friendly_auth_failure_message(e)}",
+            file=sys.stderr,
+            flush=True,
+        )
         sys.exit(1)
