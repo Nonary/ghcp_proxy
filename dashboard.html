@@ -2757,7 +2757,10 @@
                 <code>{{ name }}</code>
               </div>
             </div>
-            <div class="subtle" style="margin-top: 4px;">{{ backgroundProxyStatus.shell_profile_path }}</div>
+            <div class="subtle" style="margin-top: 4px;" v-if="backgroundProxyProfilePaths.length">
+              <div v-for="path in backgroundProxyProfilePaths" :key="path">{{ path }}</div>
+            </div>
+            <div class="subtle" style="margin-top: 4px;" v-else>{{ backgroundProxyStatus.shell_profile_path }}</div>
             <div v-if="backgroundProxyStatus.error" class="status error" style="margin-top: 10px;">{{ backgroundProxyStatus.error }}</div>
             <div v-else-if="backgroundProxyStatus.statusMessage" class="status good" style="margin-top: 10px;">{{ backgroundProxyStatus.statusMessage }}</div>
           </article>
@@ -4022,6 +4025,7 @@
             shell_commands_supported: false,
             shell_commands_installed: false,
             shell_profile_path: '',
+            shell_profile_paths: [],
             commands: {},
             error: '',
             statusMessage: '',
@@ -5325,6 +5329,11 @@
         backgroundProxyCommandNames() {
           const commands = this.backgroundProxyStatus.commands || {};
           return [commands.start, commands.stop].filter(Boolean);
+        },
+        backgroundProxyProfilePaths() {
+          const paths = this.backgroundProxyStatus.shell_profile_paths;
+          if (Array.isArray(paths) && paths.length) return paths;
+          return this.backgroundProxyStatus.shell_profile_path ? [this.backgroundProxyStatus.shell_profile_path] : [];
         },
         backgroundProxyStartupLabel() {
           if (!this.backgroundProxyStatus.startup_supported) return 'Login startup is not supported on this OS';

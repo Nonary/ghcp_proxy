@@ -15,6 +15,8 @@ from constants import (
 
 START_MARKER = "# >>> ghcp_proxy commands >>>"
 END_MARKER = "# <<< ghcp_proxy commands <<<"
+WINDOWS_POWERSHELL_PROFILE_DIRS = ("WindowsPowerShell", "PowerShell")
+POWERSHELL_PROFILE_FILENAME = "Microsoft.PowerShell_profile.ps1"
 
 
 def _quote_ps(value: str) -> str:
@@ -45,6 +47,44 @@ def _expand_user_path(path: str) -> str:
         if home:
             return os.path.join(home, path[2:])
     return os.path.expanduser(path)
+
+
+def _windows_documents_path() -> str:
+    """Return the user's actual Windows Documents folder.
+
+    PowerShell places user profiles under the shell "Personal"/Documents known
+    folder.  That folder is often redirected to OneDrive, so USERPROFILE +
+    "Documents" can point at a path PowerShell never reads.
+    """
+
+    for key_path in (
+        r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders",
+        r"Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders",
+    ):
+        try:
+            import winreg
+
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path) as key:
+                value, _value_type = winreg.QueryValueEx(key, "Personal")
+        except (ImportError, OSError):
+            continue
+        if isinstance(value, str) and value.strip():
+            return os.path.expandvars(value)
+
+    user_profile = os.environ.get("USERPROFILE") or os.path.expanduser("~")
+    return os.path.join(user_profile, "Documents")
+
+
+def _dedupe_paths(paths: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for path in paths:
+        key = os.path.normcase(os.path.abspath(path))
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(path)
+    return result
 
 
 def _replace_profile_block(path: str, block: str | None) -> None:
@@ -89,6 +129,7 @@ class BackgroundProxyManager:
             "shell_commands_supported": self.shell_commands_supported(),
             "shell_commands_installed": self.shell_commands_installed(),
             "shell_profile_path": self.shell_profile_path(),
+            "shell_profile_paths": self.shell_profile_paths(),
             "commands": self.command_names(),
             "pid_file": PROXY_PID_FILE,
             "stdout_log": PROXY_STDOUT_LOG_FILE,
@@ -125,20 +166,29 @@ class BackgroundProxyManager:
         return ""
 
     def shell_profile_path(self) -> str:
+        paths = self.shell_profile_paths()
+        return paths[0] if paths else ""
+
+    def shell_profile_paths(self) -> list[str]:
         if self.platform == "win32":
-            user_profile = os.environ.get("USERPROFILE") or os.path.expanduser("~")
-            return os.path.join(user_profile, "Documents", "PowerShell", "Microsoft.PowerShell_profile.ps1")
+            documents = _windows_documents_path()
+            return _dedupe_paths(
+                [
+                    os.path.join(documents, profile_dir, POWERSHELL_PROFILE_FILENAME)
+                    for profile_dir in WINDOWS_POWERSHELL_PROFILE_DIRS
+                ]
+            )
         if self.platform == "darwin":
-            return _expand_user_path("~/.zshrc")
-        return ""
+            return [_expand_user_path("~/.zshrc")]
+        return []
 
     def startup_enabled(self) -> bool:
         path = self.startup_path()
         return bool(path and os.path.exists(path))
 
     def shell_commands_installed(self) -> bool:
-        path = self.shell_profile_path()
-        return bool(path and _profile_has_block(path))
+        paths = self.shell_profile_paths()
+        return bool(paths and all(_profile_has_block(path) for path in paths))
 
     def enable_startup(self) -> dict[str, object]:
         if not self.startup_supported():
@@ -160,12 +210,12 @@ class BackgroundProxyManager:
         if not self.shell_commands_supported():
             raise RuntimeError("shell commands are only supported on PowerShell for Windows and zsh on macOS")
         block = self._powershell_profile_block() if self.platform == "win32" else self._zsh_profile_block()
-        _replace_profile_block(self.shell_profile_path(), block)
+        for path in self.shell_profile_paths():
+            _replace_profile_block(path, block)
         return self.status_payload()
 
     def uninstall_shell_commands(self) -> dict[str, object]:
-        path = self.shell_profile_path()
-        if path:
+        for path in self.shell_profile_paths():
             _replace_profile_block(path, None)
         return self.status_payload()
 
