@@ -5,7 +5,7 @@ import json
 import os
 import tempfile
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from contextlib import closing
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -28,10 +28,9 @@ from util import (
     normalize_usage_payload, _normalize_model_name,
     _usage_event_model_name, _usage_event_source,
     _usage_event_cost, _usage_event_estimated_cost,
-    _premium_request_multiplier, _counted_premium_requests,
     _server_request_chain_key, _codex_native_session_id_from_request_id, _codex_logs_service_tiers, _is_claude_request,
     extract_item_text, _parse_iso_datetime,
-    _extract_payload_usage,
+    _extract_payload_usage, _native_usage_event_dedupe_key, deduplicate_usage_events,
 )
 from event_bus import EventBus
 
@@ -42,6 +41,7 @@ from event_bus import EventBus
 
 REQUEST_FINISHED_EVENT = "request_finished"
 USAGE_EVENT_RECORDED_EVENT = "usage_event_recorded"
+_NATIVE_USAGE_EVENT_DEDUPE_KEY_LIMIT = 100_000
 
 
 # ---------------------------------------------------------------------------
@@ -61,6 +61,7 @@ class UsageTrackingState:
     usage_log_lock: object = field(default_factory=Lock)
     recent_usage_events: deque[dict] = field(default_factory=deque)
     archived_usage_events: list[dict] = field(default_factory=list)
+    native_usage_event_dedupe_keys: OrderedDict[str, None] = field(default_factory=OrderedDict)
     session_request_id_lock: object = field(default_factory=Lock)
     latest_server_request_ids_by_chain: dict[tuple[str, str], str] = field(default_factory=dict)
     active_server_request_ids_by_request: dict[str, dict[str, str | None]] = field(default_factory=dict)
@@ -437,7 +438,6 @@ def _usage_event_archive_summary(event: dict) -> dict:
         "server_request_id": event.get("server_request_id"),
         "status_code": event.get("status_code"),
         "success": event.get("success"),
-        "premium_requests": _counted_premium_requests(event),
         "cost_usd": round(_coerce_float(event.get("cost_usd")), 6),
     }
 
@@ -456,6 +456,8 @@ def _usage_event_archive_summary(event: dict) -> dict:
         "native_service_tier_source",
         "native_reasoning_effort",
         "native_turn_id",
+        "native_source_event_key",
+        "native_dedupe_key",
     ):
         value = event.get(native_key)
         if value is not None:
@@ -469,6 +471,9 @@ def _usage_event_archive_summary(event: dict) -> dict:
 
 
 def _usage_event_archive_key(summary: dict) -> str:
+    native_dedupe_key = _native_usage_event_dedupe_key(summary)
+    if native_dedupe_key:
+        return f"native:{native_dedupe_key}"
     request_id = summary.get("request_id")
     if isinstance(request_id, str) and request_id:
         return f"request:{request_id}"
@@ -608,6 +613,31 @@ class UsageTracker:
     def create_sse_capture(self, stream_type: str) -> SSEUsageCapture:
         return SSEUsageCapture(stream_type)
 
+    def _register_native_usage_event_locked(self, event: dict) -> bool:
+        """Return whether a native usage observation has not been recorded yet.
+
+        The scanner is intentionally read-only and may revisit a rollout after
+        a cursor reset or when Codex preserves a turn in another rollout file.
+        Only native events have a durable logical-turn fingerprint, so leave
+        proxied request attempts untouched.
+        """
+        key = _native_usage_event_dedupe_key(event)
+        if not key:
+            return True
+        keys = self.state.native_usage_event_dedupe_keys
+        if key in keys:
+            keys.move_to_end(key)
+            return False
+        keys[key] = None
+        while len(keys) > _NATIVE_USAGE_EVENT_DEDUPE_KEY_LIMIT:
+            keys.popitem(last=False)
+        return True
+
+    def _rebuild_native_usage_event_dedupe_keys_locked(self) -> None:
+        self.state.native_usage_event_dedupe_keys.clear()
+        for event in (*self.state.archived_usage_events, *self.state.recent_usage_events):
+            self._register_native_usage_event_locked(event)
+
     # ------------------------------------------------------------------
     # State management
     # ------------------------------------------------------------------
@@ -616,6 +646,7 @@ class UsageTracker:
         with self.state.usage_log_lock:
             self.state.recent_usage_events.clear()
             self.state.archived_usage_events.clear()
+            self.state.native_usage_event_dedupe_keys.clear()
         with self.state.session_request_id_lock:
             self.state.latest_server_request_ids_by_chain.clear()
             self.state.active_server_request_ids_by_request.clear()
@@ -639,13 +670,18 @@ class UsageTracker:
         ]
         with self.state.usage_log_lock:
             self.state.recent_usage_events.clear()
-            self.state.recent_usage_events.extend(normalized_recent)
             self.state.archived_usage_events.clear()
-            self.state.archived_usage_events.extend(normalized_archived)
+            self.state.native_usage_event_dedupe_keys.clear()
+            for event in normalized_archived:
+                if self._register_native_usage_event_locked(event):
+                    self.state.archived_usage_events.append(event)
+            for event in normalized_recent:
+                if self._register_native_usage_event_locked(event):
+                    self.state.recent_usage_events.append(event)
 
     def snapshot_archived_usage_events(self) -> list[dict]:
         with self.state.usage_log_lock:
-            return list(self.state.archived_usage_events)
+            return deduplicate_usage_events(self.state.archived_usage_events)
 
     def remember_latest_server_request_id(
         self,
@@ -914,10 +950,18 @@ class UsageTracker:
 
         os.makedirs(os.path.dirname(self.usage_log_file) or TOKEN_DIR, exist_ok=True)
         serialized = json.dumps(event, separators=(",", ":"), default=_json_default)
+        native_dedupe_key = _native_usage_event_dedupe_key(event)
         with self.state.usage_log_lock:
-            with open(self.usage_log_file, "a", encoding="utf-8") as f:
-                f.write(serialized)
-                f.write("\n")
+            if not self._register_native_usage_event_locked(event):
+                return
+            try:
+                with open(self.usage_log_file, "a", encoding="utf-8") as f:
+                    f.write(serialized)
+                    f.write("\n")
+            except Exception:
+                if native_dedupe_key:
+                    self.state.native_usage_event_dedupe_keys.pop(native_dedupe_key, None)
+                raise
             self.state.recent_usage_events.append(event)
         self._compact_if_needed()
         self._remember_server_request_id(event)
@@ -944,7 +988,7 @@ class UsageTracker:
             self.archive_store.mark_unavailable(str(exc))
             return
 
-        self.state.archived_usage_events.clear()
+        loaded_events: list[dict] = []
         for row in rows:
             try:
                 payload = json.loads(row["payload_json"])
@@ -952,7 +996,11 @@ class UsageTracker:
                 continue
             normalized_event = _normalize_recorded_usage_event(payload, refresh_native_tiers=False)
             if normalized_event is not None:
-                self.state.archived_usage_events.append(normalized_event)
+                loaded_events.append(normalized_event)
+        with self.state.usage_log_lock:
+            self.state.archived_usage_events.clear()
+            self.state.archived_usage_events.extend(deduplicate_usage_events(loaded_events))
+            self._rebuild_native_usage_event_dedupe_keys_locked()
 
     def _compact_if_needed(self):
         with self.state.usage_log_lock:
@@ -1010,7 +1058,11 @@ class UsageTracker:
         if not os.path.exists(self.usage_log_file):
             return
 
+        loaded_events: list[dict] = []
         try:
+            # Hold the same lock used by persistence: replacing the in-memory
+            # history after an unlocked file read could otherwise discard an
+            # event that completed while this reload was in progress.
             with self.state.usage_log_lock:
                 with open(self.usage_log_file, encoding="utf-8") as f:
                     for line in f:
@@ -1022,13 +1074,21 @@ class UsageTracker:
                         except json.JSONDecodeError:
                             continue
                         normalized_event = _normalize_recorded_usage_event(payload, refresh_native_tiers=False)
-                        if normalized_event is None:
-                            continue
-                        self.state.recent_usage_events.append(normalized_event)
-                        self._remember_server_request_id(normalized_event)
-                        self._remember_latest_claude_user_session_context(normalized_event)
+                        if normalized_event is not None:
+                            loaded_events.append(normalized_event)
+
+                loaded_events = deduplicate_usage_events(loaded_events)
+                self.state.recent_usage_events.clear()
+                self._rebuild_native_usage_event_dedupe_keys_locked()
+                for event in loaded_events:
+                    if self._register_native_usage_event_locked(event):
+                        self.state.recent_usage_events.append(event)
         except OSError:
-            pass
+            return
+
+        for event in self.snapshot_usage_events():
+            self._remember_server_request_id(event)
+            self._remember_latest_claude_user_session_context(event)
         self._compact_if_needed()
 
     # ------------------------------------------------------------------
@@ -1227,7 +1287,8 @@ class UsageTracker:
             if content_type:
                 finished_event["response_content_type"] = content_type
 
-            # Copilot upstream emits x-quota-snapshot-{chat,completions,premium_interactions}
+            # Retain any legacy Copilot x-quota-snapshot headers for old-log
+            # compatibility even though current billing is token based.
             # with URL-encoded "ent=...&ov=...&ovPerm=...&rem=...&rst=..." values.
             # `rem` is a remaining percentage, not an absolute count. This is more
             # authoritative than the user-scoped /settings/billing endpoint because
@@ -1238,8 +1299,7 @@ class UsageTracker:
 
             # Copilot CLI's chat completions also emit per-window usage gauges.
             # We surface them so the dashboard and response reminders can show the
-            # live session/weekly throttles GitHub uses to slow Copilot down before
-            # the monthly premium cap bites.
+            # live session/weekly throttles GitHub applies independently of billing.
             usage_ratelimits = extract_usage_ratelimits_from_headers(upstream.headers)
             if usage_ratelimits:
                 finished_event["usage_ratelimits"] = usage_ratelimits
@@ -1297,12 +1357,6 @@ class UsageTracker:
             model_name=model_name,
             usage=derived_usage,
         )
-        finished_event["premium_requests"] = _counted_premium_requests(
-            {
-                **finished_event,
-                "premium_requests": _premium_request_multiplier(model_name) if status_code < 400 else 0.0,
-            }
-        )
         self._remember_server_request_id(finished_event)
         self._remember_latest_claude_user_session_context(finished_event)
         self._persist_event(finished_event)
@@ -1313,11 +1367,13 @@ class UsageTracker:
 
     def snapshot_usage_events(self) -> list[dict]:
         with self.state.usage_log_lock:
-            return list(self.state.recent_usage_events)
+            return deduplicate_usage_events(self.state.recent_usage_events)
 
     def snapshot_all_usage_events(self) -> list[dict]:
         with self.state.usage_log_lock:
-            return [*list(self.state.archived_usage_events), *list(self.state.recent_usage_events)]
+            return deduplicate_usage_events(
+                [*self.state.archived_usage_events, *self.state.recent_usage_events]
+            )
 
     # ------------------------------------------------------------------
     # Error recording

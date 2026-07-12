@@ -20,6 +20,7 @@ _COPILOT_LOCAL_ONLY_RESPONSES_BODY_KEYS = {
     "promptCacheKey",
     "prompt_cache_retention",
     "previous_response_id",
+    "previousResponseId",
     "session_id",
     "sessionId",
 }

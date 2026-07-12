@@ -1,6 +1,7 @@
 """Pure stateless utility functions for ghcp_proxy."""
 
 import glob
+import hashlib
 import gzip
 import json
 import os
@@ -27,7 +28,7 @@ try:
 except ImportError:
     brotli = None
 
-from constants import MODEL_PRICING_ALIASES, MODEL_PRICING, PREMIUM_REQUEST_MULTIPLIERS
+from constants import MODEL_PRICING_ALIASES, MODEL_PRICING
 
 
 # ---------------------------------------------------------------------------
@@ -232,6 +233,19 @@ def _codex_native_session_id_from_request_id(request_id: str | None) -> str | No
     remainder = request_id[len(prefix):]
     if not remainder:
         return None
+    # Newer native records include a per-rollout path fingerprint before their
+    # per-file sequence number. Keep the session component intact so fallback
+    # grouping does not turn one native session into many synthetic sessions.
+    path_parts = remainder.rsplit(":", 2)
+    if len(path_parts) == 3:
+        session_id, path_fingerprint, turn_id = path_parts
+        if (
+            session_id
+            and len(path_fingerprint) == 16
+            and all(ch in "0123456789abcdefABCDEF" for ch in path_fingerprint)
+            and turn_id.isdigit()
+        ):
+            return session_id
     session_id, separator, turn_id = remainder.rpartition(":")
     if not separator or not session_id or not turn_id:
         return None
@@ -481,6 +495,82 @@ def _usage_event_source(event: dict | None) -> str:
 
     return "codex"
 
+
+def _native_usage_event_dedupe_key(event: dict | None) -> str | None:
+    """Return a stable idempotency key for one native Codex usage observation.
+
+    Native rollout logs can contain the same completed turn in more than one
+    rollout file.  The source file is deliberately not part of the normal key:
+    identical observations of the same session/turn/model should count once,
+    while a changed token snapshot for that turn must remain visible.
+    """
+    if not isinstance(event, dict):
+        return None
+
+    request_id = event.get("request_id")
+    source = _usage_event_source(event)
+    if source != "codex_native" and not (
+        isinstance(request_id, str) and request_id.startswith("codex-native:")
+    ):
+        return None
+
+    explicit_key = event.get("native_dedupe_key")
+    if isinstance(explicit_key, str) and explicit_key.strip():
+        return f"native-explicit:{explicit_key.strip()}"
+
+    session_id = event.get("session_id")
+    turn_id = event.get("native_turn_id")
+    if isinstance(session_id, str) and session_id.strip() and isinstance(turn_id, str) and turn_id.strip():
+        usage = normalize_usage_payload(event.get("usage")) or {}
+        model = (
+            event.get("response_model")
+            or event.get("resolved_model")
+            or event.get("requested_model")
+            or ""
+        )
+        identity = {
+            "session_id": session_id.strip(),
+            "turn_id": turn_id.strip(),
+            "model": str(model).strip().lower(),
+            "usage": {
+                "input_tokens": _coerce_int(usage.get("input_tokens")),
+                "cached_input_tokens": _coerce_int(usage.get("cached_input_tokens")),
+                "cache_creation_input_tokens": _coerce_int(usage.get("cache_creation_input_tokens")),
+                "output_tokens": _coerce_int(usage.get("output_tokens")),
+                "reasoning_output_tokens": _coerce_int(usage.get("reasoning_output_tokens")),
+                "total_tokens": _coerce_int(usage.get("total_tokens")),
+            },
+        }
+        serialized = json.dumps(identity, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        digest = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+        return f"native-turn:{digest}"
+
+    source_event_key = event.get("native_source_event_key")
+    if isinstance(source_event_key, str) and source_event_key.strip():
+        return f"native-source:{source_event_key.strip()}"
+    return None
+
+
+def deduplicate_usage_events(events) -> list[dict]:
+    """Keep the first occurrence of each duplicate native usage observation.
+
+    This is intentionally native-only: proxied Responses requests do not have a
+    comparable durable source-event identity, and collapsing those could hide a
+    real retry that reached the upstream service.
+    """
+    deduplicated: list[dict] = []
+    seen_native_keys: set[str] = set()
+    for event in events or ():
+        if not isinstance(event, dict):
+            continue
+        key = _native_usage_event_dedupe_key(event)
+        if key:
+            if key in seen_native_keys:
+                continue
+            seen_native_keys.add(key)
+        deduplicated.append(event)
+    return deduplicated
+
 # ---------------------------------------------------------------------------
 # Pricing helpers
 # ---------------------------------------------------------------------------
@@ -533,6 +623,18 @@ def _usage_event_cost_breakdown(model_name: str | None, usage: dict | None) -> d
     if cache_creation_input_tokens is None:
         cache_creation_input_tokens = _coerce_int(usage.get("cache_creation_input_tokens"))
     reasoning_output_tokens = _coerce_int(usage.get("reasoning_output_tokens"))
+
+    billed_input_tokens = input_tokens + cached_input_tokens + cache_creation_input_tokens
+    long_context_threshold = _coerce_int(entry.get("long_context_threshold"), default=None)
+    if long_context_threshold is not None and billed_input_tokens > long_context_threshold:
+        entry = {
+            **entry,
+            "input_per_million": entry.get("long_context_input_per_million", entry.get("input_per_million")),
+            "cached_input_per_million": entry.get(
+                "long_context_cached_input_per_million", entry.get("cached_input_per_million")
+            ),
+            "output_per_million": entry.get("long_context_output_per_million", entry.get("output_per_million")),
+        }
 
     input_rate = _coerce_float(entry.get("input_per_million"))
     output_rate = _coerce_float(entry.get("output_per_million"))
@@ -588,22 +690,6 @@ def _usage_event_estimated_cost(
     if resolved_usage is None and isinstance(event, dict):
         resolved_usage = event.get("usage")
     return _usage_event_cost(resolved_model_name, resolved_usage) * _usage_event_cost_multiplier(event)
-
-
-def _premium_request_multiplier(model_name: str | None) -> float:
-    normalized = _normalize_model_name(model_name)
-    if not normalized:
-        return 1.0
-    return PREMIUM_REQUEST_MULTIPLIERS.get(normalized, 1.0)
-
-
-def _counted_premium_requests(event: dict | None) -> float:
-    if not isinstance(event, dict):
-        return 0.0
-    initiator = event.get("initiator")
-    if isinstance(initiator, str) and initiator.strip().lower() == "agent":
-        return 0.0
-    return _coerce_float(event.get("premium_requests"))
 
 
 # ---------------------------------------------------------------------------

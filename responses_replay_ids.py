@@ -8,6 +8,8 @@ import threading
 from collections import OrderedDict
 from collections.abc import Mapping
 
+from request_headers import responses_replay_affinity_value
+
 
 _MAX_LINEAGE_STATES = 256
 _MAX_IDS_PER_STATE = 4096
@@ -37,17 +39,54 @@ def _header_value(headers, name: str) -> str | None:
     return None
 
 
-def lineage_key_for_body(body: dict | None, headers=None) -> str | None:
+def lineage_key_for_body(
+    body: dict | None,
+    headers=None,
+    *,
+    subagent: str | None = None,
+) -> str | None:
     """Return the stable request lineage used to persist upstream item ids."""
+    effective_subagent = (
+        _normalized_non_empty_string(subagent)
+        or _header_value(headers, "x-openai-subagent")
+    )
     if isinstance(body, dict):
         for key in ("prompt_cache_key", "promptCacheKey"):
             value = _normalized_non_empty_string(body.get(key))
             if value:
-                return f"prompt_cache:{value}"
+                # Header affinity gives rollout-memory writers a private
+                # namespace, but replay repair used to retain their raw prompt
+                # cache key. That let background JSON writers and the visible
+                # conversation share repaired item IDs.
+                effective_affinity = responses_replay_affinity_value(
+                    body, subagent=effective_subagent
+                )
+                return f"prompt_cache:{effective_affinity or value}"
         for key in ("session_id", "sessionId"):
             value = _normalized_non_empty_string(body.get(key))
             if value:
-                return f"session:{value}"
+                effective_affinity = responses_replay_affinity_value(
+                    body, subagent=effective_subagent
+                )
+                return f"session:{effective_affinity or value}"
+
+        metadata = body.get("metadata")
+        if isinstance(metadata, dict):
+            for key in ("session_id", "sessionId"):
+                value = _normalized_non_empty_string(metadata.get(key))
+                if value:
+                    effective_affinity = responses_replay_affinity_value(
+                        body, subagent=effective_subagent
+                    )
+                    return f"session:{effective_affinity or value}"
+
+        for key in ("previous_response_id", "previousResponseId"):
+            value = _normalized_non_empty_string(body.get(key))
+            if value:
+                effective_affinity = responses_replay_affinity_value(
+                    body, subagent=effective_subagent
+                )
+                return f"previous_response:{effective_affinity or value}"
 
     for header_name in (
         "x-client-session-id",
@@ -60,11 +99,6 @@ def lineage_key_for_body(body: dict | None, headers=None) -> str | None:
         value = _header_value(headers, header_name)
         if value:
             return f"header:{header_name}:{value}"
-
-    if isinstance(body, dict):
-        value = _normalized_non_empty_string(body.get("previous_response_id"))
-        if value:
-            return f"previous_response:{value}"
 
     return None
 
@@ -365,13 +399,23 @@ def state_for_lineage_key(lineage_key: str | None) -> ReplayIdState | None:
         return state
 
 
-def state_for_body(body: dict | None, headers=None) -> tuple[str | None, ReplayIdState | None]:
-    lineage_key = lineage_key_for_body(body, headers=headers)
+def state_for_body(
+    body: dict | None,
+    headers=None,
+    *,
+    subagent: str | None = None,
+) -> tuple[str | None, ReplayIdState | None]:
+    lineage_key = lineage_key_for_body(body, headers=headers, subagent=subagent)
     return lineage_key, state_for_lineage_key(lineage_key)
 
 
-def repair_missing_replay_ids(body: dict, headers=None) -> tuple[dict, dict | None]:
-    lineage_key, state = state_for_body(body, headers=headers)
+def repair_missing_replay_ids(
+    body: dict,
+    headers=None,
+    *,
+    subagent: str | None = None,
+) -> tuple[dict, dict | None]:
+    lineage_key, state = state_for_body(body, headers=headers, subagent=subagent)
     if state is None:
         return body, None
     repaired_body, trace = state.repair_missing_replay_ids(body)

@@ -14,7 +14,7 @@ from typing import Callable, Mapping
 
 from fastapi import HTTPException
 
-from constants import CODEX_PROXY_BASE_URL, DASHBOARD_BASE_URL, MODEL_PRICING, PREMIUM_REQUEST_MULTIPLIERS
+from constants import CODEX_PROXY_BASE_URL, DASHBOARD_BASE_URL, MODEL_PRICING
 
 LEGACY_CODEX_PROXY_BASE_URL = "http://localhost:8000/v1"
 LEGACY_DASHBOARD_BASE_URL = "http://localhost:8000"
@@ -34,6 +34,37 @@ _REASONING_LEVEL_DESCRIPTIONS = {
 _DEFAULT_REASONING_EFFORTS = ["low", "medium", "high", "xhigh"]
 _REASONING_EFFORT_RANK = {"minimal": 0, "low": 1, "medium": 2, "high": 3, "xhigh": 4}
 _DEFAULT_PREFERRED_REASONING = ("medium", "low", "high", "xhigh", "minimal")
+
+
+def _format_token_rate(value: object) -> str:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        numeric = 0.0
+    return f"${numeric:.3f}".rstrip("0").rstrip(".")
+
+
+def _model_token_pricing_description(model_name: str) -> str:
+    pricing = MODEL_PRICING.get(model_name)
+    if not isinstance(pricing, Mapping):
+        return "Token pricing unavailable"
+    parts = [
+        f"{_format_token_rate(pricing.get('input_per_million'))} input",
+        f"{_format_token_rate(pricing.get('cached_input_per_million'))} cached",
+    ]
+    if pricing.get("cache_write_5m_per_million") is not None:
+        parts.append(f"{_format_token_rate(pricing.get('cache_write_5m_per_million'))} cache write")
+    parts.append(f"{_format_token_rate(pricing.get('output_per_million'))} output")
+    description = " / ".join(parts) + " per 1M tokens"
+    threshold = pricing.get("long_context_threshold")
+    if isinstance(threshold, int) and threshold > 0:
+        description += (
+            f"; over {threshold // 1000}K input: "
+            f"{_format_token_rate(pricing.get('long_context_input_per_million'))} input / "
+            f"{_format_token_rate(pricing.get('long_context_cached_input_per_million'))} cached / "
+            f"{_format_token_rate(pricing.get('long_context_output_per_million'))} output"
+        )
+    return description
 
 
 def _toml_basic_string(value: str) -> str:
@@ -883,18 +914,29 @@ class ProxyClientConfigService:
         remapped_targets = self._catalog_remap_targets(routing_settings)
         default_context = self._config.codex_model_context_window
         default_compact = self._config.codex_model_auto_compact_token_limit
-        available_ids = (
-            set(capabilities.keys()) if isinstance(capabilities, Mapping) else set()
-        )
+        available_ids = {
+            model_id
+            for model_id, model_caps in capabilities.items()
+            if isinstance(model_id, str)
+            and (
+                not isinstance(model_caps, Mapping)
+                or model_caps.get("model_picker_enabled") is not False
+            )
+        } if isinstance(capabilities, Mapping) else set()
         models = []
         for priority, model_name in enumerate(
             self._sorted_catalog_model_names(available_ids, remapped_targets)
         ):
             routed_model_name = remapped_targets.get(model_name, model_name)
-            provider = str(MODEL_PRICING.get(routed_model_name, {}).get("provider") or "Unknown")
             family = self._model_family(routed_model_name)
             caps = capabilities.get(routed_model_name) if isinstance(capabilities, Mapping) else None
             caps = caps if isinstance(caps, Mapping) else {}
+            provider = str(
+                MODEL_PRICING.get(routed_model_name, {}).get("provider")
+                or caps.get("provider")
+                or "Unknown"
+            )
+            display_name = str(caps.get("display_name") or model_name)
 
             context_window = self._coerce_int(caps.get("context_window"), default_context)
             max_context_window = self._coerce_int(caps.get("max_context_window"), context_window)
@@ -923,27 +965,20 @@ class ProxyClientConfigService:
                 default=bool(supported_levels),
             )
             supports_verbosity = family == "gpt"
-            multiplier = PREMIUM_REQUEST_MULTIPLIERS.get(routed_model_name, 1.0)
-            if multiplier == 1.0:
-                premium_text = "1 premium request"
-            else:
-                multiplier_str = (
-                    f"{multiplier:.2f}".rstrip("0").rstrip(".")
-                )
-                premium_text = f"{multiplier_str} premium requests"
+            pricing_text = _model_token_pricing_description(routed_model_name)
             if routed_model_name == model_name:
                 description = (
-                    f"{provider} \u00b7 {context_window:,} token context \u00b7 {premium_text}."
+                    f"{provider} \u00b7 {context_window:,} token context \u00b7 {pricing_text}."
                 )
             else:
                 description = (
                     f"Routed to {routed_model_name} ({provider}) \u00b7 "
-                    f"{context_window:,} token context \u00b7 {premium_text}."
+                    f"{context_window:,} token context \u00b7 {pricing_text}."
                 )
 
             entry: dict[str, object] = {
                 "slug": model_name,
-                "display_name": model_name,
+                "display_name": display_name,
                 "description": description,
                 "shell_type": "shell_command",
                 "visibility": "list",
@@ -1086,6 +1121,9 @@ class ProxyClientConfigService:
     ) -> list[str]:
         family_order = {"gpt": 0, "claude": 1, "gemini": 2, "grok": 3}
         preferred_order = {
+            "gpt-5.6-sol": -23,
+            "gpt-5.6-terra": -22,
+            "gpt-5.6-luna": -21,
             "gpt-5.4": -20,
             "gpt-5.3-codex": -19,
             "gpt-5.4-mini": -18,
@@ -1097,16 +1135,22 @@ class ProxyClientConfigService:
                     return order
             return 99
 
-        model_names = [
+        configured_model_names = {
             model_name
             for model_name in MODEL_PRICING
             if model_name.startswith(("gpt-", "claude-", "gemini-", "grok-"))
-        ]
+        }
+        live_model_names = {
+            model_name
+            for model_name in (available_ids or set())
+            if isinstance(model_name, str) and model_name
+        }
+        model_names = configured_model_names | live_model_names
         # Filter by what the upstream Copilot plan actually exposes via /models.
         # If the capability fetch returned nothing (auth/network blip), fall
         # back to the full pricing list rather than wiping the catalog.
         if available_ids:
-            filtered = [
+            filtered = {
                 name
                 for name in model_names
                 if name in available_ids
@@ -1114,7 +1158,7 @@ class ProxyClientConfigService:
                     isinstance(remapped_targets, Mapping)
                     and remapped_targets.get(name) in available_ids
                 )
-            ]
+            }
             if filtered:
                 model_names = filtered
         return sorted(model_names, key=lambda model_name: (family_key(model_name), preferred_order.get(model_name, 0), model_name))
@@ -1202,15 +1246,10 @@ class ProxyClientConfigService:
         caps = capabilities.get(routed_model_name) if isinstance(capabilities, Mapping) else None
         caps = caps if isinstance(caps, Mapping) else {}
         context_window = self._coerce_int(caps.get("context_window"), self._config.codex_model_context_window)
-        multiplier = PREMIUM_REQUEST_MULTIPLIERS.get(routed_model_name, 1.0)
-        if multiplier == 1.0:
-            premium_text = "1 premium request"
-        else:
-            multiplier_str = f"{multiplier:.2f}".rstrip("0").rstrip(".")
-            premium_text = f"{multiplier_str} premium requests"
+        pricing_text = _model_token_pricing_description(routed_model_name)
         if routed_model_name == model_name:
-            return f"{provider} · {context_window:,} token context · {premium_text}."
-        return f"Routed to {routed_model_name} ({provider}) · {context_window:,} token context · {premium_text}."
+            return f"{provider} · {context_window:,} token context · {pricing_text}."
+        return f"Routed to {routed_model_name} ({provider}) · {context_window:,} token context · {pricing_text}."
 
     def _resolved_catalog_target_name(
         self,

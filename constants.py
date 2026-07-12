@@ -96,7 +96,7 @@ CLAUDE_PROXY_SETTINGS = {
 DETAILED_REQUEST_HISTORY_LIMIT = 5000
 # Cap on the number of detailed request rows serialized into the dashboard
 # bulk payload. The in-memory deque still holds DETAILED_REQUEST_HISTORY_LIMIT
-# events for aggregations (premium summary, daily history, sessions) and for
+# events for aggregations (cost summary, daily history, sessions) and for
 # lazy /api/request-prompt lookups, but the dashboard table only paginates
 # 100 per page; shipping all 5000 events on every refresh sent megabytes of
 # JSON the UI never rendered. 500 covers ~5 pages of history without
@@ -264,29 +264,68 @@ Please write the summary now, following the structure and guidelines above. Be c
 
 # ─── Model pricing & SKU tables ──────────────────────────────────────────────
 MODEL_PRICING = {
+    "claude-fable-5": {
+        "provider": "Anthropic",
+        "input_per_million": 10.00,
+        "cached_input_per_million": 1.00,
+        "cache_write_5m_per_million": 12.50,
+        "output_per_million": 50.00,
+    },
     "claude-haiku-4-5": {
         "provider": "Anthropic",
         "input_per_million": 1.00,
         "cached_input_per_million": 0.10,
+        "cache_write_5m_per_million": 1.25,
         "output_per_million": 5.00,
     },
     "claude-sonnet-4.6": {
         "provider": "Anthropic",
         "input_per_million": 3.00,
         "cached_input_per_million": 0.30,
+        "cache_write_5m_per_million": 3.75,
         "output_per_million": 15.00,
     },
     "claude-opus-4.6": {
         "provider": "Anthropic",
         "input_per_million": 5.00,
         "cached_input_per_million": 0.50,
+        "cache_write_5m_per_million": 6.25,
         "output_per_million": 25.00,
     },
     "claude-opus-4.7": {
         "provider": "Anthropic",
         "input_per_million": 5.00,
         "cached_input_per_million": 0.50,
+        "cache_write_5m_per_million": 6.25,
         "output_per_million": 25.00,
+    },
+    "claude-opus-4.8": {
+        "provider": "Anthropic",
+        "input_per_million": 5.00,
+        "cached_input_per_million": 0.50,
+        "cache_write_5m_per_million": 6.25,
+        "output_per_million": 25.00,
+    },
+    "claude-opus-4.8-fast": {
+        "provider": "Anthropic",
+        "input_per_million": 10.00,
+        "cached_input_per_million": 1.00,
+        "cache_write_5m_per_million": 12.50,
+        "output_per_million": 50.00,
+    },
+    "claude-sonnet-4.5": {
+        "provider": "Anthropic",
+        "input_per_million": 3.00,
+        "cached_input_per_million": 0.30,
+        "cache_write_5m_per_million": 3.75,
+        "output_per_million": 15.00,
+    },
+    "claude-sonnet-5": {
+        "provider": "Anthropic",
+        "input_per_million": 2.00,
+        "cached_input_per_million": 0.20,
+        "cache_write_5m_per_million": 2.50,
+        "output_per_million": 10.00,
     },
     "gpt-4.1": {
         "provider": "OpenAI",
@@ -342,6 +381,36 @@ MODEL_PRICING = {
         "cached_input_per_million": 0.50,
         "output_per_million": 30.00,
     },
+    "gpt-5.6-luna": {
+        "provider": "OpenAI",
+        "input_per_million": 1.00,
+        "cached_input_per_million": 0.10,
+        "output_per_million": 6.00,
+        "long_context_threshold": 200_000,
+        "long_context_input_per_million": 2.00,
+        "long_context_cached_input_per_million": 0.20,
+        "long_context_output_per_million": 9.00,
+    },
+    "gpt-5.6-sol": {
+        "provider": "OpenAI",
+        "input_per_million": 5.00,
+        "cached_input_per_million": 0.50,
+        "output_per_million": 30.00,
+        "long_context_threshold": 272_000,
+        "long_context_input_per_million": 10.00,
+        "long_context_cached_input_per_million": 1.00,
+        "long_context_output_per_million": 45.00,
+    },
+    "gpt-5.6-terra": {
+        "provider": "OpenAI",
+        "input_per_million": 2.50,
+        "cached_input_per_million": 0.25,
+        "output_per_million": 15.00,
+        "long_context_threshold": 272_000,
+        "long_context_input_per_million": 5.00,
+        "long_context_cached_input_per_million": 0.50,
+        "long_context_output_per_million": 22.50,
+    },
     "gpt-5.4-mini": {
         "provider": "OpenAI",
         "input_per_million": 0.75,
@@ -350,15 +419,49 @@ MODEL_PRICING = {
     },
     "gemini-3-flash-preview": {
         "provider": "Google",
-        "input_per_million": 0.10,
-        "cached_input_per_million": 0.025,
-        "output_per_million": 0.40,
+        "input_per_million": 0.50,
+        "cached_input_per_million": 0.05,
+        "output_per_million": 3.00,
+    },
+    "gemini-2.5-pro": {
+        "provider": "Google",
+        "input_per_million": 1.25,
+        "cached_input_per_million": 0.125,
+        "output_per_million": 10.00,
     },
     "gemini-3.1-pro-preview": {
         "provider": "Google",
-        "input_per_million": 1.75,
-        "cached_input_per_million": 0.175,
-        "output_per_million": 14.00,
+        "input_per_million": 2.00,
+        "cached_input_per_million": 0.20,
+        "output_per_million": 12.00,
+        "long_context_threshold": 200_000,
+        "long_context_input_per_million": 4.00,
+        "long_context_cached_input_per_million": 0.40,
+        "long_context_output_per_million": 18.00,
+    },
+    "gemini-3.5-flash": {
+        "provider": "Google",
+        "input_per_million": 1.50,
+        "cached_input_per_million": 0.15,
+        "output_per_million": 9.00,
+    },
+    "kimi-k2.7-code": {
+        "provider": "Moonshot AI",
+        "input_per_million": 0.95,
+        "cached_input_per_million": 0.19,
+        "output_per_million": 4.00,
+    },
+    "mai-code-1-flash-picker": {
+        "provider": "Microsoft",
+        "input_per_million": 0.75,
+        "cached_input_per_million": 0.075,
+        "output_per_million": 4.50,
+    },
+    "oswe-vscode-prime": {
+        "provider": "GitHub",
+        "input_per_million": 0.25,
+        "cached_input_per_million": 0.025,
+        "output_per_million": 2.00,
     },
     "grok-code-fast-1": {
         "provider": "xAI",
@@ -383,33 +486,9 @@ MODEL_PRICING_ALIASES = {
     "gpt-5.4-mini": "gpt-5.4-mini",
     "gpt-5 mini": "gpt-5-mini",
     "gpt-5-mini": "gpt-5-mini",
-}
-
-PREMIUM_REQUEST_MULTIPLIERS = {
-    "claude-haiku-4-5": 0.33,
-    "claude-opus-4.5": 3.0,
-    "claude-opus-4.6": 3.0,
-    "claude-opus-4.7": 7.5,
-    "claude-sonnet-4": 1.0,
-    "claude-sonnet-4.5": 1.0,
-    "claude-sonnet-4.6": 1.0,
-    "gpt-4.1": 0.0,
-    "gpt-4o": 0.0,
-    "gpt-5.2": 1.0,
-    "gpt-5.2-codex": 1.0,
-    "gpt-5.3-codex": 1.0,
-    "gpt-5.4": 1.0,
-    "gpt-5.5": 7.5,
-    "gpt-5.4-mini": 0.33,
-    "gpt-5-mini": 0.0,
-    "gemini-2.5-pro": 1.0,
-    "gemini-3-flash": 0.33,
-    "gemini-3-flash-preview": 0.33,
-    "gemini-3-pro": 1.0,
-    "gemini-3.1-pro": 1.0,
-    "gemini-3.1-pro-preview": 1.0,
-    "grok-code-fast-1": 0.33,
-    "raptor-mini": 0.0,
+    "gpt-5.6 luna": "gpt-5.6-luna",
+    "gpt-5.6 sol": "gpt-5.6-sol",
+    "gpt-5.6 terra": "gpt-5.6-terra",
 }
 
 # ─── Safeguard defaults ──────────────────────────────────────────────────────

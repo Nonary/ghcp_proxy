@@ -3,7 +3,6 @@
 import hashlib
 import json
 import os
-import time
 import uuid
 
 from fastapi import Request
@@ -93,182 +92,73 @@ def _responses_subagent_task_id(parent_scope, subagent, affinity_value=None) -> 
     )
 
 
-_RESPONSES_CURRENT_PARENT_BY_CLIENT_SESSION: dict[str, tuple[str, str, str, float]] = {}
-_RESPONSES_SUBAGENT_PARENT_BY_AFFINITY: dict[str, tuple[str, str, str, float]] = {}
-_RESPONSES_PARENT_CONTEXT_TTL_SECONDS = 10 * 60
-_RESPONSES_PARENT_CONTEXT_MAX_SUBAGENTS = 512
+def _responses_subagent_affinity_scope(subagent: str, affinity_value: str) -> str:
+    return f"{subagent.strip().lower()}:{affinity_value.strip()}"
 
 
-def _responses_parent_context_is_fresh(context: tuple[str, str, str, float] | None) -> bool:
-    if not context:
-        return False
-    try:
-        return (time.monotonic() - float(context[3])) <= _RESPONSES_PARENT_CONTEXT_TTL_SECONDS
-    except (TypeError, ValueError):
-        return False
+def _responses_request_local_subagent_affinity(request_id: str | None) -> str:
+    """Return a safe one-request worker scope when durable affinity is absent.
 
-
-def _responses_fresh_parent_contexts() -> list[tuple[str, str, str, float]]:
-    contexts: list[tuple[str, str, str, float]] = []
-    seen: set[tuple[str, str, str]] = set()
-    for context in _RESPONSES_CURRENT_PARENT_BY_CLIENT_SESSION.values():
-        if not _responses_parent_context_is_fresh(context):
-            continue
-        identity = context[:3]
-        if identity in seen:
-            continue
-        seen.add(identity)
-        contexts.append(context)
-    return contexts
-
-
-def _responses_only_fresh_parent_context() -> tuple[str, str, str] | None:
-    contexts = _responses_fresh_parent_contexts()
-    if len(contexts) != 1:
-        return None
-    return contexts[0][:3]
-
-
-def _responses_current_parent(
-    headers: dict,
-    affinity_value: str | None = None,
-) -> tuple[str, str, str] | None:
-    """Return the active Responses parent context.
-
-    Copilot CLI keeps subagents in the same client-session bucket as the parent
-    turn and sends the parent's x-agent-task-id as x-parent-agent-id.  Codex
-    gives each subagent its own prompt_cache_key, so an exact parent binding is
-    authoritative once learned. Affinity-bearing subagents must not use weak
-    root fallback: an older root may have simply aged out, making an unrelated
-    root look like the only candidate.
+    A named worker without a prompt-cache key or session must not inherit the
+    active root's parent-agent family: that is exactly the shape that lets a
+    concurrent subagent invalidate the root's upstream cache.  There is no
+    reusable lineage to preserve in this case, so request-local isolation is
+    safer than a best-effort parent lookup.
     """
-    normalized_affinity = affinity_value.strip() if isinstance(affinity_value, str) and affinity_value.strip() else None
-    if normalized_affinity:
-        # Once a subagent prompt_cache_key has been attached to a parent, keep
-        # that exact binding authoritative.
-        context = _RESPONSES_SUBAGENT_PARENT_BY_AFFINITY.get(normalized_affinity)
-        if _responses_parent_context_is_fresh(context):
-            return context[:3]
-
-    client_session_id = headers.get("x-client-session-id")
-    if isinstance(client_session_id, str) and client_session_id.strip():
-        context = _RESPONSES_CURRENT_PARENT_BY_CLIENT_SESSION.get(client_session_id.strip())
-        if _responses_parent_context_is_fresh(context):
-            return context[:3]
-
-    if normalized_affinity:
-        return None
-
-    # The first UUID field of Codex prompt_cache_key is only a coarse timestamp
-    # window.  Live multi-session traces show unrelated roots and subagents
-    # sharing it, so using that group or a global "last parent" lets one active
-    # session steal another subagent's upstream parent.  For requests with an
-    # explicit affinity, guessing is still unsafe even when only one fresh root
-    # remains, because earlier roots may have simply aged out.  Only affinity-
-    # less legacy callers get the weak fallback.
-    return _responses_only_fresh_parent_context()
+    if isinstance(request_id, str) and request_id.strip():
+        return f"request:{request_id.strip()}"
+    return f"request:{uuid.uuid4()}"
 
 
-def _remember_responses_subagent_parent(affinity_value: str | None, context: tuple[str, str, str]) -> None:
-    normalized_affinity = affinity_value.strip() if isinstance(affinity_value, str) and affinity_value.strip() else None
-    if not normalized_affinity:
+def _apply_responses_isolated_subagent_context(
+    headers: dict,
+    subagent: str,
+    affinity_value: str,
+) -> None:
+    """Keep an affinity-bearing Codex worker out of its root cache family.
+
+    Copilot's parent-agent fields act as a mutable upstream cache family.  A
+    captured GPT-5.5 miss occurred when three Codex subagents shared that
+    family: an append-only follow-up lost its entire cache hit while a sibling
+    was still in flight.  Unlike a native CLI process, this proxy multiplexes
+    independent Codex workers, so each explicit worker affinity needs its own
+    client, parent, interaction, and task scope.
+    """
+    scope = _responses_subagent_affinity_scope(subagent, affinity_value)
+    client_session_id = _responses_isolated_subagent_client_session_id(scope)
+    if not client_session_id:
         return
-    _RESPONSES_SUBAGENT_PARENT_BY_AFFINITY[normalized_affinity] = (*context, time.monotonic())
-    while len(_RESPONSES_SUBAGENT_PARENT_BY_AFFINITY) > _RESPONSES_PARENT_CONTEXT_MAX_SUBAGENTS:
-        oldest_key = min(
-            _RESPONSES_SUBAGENT_PARENT_BY_AFFINITY,
-            key=lambda key: _RESPONSES_SUBAGENT_PARENT_BY_AFFINITY[key][3],
-        )
-        _RESPONSES_SUBAGENT_PARENT_BY_AFFINITY.pop(oldest_key, None)
-
-
-def _remember_responses_current_parent(headers: dict, affinity_value: str | None = None) -> None:
-    del affinity_value
-    client_session_id = headers.get("x-client-session-id")
-    agent_task_id = headers.get("x-agent-task-id")
-    interaction_id = headers.get("x-interaction-id")
-    if not (
-        isinstance(client_session_id, str)
-        and client_session_id.strip()
-        and isinstance(agent_task_id, str)
-        and agent_task_id.strip()
-        and isinstance(interaction_id, str)
-        and interaction_id.strip()
-    ):
-        return
-    now = time.monotonic()
-    context = (client_session_id.strip(), agent_task_id.strip(), interaction_id.strip(), now)
-    _RESPONSES_CURRENT_PARENT_BY_CLIENT_SESSION[context[0]] = context
-
-
-def _apply_responses_current_parent(headers: dict) -> None:
-    parent = _responses_current_parent(headers)
-    if not parent:
-        return
-    _, parent_task_id, interaction_id = parent
-    headers["x-agent-task-id"] = parent_task_id
-    headers["x-interaction-id"] = interaction_id
-
-
-_ISOLATED_RESPONSES_SUBAGENTS = {"guardian", "memory_consolidation"}
+    headers["x-client-session-id"] = client_session_id
+    headers["x-parent-agent-id"] = _copilot_uuid(
+        f"responses-isolated-subagent-parent:{scope}"
+    )
+    headers["x-interaction-id"] = _copilot_uuid(
+        f"responses-isolated-subagent-interaction:{scope}"
+    )
+    headers["x-agent-task-id"] = _copilot_uuid(
+        f"responses-isolated-subagent-task:{scope}"
+    )
 
 
 def _apply_responses_current_subagent_parent(
     headers: dict,
     subagent: str | None,
     affinity_value: str | None = None,
+    *,
+    request_scope: str | None = None,
 ) -> None:
     if not isinstance(subagent, str) or not subagent.strip():
         return
     sub = subagent.strip()
-    isolated_subagent = sub.lower()
-    if isolated_subagent in _ISOLATED_RESPONSES_SUBAGENTS:
-        # Approval and memory workers are background subagents. Pinning their
-        # x-parent-agent-id to the main agent's task makes them share the main
-        # parent_task cache namespace upstream, so writes from either side can
-        # evict the other's cached prefix. Anchor each worker family in a
-        # synthetic parent per affinity, disjoint from main-agent traffic and
-        # from the same worker in other Codex sessions.
-        client_session_id = (
-            _responses_isolated_subagent_client_session_id(affinity_value)
-            or headers.get("x-client-session-id")
-            or "default"
-        )
-        headers["x-client-session-id"] = client_session_id
-        isolated_parent = _copilot_uuid(
-            f"responses-{isolated_subagent}-parent:{client_session_id}"
-        )
-        isolated_interaction = _copilot_uuid(
-            f"responses-{isolated_subagent}-interaction:{client_session_id}"
-        )
-        headers["x-parent-agent-id"] = isolated_parent
-        headers["x-interaction-id"] = isolated_interaction
-        current_task_id = headers.get("x-agent-task-id")
-        if (
-            not isinstance(current_task_id, str)
-            or not current_task_id.strip()
-            or current_task_id == isolated_parent
-        ):
-            headers["x-agent-task-id"] = _copilot_uuid(
-                f"responses-{isolated_subagent}-task:{client_session_id}"
-            )
-        return
-    parent = _responses_current_parent(headers, affinity_value)
-    if not parent:
-        isolated_client_session_id = _responses_isolated_subagent_client_session_id(affinity_value)
-        if isolated_client_session_id:
-            headers["x-client-session-id"] = isolated_client_session_id
-        return
-    parent_client_session_id, parent_task_id, interaction_id = parent
-    _remember_responses_subagent_parent(affinity_value, parent)
-    current_task_id = headers.get("x-agent-task-id")
-    headers["x-client-session-id"] = parent_client_session_id
-    headers["x-parent-agent-id"] = parent_task_id
-    headers["x-interaction-id"] = interaction_id
-    if not isinstance(current_task_id, str) or not current_task_id.strip() or current_task_id == parent_task_id:
-        headers["x-agent-task-id"] = _copilot_uuid(
-            f"responses-subagent-task:{parent_task_id}:{sub}"
-        )
+    normalized_affinity = (
+        affinity_value.strip()
+        if isinstance(affinity_value, str) and affinity_value.strip()
+        else None
+    )
+    worker_scope = normalized_affinity or _responses_request_local_subagent_affinity(
+        request_scope
+    )
+    _apply_responses_isolated_subagent_context(headers, sub, worker_scope)
 
 
 _COPILOT_MACHINE_ID = hashlib.sha256(f"{uuid.getnode():012x}".encode("utf-8")).hexdigest()
@@ -448,6 +338,16 @@ def _responses_affinity_value(payload, session_id: str | None = None) -> str | N
                         if isolated:
                             return isolated
                         return normalized
+        for key in ("previous_response_id", "previousResponseId"):
+            value = payload.get(key)
+            if isinstance(value, str):
+                normalized = value.strip()
+                if normalized:
+                    # A bare previous-response chain has no durable session or
+                    # prompt-cache key. Keep it out of the fallback task ID
+                    # namespace, where identical user text can otherwise join
+                    # unrelated conversations.
+                    return f"previous_response:{normalized}"
     if isinstance(session_id, str):
         normalized = session_id.strip()
         if normalized:
@@ -455,10 +355,36 @@ def _responses_affinity_value(payload, session_id: str | None = None) -> str | N
     return None
 
 
+def responses_affinity_value(payload, session_id: str | None = None) -> str | None:
+    """Expose the effective Responses affinity used for upstream identity."""
+    return _responses_affinity_value(payload, session_id)
+
+
+def responses_replay_affinity_value(
+    payload,
+    session_id: str | None = None,
+    subagent: str | None = None,
+) -> str | None:
+    """Return the same scope used by upstream headers for replay-ID state."""
+    affinity_value = _responses_affinity_value(payload, session_id)
+    if not affinity_value:
+        return None
+    if isinstance(subagent, str) and subagent.strip():
+        return _responses_subagent_affinity_scope(subagent, affinity_value)
+    return affinity_value
+
+
 def _responses_body_has_affinity_hint(payload) -> bool:
     if not isinstance(payload, dict):
         return False
-    for key in ("prompt_cache_key", "promptCacheKey", "session_id", "sessionId"):
+    for key in (
+        "prompt_cache_key",
+        "promptCacheKey",
+        "session_id",
+        "sessionId",
+        "previous_response_id",
+        "previousResponseId",
+    ):
         value = payload.get(key)
         if isinstance(value, str) and value.strip():
             return True
@@ -680,23 +606,17 @@ def build_responses_headers_for_request(
         if effective_subagent
         else _interaction_type_for_initiator(initiator)
     )
-    stable_affinity = stable_user_affinity or _responses_body_has_affinity_hint(identity_source)
-    affinity_value = _responses_affinity_value(identity_source, session_id) if stable_affinity else None
+    affinity_value = _responses_affinity_value(identity_source, session_id)
+    stable_affinity = (
+        stable_user_affinity
+        or _responses_body_has_affinity_hint(identity_source)
+        or affinity_value is not None
+    )
     affinity_client_session_id = _responses_client_session_id_for_affinity(
         affinity_value, model=body.get("model")
     )
     if affinity_client_session_id and not effective_subagent:
         headers["x-client-session-id"] = affinity_client_session_id
-    if effective_subagent and isinstance(session_id, str) and session_id.strip():
-        # Codex subagents carry their own prompt_cache_key, while the resolved
-        # session id still points at the parent conversation. Use that parent
-        # session bucket for exact parent lookup instead of a process-global
-        # "only fresh root" guess.
-        root_client_session_id = _responses_client_session_id_for_affinity(
-            session_id, model=body.get("model")
-        )
-        if root_client_session_id:
-            headers["x-client-session-id"] = root_client_session_id
     headers.update(
         _responses_copilot_identity_headers(
             identity_source,
@@ -708,9 +628,12 @@ def build_responses_headers_for_request(
         )
     )
     if effective_subagent:
-        _apply_responses_current_subagent_parent(headers, effective_subagent, affinity_value)
-    else:
-        _remember_responses_current_parent(headers, affinity_value)
+        _apply_responses_current_subagent_parent(
+            headers,
+            effective_subagent,
+            affinity_value,
+            request_scope=request_id,
+        )
 
     if has_vision_input(effective_input):
         headers["Copilot-Vision-Request"] = "true"
@@ -729,6 +652,7 @@ def build_chat_headers_for_request(
     session_id_resolver=None,
     verdict_sink: dict | None = None,
     affinity_body: dict | None = None,
+    synthetic_subagent: str | None = None,
 ) -> dict:
     headers = build_copilot_headers(api_key)
     identity_source = affinity_body if isinstance(affinity_body, dict) else None
@@ -739,47 +663,58 @@ def build_chat_headers_for_request(
         session_id_resolver=session_id_resolver,
     )
     affinity_value = _responses_affinity_value(identity_source, session_id)
-    subagent = request.headers.get("x-openai-subagent")
+    inbound_subagent = (
+        request.headers.get("x-openai-subagent")
+        if hasattr(request, "headers")
+        else None
+    )
+    effective_subagent = (
+        inbound_subagent.strip()
+        if isinstance(inbound_subagent, str) and inbound_subagent.strip()
+        else None
+    )
+    if (
+        effective_subagent is None
+        and isinstance(synthetic_subagent, str)
+        and synthetic_subagent.strip()
+    ):
+        effective_subagent = synthetic_subagent.strip()
+    headers.pop("x-openai-subagent", None)
     affinity_client_session_id = _responses_client_session_id_for_affinity(
         affinity_value, model=model_name
     )
     if affinity_client_session_id and not (
-        isinstance(subagent, str) and subagent.strip()
+        isinstance(effective_subagent, str) and effective_subagent.strip()
     ):
         headers["x-client-session-id"] = affinity_client_session_id
 
     initiator = initiator_policy.resolve_chat_messages(
         messages,
         model_name,
-        subagent=subagent,
+        subagent=effective_subagent,
         request_id=request_id,
         verdict_sink=verdict_sink,
     )
     headers["x-initiator"] = initiator
-    headers["x-interaction-type"] = _interaction_type_for_initiator(initiator)
+    headers["x-interaction-type"] = (
+        "conversation-subagent"
+        if effective_subagent
+        else _interaction_type_for_initiator(initiator)
+    )
     headers["x-interaction-id"] = _interaction_id_for_session(session_id)
     headers["x-agent-task-id"] = str(uuid.uuid4())
     if affinity_value:
         headers["x-interaction-id"] = _copilot_uuid(f"chat-interaction:{affinity_value}")
         headers["x-agent-task-id"] = _copilot_uuid(f"chat-task:{affinity_value}")
 
-    if isinstance(subagent, str) and subagent.strip():
-        normalized_subagent = subagent.strip()
+    if effective_subagent:
         headers["x-initiator"] = "agent"
-        headers["x-interaction-type"] = "conversation-subagent"
-        parent_scope = (
-            affinity_value
-            or session_id
-            or headers.get("x-client-request-id")
-            or headers.get("x-client-session-id")
-            or _CLIENT_SESSION_ID
+        _apply_responses_current_subagent_parent(
+            headers,
+            effective_subagent,
+            affinity_value,
+            request_scope=request_id,
         )
-        parent_task_id = _copilot_uuid(f"chat-task:{parent_scope}")
-        headers["x-parent-agent-id"] = parent_task_id
-        headers["x-agent-task-id"] = _copilot_uuid(
-            f"chat-subagent-task:{parent_task_id}:{normalized_subagent}"
-        )
-        headers["x-interaction-id"] = _copilot_uuid(f"chat-interaction:{parent_scope}")
 
     if isinstance(messages, list):
         for msg in messages:

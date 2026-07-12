@@ -13,13 +13,12 @@ and GitHub's acceptable-use rules include service usage limits.
 Use your own account, respect GitHub's limits, and do not use this project to
 evade billing or quotas. Rate limits make runaway usage less likely than it used
 to be, but they are not permission to abuse the service. If you mark every
-ordinary request as free/agent traffic or try to bypass premium-request
-accounting, you are taking on account risk, including possible suspension or a
-permanent ban.
+ordinary request as free/agent traffic or try to bypass billing accounting, you
+are taking on account risk, including possible suspension or a permanent ban.
 
 GitHub remains the source of truth for billing and enforcement:
 
-- [GitHub Copilot premium requests](https://docs.github.com/copilot/managing-copilot/monitoring-usage-and-entitlements/about-premium-requests)
+- [GitHub Copilot models and token pricing](https://docs.github.com/en/copilot/reference/copilot-billing/models-and-pricing)
 - [GitHub Copilot usage limits](https://docs.github.com/en/copilot/concepts/rate-limits)
 - [GitHub API terms](https://docs.github.com/github/site-policy/github-terms-of-service#h-api-terms)
 - [GitHub Acceptable Use Policies](https://docs.github.com/site-policy/acceptable-use-policies/github-acceptable-use-policies)
@@ -59,32 +58,21 @@ In the dashboard:
 That is the normal setup. You do not need Node.js, `npx`, or hand-edited
 `~/.codex` / `~/.claude` config files.
 
-## Premium Requests And Billing
+## Token Pricing And Billing
 
-GitHub Copilot bills and limits usage through premium requests, model
-multipliers, monthly allowances, budgets, and rate limits. GHCP Proxy tries to
-mirror GitHub's billing semantics where it can, but the dashboard is only a
-local estimate. Your GitHub account and billing pages are the source of truth.
-
-Practical rules:
-
-- normal prompts you send should count as user traffic
-- autonomous tool calls should not add premium requests by themselves
-- model requests that produce or consume tool calls can still count
-- premium models can consume more than one premium request through model
-  multipliers
-- requests resolved as agent traffic are tracked locally but estimated as `0`
-  premium requests
+GitHub Copilot usage-based billing prices input, cached-input, cache-write, and
+output tokens according to the selected model, then converts the cost to GitHub
+AI Credits (1 credit = $0.01 USD). GHCP Proxy applies the published per-token
+rates to locally observed usage, but the dashboard remains an estimate. Your
+GitHub account and billing pages are the source of truth.
 
 For responsible use, leave prompts unprefixed most of the time and let the proxy
 classify traffic. Use `_` only when you are deliberately continuing a tool-driven
 agent workflow. Use `+` only when you are starting a fresh user request
 immediately after prior proxy activity and want it counted as user traffic.
 
-The dashboard shows recent request classification, local premium-request
-estimates, and the latest upstream quota snapshot seen in GitHub's
-`x-quota-snapshot-*` response headers. Treat that display as guidance, not a
-guarantee.
+The dashboard shows recent request classification, token counts, and estimated
+cost by token type and provider. Treat that display as guidance, not a guarantee.
 
 ## First-Time Python Setup
 
@@ -266,7 +254,7 @@ before starting a manual copy.
 - Also works with Claude Code
 - Installs Codex and Claude Code integrations from the local dashboard
 - Supports GitHub Copilot auth from the local dashboard on first run
-- Shows tracked GitHub premium request usage for traffic that passes through the proxy
+- Shows input, cached-input, cache-write, output-token, and estimated AI-credit cost data
 - Tracks session, token, and estimated cost data from the proxy's own request log
 - Saves recent request prompt transcripts for dashboard drill-downs; set
   `GHCP_REQUEST_PROMPT_ARCHIVE_DIR` to override that local archive location

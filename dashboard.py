@@ -1,10 +1,4 @@
-"""Dashboard payload construction and SQLite cache.
-
-Premium quota is sourced exclusively from the upstream `x-quota-snapshot-*`
-response headers captured by `usage_tracking.UsageTrackingService`. There is
-no separate REST billing fetch, no manual sync, and no billing token: every
-successful chat completion already tells us what the dashboard needs.
-"""
+"""Dashboard payload construction and SQLite cache."""
 
 import asyncio
 import hashlib
@@ -27,9 +21,9 @@ from util import (
     utc_now, utc_now_iso, _parse_iso_datetime,
     normalize_usage_payload, _normalize_model_name,
     _usage_event_model_name, _usage_event_source,
+    deduplicate_usage_events,
     _pricing_entry_for_model, _usage_event_cost, _usage_event_cost_breakdown,
     _usage_event_cost_multiplier,
-    _premium_request_multiplier, _counted_premium_requests,
     _month_key, month_key_for_source_row, _codex_native_session_id_from_request_id,
 )
 
@@ -526,8 +520,8 @@ def _monotonic_loaded_at_from_payload(payload: dict | None) -> float:
 def seed_cached_payloads_from_sqlite():
     """No-op shim retained for backward compatibility.
 
-    Premium quota is now sourced live from upstream `x-quota-snapshot-*` headers
-    captured by UsageTrackingService. No SQLite-cached premium payload to seed.
+    Usage is calculated from locally recorded token counts. There is no legacy
+    billing payload to seed from SQLite.
     """
     return None
 
@@ -554,7 +548,6 @@ def _new_usage_aggregate_bucket() -> dict:
         "_last_activity_dt": None,
         "project_path": None,
         "request_count": 0,
-        "premium_requests": 0.0,
         "session_id": None,
         "session_kind": "unknown",
         "session_display_id": None,
@@ -633,8 +626,6 @@ def _ingest_usage_event(bucket: dict, event: dict):
     for key, value in cost_breakdown.items():
         bucket_cost_breakdown[key] = bucket_cost_breakdown.get(key, 0.0) + _coerce_float(value)
     bucket["request_count"] += 1
-    bucket["premium_requests"] += _coerce_float(_counted_premium_requests(event))
-
     model_bucket = bucket["_models"].setdefault(model_name, {"inputTokens": 0})
     model_bucket["inputTokens"] += input_tokens
     if model_name not in bucket["_model_order"]:
@@ -666,7 +657,6 @@ def _finalize_usage_bucket(bucket: dict, source: str, *, session_id: str | None 
         "outputTokens": bucket.get("output_tokens", 0),
         "totalTokens": bucket.get("total_tokens", 0),
         "requestCount": bucket.get("request_count", 0),
-        "premiumRequests": round(_coerce_float(bucket.get("premium_requests")), 2),
         "costBreakdown": {
             "input_fresh": round(_coerce_float(cost_breakdown.get("input_fresh")), 6),
             "cached_input": round(_coerce_float(cost_breakdown.get("cached_input")), 6),
@@ -701,6 +691,7 @@ def _aggregate_usage_event_buckets(
         usage_events = snapshot_usage_events() if snapshot_usage_events is not None else []
     else:
         usage_events = list(usage_events)
+    usage_events = deduplicate_usage_events(usage_events)
     source_month_buckets: dict[str, dict[str, dict]] = {}
     source_session_buckets: dict[str, dict[str, dict]] = {}
 
@@ -812,7 +803,6 @@ def _normalize_usage_rollup(source: str, row: dict) -> dict:
         "cache_creation_tokens": cache_creation_tokens,
         "reasoning_output_tokens": reasoning_tokens,
         "request_count": _coerce_int(row.get("requestCount")),
-        "premium_requests": round(_coerce_float(row.get("premiumRequests")), 2),
         "cost_usd": cost_usd,
         "cost_breakdown": cost_breakdown,
         "models": models,
@@ -863,7 +853,6 @@ def _combine_month_rows(rows: list[dict]) -> list[dict]:
                 "cache_creation_tokens": 0,
                 "reasoning_output_tokens": 0,
                 "request_count": 0,
-                "premium_requests": 0.0,
                 "cost_usd": 0.0,
                 "cost_breakdown": {
                     "input_fresh": 0.0,
@@ -881,18 +870,13 @@ def _combine_month_rows(rows: list[dict]) -> list[dict]:
         current["cache_creation_tokens"] += row.get("cache_creation_tokens", 0)
         current["reasoning_output_tokens"] += row.get("reasoning_output_tokens", 0)
         current["request_count"] += row.get("request_count", 0)
-        current["premium_requests"] += _coerce_float(row.get("premium_requests"))
         current["cost_usd"] += row.get("cost_usd", 0.0)
         for key, value in (row.get("cost_breakdown") or {}).items():
             current["cost_breakdown"][key] = current["cost_breakdown"].get(key, 0.0) + _coerce_float(value)
         current["sources"][row["source"]] = row
 
     return [
-        grouped[key]
-        | {
-            "cost_usd": round(grouped[key]["cost_usd"], 4),
-            "premium_requests": round(_coerce_float(grouped[key]["premium_requests"]), 2),
-        }
+        grouped[key] | {"cost_usd": round(grouped[key]["cost_usd"], 4)}
         for key in sorted(grouped.keys(), reverse=True)
     ]
 
@@ -915,7 +899,6 @@ def _combine_day_rows(rows: list[dict]) -> list[dict]:
                 "cache_creation_tokens": 0,
                 "reasoning_output_tokens": 0,
                 "request_count": 0,
-                "premium_requests": 0.0,
                 "cost_usd": 0.0,
                 "cost_breakdown": {
                     "input_fresh": 0.0,
@@ -933,18 +916,13 @@ def _combine_day_rows(rows: list[dict]) -> list[dict]:
         current["cache_creation_tokens"] += row.get("cache_creation_tokens", 0)
         current["reasoning_output_tokens"] += row.get("reasoning_output_tokens", 0)
         current["request_count"] += row.get("request_count", 0)
-        current["premium_requests"] += _coerce_float(row.get("premium_requests"))
         current["cost_usd"] += row.get("cost_usd", 0.0)
         for key, value in (row.get("cost_breakdown") or {}).items():
             current["cost_breakdown"][key] = current["cost_breakdown"].get(key, 0.0) + _coerce_float(value)
         current["sources"][row["source"]] = row
 
     return [
-        grouped[key]
-        | {
-            "cost_usd": round(grouped[key]["cost_usd"], 4),
-            "premium_requests": round(_coerce_float(grouped[key]["premium_requests"]), 2),
-        }
+        grouped[key] | {"cost_usd": round(grouped[key]["cost_usd"], 4)}
         for key in sorted(grouped.keys())
     ]
 
@@ -966,7 +944,6 @@ def _combine_usage_rows(rows: list[dict], *, month_key: str | None = None) -> di
                 "cache_creation_tokens": 0,
                 "reasoning_output_tokens": 0,
                 "request_count": 0,
-                "premium_requests": 0.0,
                 "cost_usd": 0.0,
                 "cost_breakdown": {
                     "input_fresh": 0.0,
@@ -984,7 +961,6 @@ def _combine_usage_rows(rows: list[dict], *, month_key: str | None = None) -> di
         current["cache_creation_tokens"] += row.get("cache_creation_tokens", 0)
         current["reasoning_output_tokens"] += row.get("reasoning_output_tokens", 0)
         current["request_count"] += row.get("request_count", 0)
-        current["premium_requests"] += _coerce_float(row.get("premium_requests"))
         current["cost_usd"] += row.get("cost_usd", 0.0)
         for key, value in (row.get("cost_breakdown") or {}).items():
             current["cost_breakdown"][key] = current["cost_breakdown"].get(key, 0.0) + _coerce_float(value)
@@ -998,7 +974,6 @@ def _combine_usage_rows(rows: list[dict], *, month_key: str | None = None) -> di
         "cache_creation_tokens": sum(item.get("cache_creation_tokens", 0) for item in per_source.values()),
         "reasoning_output_tokens": sum(item.get("reasoning_output_tokens", 0) for item in per_source.values()),
         "request_count": sum(item.get("request_count", 0) for item in per_source.values()),
-        "premium_requests": round(sum(_coerce_float(item.get("premium_requests")) for item in per_source.values()), 2),
         "cost_usd": round(sum(item.get("cost_usd", 0.0) for item in per_source.values()), 4),
         "cost_breakdown": {
             "input_fresh": round(sum(item.get("cost_breakdown", {}).get("input_fresh", 0.0) for item in per_source.values()), 6),
@@ -1037,6 +1012,8 @@ def collect_daily_dashboard_usage(
     else:
         usage_events = list(usage_events)
 
+    usage_events = deduplicate_usage_events(usage_events)
+
     source_day_buckets: dict[str, dict[str, dict]] = {}
     for event in usage_events:
         event_time = _parse_iso_datetime(event.get("finished_at") or event.get("started_at"))
@@ -1073,7 +1050,6 @@ def _empty_day_history_row(day_key: str) -> dict:
         "cache_creation_tokens": 0,
         "reasoning_output_tokens": 0,
         "request_count": 0,
-        "premium_requests": 0.0,
         "cost_usd": 0.0,
         "cost_breakdown": {
             "input_fresh": 0.0,
@@ -1634,6 +1610,7 @@ def _build_window_burn_breakdown(events_for_window: list[dict]) -> dict:
 
 def _build_burn_rate_summary(usage_events: list[dict]) -> dict:
     """Return per-window burn-rate breakdown keyed by window name."""
+    usage_events = deduplicate_usage_events(usage_events)
     # Pre-sort once chronologically so each window walk is consistent.
     timed_events: list[tuple[str, dict]] = []
     for event in usage_events:
@@ -1684,6 +1661,7 @@ def _build_usage_ratelimits_summary(
     output tokens for that model to estimate "% limit decrease per 100K tokens".
     Cached input tokens are excluded from the burn-rate basis.
     """
+    usage_events = deduplicate_usage_events(usage_events)
     latest = _latest_usage_ratelimits(usage_events)
     burn_rate = _build_burn_rate_summary(usage_events)
     if latest is None:
@@ -1717,98 +1695,6 @@ def _build_usage_ratelimits_summary(
         "request_id": latest.get("request_id"),
         "windows": windows_out,
         "burn_rate": burn_rate,
-    }
-
-
-def _build_premium_usage_summary(
-    usage_events: list[dict],
-    *,
-    now: datetime,
-) -> dict:
-    """Build the dashboard's `premium` block from the most recent quota snapshot.
-
-    Source of truth: the `quota_snapshots` field that UsageTrackingService writes
-    on every successful chat completion (parsed from `x-quota-snapshot-*` headers).
-    Returns an `awaiting-first-request` placeholder when no snapshot has been seen.
-    """
-    latest = _latest_quota_snapshots(usage_events)
-    if latest is None:
-        return {
-            "configured": False,
-            "source": "awaiting-first-request",
-            "message": "Make a request through the proxy to populate the live quota.",
-            "captured_at": None,
-            "buckets": {},
-            "included": None,
-            "remaining": None,
-            "used": None,
-            "percent_remaining": None,
-            "percent_used": None,
-            "reset_at": None,
-            "days_until_reset": None,
-            "unlimited": None,
-        }
-
-    snapshots = latest["snapshots"]
-    primary = snapshots.get("premium_interactions") if isinstance(snapshots, dict) else None
-    primary = primary if isinstance(primary, dict) else {}
-
-    reset_at = primary.get("reset_at")
-    days_until_reset = _days_until(reset_at, now)
-
-    return {
-        "configured": True,
-        "source": "upstream-quota-snapshot",
-        "captured_at": latest.get("captured_at"),
-        "request_id": latest.get("request_id"),
-        "buckets": snapshots,
-        "included": primary.get("included"),
-        "remaining": primary.get("absolute_remaining"),
-        "used": primary.get("absolute_used"),
-        "percent_remaining": primary.get("percent_remaining"),
-        "percent_used": primary.get("percent_used"),
-        "overage": primary.get("overage"),
-        "overage_permitted": primary.get("overage_permitted"),
-        "reset_at": reset_at,
-        "days_until_reset": days_until_reset,
-        "unlimited": bool(primary.get("unlimited")),
-    }
-
-
-def _build_premium_consumption_summary(
-    usage_events: list[dict],
-    *,
-    now: datetime,
-) -> dict:
-    day_start = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
-    week_start = day_start - timedelta(days=6)
-    month_start, _month_end = _current_billing_month_bounds(now)
-
-    summary = {
-        "today": 0.0,
-        "last_7_days": 0.0,
-        "current_month": 0.0,
-        "all_time": 0.0,
-    }
-
-    for event in usage_events:
-        event_time = _parse_iso_datetime(event.get("finished_at") or event.get("started_at"))
-        if event_time is None:
-            continue
-        premium_requests = _coerce_float(_counted_premium_requests(event))
-        if premium_requests <= 0:
-            continue
-        summary["all_time"] += premium_requests
-        if event_time >= month_start:
-            summary["current_month"] += premium_requests
-        if event_time >= week_start:
-            summary["last_7_days"] += premium_requests
-        if event_time >= day_start:
-            summary["today"] += premium_requests
-
-    return {
-        key: round(value, 2)
-        for key, value in summary.items()
     }
 
 
@@ -1884,8 +1770,8 @@ class DashboardService:
         month_start, month_end = _current_billing_month_bounds(now)
         current_month_key = _month_key(now)
         current_day_start = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
-        usage_events = self.dependencies.snapshot_all_usage_events()
-        detailed_usage_events = self.dependencies.snapshot_usage_events()
+        usage_events = deduplicate_usage_events(self.dependencies.snapshot_all_usage_events())
+        detailed_usage_events = deduplicate_usage_events(self.dependencies.snapshot_usage_events())
         current_month_events = []
         for event in usage_events:
             recorded_at = _parse_iso_datetime(event.get("finished_at") or event.get("started_at"))
@@ -1894,8 +1780,6 @@ class DashboardService:
             if month_start <= recorded_at < month_end:
                 current_month_events.append(event)
 
-        premium_summary = _build_premium_usage_summary(usage_events, now=now)
-        premium_summary["consumed"] = _build_premium_consumption_summary(usage_events, now=now)
         usage_ratelimits_summary = _build_usage_ratelimits_summary(usage_events, now=now)
 
         local_usage = collect_local_dashboard_usage(usage_events)
@@ -1935,7 +1819,6 @@ class DashboardService:
 
         return {
             "generated_at": now.isoformat(),
-            "premium": premium_summary,
             "usage_ratelimits": usage_ratelimits_summary,
             "safeguard": {
                 "today_count": int(safeguard_stats.get("today_count") or 0),

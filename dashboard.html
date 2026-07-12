@@ -1814,70 +1814,62 @@
         <!-- ─── Right rail ─────────────────────────────────────── -->
         <aside class="rail">
 
-          <!-- Premium Plan (compact, dense) -->
+          <!-- AI credit spend (compact, dense) -->
           <article class="card premium-card">
             <div class="card-head">
               <div>
-                <div class="eyebrow">▮ Premium Plan</div>
+                <div class="eyebrow">▮ AI Credit Usage</div>
               </div>
-              <span class="premium-tone-pill" :class="premiumPaceTone.pillClass" :title="premiumPaceTone.tooltip">
-                <span class="dot"></span>{{ premiumPaceTone.label }}
+              <span class="premium-tone-pill tone-cyan" title="Estimated from recorded token usage and published model rates">
+                <span class="dot"></span>Token priced
               </span>
             </div>
 
             <div class="premium-top">
               <div class="premium-headline">
-                <span class="pct">{{ premiumUsedPercent.toFixed(0) }}%</span>
-                <span class="of">used · {{ premiumUsedLabel }} / {{ premiumIncludedLabel }}</span>
+                <span class="pct">{{ money(currentMonth.cost_usd) }}</span>
+                <span class="of">estimated this month</span>
               </div>
             </div>
 
-            <div class="premium-bar" :title="premiumPaceTone.tooltip">
-              <span class="fill" :class="premiumPaceTone.fillClass" :style="{ width: Math.min(100, premiumUsedPercent) + '%' }"></span>
-              <span v-if="premiumPaceTickPercent !== null"
-                    class="pace"
-                    :style="{ left: premiumPaceTickPercent + '%' }"
-                    :title="'Expected pace at this point in cycle: ' + premiumPaceTickPercent.toFixed(0) + '%'"></span>
-            </div>
             <div class="premium-bar-foot">
-              <span>{{ premiumResetLine }}</span>
-              <span class="right" v-if="premiumPaceTickPercent !== null">pace tick = expected</span>
+              <span>1 AI credit = $0.01 USD</span>
+              <span class="right">input · cached · output tokens</span>
             </div>
 
             <div class="premium-stats">
               <div class="premium-stat">
                 <div class="k">Today</div>
-                <div class="v">{{ premiumCount(premiumTodayCount) }}</div>
-                <div class="sub">{{ premiumWeekPeakDay && premiumWeekPeakDay.is_today ? 'peak day' : '&nbsp;' }}</div>
+                <div class="v">{{ money(todayUsage.cost_usd) }}</div>
+                <div class="sub">estimated</div>
               </div>
               <div class="premium-stat">
                 <div class="k">Avg/day</div>
-                <div class="v">{{ premiumCount(premiumWeekAverage) }}</div>
+                <div class="v">{{ money(averageDailySpend) }}</div>
                 <div class="sub">last 7d</div>
               </div>
               <div class="premium-stat">
-                <div class="k">Peak</div>
-                <div class="v">{{ premiumCount(premiumWeekPeakDay && premiumWeekPeakDay.premium_requests || 0) }}</div>
-                <div class="sub">{{ (premiumWeekPeakDay && Number(premiumWeekPeakDay.premium_requests || 0) > 0) ? premiumWeekPeakDay.dayNumber : '—' }}</div>
+                <div class="k">Tokens</div>
+                <div class="v">{{ compact(currentMonth.total_tokens) }}</div>
+                <div class="sub">this month</div>
               </div>
-              <div class="premium-stat" :class="premiumProjectionStatClass">
+              <div class="premium-stat">
                 <div class="k">Projected</div>
-                <div class="v">{{ premiumProjectedLabel }}</div>
-                <div class="sub">{{ premiumProjectedSubLabel }}</div>
+                <div class="v">{{ money(monthlySpendProjection) }}</div>
+                <div class="sub">month end</div>
               </div>
             </div>
 
             <div class="premium-spark">
-              <div v-for="day in premiumLast7Days" :key="day.day_key"
-                   class="col" :class="{ 'is-today': day.is_today }">
+              <div v-for="day in costLast7Days" :key="day.day_key" class="col" :class="{ 'is-today': day.is_today }">
                 <div class="bar"
                      :style="{ height: Math.max(2, day.fill_percent) + '%' }"
-                     :title="day.dayNumber + ': ' + premiumCount(day.premium_requests) + ' premium'"></div>
+                     :title="day.dayNumber + ': ' + money(day.cost_usd)"></div>
                 <div class="lbl">{{ day.weekday.charAt(0) }}</div>
               </div>
             </div>
             <div class="premium-spark-foot">
-              <span>7-day total <strong style="color:var(--text); font-weight:700;">{{ premiumCount(premiumWeekTotal) }}</strong></span>
+              <span>7-day total <strong style="color:var(--text); font-weight:700;">{{ money(costWeekTotal) }}</strong></span>
               <a href="#" class="card-link" @click.prevent="activeView = 'usage'">Details →</a>
             </div>
           </article>
@@ -1979,11 +1971,8 @@
               :current-month="currentMonth"
               :today-usage="todayUsage"
               :safeguard="safeguardStats"
-              :premium-value="premiumRemainingLabel"
-              :premium-meta="premiumRemainingMetaLabel"
               :tracked-months="trackedMonths"
               :updated-label="updatedLabel"
-              :premium-source-label="premiumSourceLabel"
             ></summary-explorer-card>
           </article>
 
@@ -2213,7 +2202,7 @@
                   <div><div class="detail-label">Requested Model</div><div class="detail-value">{{ selectedRequest.requested_model || '-' }}</div></div>
                   <div><div class="detail-label">Resolved Model</div><div class="detail-value">{{ selectedRequest.response_model || selectedRequest.resolved_model || '-' }}</div></div>
                   <div><div class="detail-label">Initiator</div><div class="detail-value">{{ selectedRequest.initiator || '-' }}</div></div>
-                  <div><div class="detail-label">Premium</div><div class="detail-value">{{ selectedRequest.premium_requests ?? '-' }}</div></div>
+                  <div><div class="detail-label">Estimated cost</div><div class="detail-value">{{ money(selectedRequest.cost_usd) }}</div></div>
                   <div><div class="detail-label">Duration</div><div class="detail-value">{{ selectedRequest.duration_ms != null ? `${selectedRequest.duration_ms} ms` : '-' }}</div></div>
                   <div><div class="detail-label">Cost</div><div class="detail-value">{{ money(selectedRequest.cost_usd) }}</div></div>
                   <div><div class="detail-label">Session ID</div><div class="detail-value mono">{{ selectedRequest.session_id || '-' }}</div></div>
@@ -3178,7 +3167,7 @@
       </p>
       <div class="chips hero-chips">
         <span class="chip">{{ updatedLabel }}</span>
-        <span class="chip">{{ premiumSourceLabel }}</span>
+        <span class="chip">Estimated from published per-token rates</span>
       </div>
       <div class="summary-badges">
         <div class="summary-badge-row">
@@ -3205,12 +3194,7 @@
           <span class="summary-chip"><span class="chip-k">Month</span>{{ integer(safeguard.current_month_count) }}</span>
           <span class="summary-chip"><span class="chip-k">All-Time</span>{{ integer(safeguard.all_time_count) }}</span>
         </div>
-        <div class="summary-badge-row">
-          <span class="summary-label">Premium</span>
-          <span class="summary-chip"><span class="chip-k">Used</span>{{ premiumValue }}</span>
-        </div>
       </div>
-      <div class="subtle">{{ premiumMeta }}</div>
     </article>
   </template>
   <script>
@@ -3501,11 +3485,8 @@
         currentMonth: { type: Object, default: () => ({}) },
         todayUsage: { type: Object, default: () => ({}) },
         safeguard: { type: Object, default: () => ({}) },
-        premiumValue: { type: String, default: '-' },
-        premiumMeta: { type: String, default: '' },
         trackedMonths: { type: Number, default: 0 },
         updatedLabel: { type: String, default: '' },
-        premiumSourceLabel: { type: String, default: '' },
       },
       methods: {
         ...sharedFormatters,
@@ -4918,6 +4899,24 @@
         monthlyTokenMeta() {
           return `${this.compact(this.allTimeTokenConsumption)} total · ${this.compact(this.allTime.input_tokens)} input · ${this.compact(totalTokenConsumption(this.allTime).visible_output_tokens)} output`;
         },
+        costLast7Days() {
+          const rows = (this.dailyHistory || []).slice(-7);
+          const maximum = Math.max(...rows.map((row) => Number(row.cost_usd || 0)), 0);
+          return rows.map((row, index) => {
+            const date = parseDayKey(row.day_key);
+            const cost = Number(row.cost_usd || 0);
+            return {
+              ...row,
+              is_today: index === rows.length - 1,
+              weekday: date ? date.toLocaleDateString([], { weekday: 'short' }) : '-',
+              dayNumber: date ? date.toLocaleDateString([], { month: 'short', day: 'numeric' }) : row.day_key,
+              fill_percent: maximum > 0 ? Math.max(8, (cost / maximum) * 100) : 0,
+            };
+          });
+        },
+        costWeekTotal() {
+          return this.costLast7Days.reduce((sum, row) => sum + Number(row.cost_usd || 0), 0);
+        },
         premiumSourceLabel() {
           const source = String(this.premium.source || '').trim();
           if (source === 'upstream-quota-snapshot') return 'Live quota from upstream response headers';
@@ -4996,7 +4995,7 @@
           const percentUsed = this._asPremiumNumber(this.premium.percent_used);
           const pieces = [];
           if (Number.isFinite(used) && Number.isFinite(included)) {
-            pieces.push(`${this._formatPremiumValue(used)} of ${this._formatPremiumValue(included)} premium requests used`);
+            pieces.push(`${this._formatPremiumValue(used)} of ${this._formatPremiumValue(included)} legacy quota units used`);
           }
           if (Number.isFinite(percentUsed)) {
             pieces.push(`${this._formatPercent(percentUsed)}% used`);
@@ -5026,7 +5025,7 @@
           if (!this.premium.configured) return 'Awaiting first proxied request to capture upstream quota';
           if (this.premium.unlimited) return 'Unlimited plan';
           const included = this._asPremiumNumber(this.premium.included);
-          if (Number.isFinite(included)) return `${this.integer(included)} premium requests included this period`;
+          if (Number.isFinite(included)) return `${this.integer(included)} legacy quota units included this period`;
           return 'Live premium quota from upstream headers';
         },
         premiumConsumedCards() {
@@ -5035,7 +5034,7 @@
             { key: 'today', label: 'Today', value: this.premiumCount(todayConsumed), meta: 'Same local day shown in the expanded view' },
             { key: 'last_7_days', label: '7 Days', value: this.premiumCount(this.premiumWeekTotal), meta: 'Rolling seven-day total' },
             { key: 'current_month', label: 'Month', value: this.premiumCount(this.currentMonth?.premium_requests), meta: 'Current month so far' },
-            { key: 'all_time', label: 'All-Time', value: this.premiumCount(this.allTime?.premium_requests), meta: 'All recorded premium requests' },
+            { key: 'all_time', label: 'All-Time', value: this.premiumCount(this.allTime?.premium_requests), meta: 'All recorded legacy quota units' },
           ];
         },
         premiumLast7Days() {
@@ -5083,7 +5082,7 @@
         },
         premiumWeekPeakMeta() {
           const peak = this.premiumWeekPeakDay;
-          if (!peak || Number(peak.premium_requests || 0) <= 0) return 'No premium requests this week';
+          if (!peak || Number(peak.premium_requests || 0) <= 0) return 'No legacy quota activity this week';
           return `${peak.weekday} ${peak.dayNumber} · ${this.integer(peak.request_count || 0)} proxy call${Number(peak.request_count || 0) === 1 ? '' : 's'}`;
         },
         premiumWeekSummaryLine() {
@@ -5111,7 +5110,7 @@
           return Math.max(0, Math.min(100, p * 100));
         },
         premiumProjectedTotal() {
-          // Project end-of-cycle premium request usage based on rate so far this cycle.
+          // Legacy compatibility projection retained for old dashboard payloads.
           if (this.premium.unlimited) return null;
           const used = this._asPremiumNumber(this.premium.used);
           const p = this.premiumCycleProgress;
@@ -5476,14 +5475,14 @@
           const days14 = (this.dailyHistory || []).slice(-14);
           const monthRows = this.dailyHistory || [];
           const all = this.monthHistoryEnriched || [];
-          const todaySeries = days14.length ? days14.map(r => Number(r.premium_requests || 0)) : [0];
-          const week = days7.map(r => Number(r.premium_requests || 0));
-          const month = monthRows.map(r => Number(r.premium_requests || 0));
-          const allTime = all.length ? all.map(r => Number(r.premium_requests || 0)) : month;
-          const todayVal = Number(this.todayUsage?.premium_requests || 0);
-          const weekTotal = this.premiumWeekTotal;
-          const monthTotal = Number(this.currentMonth?.premium_requests || 0);
-          const allTotal = Number(this.allTime?.premium_requests || 0);
+          const todaySeries = days14.length ? days14.map(r => Number(r.cost_usd || 0)) : [0];
+          const week = days7.map(r => Number(r.cost_usd || 0));
+          const month = monthRows.map(r => Number(r.cost_usd || 0));
+          const allTime = all.length ? all.map(r => Number(r.cost_usd || 0)) : month;
+          const todayVal = Number(this.todayUsage?.cost_usd || 0);
+          const weekTotal = this.costWeekTotal;
+          const monthTotal = Number(this.currentMonth?.cost_usd || 0);
+          const allTotal = Number(this.allTime?.cost_usd || 0);
 
           const buildSpark = (series, w = 200, h = 80) => {
             const arr = (series && series.length ? series : [0]).map(v => Number.isFinite(Number(v)) ? Number(v) : 0);
@@ -5515,20 +5514,20 @@
           const allEnd      = all.length ? (all[all.length-1].label || all[all.length-1].month_label || '') : '';
 
           return [
-            { key: 'today', title: 'Today', value: this.premiumCount(todayVal),
+            { key: 'today', title: 'Today', value: this.money(todayVal),
               desc: 'Same local day shown in the expanded view',
               ...buildSpark(todaySeries),
               xStart: '12 AM', xMid: '12 PM', xEnd: '12 AM' },
-            { key: 'week', title: '7 Days', value: this.premiumCount(weekTotal),
+            { key: 'week', title: '7 Days', value: this.money(weekTotal),
               desc: 'Rolling seven-day total',
               ...buildSpark(week),
               xStart: last7Start, xMid: (days7.length > 2 ? labelDate(dayKeyToDate(days7[Math.floor(days7.length/2)].day_key)) : ''), xEnd: last7End },
-            { key: 'month', title: 'Month', value: this.premiumCount(monthTotal),
+            { key: 'month', title: 'Month', value: this.money(monthTotal),
               desc: 'Current month so far',
               ...buildSpark(month),
               xStart: monthStart, xMid: (monthRows.length > 2 ? labelDate(dayKeyToDate(monthRows[Math.floor(monthRows.length/2)].day_key)) : ''), xEnd: monthEnd },
-            { key: 'all', title: 'All-Time', value: this.premiumCount(allTotal),
-              desc: 'All recorded premium requests',
+            { key: 'all', title: 'All-Time', value: this.money(allTotal),
+              desc: 'All recorded token cost',
               ...buildSpark(allTime),
               xStart: allStart, xMid: (all.length > 2 ? (all[Math.floor(all.length/2)].label || all[Math.floor(all.length/2)].month_label || '') : ''), xEnd: allEnd },
           ];

@@ -90,7 +90,7 @@ from bridge_streams import (
     ResponsesStreamIdSyncer,
     ResponsesToAnthropicStreamTranslator,
 )
-from initiator_policy import InitiatorPolicy
+from initiator_policy import InitiatorPolicy, is_approval_agent_request
 from event_bus import EventBus
 from model_routing_config import ModelRoutingConfig, ModelRoutingConfigService, model_provider_family
 from protocol_bridge import BridgeExecutionPlan, ProtocolBridgePlanner
@@ -210,7 +210,6 @@ _DEBUG_DETAIL_SNAPSHOT_SEQUENCE = 0
 CACHE_SETTLE_DELAY_SECONDS = 0.0
 _PROMPT_CACHE_SETTLE_LOCK = threading.Lock()
 _PROMPT_CACHE_LAST_FINISH_BY_FAMILY: dict[tuple[str, str], tuple[str, float]] = {}
-
 
 def _reset_debug_detail_capture_state() -> None:
     global _DEBUG_DETAIL_SNAPSHOT_SEQUENCE
@@ -755,6 +754,7 @@ class UpstreamRequestPlan:
     requested_model: str | None
     resolved_model: str | None
     source_body: dict | None = None
+    replay_subagent: str | None = None
     trace_context: dict | None = None
     debug_detail_session_key: str | None = None
     auto_update_request_tracked: bool = False
@@ -2114,6 +2114,7 @@ def _prepare_upstream_request(
     api_key: str | None = None,
     source_body: dict | None = None,
     trace_metadata: dict | None = None,
+    replay_subagent: str | None = None,
 ) -> tuple[UpstreamRequestPlan | None, Response | None]:
     request_id = uuid4().hex
 
@@ -2217,6 +2218,11 @@ def _prepare_upstream_request(
             requested_model=requested_model,
             resolved_model=resolved_model,
             source_body=source_body if isinstance(source_body, dict) else body,
+            replay_subagent=(
+                replay_subagent.strip()
+                if isinstance(replay_subagent, str) and replay_subagent.strip()
+                else None
+            ),
             trace_context=trace_context,
             debug_detail_session_key=debug_detail_session_key,
             auto_update_request_tracked=True,
@@ -2230,6 +2236,35 @@ def _bridge_error_response(plan: BridgeExecutionPlan):
     if plan.caller_protocol == "anthropic":
         return format_translation.anthropic_error_response
     return format_translation.openai_error_response
+
+
+def _responses_effective_subagent(
+    request: Request,
+    body: dict | None,
+    *,
+    approval_agent: bool | None = None,
+) -> str | None:
+    """Return the inbound or synthesized worker identity for Responses state.
+
+    The header builder intentionally removes ``x-openai-subagent`` before the
+    Copilot request is sent. Keep its normalized value with the request plan so
+    replay-ID observation and repair stay in the same worker namespace.  An
+    approval prompt without the inbound header is synthesized as ``guardian``
+    by the bridge, so replay state needs that same identity too.
+    """
+    inbound_subagent = (
+        request.headers.get("x-openai-subagent")
+        if hasattr(request, "headers")
+        else None
+    )
+    if isinstance(inbound_subagent, str) and inbound_subagent.strip():
+        return inbound_subagent.strip()
+    if approval_agent is None:
+        approval_agent = is_approval_agent_request(
+            inbound_protocol="responses",
+            body=body if isinstance(body, dict) else None,
+        )
+    return "guardian" if approval_agent else None
 
 
 import request_headers as _request_headers_module
@@ -2367,6 +2402,7 @@ def _build_bridge_headers(
             session_id_resolver=usage_tracking.request_session_id,
             verdict_sink=verdict_sink,
             affinity_body=original_body,
+            synthetic_subagent="guardian" if bridge_plan.approval_agent else None,
         )
     if bridge_plan.header_kind == "anthropic":
         return format_translation.build_anthropic_headers_for_request(
@@ -2414,6 +2450,11 @@ def _prepare_bridge_request(
         trace_metadata["sanitizer_diagnostics"] = list(bridge_plan.diagnostics)
     if isinstance(trace_metadata_extra, dict):
         trace_metadata.update(trace_metadata_extra)
+    replay_subagent = _responses_effective_subagent(
+        request,
+        original_body,
+        approval_agent=bridge_plan.approval_agent,
+    )
     return _prepare_upstream_request(
         request,
         body=bridge_plan.upstream_body,
@@ -2434,6 +2475,7 @@ def _prepare_bridge_request(
         api_key=api_key,
         source_body=original_body,
         trace_metadata=trace_metadata,
+        replay_subagent=replay_subagent,
     )
 
 
@@ -2557,6 +2599,7 @@ async def _post_bridge_non_streaming_request(plan: UpstreamRequestPlan, bridge_p
         _, replay_id_state = responses_replay_ids.state_for_body(
             plan.source_body,
             headers=plan.headers,
+            subagent=plan.replay_subagent,
         )
         if replay_id_state is not None:
             replay_id_state.observe_response_payload(upstream_payload)
@@ -2795,6 +2838,11 @@ async def proxy_streaming_response(
             _, replay_id_state = responses_replay_ids.state_for_body(
                 replay_source_body,
                 headers=replay_headers,
+                subagent=(
+                    trace_plan.replay_subagent
+                    if isinstance(trace_plan, UpstreamRequestPlan)
+                    else None
+                ),
             )
         source_iter = _stream_with_update_notice(upstream.aiter_bytes(), stream_type, getattr(upstream, "headers", None))
         if stream_type == "responses":
@@ -3490,6 +3538,15 @@ def fetch_copilot_model_capabilities() -> dict[str, dict]:
             "input_modalities": input_modalities,
             "vision": vision_flag,
         }
+        picker_enabled = entry.get("model_picker_enabled")
+        if isinstance(picker_enabled, bool):
+            enriched["model_picker_enabled"] = picker_enabled
+        display_name = entry.get("name")
+        if isinstance(display_name, str) and display_name.strip():
+            enriched["display_name"] = display_name.strip()
+        vendor = entry.get("vendor")
+        if isinstance(vendor, str) and vendor.strip():
+            enriched["provider"] = vendor.strip()
         if isinstance(max_prompt_tokens, int) and max_prompt_tokens > 0:
             enriched["context_window"] = max_prompt_tokens
         elif isinstance(max_context_window, int) and max_context_window > 0:
@@ -4084,9 +4141,11 @@ async def responses(request: Request):
 
     replay_id_repair_trace = None
     if native_responses_passthrough:
+        replay_subagent = _responses_effective_subagent(request, body)
         body, replay_id_repair_trace = responses_replay_ids.repair_missing_replay_ids(
             body,
             headers=request.headers,
+            subagent=replay_subagent,
         )
 
     try:
@@ -4220,6 +4279,7 @@ async def chat_completions(request: Request):
             initiator_policy=_initiator_policy,
             session_id_resolver=usage_tracking.request_session_id,
             verdict_sink=verdict_sink,
+            affinity_body=body,
         ),
         error_response=format_translation.openai_error_response,
         trace_metadata={"initiator_verdict": verdict_sink},

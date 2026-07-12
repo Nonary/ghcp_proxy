@@ -17,6 +17,7 @@ idempotent and incremental.
 from __future__ import annotations
 
 import glob
+import hashlib
 import json
 import os
 import threading
@@ -76,6 +77,17 @@ def _save_cursor(cursor: dict) -> None:
 def _iter_rollout_files() -> Iterable[str]:
     pattern = os.path.join(CODEX_SESSIONS_DIR, "*", "*", "*", "rollout-*.jsonl")
     return sorted(glob.glob(pattern))
+
+
+def _rollout_path_fingerprint(path: str) -> str:
+    """Return a stable, privacy-preserving identifier for one rollout file."""
+    normalized_path = os.path.normcase(os.path.abspath(path))
+    return hashlib.sha256(normalized_path.encode("utf-8")).hexdigest()[:16]
+
+
+def _native_source_event_key(path: str, line_start: int) -> str:
+    """Identify one append-only rollout-log record across scanner restarts."""
+    return f"{_rollout_path_fingerprint(path)}:{line_start}"
 
 
 # In-process cache of parsed header state per rollout file. Lets a partial
@@ -322,7 +334,12 @@ def _parse_rollout(
                 plan_type = plan_type_raw.strip() if isinstance(plan_type_raw, str) and plan_type_raw.strip() else None
 
                 ts = record.get("timestamp")
-                request_id = f"codex-native:{meta.session_id or os.path.basename(path)}:{turn_index}"
+                path_fingerprint = _rollout_path_fingerprint(path)
+                request_id = (
+                    f"codex-native:{meta.session_id or os.path.basename(path)}:"
+                    f"{path_fingerprint}:{turn_index}"
+                )
+                source_event_key = _native_source_event_key(path, line_start)
                 turn_index += 1
                 native_service_tiers = _codex_logs_service_tiers(meta.session_id, current_turn_id, ts)
                 native_requested_service_tier = native_service_tiers.get("requested")
@@ -349,7 +366,6 @@ def _parse_rollout(
                     "duration_ms": None,
                     "time_to_first_token_ms": None,
                     "usage": usage,
-                    "premium_requests": 0.0,
                     "quota_snapshots": None,
                     "rate_limit": rate_limits,
                     "native_source": NATIVE_SOURCE_LABEL,
@@ -364,6 +380,7 @@ def _parse_rollout(
                     "native_reasoning_effort": current_effort,
                     "native_turn_id": current_turn_id,
                     "native_rollout_path": path,
+                    "native_source_event_key": source_event_key,
                 }
                 event["cost_usd"] = round(
                     _usage_event_estimated_cost(event, model_name=normalized_model, usage=usage),
