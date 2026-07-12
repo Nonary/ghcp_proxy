@@ -143,6 +143,11 @@ _REQUEST_TRACE_LOCK = Lock()
 _REQUEST_PROMPT_LOCK = Lock()
 _REQUEST_PROMPT_ACTIVE_IDS: set[str] = set()
 _REQUEST_PROMPT_FILE_PREFIX = "request-prompt-"
+# Prompt archives are retained for drill-downs, but pruning the directory on
+# every completed request turns normal proxy traffic into a directory scan and
+# delete workload.  Keep the cleanup opportunistic and amortized.
+_REQUEST_PROMPT_PRUNE_INTERVAL_SECONDS = 60.0
+_REQUEST_PROMPT_LAST_PRUNED_MONOTONIC = 0.0
 _CLIENT_PROXY_STARTUP_RESTORE_LOCK = Lock()
 _CLIENT_PROXY_STARTUP_RESTORE_COMPLETE = False
 _CLIENT_PROXY_SHUTDOWN_REVERT_LOCK = Lock()
@@ -386,6 +391,14 @@ def _recent_request_prompt_ids() -> set[str]:
 
 
 def _prune_request_prompt_archive(request_ids: set[str] | None = None) -> None:
+    global _REQUEST_PROMPT_LAST_PRUNED_MONOTONIC
+    if request_ids is None:
+        now = time.monotonic()
+        with _REQUEST_PROMPT_LOCK:
+            if now - _REQUEST_PROMPT_LAST_PRUNED_MONOTONIC < _REQUEST_PROMPT_PRUNE_INTERVAL_SECONDS:
+                return
+            _REQUEST_PROMPT_LAST_PRUNED_MONOTONIC = now
+
     archive_dir = request_prompt_archive_dir()
     if not os.path.isdir(archive_dir):
         return
@@ -505,6 +518,7 @@ dashboard_service = dashboard_module.create_dashboard_service(
         load_api_key_payload=auth.load_api_key_payload,
         snapshot_all_usage_events=usage_tracker.snapshot_all_usage_events,
         snapshot_usage_events=usage_tracker.snapshot_usage_events,
+        usage_snapshots_are_deduplicated=True,
         load_safeguard_trigger_stats=safeguard_event_store.load_stats,
         prompt_payload=_prompt_payload_for_dashboard,
     ),
@@ -3703,7 +3717,11 @@ async def dashboard(request: Request):
 
 
 def _build_dashboard_response_body(refresh: bool, gzip_body: bool = False) -> tuple[bytes, bool]:
-    payload = dashboard_service.build_payload(refresh)
+    # Browser refreshes are advisory: the stream version already invalidates
+    # the in-memory materialized payload when data changes.  Rebuilding an
+    # unchanged archive just because the URL contains refresh=1 defeats the
+    # dashboard cache.
+    payload = dashboard_service.build_payload(refresh, prefer_cached=True)
     body = json.dumps(payload, separators=(",", ":"), default=util._json_default).encode("utf-8")
     if gzip_body and len(body) >= 1024:
         return gzip.compress(body, compresslevel=6), True
@@ -4355,6 +4373,14 @@ async def anthropic_messages(request: Request):
 
 # ─── Entrypoint ───────────────────────────────────────────────────────────────
 
+def _prewarm_dashboard_payload() -> None:
+    """Materialize the dashboard while the proxy is finishing startup."""
+    try:
+        dashboard_service.build_payload()
+    except Exception as exc:  # pragma: no cover - best effort startup work
+        print(f"Dashboard prewarm skipped: {exc}", file=sys.stderr, flush=True)
+
+
 if __name__ == "__main__":
     update_result = auto_update_manager.startup_check_for_update()
     if update_result.get("attempted"):
@@ -4371,6 +4397,14 @@ if __name__ == "__main__":
             os.remove(legacy_path)
         except OSError:
             pass
+
+    # Build the large all-time materialization off the startup path so the
+    # first browser load can usually use the in-memory payload immediately.
+    Thread(
+        target=_prewarm_dashboard_payload,
+        name="dashboard-prewarm",
+        daemon=True,
+    ).start()
 
     # Start the server immediately so first-run setup can complete from the
     # browser dashboard instead of blocking on a terminal prompt.

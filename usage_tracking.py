@@ -61,6 +61,12 @@ class UsageTrackingState:
     usage_log_lock: object = field(default_factory=Lock)
     recent_usage_events: deque[dict] = field(default_factory=deque)
     archived_usage_events: list[dict] = field(default_factory=list)
+    # The dashboard asks for the combined all-time history on every update.
+    # Keep a deduplicated snapshot in memory and invalidate it only when the
+    # history actually changes instead of hashing the entire archive per
+    # browser refresh.
+    all_usage_events_snapshot: list[dict] | None = None
+    recent_usage_events_snapshot: list[dict] | None = None
     native_usage_event_dedupe_keys: OrderedDict[str, None] = field(default_factory=OrderedDict)
     session_request_id_lock: object = field(default_factory=Lock)
     latest_server_request_ids_by_chain: dict[tuple[str, str], str] = field(default_factory=dict)
@@ -646,6 +652,8 @@ class UsageTracker:
         with self.state.usage_log_lock:
             self.state.recent_usage_events.clear()
             self.state.archived_usage_events.clear()
+            self.state.all_usage_events_snapshot = None
+            self.state.recent_usage_events_snapshot = None
             self.state.native_usage_event_dedupe_keys.clear()
         with self.state.session_request_id_lock:
             self.state.latest_server_request_ids_by_chain.clear()
@@ -671,6 +679,8 @@ class UsageTracker:
         with self.state.usage_log_lock:
             self.state.recent_usage_events.clear()
             self.state.archived_usage_events.clear()
+            self.state.all_usage_events_snapshot = None
+            self.state.recent_usage_events_snapshot = None
             self.state.native_usage_event_dedupe_keys.clear()
             for event in normalized_archived:
                 if self._register_native_usage_event_locked(event):
@@ -963,6 +973,14 @@ class UsageTracker:
                     self.state.native_usage_event_dedupe_keys.pop(native_dedupe_key, None)
                 raise
             self.state.recent_usage_events.append(event)
+            # Preserve the combined dashboard snapshot incrementally when it
+            # has already been materialized.  Archived rows are immutable for
+            # aggregation purposes, so compaction does not require a full
+            # archive rebuild.
+            if self.state.all_usage_events_snapshot is not None:
+                self.state.all_usage_events_snapshot.append(event)
+            if self.state.recent_usage_events_snapshot is not None:
+                self.state.recent_usage_events_snapshot.append(event)
         self._compact_if_needed()
         self._remember_server_request_id(event)
         self._remember_latest_claude_user_session_context(event)
@@ -1000,6 +1018,8 @@ class UsageTracker:
         with self.state.usage_log_lock:
             self.state.archived_usage_events.clear()
             self.state.archived_usage_events.extend(deduplicate_usage_events(loaded_events))
+            self.state.all_usage_events_snapshot = None
+            self.state.recent_usage_events_snapshot = None
             self._rebuild_native_usage_event_dedupe_keys_locked()
 
     def _compact_if_needed(self):
@@ -1049,10 +1069,23 @@ class UsageTracker:
 
             self.state.recent_usage_events.clear()
             self.state.recent_usage_events.extend(remaining_events)
-            for summary in archived_summaries:
+            self.state.recent_usage_events_snapshot = None
+            archived_replacements = []
+            for original_event, summary in zip(events_to_archive, archived_summaries):
                 normalized_event = _normalize_recorded_usage_event(summary)
                 if normalized_event is not None:
                     self.state.archived_usage_events.append(normalized_event)
+                    archived_replacements.append((original_event, normalized_event))
+
+            if self.state.all_usage_events_snapshot is not None and archived_replacements:
+                replacements = {
+                    id(original): normalized
+                    for original, normalized in archived_replacements
+                }
+                self.state.all_usage_events_snapshot = [
+                    replacements.get(id(event), event)
+                    for event in self.state.all_usage_events_snapshot
+                ]
 
     def load_history(self):
         if not os.path.exists(self.usage_log_file):
@@ -1083,6 +1116,8 @@ class UsageTracker:
                 for event in loaded_events:
                     if self._register_native_usage_event_locked(event):
                         self.state.recent_usage_events.append(event)
+                self.state.all_usage_events_snapshot = None
+                self.state.recent_usage_events_snapshot = None
         except OSError:
             return
 
@@ -1367,13 +1402,17 @@ class UsageTracker:
 
     def snapshot_usage_events(self) -> list[dict]:
         with self.state.usage_log_lock:
-            return deduplicate_usage_events(self.state.recent_usage_events)
+            if self.state.recent_usage_events_snapshot is None:
+                self.state.recent_usage_events_snapshot = deduplicate_usage_events(self.state.recent_usage_events)
+            return list(self.state.recent_usage_events_snapshot)
 
     def snapshot_all_usage_events(self) -> list[dict]:
         with self.state.usage_log_lock:
-            return deduplicate_usage_events(
-                [*self.state.archived_usage_events, *self.state.recent_usage_events]
-            )
+            if self.state.all_usage_events_snapshot is None:
+                self.state.all_usage_events_snapshot = deduplicate_usage_events(
+                    [*self.state.archived_usage_events, *self.state.recent_usage_events]
+                )
+            return list(self.state.all_usage_events_snapshot)
 
     # ------------------------------------------------------------------
     # Error recording

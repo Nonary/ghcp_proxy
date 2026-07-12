@@ -974,6 +974,508 @@
     }
     @keyframes boot-spin { to { transform: rotate(360deg); } }
 
+    /* ─── Modern visual refresh ──────────────────────────────────────────────
+       Keep the existing Vue structure and data flows, but give the dashboard
+       a calmer, more editorial surface with clearer hierarchy. */
+    :root {
+      --bg: #071019;
+      --bg-soft: rgba(9, 18, 29, 0.82);
+      --panel: rgba(15, 27, 41, 0.86);
+      --panel-soft: rgba(23, 39, 57, 0.72);
+      --panel-hi: rgba(29, 48, 68, 0.82);
+      --line: rgba(171, 196, 220, 0.12);
+      --line-strong: rgba(171, 196, 220, 0.22);
+      --text: #edf7f5;
+      --muted: #91a6b4;
+      --muted-2: #637887;
+      --accent: #8bf0c7;
+      --accent-soft: rgba(139, 240, 199, 0.12);
+      --accent-glow: rgba(139, 240, 199, 0.30);
+      --success: #79e8b8;
+      --warn: #f7c978;
+      --danger: #ff8e9d;
+      --indigo: #a99cff;
+      --violet: #d19cff;
+      --cyan: #7ddcff;
+      --shadow: 0 20px 60px rgba(0, 0, 0, 0.25), 0 1px 0 rgba(255, 255, 255, 0.045) inset;
+    }
+
+    html {
+      background: var(--bg);
+      scrollbar-color: rgba(139, 240, 199, 0.34) transparent;
+    }
+    body {
+      position: relative;
+      isolation: isolate;
+      background:
+        radial-gradient(circle at 78% -8%, rgba(125, 220, 255, 0.12), transparent 30rem),
+        radial-gradient(circle at 22% 0%, rgba(169, 156, 255, 0.09), transparent 27rem),
+        linear-gradient(145deg, #071019 0%, #091520 48%, #071019 100%);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      letter-spacing: -0.01em;
+    }
+    body::before {
+      content: "";
+      position: fixed;
+      inset: 0;
+      z-index: -1;
+      pointer-events: none;
+      opacity: 0.34;
+      background-image:
+        linear-gradient(rgba(158, 193, 218, 0.035) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(158, 193, 218, 0.035) 1px, transparent 1px);
+      background-size: 48px 48px;
+      mask-image: linear-gradient(to bottom, black, transparent 88%);
+    }
+    ::selection { background: rgba(139, 240, 199, 0.28); color: #fff; }
+    ::-webkit-scrollbar { width: 10px; height: 10px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb {
+      background: rgba(145, 166, 180, 0.24);
+      border: 3px solid transparent;
+      background-clip: padding-box;
+      border-radius: 999px;
+    }
+
+    .app {
+      grid-template-columns: 258px minmax(0, 1fr);
+      min-height: 100vh;
+    }
+    .sidebar {
+      padding: 24px 16px 18px;
+      background:
+        linear-gradient(180deg, rgba(9, 19, 30, 0.94), rgba(8, 17, 27, 0.78)),
+        radial-gradient(circle at 50% 0%, rgba(139, 240, 199, 0.08), transparent 18rem);
+      border-right: 1px solid rgba(171, 196, 220, 0.13);
+      box-shadow: 18px 0 60px rgba(0, 0, 0, 0.12);
+      backdrop-filter: blur(24px);
+      -webkit-backdrop-filter: blur(24px);
+    }
+    .brand {
+      gap: 12px;
+      padding: 4px 10px 28px;
+    }
+    .brand-mark {
+      width: 38px;
+      height: 38px;
+      border-radius: 13px;
+      background:
+        linear-gradient(145deg, rgba(255, 255, 255, 0.26), transparent 46%),
+        linear-gradient(145deg, #9df5d1, #5ecdb1);
+      color: #082117;
+      box-shadow: 0 0 0 1px rgba(139, 240, 199, 0.42), 0 12px 28px rgba(95, 223, 180, 0.2);
+    }
+    .brand-text .t1 { font-size: 0.98rem; letter-spacing: -0.025em; }
+    .brand-text .t2 {
+      color: #7893a1;
+      font-size: 0.72rem;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+    }
+    .nav {
+      gap: 6px;
+      margin-top: 4px;
+    }
+    .nav::before {
+      content: "Workspace";
+      padding: 0 14px 8px;
+      color: var(--muted-2);
+      font-size: 0.64rem;
+      font-weight: 700;
+      letter-spacing: 0.16em;
+      text-transform: uppercase;
+    }
+    .nav-item {
+      min-height: 44px;
+      gap: 12px;
+      padding: 11px 13px;
+      border-radius: 13px;
+      color: #8ca2b1;
+      font-size: 0.86rem;
+      border-color: transparent;
+    }
+    .nav-item svg { width: 17px; height: 17px; }
+    .nav-item:hover {
+      color: var(--text);
+      background: rgba(255, 255, 255, 0.045);
+      border-color: rgba(171, 196, 220, 0.1);
+      transform: translateX(2px);
+    }
+    .nav-item.active {
+      color: #eafff7;
+      background: linear-gradient(100deg, rgba(139, 240, 199, 0.17), rgba(139, 240, 199, 0.045));
+      border-color: rgba(139, 240, 199, 0.22);
+      box-shadow: 0 8px 24px rgba(32, 113, 92, 0.11);
+    }
+    .nav-item.active svg { color: var(--accent); }
+    .sidebar-foot {
+      padding: 14px 8px 0;
+    }
+    .status-pill {
+      padding: 11px 12px;
+      border-radius: 14px;
+      background: rgba(139, 240, 199, 0.06);
+      border-color: rgba(139, 240, 199, 0.16);
+    }
+    .sidebar-foot .meta {
+      padding: 12px 12px 0;
+      color: #78909e;
+      font-size: 0.72rem;
+    }
+
+    .workspace {
+      width: 100%;
+      max-width: 1680px;
+      margin: 0 auto;
+      padding: 34px clamp(22px, 4vw, 58px) 54px;
+    }
+    .workspace-header {
+      position: relative;
+      gap: 24px;
+      margin-bottom: 30px;
+      padding-bottom: 24px;
+      border-bottom: 1px solid rgba(171, 196, 220, 0.11);
+    }
+    .workspace-header > div:first-child::before {
+      content: "CONTROL ROOM  /  LOCAL TELEMETRY";
+      display: block;
+      margin-bottom: 11px;
+      color: var(--accent);
+      font-size: 0.64rem;
+      font-weight: 800;
+      letter-spacing: 0.17em;
+      opacity: 0.8;
+    }
+    .workspace-header h1 {
+      font-size: clamp(1.9rem, 2.6vw, 2.6rem);
+      font-weight: 720;
+      letter-spacing: -0.055em;
+      line-height: 1.05;
+    }
+    .workspace-header .subtitle {
+      max-width: 640px;
+      margin-top: 9px;
+      color: #8da4b3;
+      font-size: 0.92rem;
+    }
+    .header-tools {
+      align-self: flex-end;
+      gap: 8px;
+    }
+    .live-pill {
+      padding: 8px 12px;
+      border-radius: 999px;
+      background: rgba(139, 240, 199, 0.1);
+      border-color: rgba(139, 240, 199, 0.23);
+      color: var(--accent);
+      font-size: 0.74rem;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+    .updated-text { font-size: 0.76rem; color: #718a98; }
+    .icon-btn, .select-btn {
+      border-radius: 12px;
+      background: rgba(18, 32, 47, 0.78);
+      border-color: rgba(171, 196, 220, 0.14);
+      box-shadow: 0 8px 22px rgba(0, 0, 0, 0.1);
+    }
+    .icon-btn { width: 38px; height: 38px; }
+    .icon-btn:hover, .select-btn:hover {
+      color: var(--accent);
+      border-color: rgba(139, 240, 199, 0.32);
+      background: rgba(139, 240, 199, 0.08);
+    }
+    .select-btn { padding: 9px 12px; font-size: 0.78rem; }
+
+    .work-grid { grid-template-columns: minmax(0, 1fr) minmax(330px, 380px); gap: 24px; }
+    .stack { gap: 20px; }
+    .rail { gap: 20px; }
+    .card, .kpi, .panel, .update-panel {
+      border: 1px solid rgba(171, 196, 220, 0.13);
+      border-radius: 20px;
+      background:
+        linear-gradient(145deg, rgba(20, 37, 55, 0.86), rgba(12, 24, 37, 0.9));
+      box-shadow: var(--shadow);
+    }
+    .card { padding: 20px; }
+    .card:hover, .kpi:hover {
+      border-color: rgba(171, 196, 220, 0.22);
+    }
+    .card-head { margin-bottom: 14px; }
+    .card-head h3, .panel-head h3 {
+      font-size: 1rem;
+      letter-spacing: -0.025em;
+    }
+    .subtle { color: #849aa8; font-size: 0.78rem; }
+    .eyebrow {
+      color: #6f8795;
+      font-size: 0.63rem;
+      letter-spacing: 0.16em;
+    }
+
+    .update-panel {
+      position: relative;
+      overflow: hidden;
+      padding: 18px 20px;
+      background:
+        radial-gradient(circle at 98% 0%, rgba(169, 156, 255, 0.18), transparent 18rem),
+        linear-gradient(145deg, rgba(28, 40, 68, 0.92), rgba(14, 28, 43, 0.9));
+    }
+    .update-panel::after {
+      content: "";
+      position: absolute;
+      width: 170px;
+      height: 170px;
+      right: -92px;
+      bottom: -106px;
+      border-radius: 50%;
+      border: 1px solid rgba(139, 240, 199, 0.18);
+      box-shadow: 0 0 0 18px rgba(139, 240, 199, 0.025), 0 0 0 36px rgba(139, 240, 199, 0.018);
+      pointer-events: none;
+    }
+
+    .kpi-grid { gap: 16px; }
+    .kpi {
+      min-height: 164px;
+      padding: 18px;
+      overflow: hidden;
+    }
+    .kpi::after {
+      content: "";
+      position: absolute;
+      width: 180px;
+      height: 180px;
+      right: -92px;
+      bottom: -112px;
+      border-radius: 50%;
+      background: radial-gradient(circle, rgba(139, 240, 199, 0.13), transparent 68%);
+      pointer-events: none;
+    }
+    .kpi:nth-child(2)::after { background: radial-gradient(circle, rgba(209, 156, 255, 0.14), transparent 68%); }
+    .kpi:nth-child(3)::after { background: radial-gradient(circle, rgba(125, 220, 255, 0.14), transparent 68%); }
+    .kpi-head { margin-bottom: 16px; }
+    .kpi-icon {
+      width: 38px;
+      height: 38px;
+      border-radius: 13px;
+      background: rgba(139, 240, 199, 0.13);
+      border-color: rgba(139, 240, 199, 0.22);
+    }
+    .kpi-icon.icon-tokens { background: rgba(209, 156, 255, 0.13); border-color: rgba(209, 156, 255, 0.22); }
+    .kpi-icon.icon-calls { background: rgba(125, 220, 255, 0.13); border-color: rgba(125, 220, 255, 0.22); }
+    .kpi .value {
+      font-size: clamp(1.75rem, 2.3vw, 2.15rem);
+      letter-spacing: -0.06em;
+    }
+    .kpi-meta { margin-top: 16px; color: #8298a5; }
+    .kpi-meta .row .k { color: #627b89; }
+    .kpi-meta .row .v { color: #b6c9d2; }
+
+    .spark-grid { gap: 12px; }
+    .spark {
+      min-height: 108px;
+      padding: 14px;
+      border: 1px solid rgba(171, 196, 220, 0.11);
+      border-radius: 16px;
+      background: rgba(10, 23, 36, 0.48);
+    }
+    .spark .value { font-size: 1.17rem; letter-spacing: -0.035em; }
+    .spark .desc { color: #78919e; }
+
+    .request-list, .request-row, .mini-card, .credit-stat, .credit-day, .credit-week-stat,
+    .source-period-card, .source-detail-card, .control, .detail-block {
+      border-color: rgba(171, 196, 220, 0.12);
+      border-radius: 15px;
+      background: rgba(10, 23, 36, 0.52);
+    }
+    .request-row:hover, .source-period-card:hover, .source-period-card.active,
+    .credit-consumed-card.active {
+      border-color: rgba(139, 240, 199, 0.3);
+      background: rgba(139, 240, 199, 0.07);
+    }
+    .request-row.active { background: rgba(139, 240, 199, 0.08); }
+    .request-title { color: #e5f2f0; }
+    .request-meta { color: #718896; }
+    .req-table {
+      border: 1px solid rgba(171, 196, 220, 0.11);
+      border-radius: 15px;
+      overflow: hidden;
+    }
+    .req-table th {
+      color: #75909e;
+      background: rgba(9, 20, 32, 0.75);
+      letter-spacing: 0.12em;
+    }
+    .req-table td { border-color: rgba(171, 196, 220, 0.08); }
+    .req-table tbody tr:hover { background: rgba(139, 240, 199, 0.04); }
+    table td, table th { padding: 12px 13px; }
+    .pill { border-radius: 999px; padding: 4px 8px; font-size: 0.64rem; letter-spacing: 0.08em; }
+    .pill-success { background: rgba(121, 232, 184, 0.1); border-color: rgba(121, 232, 184, 0.22); color: var(--success); }
+    .pill-error { background: rgba(255, 142, 157, 0.1); border-color: rgba(255, 142, 157, 0.22); color: var(--danger); }
+    .pager { padding-top: 14px; color: #718996; }
+    .pager .pgbtn {
+      border-radius: 9px;
+      border-color: rgba(171, 196, 220, 0.14);
+      background: rgba(10, 23, 36, 0.6);
+    }
+    .pager .pgbtn.active {
+      background: var(--accent-soft);
+      border-color: rgba(139, 240, 199, 0.24);
+      color: var(--accent);
+    }
+
+    .donut {
+      width: 116px;
+      height: 116px;
+      padding: 8px;
+      border-radius: 50%;
+      background: rgba(9, 20, 32, 0.55);
+      box-shadow: 0 0 0 1px rgba(171, 196, 220, 0.08);
+    }
+    .donut .ring-bg { stroke: rgba(171, 196, 220, 0.1); }
+    .donut-label .big { font-size: 1.05rem !important; letter-spacing: -0.04em; }
+    .donut-label .tiny { color: #718a98; letter-spacing: 0.08em; text-transform: uppercase; }
+    .legend-row { gap: 9px; padding: 6px 0; }
+    .legend-row .name { color: #b6c8d0; }
+    .legend-row .pct { color: #718a98; }
+    .legend-row .val { color: #d8e8e7; }
+    .card-link { color: var(--accent); opacity: 0.84; }
+    .card-link:hover { opacity: 1; }
+
+    .button-link, button.primary, button.danger, button:not(.icon-btn):not(.copy-btn):not(.pgbtn):not(.tabbtn) {
+      border-radius: 11px;
+      border-color: rgba(171, 196, 220, 0.16);
+      background: rgba(18, 34, 49, 0.78);
+    }
+    button.primary, .button-link {
+      background: linear-gradient(135deg, #9bf4d0, #69d8b4);
+      border-color: rgba(139, 240, 199, 0.46);
+      color: #082117;
+      font-weight: 750;
+      box-shadow: 0 10px 24px rgba(82, 211, 168, 0.14);
+    }
+    button.primary:hover, .button-link:hover {
+      background: linear-gradient(135deg, #b6f8dc, #79e7c2);
+      color: #051b12;
+    }
+    button.danger {
+      background: rgba(255, 142, 157, 0.1);
+      border-color: rgba(255, 142, 157, 0.24);
+      color: var(--danger);
+    }
+    .tabbtn {
+      border-radius: 10px;
+      color: #78919f;
+    }
+    .tabbtn.active {
+      color: var(--text);
+      background: rgba(139, 240, 199, 0.09);
+      border-color: rgba(139, 240, 199, 0.18);
+    }
+    input, select, textarea, .control input, .control select {
+      border-color: rgba(171, 196, 220, 0.16) !important;
+      border-radius: 10px !important;
+      background: rgba(8, 20, 32, 0.72) !important;
+      color: var(--text) !important;
+    }
+    .status.good { color: var(--success); }
+    .status.warn { color: var(--warn); }
+    .status.error { color: var(--danger); }
+
+    .auth-panel {
+      width: min(900px, calc(100vw - 48px));
+      padding: 34px;
+      border: 1px solid rgba(171, 196, 220, 0.16);
+      border-radius: 24px;
+      background:
+        radial-gradient(circle at 100% 0%, rgba(169, 156, 255, 0.16), transparent 24rem),
+        linear-gradient(145deg, rgba(20, 37, 55, 0.94), rgba(11, 24, 38, 0.96));
+      box-shadow: 0 30px 90px rgba(0, 0, 0, 0.32);
+    }
+    .auth-panel h2 { font-size: clamp(1.65rem, 4vw, 2.35rem); letter-spacing: -0.055em; }
+    .auth-panel .auth-grid { gap: 20px; }
+    .auth-code-card {
+      border-radius: 18px;
+      border-color: rgba(139, 240, 199, 0.22);
+      background: rgba(139, 240, 199, 0.07);
+    }
+    .auth-code { color: var(--accent); letter-spacing: 0.12em; }
+
+    @media (max-width: 1250px) {
+      .workspace { padding-inline: 28px; }
+      .work-grid { grid-template-columns: 1fr; }
+      .rail {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        align-items: stretch;
+      }
+    }
+    @media (max-width: 980px) {
+      .app { display: block; }
+      .sidebar {
+        position: sticky;
+        z-index: 20;
+        top: 0;
+        height: auto;
+        min-height: 72px;
+        flex-direction: row;
+        align-items: center;
+        gap: 18px;
+        padding: 12px 18px;
+        border-right: 0;
+        border-bottom: 1px solid rgba(171, 196, 220, 0.13);
+      }
+      .brand { padding: 0; }
+      .nav {
+        flex: 1;
+        flex-direction: row;
+        align-items: center;
+        gap: 4px;
+        margin: 0;
+        overflow-x: auto;
+      }
+      .nav::before { display: none; }
+      .nav-item { min-height: 40px; white-space: nowrap; }
+      .sidebar-foot { margin-left: auto; padding: 0; }
+      .sidebar-foot .meta { display: none; }
+      .status-pill { padding: 9px 10px; }
+    }
+    @media (max-width: 760px) {
+      .sidebar { flex-wrap: wrap; }
+      .brand { flex: 1; }
+      .sidebar-foot { order: 2; }
+      .nav { order: 3; flex-basis: 100%; }
+      .workspace { padding: 24px 16px 40px; }
+      .workspace-header {
+        flex-direction: column;
+        align-items: stretch;
+        padding-bottom: 20px;
+        margin-bottom: 22px;
+      }
+      .header-tools { align-self: stretch; }
+      .updated-text { margin-right: auto; }
+      .rail { grid-template-columns: 1fr; }
+      .kpi-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .kpi { min-height: 148px; padding: 15px; }
+      .kpi-meta { grid-template-columns: 1fr 1fr; }
+      .kpi-meta .row:last-child { grid-column: 1 / -1; }
+      .auth-panel { width: min(100% - 28px, 900px); padding: 24px; }
+      .auth-panel .auth-grid { grid-template-columns: 1fr; }
+    }
+    @media (max-width: 480px) {
+      .brand-text .t2 { display: none; }
+      .status-pill > div { display: none; }
+      .status-pill { padding: 10px; }
+      .header-tools { flex-wrap: wrap; }
+      .updated-text { flex-basis: 100%; order: 4; }
+      .kpi-grid { grid-template-columns: 1fr; }
+      .kpi-meta { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+      .kpi-meta .row:last-child { grid-column: auto; }
+      .card { padding: 16px; border-radius: 17px; }
+      .workspace-header h1 { font-size: 1.9rem; }
+    }
+
   </style>
 </head>
 <body>
@@ -1954,6 +2456,18 @@
             </div>
             <div v-if="clientProxySettings.error" class="status error" style="margin-top: 10px;">{{ clientProxySettings.error }}</div>
             <div v-else-if="clientProxySettings.statusMessage" class="status good" style="margin-top: 10px;">{{ clientProxySettings.statusMessage }}</div>
+          </article>
+          <article class="mini-card" style="margin-top: 12px;">
+            <div class="eyebrow">Proxy Runtime</div>
+            <div class="subtle" style="margin-top: 6px;">
+              Reload GHCP Proxy after changing Python code or configuration. Active requests are allowed to finish first.
+            </div>
+            <div class="toolbar" style="margin-top: 10px;">
+              <button class="primary" @click="restartProxy" :disabled="savingAutoUpdate">
+                <span v-if="autoUpdateAction === 'restart_proxy'" class="spinner"></span>
+                {{ autoUpdateAction === 'restart_proxy' ? 'Restarting…' : 'Restart proxy' }}
+              </button>
+            </div>
           </article>
           <article class="mini-card" style="margin-top: 12px;">
             <div class="eyebrow">Background Proxy</div>
@@ -3167,6 +3681,8 @@
       data() {
         return {
           autoRefreshTimer: null,
+          dashboardLoadPromise: null,
+          dashboardLoadQueued: false,
           authStatusTimer: null,
           loadingAuthStatus: false,
           startingAuthFlow: false,
@@ -4847,6 +5363,18 @@
           if (Number.isFinite(incomingGeneratedAt) && Number.isFinite(currentGeneratedAt) && incomingGeneratedAt < currentGeneratedAt) {
             return;
           }
+          if (
+            Number.isFinite(incomingGeneratedAt)
+            && Number.isFinite(currentGeneratedAt)
+            && incomingGeneratedAt === currentGeneratedAt
+            && Array.isArray(this.data?.recent_requests)
+            && this.data.recent_requests.length
+          ) {
+            // A manual refresh can legitimately return the same
+            // materialized payload.  Avoid forcing Vue to diff/re-render
+            // hundreds of unchanged request rows.
+            return;
+          }
           const preserveScroll = this.activeTab === 'requests';
           const requestList = preserveScroll ? this.$refs.requestList : null;
           const previousScrollTop = requestList ? requestList.scrollTop : null;
@@ -4934,18 +5462,36 @@
           }
         },
         async load(forceRefresh = false) {
-          try {
-            const suffix = forceRefresh ? '?refresh=1' : '';
-            // Default cache mode (no explicit option) so the browser can
-            // reuse the <link rel="preload"> response on first load. The
-            // server pins Cache-Control: no-store on the response itself.
-            const response = await fetch(`/api/dashboard${suffix}`);
-            if (!response.ok) throw new Error(`dashboard request failed: ${response.status}`);
-            const payload = await response.json();
-            this._applyDashboardPayload(payload, { replaceRequests: forceRefresh });
-          } catch (error) {
-            console.error('Dashboard load failed:', error.message);
+          if (this.dashboardLoadPromise) {
+            // The preload, Vue mount, SSE reconnect, and the five-minute
+            // safety timer can overlap during a slow initial build.  Share
+            // one request instead of queueing another full dashboard scan.
+            if (forceRefresh) this.dashboardLoadQueued = true;
+            return this.dashboardLoadPromise;
           }
+
+          const request = (async () => {
+            try {
+              const suffix = forceRefresh ? '?refresh=1' : '';
+              const response = await fetch(`/api/dashboard${suffix}`);
+              if (!response.ok) throw new Error(`dashboard request failed: ${response.status}`);
+              const payload = await response.json();
+              this._applyDashboardPayload(payload, { replaceRequests: forceRefresh });
+            } catch (error) {
+              console.error('Dashboard load failed:', error.message);
+            }
+          })();
+          this.dashboardLoadPromise = request;
+          try {
+            await request;
+          } finally {
+            this.dashboardLoadPromise = null;
+            if (this.dashboardLoadQueued) {
+              this.dashboardLoadQueued = false;
+              void this.load(true);
+            }
+          }
+          return request;
         },
 
         sourceLabel(source) {

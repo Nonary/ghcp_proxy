@@ -50,6 +50,7 @@ class DashboardDependencies:
     load_api_key_payload: Callable[[], dict] = lambda: {}
     snapshot_all_usage_events: Callable[[], list[dict]] = lambda: []
     snapshot_usage_events: Callable[[], list[dict]] = lambda: []
+    usage_snapshots_are_deduplicated: bool = False
     load_safeguard_trigger_stats: Callable[[datetime], dict] = lambda _now: {}
     prompt_payload: Callable[[object], object] = lambda value: value
 
@@ -58,6 +59,13 @@ class DashboardDependencies:
 
 class DashboardCacheStore:
     """Owns dashboard SQLite cache lifecycle and adapts it for runtime consumers."""
+
+    def __init__(self):
+        # Schema creation and WAL setup are process-level work.  Running them
+        # from every dashboard read turns a read-only page refresh into a
+        # SQLite write/metadata storm, especially on Windows.
+        self._initialized = False
+        self._cache_dir_ready = False
 
     @property
     def lock(self) -> Lock:
@@ -73,19 +81,34 @@ class DashboardCacheStore:
     def connect(self) -> sqlite3.Connection:
         if not _sqlite_cache_enabled:
             raise RuntimeError("sqlite cache disabled")
-        cache_dir = os.path.dirname(SQLITE_CACHE_FILE) or TOKEN_DIR
-        os.makedirs(cache_dir, exist_ok=True)
+        if not self._cache_dir_ready:
+            cache_dir = os.path.dirname(SQLITE_CACHE_FILE) or TOKEN_DIR
+            os.makedirs(cache_dir, exist_ok=True)
+            self._cache_dir_ready = True
         connection = sqlite3.connect(SQLITE_CACHE_FILE, timeout=10)
         connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA busy_timeout=10000")
         return connection
 
     def initialize(self) -> bool:
         if not _sqlite_cache_enabled:
             return False
+        if self._initialized:
+            return True
         try:
             with self.lock:
+                if self._initialized:
+                    return True
+                cache_dir = os.path.dirname(SQLITE_CACHE_FILE) or TOKEN_DIR
+                os.makedirs(cache_dir, exist_ok=True)
+                self._cache_dir_ready = True
                 with closing(self.connect()) as connection:
+                    # These are deliberately process-startup operations, not
+                    # per-request connection setup.  NORMAL is sufficient for
+                    # this cache and avoids making every cache write wait for
+                    # the strongest possible fsync behavior.
+                    connection.execute("PRAGMA journal_mode=WAL")
+                    connection.execute("PRAGMA synchronous=NORMAL")
                     connection.execute(
                         """
                         CREATE TABLE IF NOT EXISTS cache_entries (
@@ -130,6 +153,7 @@ class DashboardCacheStore:
                         """
                     )
                     connection.commit()
+                self._initialized = True
             return True
         except Exception as exc:
             self.mark_unavailable(str(exc))
@@ -232,6 +256,17 @@ class SafeguardEventStore:
         self.lock = lock
         self.connect = connect
         self.mark_unavailable = mark_unavailable
+        self._stats_cache_lock = Lock()
+        self._stats_cache: dict | None = None
+        self._stats_cache_day: tuple[str, str] | None = None
+        self._stats_cache_loaded_at = 0.0
+        self._stats_cache_ttl = 5.0
+
+    def _invalidate_stats_cache(self):
+        with self._stats_cache_lock:
+            self._stats_cache = None
+            self._stats_cache_day = None
+            self._stats_cache_loaded_at = 0.0
 
     def clear(self):
         if not self.init_storage():
@@ -241,6 +276,7 @@ class SafeguardEventStore:
                 with closing(self.connect()) as connection:
                     connection.execute("DELETE FROM safeguard_trigger_events")
                     connection.commit()
+            self._invalidate_stats_cache()
         except Exception as exc:
             self.mark_unavailable(f"failed to clear safeguard trigger events: {exc}")
 
@@ -280,6 +316,7 @@ class SafeguardEventStore:
                         ),
                     )
                     connection.commit()
+            self._invalidate_stats_cache()
         except Exception as exc:
             self.mark_unavailable(f"failed to record safeguard trigger event: {exc}")
 
@@ -288,6 +325,15 @@ class SafeguardEventStore:
         month_start, month_end = _current_billing_month_bounds(reference_now)
         day_start = datetime(reference_now.year, reference_now.month, reference_now.day, tzinfo=timezone.utc)
         day_end = day_start + timedelta(days=1)
+        cache_day = (day_start.strftime("%Y-%m-%d"), month_start.strftime("%Y-%m"))
+        now_monotonic = time.monotonic()
+        with self._stats_cache_lock:
+            if (
+                self._stats_cache is not None
+                and self._stats_cache_day == cache_day
+                and now_monotonic - self._stats_cache_loaded_at < self._stats_cache_ttl
+            ):
+                return dict(self._stats_cache)
         default_payload = {
             "today_count": 0,
             "current_month_count": 0,
@@ -319,13 +365,19 @@ class SafeguardEventStore:
             self.mark_unavailable(f"failed to load safeguard trigger stats: {exc}")
             return default_payload
         if row is None:
-            return default_payload
-        return {
-            "today_count": int(row["today_count"] or 0),
-            "current_month_count": int(row["current_month_count"] or 0),
-            "all_time_count": int(row["all_time_count"] or 0),
-            "latest_triggered_at": row["latest_triggered_at"],
-        }
+            payload = default_payload
+        else:
+            payload = {
+                "today_count": int(row["today_count"] or 0),
+                "current_month_count": int(row["current_month_count"] or 0),
+                "all_time_count": int(row["all_time_count"] or 0),
+                "latest_triggered_at": row["latest_triggered_at"],
+            }
+        with self._stats_cache_lock:
+            self._stats_cache = dict(payload)
+            self._stats_cache_day = cache_day
+            self._stats_cache_loaded_at = time.monotonic()
+        return payload
 
 
 dashboard_cache_store = DashboardCacheStore()
@@ -577,29 +629,27 @@ def _usage_display_total_tokens(usage: dict, *, input_tokens: int, output_tokens
     return _coerce_int(usage.get("total_tokens"))
 
 
-def _ingest_usage_event(bucket: dict, event: dict):
-    if not isinstance(bucket, dict) or not isinstance(event, dict):
-        return
+def _prepare_usage_event(event: dict) -> dict | None:
+    """Compute the expensive, event-local dashboard fields once.
+
+    A single event contributes to month, session, and day rollups.  Keeping
+    this preparation separate from bucket ingestion avoids normalizing usage,
+    parsing timestamps, resolving model pricing, and calculating costs three
+    times for every request.
+    """
+    if not isinstance(event, dict):
+        return None
 
     usage = normalize_usage_payload(event.get("usage")) or {}
     event_cost = event.get("cost_usd")
     cost_multiplier = _usage_event_cost_multiplier(event)
+    model_name = _usage_event_model_name(event) or "unknown"
     if not isinstance(event_cost, (int, float)) or not event_cost:
-        recomputed_cost = _usage_event_cost(_usage_event_model_name(event), usage) * cost_multiplier
+        recomputed_cost = _usage_event_cost(model_name, usage) * cost_multiplier
         if recomputed_cost:
             event_cost = recomputed_cost
         elif not isinstance(event_cost, (int, float)):
             event_cost = 0.0
-
-    event_time = _parse_iso_datetime(event.get("finished_at") or event.get("started_at"))
-    if event_time is not None:
-        current_last = bucket.get("_last_activity_dt")
-        if not isinstance(current_last, datetime) or event_time > current_last:
-            bucket["_last_activity_dt"] = event_time
-
-    project_path = event.get("project_path")
-    if bucket.get("project_path") is None and isinstance(project_path, str) and project_path:
-        bucket["project_path"] = project_path
 
     input_tokens = _usage_display_input_tokens(usage)
     output_tokens = _coerce_int(usage.get("output_tokens"))
@@ -607,10 +657,56 @@ def _ingest_usage_event(bucket: dict, event: dict):
     cached_input_tokens = _coerce_int(usage.get("cached_input_tokens"))
     cache_creation_tokens = _coerce_int(usage.get("cache_creation_input_tokens"))
     reasoning_output_tokens = _coerce_int(usage.get("reasoning_output_tokens"))
-    model_name = _usage_event_model_name(event) or "unknown"
     cost_breakdown = _usage_event_cost_breakdown(model_name, usage)
     if cost_multiplier != 1.0:
         cost_breakdown = {key: value * cost_multiplier for key, value in cost_breakdown.items()}
+
+    event_time = _parse_iso_datetime(event.get("finished_at") or event.get("started_at"))
+    if event_time is None:
+        return None
+
+    return {
+        "event_time": event_time,
+        "source": _usage_event_source(event),
+        "descriptor": _usage_event_session_descriptor(event),
+        "project_path": event.get("project_path"),
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens,
+        "cached_input_tokens": cached_input_tokens,
+        "cache_creation_tokens": cache_creation_tokens,
+        "reasoning_output_tokens": reasoning_output_tokens,
+        "event_cost": event_cost,
+        "cost_breakdown": cost_breakdown,
+        "model_name": model_name,
+    }
+
+
+def _ingest_usage_event(bucket: dict, event: dict, prepared: dict | None = None):
+    if not isinstance(bucket, dict) or not isinstance(event, dict):
+        return
+
+    prepared = prepared or _prepare_usage_event(event)
+    if not isinstance(prepared, dict):
+        return
+
+    event_time = prepared["event_time"]
+    current_last = bucket.get("_last_activity_dt")
+    if not isinstance(current_last, datetime) or event_time > current_last:
+        bucket["_last_activity_dt"] = event_time
+
+    project_path = prepared.get("project_path")
+    if bucket.get("project_path") is None and isinstance(project_path, str) and project_path:
+        bucket["project_path"] = project_path
+
+    input_tokens = prepared["input_tokens"]
+    output_tokens = prepared["output_tokens"]
+    total_tokens = prepared["total_tokens"]
+    cached_input_tokens = prepared["cached_input_tokens"]
+    cache_creation_tokens = prepared["cache_creation_tokens"]
+    reasoning_output_tokens = prepared["reasoning_output_tokens"]
+    model_name = prepared["model_name"]
+    cost_breakdown = prepared["cost_breakdown"]
 
     bucket["input_tokens"] += input_tokens
     bucket["output_tokens"] += output_tokens
@@ -618,7 +714,7 @@ def _ingest_usage_event(bucket: dict, event: dict):
     bucket["cached_input_tokens"] += cached_input_tokens
     bucket["cache_creation_tokens"] += cache_creation_tokens
     bucket["reasoning_output_tokens"] += reasoning_output_tokens
-    bucket["cost_usd"] += _coerce_float(event_cost)
+    bucket["cost_usd"] += _coerce_float(prepared["event_cost"])
     bucket_cost_breakdown = bucket.setdefault(
         "cost_breakdown",
         {"input_fresh": 0.0, "cached_input": 0.0, "cache_creation": 0.0, "output": 0.0},
@@ -630,6 +726,206 @@ def _ingest_usage_event(bucket: dict, event: dict):
     model_bucket["inputTokens"] += input_tokens
     if model_name not in bucket["_model_order"]:
         bucket["_model_order"].append(model_name)
+
+
+def _dashboard_event_key(event: dict) -> tuple:
+    """Return a stable key for an event across recent-history compaction.
+
+    UsageTracker moves the oldest detailed rows into SQLite and recreates the
+    in-memory summary dictionaries.  Object identity therefore cannot be used
+    for incremental aggregation.  Request IDs are stable for proxied rows;
+    native rows also include their token snapshot so a changed observation is
+    not accidentally treated as the old one.
+    """
+    if not isinstance(event, dict):
+        return ("invalid", id(event))
+
+    request_id = event.get("request_id")
+    native_source = event.get("native_source")
+    is_native = native_source == "codex_native" or (
+        isinstance(request_id, str) and request_id.startswith("codex-native:")
+    )
+    if is_native:
+        usage = event.get("usage") if isinstance(event.get("usage"), dict) else {}
+        return (
+            "native",
+            request_id,
+            event.get("native_turn_id"),
+            event.get("native_source_event_key"),
+            event.get("native_dedupe_key"),
+            event.get("resolved_model") or event.get("requested_model"),
+            event.get("session_id"),
+            event.get("finished_at") or event.get("started_at"),
+            _coerce_int(usage.get("input_tokens")),
+            _coerce_int(usage.get("cached_input_tokens")),
+            _coerce_int(usage.get("cache_creation_input_tokens")),
+            _coerce_int(usage.get("output_tokens")),
+            _coerce_int(usage.get("reasoning_output_tokens")),
+            _coerce_int(usage.get("total_tokens")),
+        )
+
+    if isinstance(request_id, str) and request_id:
+        return (
+            "request",
+            request_id,
+            event.get("finished_at") or event.get("started_at"),
+            event.get("path"),
+        )
+
+    # Events without an ID are not normal proxy records.  Retain the old
+    # behavior rather than collapsing two independent attempts that happen to
+    # have the same sparse fields.
+    return ("object", id(event))
+
+
+class _DashboardUsageAccumulator:
+    """Incremental all-time/month/session/day usage materialization.
+
+    The archive can contain hundreds of thousands of immutable native events.
+    Rebuilding every aggregate from that archive for each browser refresh is
+    needlessly expensive.  This accumulator processes only newly-seen events
+    and keeps the finalized dashboard rollups in memory for the process.
+    """
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.month_buckets: dict[str, dict[str, dict]] = {}
+        self.session_buckets: dict[str, dict[str, dict]] = {}
+        self.day_buckets: dict[str, dict[str, dict]] = {}
+        self._event_keys: set[tuple] = set()
+        self._first_event_key: tuple | None = None
+        self._local_usage_cache: dict | None = None
+        self._daily_usage_cache: dict[tuple[str, str], list[dict]] = {}
+
+    def update(self, usage_events: list[dict]):
+        events = [event for event in usage_events if isinstance(event, dict)]
+        if not events:
+            if self._event_keys:
+                self.reset()
+            return
+
+        first_event_key = _dashboard_event_key(events[0])
+        if self._event_keys and first_event_key != self._first_event_key:
+            # History was replaced/reloaded rather than appended.  Rebuild
+            # once so callers never see stale totals.
+            self.reset()
+
+        if not self._event_keys:
+            new_events = [(_dashboard_event_key(event), event) for event in events]
+        else:
+            # Normal history updates append at the end.  Walk backward until
+            # the first already-materialized event instead of deriving a
+            # 160K-entry key set on every SSE notification.
+            new_events = []
+            for event in reversed(events):
+                event_key = _dashboard_event_key(event)
+                if event_key in self._event_keys:
+                    break
+                new_events.append((event_key, event))
+            new_events.reverse()
+
+        if new_events:
+            self._local_usage_cache = None
+            self._daily_usage_cache.clear()
+        for event_key, event in new_events:
+            prepared = _prepare_usage_event(event)
+            if not isinstance(prepared, dict):
+                self._event_keys.add(event_key)
+                continue
+
+            source = prepared["source"]
+            event_time = prepared["event_time"]
+            descriptor = prepared["descriptor"]
+            month_key = _month_key(event_time)
+            day_key = event_time.astimezone(timezone.utc).strftime("%Y-%m-%d")
+
+            month_bucket = self.month_buckets.setdefault(source, {}).setdefault(
+                month_key, _new_usage_aggregate_bucket()
+            )
+            _ingest_usage_event(month_bucket, event, prepared)
+
+            group_id = descriptor.get("group_id") if isinstance(descriptor, dict) else None
+            if not isinstance(group_id, str) or not group_id:
+                group_id = event.get("server_request_id") or event.get("request_id") or "unknown"
+            session_bucket = self.session_buckets.setdefault(source, {}).setdefault(
+                group_id, _new_usage_aggregate_bucket()
+            )
+            if session_bucket.get("session_display_id") is None and descriptor.get("session_display_id"):
+                session_bucket["session_display_id"] = descriptor["session_display_id"]
+            if not session_bucket.get("session_id") and descriptor.get("session_id"):
+                session_bucket["session_id"] = descriptor["session_id"]
+            if session_bucket.get("session_kind") in {None, "", "unknown"} and descriptor.get("session_kind"):
+                session_bucket["session_kind"] = descriptor["session_kind"]
+            _ingest_usage_event(session_bucket, event, prepared)
+
+            day_bucket = self.day_buckets.setdefault(source, {}).setdefault(
+                day_key, _new_usage_aggregate_bucket()
+            )
+            _ingest_usage_event(day_bucket, event, prepared)
+            self._event_keys.add(event_key)
+
+        self._first_event_key = first_event_key
+
+    def collect_local_usage(self) -> dict:
+        if self._local_usage_cache is not None:
+            return self._local_usage_cache
+
+        normalized_months = []
+        normalized_sessions = []
+        for source in sorted(set(self.month_buckets) | set(self.session_buckets)):
+            for month_key, bucket in self.month_buckets.get(source, {}).items():
+                normalized_months.append(
+                    _normalize_month_row(
+                        source,
+                        _finalize_usage_bucket(bucket, source, month=month_key),
+                    )
+                )
+            for _session_key, bucket in self.session_buckets.get(source, {}).items():
+                normalized_sessions.append(
+                    normalize_session(
+                        source,
+                        _finalize_usage_bucket(
+                            bucket,
+                            source,
+                            session_id=bucket.get("session_id"),
+                        ),
+                    )
+                )
+
+        normalized_sessions.sort(key=lambda item: item.get("last_activity") or "", reverse=True)
+        self._local_usage_cache = {
+            "month_rows": normalized_months,
+            "session_count": len(normalized_sessions),
+            "recent_sessions": normalized_sessions[:20],
+            "month_history": _combine_month_rows(normalized_months),
+            "errors": [],
+        }
+        return self._local_usage_cache
+
+    def collect_daily_usage(self, start_at: datetime, end_at: datetime) -> list[dict]:
+        start_day = start_at.astimezone(timezone.utc).strftime("%Y-%m-%d")
+        end_day = end_at.astimezone(timezone.utc).strftime("%Y-%m-%d")
+        cache_key = (start_day, end_day)
+        cached = self._daily_usage_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        normalized_days = []
+        for source, source_days in self.day_buckets.items():
+            for day_key, bucket in source_days.items():
+                if day_key < start_day or day_key >= end_day:
+                    continue
+                normalized_days.append(
+                    _normalize_day_row(
+                        source,
+                        _finalize_usage_bucket(bucket, source),
+                        day_key,
+                    )
+                )
+        result = _combine_day_rows(normalized_days)
+        self._daily_usage_cache[cache_key] = result
+        return result
 
 
 def _finalize_usage_bucket(bucket: dict, source: str, *, session_id: str | None = None, month: str | None = None) -> dict:
@@ -696,13 +992,13 @@ def _aggregate_usage_event_buckets(
     source_session_buckets: dict[str, dict[str, dict]] = {}
 
     for event in usage_events:
-        event_time = _parse_iso_datetime(event.get("finished_at") or event.get("started_at"))
-        if event_time is None:
+        prepared = _prepare_usage_event(event)
+        if not isinstance(prepared, dict):
             continue
 
-        descriptor = _usage_event_session_descriptor(event)
-        source = _usage_event_source(event)
-        month_key = _month_key(event_time)
+        descriptor = prepared["descriptor"]
+        source = prepared["source"]
+        month_key = _month_key(prepared["event_time"])
         group_source = descriptor.get("source") or source
         group_id = descriptor.get("group_id")
         session_key = group_id
@@ -713,7 +1009,7 @@ def _aggregate_usage_event_buckets(
 
         source_month_bucket = source_month_buckets.setdefault(source, {})
         month_bucket = source_month_bucket.setdefault(month_key, _new_usage_aggregate_bucket())
-        _ingest_usage_event(month_bucket, event)
+        _ingest_usage_event(month_bucket, event, prepared)
 
         source_session_bucket = source_session_buckets.setdefault(source, {})
         session_bucket = source_session_bucket.setdefault(session_key, _new_usage_aggregate_bucket())
@@ -723,7 +1019,7 @@ def _aggregate_usage_event_buckets(
             session_bucket["session_id"] = descriptor.get("session_id")
         if session_bucket.get("session_kind") in {None, "", "unknown"} and descriptor.get("session_kind"):
             session_bucket["session_kind"] = descriptor.get("session_kind")
-        _ingest_usage_event(session_bucket, event)
+        _ingest_usage_event(session_bucket, event, prepared)
 
     return source_month_buckets, source_session_buckets
 
@@ -1016,19 +1312,20 @@ def collect_daily_dashboard_usage(
 
     source_day_buckets: dict[str, dict[str, dict]] = {}
     for event in usage_events:
-        event_time = _parse_iso_datetime(event.get("finished_at") or event.get("started_at"))
-        if event_time is None:
+        prepared = _prepare_usage_event(event)
+        if not isinstance(prepared, dict):
             continue
+        event_time = prepared["event_time"]
         if start_at is not None and event_time < start_at:
             continue
         if end_at is not None and event_time >= end_at:
             continue
 
-        source = _usage_event_source(event)
+        source = prepared["source"]
         day_key = event_time.astimezone(timezone.utc).strftime("%Y-%m-%d")
         source_bucket = source_day_buckets.setdefault(source, {})
         day_bucket = source_bucket.setdefault(day_key, _new_usage_aggregate_bucket())
-        _ingest_usage_event(day_bucket, event)
+        _ingest_usage_event(day_bucket, event, prepared)
 
     normalized_days = []
     for source in sorted(source_day_buckets):
@@ -1738,13 +2035,17 @@ class DashboardService:
         self.notify_dashboard_stream_listeners = notify_dashboard_stream_listeners
         self._stream_broker = stream_broker or dashboard_stream_broker
         self.thread_class = thread_class
-        # Coalesce concurrent build_payload() calls within a short window so
-        # bursts of SSE notifications (one per AI request) don't each scan
-        # the full event history. force_refresh=True bypasses the cache.
-        self._payload_cache_ttl = 0.25
+        # Coalesce concurrent build_payload() calls and keep the materialized
+        # payload until new data arrives.  The UI asks for ``refresh=1`` on manual
+        # refreshes; that must not turn an unchanged 160K-row archive into a
+        # full CPU/SSD workload.  Direct callers can still use
+        # force_refresh=True to explicitly bypass this policy.
         self._payload_cache_value: dict | None = None
-        self._payload_cache_monotonic: float = 0.0
+        self._payload_cache_stream_version: int = -1
+        self._payload_cache_calendar_key: tuple[int, int, int] | None = None
         self._payload_cache_lock = Lock()
+        self._payload_build_lock = Lock()
+        self._usage_accumulator = _DashboardUsageAccumulator()
 
     def _resolved_thread_class(self):
         resolved_thread_class = self.thread_class
@@ -1752,37 +2053,59 @@ class DashboardService:
             resolved_thread_class = resolved_thread_class()
         return resolved_thread_class
 
-    def build_payload(self, force_refresh: bool = False) -> dict:
-        if not force_refresh:
+    def build_payload(self, force_refresh: bool = False, *, prefer_cached: bool = False) -> dict:
+        stream_version = self._stream_broker.current_version()
+        now = self.utc_now()
+        calendar_key = (now.year, now.month, now.day)
+        with self._payload_cache_lock:
+            cached = self._payload_cache_value
+            cached_version = self._payload_cache_stream_version
+            cached_calendar_key = self._payload_cache_calendar_key
+
+        if (
+            cached is not None
+            and cached_version == stream_version
+            and cached_calendar_key == calendar_key
+        ):
+            if not force_refresh or prefer_cached:
+                return cached
+        with self._payload_build_lock:
+            # A concurrent preload, API refresh, and SSE update should share
+            # one expensive build rather than each scanning the archive.
+            stream_version = self._stream_broker.current_version()
+            now = self.utc_now()
+            calendar_key = (now.year, now.month, now.day)
             with self._payload_cache_lock:
                 cached = self._payload_cache_value
-                cached_at = self._payload_cache_monotonic
-            if cached is not None and (time.monotonic() - cached_at) < self._payload_cache_ttl:
-                return cached
-        result = self._build_payload_uncached()
-        with self._payload_cache_lock:
-            self._payload_cache_value = result
-            self._payload_cache_monotonic = time.monotonic()
-        return result
+                cached_version = self._payload_cache_stream_version
+                cached_calendar_key = self._payload_cache_calendar_key
+            if (
+                cached is not None
+                and cached_version == stream_version
+                and cached_calendar_key == calendar_key
+            ):
+                if not force_refresh or prefer_cached:
+                    return cached
+            build_version = stream_version
+            result = self._build_payload_uncached()
+            with self._payload_cache_lock:
+                self._payload_cache_value = result
+                self._payload_cache_stream_version = build_version
+                self._payload_cache_calendar_key = calendar_key
+            return result
 
     def _build_payload_uncached(self) -> dict:
         now = self.utc_now()
         month_start, month_end = _current_billing_month_bounds(now)
         current_month_key = _month_key(now)
         current_day_start = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
-        usage_events = deduplicate_usage_events(self.dependencies.snapshot_all_usage_events())
-        detailed_usage_events = deduplicate_usage_events(self.dependencies.snapshot_usage_events())
-        current_month_events = []
-        for event in usage_events:
-            recorded_at = _parse_iso_datetime(event.get("finished_at") or event.get("started_at"))
-            if recorded_at is None:
-                continue
-            if month_start <= recorded_at < month_end:
-                current_month_events.append(event)
-
-        usage_ratelimits_summary = _build_usage_ratelimits_summary(usage_events, now=now)
-
-        local_usage = collect_local_dashboard_usage(usage_events)
+        usage_events = self.dependencies.snapshot_all_usage_events()
+        detailed_usage_events = self.dependencies.snapshot_usage_events()
+        if not self.dependencies.usage_snapshots_are_deduplicated:
+            usage_events = deduplicate_usage_events(usage_events)
+            detailed_usage_events = deduplicate_usage_events(detailed_usage_events)
+        self._usage_accumulator.update(usage_events)
+        local_usage = self._usage_accumulator.collect_local_usage()
         month_rows = list(local_usage.get("month_rows") or [])
         current_month_usage = _combine_usage_rows(
             [row for row in month_rows if row.get("month_key") == current_month_key],
@@ -1790,11 +2113,13 @@ class DashboardService:
         )
         all_time_usage = _combine_usage_rows(month_rows)
         all_time_usage["months_tracked"] = len(local_usage.get("month_history") or [])
-        daily_history = collect_daily_dashboard_usage(
-            usage_events,
-            start_at=month_start,
-            end_at=month_end,
-        )
+        daily_history = self._usage_accumulator.collect_daily_usage(month_start, month_end)
+        ratelimit_events = [
+            event
+            for event in usage_events
+            if isinstance(event.get("usage_ratelimits"), dict) and event.get("usage_ratelimits")
+        ]
+        usage_ratelimits_summary = _build_usage_ratelimits_summary(ratelimit_events, now=now)
         safeguard_stats = self.dependencies.load_safeguard_trigger_stats(now)
         if not isinstance(safeguard_stats, dict):
             safeguard_stats = {}
@@ -1830,7 +2155,7 @@ class DashboardService:
                 "label": current_month_key,
                 "start_at": month_start.isoformat(),
                 "end_at": month_end.isoformat(),
-                "proxy_requests": len(current_month_events),
+                "proxy_requests": current_month_usage.get("request_count", 0),
                 "sessions": local_usage.get("session_count", 0),
                 "usage": current_month_usage,
                 "daily_history": filled_daily_history,
