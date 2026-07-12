@@ -71,8 +71,8 @@ classify traffic. Use `_` only when you are deliberately continuing a tool-drive
 agent workflow. Use `+` only when you are starting a fresh user request
 immediately after prior proxy activity and want it counted as user traffic.
 
-The dashboard shows recent request classification, token counts, and estimated
-cost by token type and provider. Treat that display as guidance, not a guarantee.
+The dashboard shows recent requests, token counts, and estimated cost by token
+type and provider. Treat that display as guidance, not a guarantee.
 
 ## First-Time Python Setup
 

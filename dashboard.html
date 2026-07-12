@@ -416,70 +416,10 @@
       padding: 2px 0 12px;
     }
 
-    /* Rate limit & Limit impact pair */
     .pair-grid {
       display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px;
     }
     @media (max-width: 1100px) { .pair-grid { grid-template-columns: 1fr; } }
-    .rl-row {
-      display: flex; align-items: flex-start; gap: 12px; padding: 12px 0;
-      border-bottom: 1px dashed var(--line);
-    }
-    .rl-row:last-child { border-bottom: none; }
-    .rl-icon {
-      width: 36px; height: 36px; border-radius: 10px;
-      display: grid; place-items: center;
-      background: rgba(255,255,255,0.03); color: var(--muted);
-      border: 1px solid var(--line);
-      flex: 0 0 auto;
-    }
-    .rl-body { flex: 1 1 auto; min-width: 0; }
-    .rl-title { font-weight: 600; font-size: 0.85rem; }
-    .rl-sub { color: var(--muted); font-size: 0.76rem; margin-top: 2px; }
-    .rl-bar {
-      margin-top: 8px; height: 6px; border-radius: 4px; overflow: hidden;
-      background: rgba(255,255,255,0.05);
-    }
-    .rl-bar > span {
-      display: block; height: 100%; border-radius: 4px;
-      background: linear-gradient(90deg, #43d8a3, #58e9b6);
-    }
-    .rl-bar > span.tone-yellow { background: linear-gradient(90deg, #f4b740, #f8d066); }
-    .rl-bar > span.tone-red { background: linear-gradient(90deg, #f87272, #ff8a8a); }
-    .rl-stats {
-      display: flex; justify-content: space-between; gap: 8px;
-      font-size: 0.76rem; color: var(--muted); margin-top: 6px;
-    }
-    .rl-stats .ok { color: var(--text); }
-    .rl-live {
-      display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px;
-      margin-top: 8px;
-    }
-    .rl-live-chip {
-      border: 1px solid var(--line); border-radius: 9px;
-      background: rgba(255,255,255,0.025); padding: 7px 8px;
-    }
-    .rl-live-k { color: var(--muted-2); font-size: 0.64rem; text-transform: uppercase; letter-spacing: 0.09em; }
-    .rl-live-v { color: var(--text); font-weight: 700; font-size: 0.9rem; margin-top: 2px; }
-    .rl-live-sub { color: var(--muted); font-size: 0.68rem; margin-top: 1px; }
-
-    /* Limit impact card */
-    .li-window {
-      background: var(--panel-soft); border: 1px solid var(--line);
-      border-radius: 8px; padding: 12px; margin-top: 10px;
-    }
-    .li-window-head {
-      display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: baseline; gap: 8px;
-      margin-bottom: 8px;
-    }
-    .li-window-title { font-weight: 600; font-size: 0.84rem; }
-    .li-window-meta { color: var(--muted); font-size: 0.74rem; overflow: hidden; text-align: right; text-overflow: ellipsis; white-space: nowrap; }
-    .li-table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
-    .li-table th, .li-table td { text-align: left; padding: 6px 0; }
-    .li-table th { color: var(--muted-2); font-weight: 600; font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.1em; }
-    .li-table td.amt { text-align: right; color: var(--accent); font-variant-numeric: tabular-nums; }
-    .li-link { color: var(--accent); font-size: 0.82rem; font-weight: 500; }
-    .li-link:hover { text-decoration: underline; }
 
     /* Recent requests table */
     .req-toolbar {
@@ -517,7 +457,6 @@
     }
     .pill-success { background: rgba(52,211,153,0.10); color: var(--success); border: 1px solid rgba(52,211,153,0.20); }
     .pill-error { background: rgba(248,114,114,0.10); color: var(--danger); border: 1px solid rgba(248,114,114,0.22); }
-    .pill-safeguard { background: rgba(255,122,58,0.10); color: var(--accent); border: 1px solid rgba(255,122,58,0.22); margin-left: 4px; }
     .pill-neutral { background: rgba(255,255,255,0.04); color: var(--muted); border: 1px solid var(--line); }
     .copy-btn {
       width: 24px; height: 24px; border-radius: 6px;
@@ -544,103 +483,103 @@
     .pager .pgbtn:disabled { opacity: 0.4; cursor: default; }
 
 
-    /* ─── Premium Plan (compact rail card) ─────────────────────── */
-    .premium-card { padding: 14px 16px 12px; }
-    .premium-card .card-head { margin-bottom: 6px; }
-    .premium-top {
+    /* ─── AI credit usage (compact rail card) ─────────────────── */
+    .credit-card { padding: 14px 16px 12px; }
+    .credit-card .card-head { margin-bottom: 6px; }
+    .credit-top {
       display: grid;
       grid-template-columns: 1fr auto;
       align-items: baseline;
       gap: 8px;
       margin-bottom: 8px;
     }
-    .premium-headline {
+    .credit-headline {
       display: flex; align-items: baseline; gap: 6px;
       font-weight: 700; font-size: 1.05rem; letter-spacing: -0.01em;
     }
-    .premium-headline .pct { color: var(--accent); }
-    .premium-headline .of { color: var(--muted); font-weight: 500; font-size: 0.82rem; }
-    .premium-tone-pill {
+    .credit-headline .pct { color: var(--accent); }
+    .credit-headline .of { color: var(--muted); font-weight: 500; font-size: 0.82rem; }
+    .credit-tone-pill {
       display: inline-flex; align-items: center; gap: 6px;
       padding: 2px 8px; border-radius: 999px;
       font-size: 0.7rem; font-weight: 600;
       background: rgba(52,211,153,0.10); color: var(--success);
       border: 1px solid rgba(52,211,153,0.25);
     }
-    .premium-tone-pill.tone-yellow {
+    .credit-tone-pill.tone-yellow {
       background: rgba(244,183,64,0.10); color: var(--warn);
       border-color: rgba(244,183,64,0.30);
     }
-    .premium-tone-pill.tone-red {
+    .credit-tone-pill.tone-red {
       background: rgba(248,114,114,0.12); color: var(--danger);
       border-color: rgba(248,114,114,0.30);
     }
-    .premium-tone-pill.tone-cyan {
+    .credit-tone-pill.tone-cyan {
       background: rgba(94,200,255,0.10); color: var(--cyan);
       border-color: rgba(94,200,255,0.30);
     }
-    .premium-tone-pill .dot {
+    .credit-tone-pill .dot {
       width: 6px; height: 6px; border-radius: 50%; background: currentColor;
     }
 
-    .premium-bar {
+    .credit-bar {
       position: relative;
       height: 8px;
       border-radius: 5px;
       background: rgba(255,255,255,0.06);
       overflow: visible;
     }
-    .premium-bar > .fill {
+    .credit-bar > .fill {
       display: block; height: 100%; border-radius: 5px;
       background: linear-gradient(90deg, var(--accent), #ff9a5e);
       transition: width .3s;
     }
-    .premium-bar > .fill.tone-yellow { background: linear-gradient(90deg, #f4b740, #ffd07a); }
-    .premium-bar > .fill.tone-red    { background: linear-gradient(90deg, #f87272, #ffa3a3); }
-    .premium-bar > .fill.tone-cyan   { background: linear-gradient(90deg, var(--cyan), #a4dcff); }
-    .premium-bar > .pace {
+    .credit-bar > .fill.tone-yellow { background: linear-gradient(90deg, #f4b740, #ffd07a); }
+    .credit-bar > .fill.tone-red    { background: linear-gradient(90deg, #f87272, #ffa3a3); }
+    .credit-bar > .fill.tone-cyan   { background: linear-gradient(90deg, var(--cyan), #a4dcff); }
+    .credit-bar > .pace {
       position: absolute; top: -3px; bottom: -3px; width: 2px;
       background: var(--text); opacity: 0.85; border-radius: 1px;
       transform: translateX(-1px);
       box-shadow: 0 0 0 2px var(--panel);
     }
-    .premium-bar-foot {
+    .credit-bar-foot {
       display: flex; justify-content: space-between; align-items: baseline;
       color: var(--muted); font-size: 0.72rem; margin-top: 6px;
     }
-    .premium-bar-foot .right { color: var(--muted-2); }
+    .credit-bar-foot .right { color: var(--muted-2); }
 
-    .premium-stats {
+    .credit-stats {
       display: grid;
       grid-template-columns: repeat(4, minmax(0, 1fr));
       gap: 8px;
       margin: 12px 0 10px;
     }
-    .premium-stat {
+    .credit-stat {
       background: var(--panel-soft);
       border: 1px solid var(--line);
       border-radius: 8px;
       padding: 7px 8px;
       min-width: 0;
     }
-    .premium-stat .k {
+    .credit-stat .k {
       color: var(--muted-2); font-size: 0.62rem;
       text-transform: uppercase; letter-spacing: 0.08em;
       white-space: nowrap;
     }
-    .premium-stat .v {
+    .credit-stat .v {
       font-weight: 700; font-size: 0.92rem; margin-top: 2px;
       white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
     }
-    .premium-stat .sub {
+    .credit-stat .sub {
       color: var(--muted); font-size: 0.66rem; margin-top: 1px;
       white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
     }
-    .premium-stat.proj-yellow .v { color: var(--warn); }
-    .premium-stat.proj-red    .v { color: var(--danger); }
-    .premium-stat.proj-green  .v { color: var(--success); }
+    .credit-stat.proj-yellow .v { color: var(--warn); }
+    .credit-stat.proj-red    .v { color: var(--danger); }
+    .credit-stat.proj-green  .v { color: var(--success); }
 
-    .premium-spark {
+    .credit-spark {
       display: flex;
       align-items: end;
       gap: 3px;
@@ -648,25 +587,25 @@
       padding-top: 4px;
       border-top: 1px dashed var(--line);
     }
-    .premium-spark .col {
+    .credit-spark .col {
       flex: 1;
       display: flex; flex-direction: column; align-items: center; gap: 3px;
       min-width: 0;
     }
-    .premium-spark .bar {
+    .credit-spark .bar {
       width: 100%; max-width: 14px;
       background: rgba(255,122,58,0.55);
       border-radius: 3px 3px 0 0;
       min-height: 2px;
       transition: height .3s;
     }
-    .premium-spark .col.is-today .bar { background: var(--accent); }
-    .premium-spark .col .lbl {
+    .credit-spark .col.is-today .bar { background: var(--accent); }
+    .credit-spark .col .lbl {
       color: var(--muted-2); font-size: 0.6rem;
       letter-spacing: 0.04em;
     }
-    .premium-spark .col.is-today .lbl { color: var(--text); font-weight: 600; }
-    .premium-spark-foot {
+    .credit-spark .col.is-today .lbl { color: var(--text); font-weight: 600; }
+    .credit-spark-foot {
       display: flex; justify-content: space-between;
       color: var(--muted); font-size: 0.7rem;
       margin-top: 6px;
@@ -691,20 +630,7 @@
     .donut-label .big { font-size: 1.15rem; font-weight: 700; }
     .donut-label .tiny { color: var(--muted); font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.1em; }
 
-    .quota-meta .big { font-size: 0.95rem; font-weight: 600; line-height: 1.25; }
-    .quota-meta .big strong { font-weight: 700; color: var(--text); }
-    .quota-meta .meta { color: var(--muted); font-size: 0.78rem; margin-top: 6px; }
-    .quota-bar {
-      margin-top: 12px; height: 6px; border-radius: 4px; background: rgba(255,255,255,0.06); overflow: hidden;
-    }
-    .quota-bar > span {
-      display: block; height: 100%;
-      background: linear-gradient(90deg, var(--accent), #ff9a5e);
-      border-radius: 4px;
-    }
-    .quota-foot { color: var(--muted); font-size: 0.76rem; margin-top: 6px; }
-
-    /* Bar chart (premium 7-day) */
+    /* Bar chart (token cost, 7-day) */
     .barchart { display: grid; grid-template-rows: auto 1fr auto; gap: 6px; padding-top: 8px; }
     .barchart-wrap { display: grid; grid-template-columns: 28px 1fr; gap: 6px; }
     .barchart-y { display: flex; flex-direction: column; justify-content: space-between; padding: 4px 0 18px; color: var(--muted-2); font-size: 0.68rem; text-align: right; }
@@ -820,7 +746,6 @@
     }
     .toolbar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
     .badge { display: inline-flex; padding: 3px 8px; border-radius: 999px; font-size: 0.72rem; background: rgba(255,255,255,0.04); color: var(--muted); border: 1px solid var(--line); text-transform: uppercase; letter-spacing: 0.08em; }
-    .badge-safeguard { background: rgba(255,122,58,0.12); color: var(--accent); border-color: rgba(255,122,58,0.22); }
 
     /* Modals */
     .modal-backdrop {
@@ -871,7 +796,6 @@
     .request-row-head { display: flex; gap: 10px; justify-content: space-between; align-items: baseline; }
     .request-title { font-weight: 600; font-size: 0.85rem; }
     .request-meta { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4px; font-size: 0.75rem; }
-    .safeguard-banner { display: flex; gap: 6px; align-items: baseline; }
     .detail-pane { background: var(--panel-soft); border: 1px solid var(--line); border-radius: 10px; padding: 14px; max-height: 540px; overflow: auto; display: grid; gap: 14px; }
     .detail-block { display: grid; gap: 8px; }
     .detail-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
@@ -955,87 +879,41 @@
     .source-context-pill.active { border-color: rgba(255,122,58,0.40); }
     .breakdown-controls { gap: 10px; }
     .breakdown-footer { margin-top: 8px; }
-    .ratelimit-section { display: grid; gap: 14px; margin-top: 12px; }
-    .ratelimit-section-head { display: flex; justify-content: space-between; align-items: baseline; }
-    .ratelimit-section-title { font-weight: 600; }
-    .ratelimit-section-meta, .ratelimit-section-note { color: var(--muted); font-size: 0.78rem; }
-    .ratelimit-list { display: grid; gap: 10px; }
-    .ratelimit-row { display: grid; grid-template-columns: 200px 1fr; gap: 12px; align-items: center; padding: 10px; background: var(--panel-soft); border: 1px solid var(--line); border-radius: 10px; }
-    .ratelimit-row-label { font-weight: 600; }
-    .ratelimit-row-meta { color: var(--muted); font-size: 0.76rem; }
-    .ratelimit-headline { display: flex; gap: 8px; align-items: baseline; font-size: 0.85rem; }
-    .ratelimit-headline-value { font-weight: 600; }
-    .ratelimit-bar { margin-top: 6px; height: 6px; background: rgba(255,255,255,0.06); border-radius: 4px; overflow: hidden; }
-    .ratelimit-bar-fill { display: block; height: 100%; background: var(--success); }
-    .ratelimit-bar-fill.tone-yellow { background: var(--warn); }
-    .ratelimit-bar-fill.tone-red { background: var(--danger); }
-    .burn-empty { padding: 14px; color: var(--muted); text-align: center; font-size: 0.82rem; border: 1px dashed var(--line); border-radius: 8px; }
-    .burn-block { display: grid; gap: 10px; padding: 10px; background: var(--panel-soft); border: 1px solid var(--line); border-radius: 10px; }
-    .burn-block-head { display: flex; justify-content: space-between; align-items: baseline; }
-    .burn-block-title { font-weight: 600; }
-    .burn-block-meta { color: var(--muted); font-size: 0.76rem; }
-    .burn-card-grid { display: grid; gap: 10px; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }
-    .burn-card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px; display: grid; gap: 8px; }
-    .burn-card.is-leader { border-color: rgba(255,122,58,0.40); }
-    .burn-card-head { display: flex; justify-content: space-between; align-items: baseline; }
-    .burn-card-kicker { color: var(--muted-2); font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.1em; }
-    .burn-card-model { font-weight: 600; }
-    .burn-card-badge { display: inline-flex; padding: 2px 8px; border-radius: 999px; font-size: 0.7rem; background: rgba(255,122,58,0.10); color: var(--accent); border: 1px solid rgba(255,122,58,0.22); }
-    .burn-impact-pair { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
-    .burn-impact-side { background: var(--panel-soft); border: 1px solid var(--line); border-radius: 8px; padding: 8px; text-align: center; }
-    .burn-impact-value { font-weight: 700; font-size: 1rem; }
-    .burn-impact-caption { color: var(--muted); font-size: 0.72rem; }
-    .burn-sample, .burn-share-block { display: grid; gap: 4px; }
-    .burn-sample-head, .burn-share-head { display: flex; justify-content: space-between; align-items: baseline; font-size: 0.78rem; }
-    .burn-sample-track, .burn-share-track { display: flex; height: 5px; background: rgba(255,255,255,0.06); border-radius: 4px; overflow: hidden; }
-    .burn-sample-track > span { background: var(--accent); height: 100%; }
-    .burn-share-segment { height: 100%; }
-    .burn-share-segment.tone-input { background: var(--violet); }
-    .burn-share-segment.tone-output { background: var(--accent); }
-    .burn-share-grid { display: grid; gap: 6px; grid-template-columns: 1fr 1fr; }
-    .burn-share-pill { background: var(--panel-soft); border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px; }
-    .burn-share-pill-head { display: flex; gap: 6px; align-items: center; font-size: 0.76rem; }
-    .burn-share-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
-    .burn-share-dot.tone-input { background: var(--violet); }
-    .burn-share-dot.tone-output { background: var(--accent); }
-    .burn-share-value { font-weight: 700; }
-    .burn-share-meta { color: var(--muted); font-size: 0.74rem; }
-
     /* Premium chip layout (legacy summary cards) */
-    .premium-shell { display: grid; grid-template-columns: 70px 1fr; gap: 14px; }
-    .premium-tower { width: 70px; display: flex; flex-direction: column; align-items: center; gap: 4px; }
-    .premium-tower-kicker { color: var(--muted-2); font-size: 0.66rem; text-transform: uppercase; letter-spacing: 0.1em; }
-    .premium-battery-cap { width: 24px; height: 4px; background: var(--muted); border-radius: 2px 2px 0 0; }
-    .premium-tower-rail { width: 36px; height: 120px; border-radius: 6px; background: rgba(255,255,255,0.06); position: relative; overflow: hidden; border: 1px solid var(--line); }
-    .premium-tower-fill { position: absolute; bottom: 0; left: 0; right: 0; background: var(--accent); transition: height .3s; }
-    .premium-tower-fill.tone-green { background: var(--success); }
-    .premium-tower-fill.tone-yellow { background: var(--warn); }
-    .premium-tower-fill.tone-red { background: var(--danger); }
-    .premium-tower-fill.tone-unlimited { background: var(--cyan); }
-    .premium-tower-value { font-weight: 700; font-size: 0.82rem; }
-    .premium-tower-meta { color: var(--muted); font-size: 0.7rem; text-align: center; }
-    .premium-content { display: grid; gap: 10px; }
-    .premium-headline-value { font-weight: 700; font-size: 1rem; }
-    .premium-consumed-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 8px; }
-    .premium-consumed-card { background: var(--panel-soft); border: 1px solid var(--line); border-radius: 10px; padding: 10px; }
-    .premium-consumed-card.active { border-color: rgba(255,122,58,0.40); }
-    .premium-consumed-label { color: var(--muted-2); font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.1em; }
-    .premium-consumed-value { font-weight: 700; font-size: 1rem; }
-    .premium-details summary { cursor: pointer; padding: 8px 0; list-style: none; display: flex; justify-content: space-between; align-items: center; }
-    .premium-details summary::-webkit-details-marker { display: none; }
-    .premium-details-summary { display: flex; gap: 10px; align-items: baseline; }
-    .premium-details-title { font-weight: 600; }
-    .premium-week-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 8px; margin: 8px 0; }
-    .premium-day { background: var(--panel-soft); border: 1px solid var(--line); border-radius: 10px; padding: 10px; display: grid; gap: 4px; }
-    .premium-day.is-today { border-color: rgba(255,122,58,0.40); }
-    .premium-day-top { display: flex; justify-content: space-between; align-items: baseline; }
-    .premium-day-name { font-weight: 600; }
-    .premium-day-date { color: var(--muted); font-size: 0.74rem; }
-    .premium-day-value { font-weight: 700; }
-    .premium-day-bar { height: 4px; background: rgba(255,255,255,0.06); border-radius: 4px; overflow: hidden; }
-    .premium-day-bar > span { display: block; height: 100%; background: var(--accent); }
-    .premium-week-foot { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 8px; }
-    .premium-week-stat { background: var(--panel-soft); border: 1px solid var(--line); border-radius: 10px; padding: 10px; }
+    .credit-shell { display: grid; grid-template-columns: 70px 1fr; gap: 14px; }
+    .credit-tower { width: 70px; display: flex; flex-direction: column; align-items: center; gap: 4px; }
+    .credit-tower-kicker { color: var(--muted-2); font-size: 0.66rem; text-transform: uppercase; letter-spacing: 0.1em; }
+    .credit-battery-cap { width: 24px; height: 4px; background: var(--muted); border-radius: 2px 2px 0 0; }
+    .credit-tower-rail { width: 36px; height: 120px; border-radius: 6px; background: rgba(255,255,255,0.06); position: relative; overflow: hidden; border: 1px solid var(--line); }
+    .credit-tower-fill { position: absolute; bottom: 0; left: 0; right: 0; background: var(--accent); transition: height .3s; }
+    .credit-tower-fill.tone-green { background: var(--success); }
+    .credit-tower-fill.tone-yellow { background: var(--warn); }
+    .credit-tower-fill.tone-red { background: var(--danger); }
+    .credit-tower-fill.tone-unlimited { background: var(--cyan); }
+    .credit-tower-value { font-weight: 700; font-size: 0.82rem; }
+    .credit-tower-meta { color: var(--muted); font-size: 0.7rem; text-align: center; }
+    .credit-content { display: grid; gap: 10px; }
+    .credit-headline-value { font-weight: 700; font-size: 1rem; }
+    .credit-consumed-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 8px; }
+    .credit-consumed-card { background: var(--panel-soft); border: 1px solid var(--line); border-radius: 10px; padding: 10px; }
+    .credit-consumed-card.active { border-color: rgba(255,122,58,0.40); }
+    .credit-consumed-label { color: var(--muted-2); font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.1em; }
+    .credit-consumed-value { font-weight: 700; font-size: 1rem; }
+    .credit-details summary { cursor: pointer; padding: 8px 0; list-style: none; display: flex; justify-content: space-between; align-items: center; }
+    .credit-details summary::-webkit-details-marker { display: none; }
+    .credit-details-summary { display: flex; gap: 10px; align-items: baseline; }
+    .credit-details-title { font-weight: 600; }
+    .credit-week-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 8px; margin: 8px 0; }
+    .credit-day { background: var(--panel-soft); border: 1px solid var(--line); border-radius: 10px; padding: 10px; display: grid; gap: 4px; }
+    .credit-day.is-today { border-color: rgba(255,122,58,0.40); }
+    .credit-day-top { display: flex; justify-content: space-between; align-items: baseline; }
+    .credit-day-name { font-weight: 600; }
+    .credit-day-date { color: var(--muted); font-size: 0.74rem; }
+    .credit-day-value { font-weight: 700; }
+    .credit-day-bar { height: 4px; background: rgba(255,255,255,0.06); border-radius: 4px; overflow: hidden; }
+    .credit-day-bar > span { display: block; height: 100%; background: var(--accent); }
+    .credit-week-foot { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 8px; }
+    .credit-week-stat { background: var(--panel-soft); border: 1px solid var(--line); border-radius: 10px; padding: 10px; }
     .summary-content { display: grid; gap: 10px; }
     .summary-hero-value { font-size: clamp(2rem, 5vw, 3rem); font-weight: 800; letter-spacing: -0.04em; margin: 0; }
     .summary-hero-meta { color: var(--muted); font-size: 0.88rem; max-width: 720px; }
@@ -1076,252 +954,6 @@
     .tabbtn { background: transparent; color: var(--muted); border: 1px solid transparent; padding: 6px 12px; border-radius: 8px; font-size: 0.82rem; cursor: pointer; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; }
     .tabbtn:hover { color: var(--text); }
     .tabbtn.active { background: var(--panel-soft); color: var(--text); border-color: var(--line-strong); }
-    .ratelimit-section-note code { background: var(--panel-soft); padding: 1px 4px; border-radius: 4px; }
-
-    /* Rate Limits page redesign */
-    .rl-page { display: grid; gap: 16px; }
-    .rl-snap-grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); }
-    .rl-snap-card { background: var(--panel-soft); border: 1px solid var(--line); border-radius: 12px; padding: 14px; display: grid; gap: 10px; }
-    .rl-snap-card.tone-red { border-color: rgba(239, 86, 80, 0.40); }
-    .rl-snap-card.tone-yellow { border-color: rgba(255, 184, 76, 0.40); }
-    .rl-snap-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
-    .rl-snap-kicker { color: var(--muted-2); font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.1em; }
-    .rl-snap-title { font-weight: 700; font-size: 1rem; }
-    .rl-snap-pct { font-weight: 800; font-size: 1.6rem; letter-spacing: -0.02em; }
-    .rl-snap-pct .pct-meta { font-size: 0.74rem; color: var(--muted); font-weight: 500; margin-left: 6px; }
-    .rl-snap-bar { height: 6px; background: rgba(255,255,255,0.06); border-radius: 4px; overflow: hidden; }
-    .rl-snap-bar > span { display: block; height: 100%; background: var(--success); }
-    .rl-snap-bar > span.tone-yellow { background: var(--warn); }
-    .rl-snap-bar > span.tone-red { background: var(--danger); }
-    .rl-snap-meta { color: var(--muted); font-size: 0.76rem; display: flex; justify-content: space-between; gap: 6px; }
-
-    /* Time-to-cap vs reset bar */
-    .ttc-block { display: grid; gap: 6px; padding-top: 4px; border-top: 1px dashed var(--line); }
-    .ttc-head { display: flex; justify-content: space-between; align-items: baseline; gap: 6px; font-size: 0.78rem; }
-    .ttc-head .ttc-label { color: var(--muted-2); text-transform: uppercase; letter-spacing: 0.08em; font-size: 0.7rem; }
-    .ttc-head .ttc-verdict { font-weight: 700; }
-    .ttc-head .ttc-verdict.tone-good { color: var(--success); }
-    .ttc-head .ttc-verdict.tone-warn { color: var(--warn); }
-    .ttc-head .ttc-verdict.tone-bad { color: var(--danger); }
-    .ttc-bar { position: relative; height: 10px; background: rgba(255,255,255,0.06); border-radius: 5px; overflow: hidden; }
-    .ttc-bar .ttc-fill { display: block; height: 100%; background: var(--success); }
-    .ttc-bar .ttc-fill.tone-warn { background: var(--warn); }
-    .ttc-bar .ttc-fill.tone-bad { background: var(--danger); }
-    .ttc-bar .ttc-threshold { position: absolute; top: -2px; bottom: -2px; width: 2px; background: var(--text); opacity: 0.55; }
-    .ttc-scale { display: flex; justify-content: space-between; color: var(--muted); font-size: 0.7rem; }
-    .ttc-meta { color: var(--muted); font-size: 0.74rem; }
-
-    /* Observation window */
-    .rl-obs-toolbar { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
-    .rl-obs-toolbar .obs-label { color: var(--muted-2); font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.08em; margin-right: 4px; }
-    .rl-obs-grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }
-    .rl-obs-card { background: var(--panel-soft); border: 1px solid var(--line); border-radius: 12px; padding: 14px; display: grid; gap: 10px; }
-    .rl-obs-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
-    .rl-obs-title { font-weight: 700; }
-    .rl-obs-meta { color: var(--muted); font-size: 0.74rem; }
-    .rl-obs-stats { display: grid; gap: 8px; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); }
-    .rl-obs-stat { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 8px; text-align: center; }
-    .rl-obs-stat-value { font-weight: 700; font-size: 0.96rem; }
-    .rl-obs-stat-label { color: var(--muted-2); font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.08em; }
-    .rl-model-table { width: 100%; border-collapse: collapse; font-size: 0.84rem; }
-    .rl-model-table th, .rl-model-table td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); }
-    .rl-model-table th { color: var(--muted-2); font-weight: 600; font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.08em; }
-    .rl-model-table td.amt, .rl-model-table th.amt { text-align: right; font-variant-numeric: tabular-nums; }
-    .rl-model-table tr:last-child td { border-bottom: none; }
-    .rl-model-share { display: inline-block; height: 6px; min-width: 24px; background: var(--accent); border-radius: 3px; vertical-align: middle; margin-right: 6px; }
-    .rl-section-note { color: var(--muted); font-size: 0.76rem; }
-
-
-    /* ─── Rate Limits page (v2 redesign) ─────────────────────────── */
-    .rl2 { display: grid; gap: 14px; overflow-wrap: normal; word-break: normal; }
-    .rl2 * { min-width: 0; }
-    .rl2-bucket-pills { display: grid; grid-template-columns: repeat(8, minmax(48px, max-content)); gap: 6px; align-items: center; }
-    .rl2-bucket-pill { min-height: 30px; padding: 6px 14px; border-radius: 8px; background: transparent; color: var(--muted); border: 1px solid var(--line); font-weight: 600; cursor: pointer; font-size: 0.82rem; letter-spacing: 0.02em; white-space: nowrap; }
-    .rl2-bucket-pill:hover { color: var(--text); border-color: var(--line-strong); }
-    .rl2-bucket-pill.active { background: var(--accent-soft); color: var(--accent); border-color: var(--accent); }
-
-    .rl2-card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; box-shadow: var(--shadow); overflow: hidden; }
-    .rl2-section-title { display: flex; align-items: baseline; gap: 8px; margin-bottom: 10px; min-width: 0; }
-    .rl2-section-title .label { color: var(--muted-2); font-size: 0.7rem; font-weight: 700; letter-spacing: 0.14em; text-transform: uppercase; }
-    .rl2-section-title .info { color: var(--muted-2); font-size: 0.78rem; white-space: nowrap; }
-    .rl2-section-title .meta { color: var(--muted); font-size: 0.78rem; margin-left: auto; overflow: hidden; text-align: right; text-overflow: ellipsis; white-space: nowrap; }
-    .rl2-section-title h3 { margin: 0; font-size: 1rem; font-weight: 700; white-space: nowrap; }
-    .rl2-section-title .sub { color: var(--muted); font-size: 0.78rem; }
-
-    /* Two main windows row */
-    .rl2-windows { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
-    .rl2-window-tiles { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin-top: 10px; }
-    .rl2-tile { background: var(--panel-soft); border: 1px solid var(--line); border-radius: 8px; padding: 12px; min-height: 96px; display: grid; align-content: center; }
-    .rl2-tile.donut-tile { display: grid; grid-template-columns: 56px minmax(0, 1fr); align-items: center; gap: 12px; }
-    .rl2-mini-donut { width: 56px; height: 56px; flex: 0 0 56px; position: relative; }
-    .rl2-mini-donut svg { transform: rotate(-90deg); width: 100%; height: 100%; }
-    .rl2-mini-donut .ring-bg { stroke: rgba(255,255,255,0.06); }
-    .rl2-mini-donut .center { position: absolute; inset: 0; display: grid; place-items: center; font-weight: 700; font-size: 0.86rem; }
-    .rl2-tile .tval { font-size: 1.16rem; font-weight: 700; letter-spacing: 0; line-height: 1.08; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .rl2-tile .tlabel { color: var(--muted-2); font-size: 0.78rem; letter-spacing: 0.02em; margin-top: 2px; }
-    .rl2-tile .thint { color: var(--muted); font-size: 0.74rem; margin-top: 6px; }
-    .rl2-tile .ttsub { color: var(--muted); font-size: 0.74rem; margin-top: 4px; }
-    .rl2-tile .icon-row { display: flex; align-items: center; gap: 6px; }
-    .rl2-tile .icon-row .tval { flex: 1 1 auto; }
-    .rl2-tile .icon-row svg { color: var(--muted); }
-    .rl2-tile.tile-burn .tval { display: flex; align-items: center; gap: 6px; }
-    .rl2-tile.tile-burn .delta-down { color: var(--success); font-size: 0.74rem; margin-top: 4px; }
-    .rl2-tile.tile-burn .delta-up { color: var(--danger); font-size: 0.74rem; margin-top: 4px; }
-    .rl2-tile.tile-ttc .verdict-good { color: var(--success); }
-    .rl2-tile.tile-ttc .verdict-warn { color: var(--warn); }
-    .rl2-tile.tile-ttc .verdict-bad  { color: var(--danger); }
-    .rl2-tile.tile-ttc .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 6px; vertical-align: middle; }
-    .rl2-tile.tile-ttc .dot.good { background: var(--success); }
-    .rl2-tile.tile-ttc .dot.warn { background: var(--warn); }
-    .rl2-tile.tile-ttc .dot.bad { background: var(--danger); }
-    .rl2-tile.tile-reqs .vline { display: flex; flex-direction: column; gap: 2px; }
-    .rl2-tile.tile-reqs .vline .v1 { font-size: 1rem; font-weight: 700; }
-    .rl2-tile.tile-reqs .vline .v2 { color: var(--muted); font-size: 0.78rem; }
-
-    /* Time-to-cap vs reset (long horizontal bars) */
-    .rl2-ttc-row { display: grid; grid-template-columns: 1fr; gap: 12px; margin-top: 8px; }
-    .rl2-ttc-grid { display: grid; grid-template-columns: minmax(120px, 150px) minmax(180px, 1fr) minmax(84px, 110px) minmax(126px, 150px); gap: 12px; align-items: center; padding: 8px 0; border-bottom: 1px solid var(--line); }
-    .rl2-ttc-grid:last-child { border-bottom: none; }
-    .rl2-ttc-head { color: var(--muted-2); font-size: 0.7rem; letter-spacing: 0.1em; text-transform: uppercase; font-weight: 700; padding-bottom: 4px; }
-    .rl2-ttc-bar { position: relative; height: 14px; background: rgba(255,255,255,0.05); border-radius: 7px; overflow: visible; }
-    .rl2-ttc-bar > .fill { display: block; height: 100%; border-radius: 7px; background: var(--success); position: relative; }
-    .rl2-ttc-bar > .fill.warn { background: var(--warn); }
-    .rl2-ttc-bar > .fill.bad { background: var(--danger); }
-    .rl2-ttc-bar .fill-label { position: absolute; right: 6px; top: 50%; transform: translateY(-50%); color: rgba(0,0,0,0.7); font-size: 0.7rem; font-weight: 700; }
-    .rl2-ttc-scale { display: grid; grid-template-columns: 1fr 1fr 1fr 1fr 1fr; color: var(--muted); font-size: 0.7rem; margin: 6px 162px 0 162px; }
-    .rl2-ttc-scale span { text-align: left; }
-    .rl2-ttc-scale span:last-child { text-align: right; }
-    .rl2-ttc-foot { color: var(--muted); font-size: 0.74rem; margin-top: 6px; text-align: center; }
-    .rl2-ttc-verdict { font-weight: 700; font-size: 0.84rem; }
-    .rl2-ttc-verdict.good { color: var(--success); }
-    .rl2-ttc-verdict.warn { color: var(--warn); }
-    .rl2-ttc-verdict.bad { color: var(--danger); }
-    .rl2-ttc-verdict .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 6px; vertical-align: middle; }
-
-    /* Window summary table */
-    .rl2-table-wrap { overflow-x: auto; overflow-y: hidden; }
-    .rl2-summary-table { width: 100%; border-collapse: collapse; font-size: 0.8rem; }
-    .rl2-summary-table th, .rl2-summary-table td { padding: 5px 5px; text-align: right; }
-    .rl2-summary-table th:first-child, .rl2-summary-table td:first-child { text-align: left; }
-    .rl2-summary-table th { color: var(--muted-2); font-weight: 700; font-size: 0.58rem; letter-spacing: 0.045em; line-height: 1.1; text-transform: uppercase; white-space: nowrap; }
-    .rl2-summary-table td { font-variant-numeric: tabular-nums; white-space: nowrap; }
-    .rl2-summary-table tr { border-bottom: 1px solid var(--line); }
-    .rl2-summary-table tr:last-child { border-bottom: none; }
-    .rl2-summary-table .pct-good { color: var(--success); font-weight: 600; }
-    .rl2-summary-table .pct-warn { color: var(--warn); font-weight: 600; }
-    .rl2-summary-table .pct-bad { color: var(--danger); font-weight: 600; }
-
-    /* Burn rate over time line chart */
-    .rl2-line { width: 100%; height: 180px; }
-    .rl2-line .axis-y { color: var(--muted); font-size: 0.65rem; }
-    .rl2-line .grid { stroke: rgba(255,255,255,0.06); stroke-width: 1; }
-    .rl2-line .axis-text { fill: var(--muted); font-size: 9px; }
-    .rl2-line-legend { display: flex; gap: 16px; justify-content: center; color: var(--muted); font-size: 0.78rem; margin-top: 4px; }
-    .rl2-line-legend .swatch { display: inline-block; width: 14px; height: 2px; vertical-align: middle; margin-right: 6px; }
-    .rl2-y-toolbar { display: flex; align-items: center; gap: 6px; flex: 0 0 auto; }
-    .rl2-y-toolbar select { background: var(--panel-soft); color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px; font-size: 0.78rem; }
-
-    /* Per-model burn */
-    .rl2-tabs { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
-    .rl2-tabs button { background: transparent; color: var(--muted); border: none; padding: 5px 14px; cursor: pointer; font-weight: 600; font-size: 0.78rem; }
-    .rl2-tabs button.active { background: var(--accent-soft); color: var(--accent); }
-    .rl2-pmb-table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
-    .rl2-pmb-table th, .rl2-pmb-table td { padding: 6px 8px; text-align: right; }
-    .rl2-pmb-table th:first-child, .rl2-pmb-table td:first-child { text-align: left; }
-    .rl2-pmb-table th { color: var(--muted-2); font-weight: 700; font-size: 0.62rem; letter-spacing: 0.055em; text-transform: uppercase; white-space: nowrap; }
-    .rl2-pmb-table td { white-space: nowrap; }
-    .rl2-pmb-table tbody tr { border-bottom: 1px solid var(--line); }
-    .rl2-pmb-table tbody tr:last-child { border-bottom: none; }
-    .rl2-pmb-table tfoot td { padding-top: 8px; border-top: 1px solid var(--line-strong); font-weight: 700; }
-    .rl2-pmb-bar { display: inline-block; height: 8px; border-radius: 4px; vertical-align: middle; }
-    .rl2-pmb-bar-wrap { display: flex; align-items: center; gap: 8px; justify-content: flex-end; }
-    .rl2-pmb-bar-wrap .pct { width: 36px; text-align: right; font-variant-numeric: tabular-nums; }
-    .rl2-pmb-stacked { height: 24px; border-radius: 6px; overflow: hidden; display: flex; background: rgba(255,255,255,0.05); }
-    .rl2-pmb-stacked > span { display: block; height: 100%; }
-    .rl2-pmb-stacked-legend { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 8px; color: var(--muted); font-size: 0.78rem; }
-    .rl2-pmb-stacked-legend .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; vertical-align: middle; margin-right: 6px; }
-
-    /* Budget & limits */
-    .rl2-budget-row { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; align-items: center; gap: 10px; padding: 10px 0; border-bottom: 1px dashed var(--line); }
-    .rl2-budget-row:last-of-type { border-bottom: none; }
-    .rl2-budget-row .name { font-weight: 600; }
-    .rl2-budget-row .desc { color: var(--muted); font-size: 0.74rem; }
-    .rl2-budget-row .target { color: var(--text); font-weight: 700; font-size: 1.05rem; text-align: right; }
-    .rl2-budget-row .used { color: var(--success); font-weight: 700; }
-    .rl2-budget-row .used.warn { color: var(--warn); }
-    .rl2-budget-row .used.bad { color: var(--danger); }
-    .rl2-budget-bar { grid-column: 1 / -1; height: 6px; background: rgba(255,255,255,0.05); border-radius: 4px; overflow: hidden; margin-top: 4px; }
-    .rl2-budget-bar > span { display: block; height: 100%; background: var(--success); }
-    .rl2-budget-bar > span.warn { background: var(--warn); }
-    .rl2-budget-bar > span.bad { background: var(--danger); }
-    .rl2-budget-foot { display: flex; gap: 6px; align-items: center; justify-content: center; padding: 10px; background: var(--panel-soft); color: var(--text); border-radius: 8px; margin-top: 14px; cursor: pointer; border: 1px solid var(--line); font-size: 0.84rem; font-weight: 600; }
-    .rl2-budget-foot:hover { background: var(--panel-hi); }
-
-    /* Efficiency & trends */
-    .rl2-eff-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; }
-    .rl2-eff-tile { background: var(--panel-soft); border: 1px solid var(--line); border-radius: 8px; padding: 10px; min-height: 108px; }
-    .rl2-eff-tile .lbl { color: var(--muted-2); font-size: 0.7rem; font-weight: 600; line-height: 1.2; }
-    .rl2-eff-tile .val { font-size: 1.35rem; font-weight: 700; margin-top: 2px; letter-spacing: 0; line-height: 1.1; white-space: nowrap; }
-    .rl2-eff-tile .vu { color: var(--muted); font-size: 0.78rem; font-weight: 500; margin-left: 2px; }
-    .rl2-eff-tile .delta-up { color: var(--danger); font-size: 0.72rem; margin-top: 4px; }
-    .rl2-eff-tile .delta-down { color: var(--success); font-size: 0.72rem; margin-top: 4px; }
-    .rl2-eff-tile .sub { color: var(--muted); font-size: 0.72rem; margin-top: 4px; }
-    .rl2-eff-tile .spark { width: 100%; height: 32px; margin-top: 6px; }
-    .rl2-heat-tile { grid-column: span 2; background: var(--panel-soft); border: 1px solid var(--line); border-radius: 8px; padding: 10px; display: grid; grid-template-rows: auto 1fr auto; gap: 6px; min-height: 108px; }
-    .rl2-heat-tile .head { display: flex; justify-content: space-between; align-items: center; color: var(--muted-2); font-size: 0.72rem; font-weight: 600; }
-    .rl2-heat-grid { display: grid; grid-template-columns: repeat(24, 1fr); gap: 2px; align-content: center; }
-    .rl2-heat-cell { aspect-ratio: 1; border-radius: 2px; background: rgba(255,255,255,0.04); }
-    .rl2-heat-axis { display: grid; grid-template-columns: repeat(4, 1fr); color: var(--muted); font-size: 0.65rem; margin-top: 4px; }
-    .rl2-heat-axis span:nth-child(1) { text-align: left; }
-    .rl2-heat-axis span:nth-child(2) { text-align: center; }
-    .rl2-heat-axis span:nth-child(3) { text-align: center; }
-    .rl2-heat-axis span:nth-child(4) { text-align: right; }
-    .rl2-heat-bar { display: inline-block; width: 80px; height: 8px; border-radius: 4px; background: linear-gradient(90deg, #1f3a36, #34d399 40%, #f4b740 70%, #ef4444); }
-    .rl2-heat-bar i { display: none; }
-    .rl2-heat-foot { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 0.7rem; }
-    .rl2-heat-key { display: inline-flex; height: 8px; width: 80px; border-radius: 4px; background: linear-gradient(90deg, #2c3641 0%, #34d399 25%, #f4b740 60%, #f87272 90%, #ef4444 100%); }
-
-    /* Alerts panel */
-    .rl2-alerts-list { display: grid; gap: 10px; }
-    .rl2-alert-row { display: grid; grid-template-columns: 24px minmax(0, 1fr) auto; gap: 10px; align-items: start; padding: 10px; border-radius: 8px; border: 1px solid var(--line); background: var(--panel-soft); }
-    .rl2-alert-row .icon { width: 22px; height: 22px; display: grid; place-items: center; border-radius: 50%; font-weight: 700; font-size: 0.74rem; }
-    .rl2-alert-row .icon.warn { background: rgba(248, 114, 114, 0.15); color: var(--danger); }
-    .rl2-alert-row .icon.alert { background: rgba(244, 183, 64, 0.15); color: var(--warn); }
-    .rl2-alert-row .icon.info { background: rgba(94, 200, 255, 0.15); color: var(--cyan); }
-    .rl2-alert-row .body .title { font-weight: 600; font-size: 0.86rem; }
-    .rl2-alert-row .body .detail { color: var(--muted); font-size: 0.76rem; margin-top: 3px; }
-    .rl2-alert-row .stamp { color: var(--muted); font-size: 0.74rem; white-space: nowrap; }
-    .rl2-manage { display: flex; gap: 6px; align-items: center; justify-content: center; padding: 10px; background: var(--panel-soft); color: var(--text); border-radius: 8px; margin-top: 12px; cursor: pointer; border: 1px solid var(--line); font-size: 0.84rem; font-weight: 600; }
-    .rl2-manage:hover { background: var(--panel-hi); }
-
-    /* Bottom row: efficiency + alerts */
-    .rl2-bottom { display: grid; grid-template-columns: minmax(0, 2fr) minmax(320px, 1fr); gap: 14px; }
-    .rl2-mid { display: grid; grid-template-columns: minmax(300px, 1fr) minmax(360px, 1.1fr) minmax(300px, 1fr); gap: 14px; }
-    .rl2-analysis-row { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(450px, 0.95fr); gap: 14px; }
-    .rl2-detail-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.12fr); gap: 14px; align-items: start; }
-    .rl2-detail-row .rl2-card:nth-child(3) { grid-column: 1 / -1; }
-
-    @media (max-width: 1280px) {
-      .rl2-windows { grid-template-columns: 1fr; }
-      .rl2-window-tiles { grid-template-columns: repeat(2, 1fr); }
-      .rl2-mid { grid-template-columns: 1fr; }
-      .rl2-analysis-row { grid-template-columns: 1fr; }
-      .rl2-detail-row { grid-template-columns: 1fr; }
-      .rl2-detail-row .rl2-card:nth-child(3) { grid-column: auto; }
-      .rl2-bottom { grid-template-columns: 1fr; }
-      .rl2-eff-grid { grid-template-columns: repeat(3, 1fr); }
-    }
-
-    @media (max-width: 760px) {
-      .rl2-bucket-pills { grid-template-columns: repeat(4, minmax(0, 1fr)); }
-      .rl2-window-tiles { grid-template-columns: 1fr; }
-      .rl2-section-title { flex-wrap: wrap; }
-      .rl2-section-title .meta { flex-basis: 100%; text-align: left; }
-      .rl2-ttc-grid { grid-template-columns: 1fr; gap: 6px; }
-      .rl2-ttc-scale { margin-left: 0; margin-right: 0; }
-      .rl2-eff-grid { grid-template-columns: 1fr; }
-      .rl2-heat-tile { grid-column: auto; }
-    }
 
     /* Hide the Vue template (with raw {{ }} placeholders) until Vue boots,
        so the boot-placeholder below is the only visible element. */
@@ -1554,20 +1186,6 @@
               </div>
             </article>
 
-            <article class="kpi">
-              <div class="kpi-head">
-                <div class="eyebrow">Safeguard</div>
-                <div class="kpi-icon icon-shield">
-                  <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
-                </div>
-              </div>
-              <div class="value">{{ integer(safeguardStats.all_time_count) }}</div>
-              <div class="kpi-meta">
-                <div class="row"><span class="k">Today</span><span class="v">{{ integer(safeguardStats.today_count) }}</span></div>
-                <div class="row"><span class="k">Month</span><span class="v">{{ integer(safeguardStats.current_month_count) }}</span></div>
-                <div class="row"><span class="k">All-Time</span><span class="v">{{ integer(safeguardStats.all_time_count) }}</span></div>
-              </div>
-            </article>
           </div>
 
           <!-- Sparkline strip -->
@@ -1596,86 +1214,6 @@
             </div>
           </div>
 
-          <!-- Rate limit + Limit impact -->
-          <div class="pair-grid">
-            <article class="card">
-              <div class="card-head">
-                <div>
-                  <div class="eyebrow">▮ Upstream Rate Limits</div>
-                </div>
-                <div class="subtle" style="font-size: 0.74rem;">{{ usageRatelimitsStatusLabel }}</div>
-              </div>
-
-              <div v-if="usageRatelimitRows.length">
-                <div v-for="row in usageRatelimitRows" :key="row.key" class="rl-row">
-                  <div class="rl-icon">
-                    <svg v-if="row.key === 'session'" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
-                    <svg v-else viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>
-                  </div>
-                  <div class="rl-body">
-                    <div class="rl-title" style="text-transform: uppercase; letter-spacing: 0.08em; font-size: 0.74rem;">{{ row.label }}</div>
-                    <div class="rl-sub">{{ row.subLabel }}</div>
-                    <div class="rl-bar"><span :class="row.toneClass" :style="{ width: row.fillPercent + '%' }"></span></div>
-                    <div class="rl-stats">
-                      <span class="ok">{{ row.percentLabel }} remaining</span>
-                      <span>used {{ row.usedLabel }}</span>
-                    </div>
-                    <div class="rl-live">
-                      <div class="rl-live-chip">
-                        <div class="rl-live-k">Current burn</div>
-                        <div class="rl-live-v">{{ row.currentBurnLabel }}</div>
-                        <div class="rl-live-sub">{{ row.currentBurnSubLabel }}</div>
-                      </div>
-                      <div class="rl-live-chip">
-                        <div class="rl-live-k">30m projection</div>
-                        <div class="rl-live-v">{{ row.projected30mBurnLabel }}</div>
-                        <div class="rl-live-sub">{{ row.projected30mBurnSubLabel }}</div>
-                      </div>
-                    </div>
-                    <div class="rl-sub">{{ row.resetLabel }}</div>
-                  </div>
-                </div>
-              </div>
-              <div v-else class="empty-state">Awaiting first proxied response…</div>
-            </article>
-
-            <article class="card">
-              <div class="card-head">
-                <div>
-                  <div class="eyebrow">Limit Impact By Model</div>
-                  <div class="subtle">Limit drop per 100K tokens (cached excluded)</div>
-                </div>
-                <a href="#limit-impact" class="li-link" @click.prevent="activeView = 'limits'">View all</a>
-              </div>
-
-              <div v-if="usageRatelimitBurnWindows.length">
-                <div style="display:flex; gap:4px; flex-wrap:wrap; margin-bottom:8px;">
-                  <button v-for="m in [15, 30, 45, 60, 120]" :key="m" class="tabbtn sm" :class="{ active: burnBucketMinutes === m }" @click="burnBucketMinutes = m" style="padding:2px 8px; font-size:0.72rem;">{{ m < 60 ? (m + 'm') : ((m/60) + 'h') }}</button>
-                </div>
-                <div v-for="win in usageRatelimitBurnWindows.slice(0, 2)" :key="win.key" class="li-window">
-                  <div class="li-window-head">
-                    <div class="li-window-title" style="text-transform: uppercase; font-size: 0.74rem; letter-spacing: 0.08em;">{{ win.label }}</div>
-                    <div class="li-window-meta">{{ win.totalDeltaLabel }} avg · {{ win.avgPerMinuteLabel }} · {{ win.projectionLabel }}</div>
-                  </div>
-                  <table class="li-table" v-if="win.hasData && win.models.length">
-                    <thead><tr><th>Model</th><th style="text-align:right;">Avg Reqs</th><th style="text-align:right;">Avg Drop</th><th style="text-align:right;">Avg Tokens</th></tr></thead>
-                    <tbody>
-                      <tr v-for="row in win.models.slice(0, 3)" :key="row.model">
-                        <td>{{ row.model }}</td>
-                        <td class="amt">{{ row.requestsLabel }}</td>
-                        <td class="amt">{{ row.deltaLabel }}</td>
-                        <td class="amt">{{ row.billableLabel }}</td>
-                      </tr>
-                    </tbody>
-                  </table>
-                  <div v-else class="subtle">No historical burn observed for {{ win.selectedMinutes }} minute periods.</div>
-                </div>
-                <a href="#" class="li-link" @click.prevent="activeView = 'limits'" style="display:block; margin-top: 12px;">View full burndown →</a>
-              </div>
-              <div v-else class="empty-state">Burndown appears once two consecutive responses share the same reset window.</div>
-            </article>
-          </div>
-
           <!-- Recent Activity (sessions + requests) -->
           <article class="card">
             <div class="card-head">
@@ -1694,16 +1232,6 @@
                 <option value="codex">Codex (proxied)</option>
                 <option value="codex_native">Codex (native)</option>
                 <option value="proxy">Proxy</option>
-              </select>
-              <select v-model="initiatorFilter" v-if="overviewActivityTab === 'requests'">
-                <option value="all">All Initiators</option>
-                <option value="user">User only</option>
-                <option value="agent">Agent only</option>
-              </select>
-              <select v-model="safeguardFilter" v-if="overviewActivityTab === 'requests'">
-                <option value="all">Any Safeguard</option>
-                <option value="triggered">Safeguarded only</option>
-                <option value="clean">Not safeguarded</option>
               </select>
               <select v-model="sortMode">
                 <option value="recent">Newest First</option>
@@ -1754,7 +1282,6 @@
                     <th>Status</th>
                     <th>Model</th>
                     <th>Path</th>
-                    <th>Initiator</th>
                     <th>Duration</th>
                     <th>Tokens (in/out)</th>
                     <th>Cost</th>
@@ -1770,11 +1297,9 @@
                       <span class="pill" :class="row.success === false ? 'pill-error' : 'pill-success'">
                         {{ row.success === false ? 'ERROR' : 'SUCCESS' }}
                       </span>
-                      <span v-if="row.safeguard_triggered" class="pill pill-safeguard">SAFEGUARDED</span>
                     </td>
                     <td>{{ row.resolved_model || row.requested_model || '—' }}</td>
                     <td><code>{{ row.path || '—' }}</code></td>
-                    <td><span class="muted">{{ row.initiator || '—' }}</span></td>
                     <td>{{ shortDuration(row.duration_ms) }}</td>
                     <td>{{ shortTokens(row) }}</td>
                     <td>{{ money(row.cost_usd) }}</td>
@@ -1787,7 +1312,7 @@
                       </span>
                     </td>
                   </tr>
-                  <tr v-if="!pagedRequests.length"><td colspan="9" class="empty">No requests match the current filter.</td></tr>
+                  <tr v-if="!pagedRequests.length"><td colspan="8" class="empty">No requests match the current filter.</td></tr>
                 </tbody>
               </table>
             </div>
@@ -1815,52 +1340,52 @@
         <aside class="rail">
 
           <!-- AI credit spend (compact, dense) -->
-          <article class="card premium-card">
+          <article class="card credit-card">
             <div class="card-head">
               <div>
                 <div class="eyebrow">▮ AI Credit Usage</div>
               </div>
-              <span class="premium-tone-pill tone-cyan" title="Estimated from recorded token usage and published model rates">
+              <span class="credit-tone-pill tone-cyan" title="Estimated from recorded token usage and published model rates">
                 <span class="dot"></span>Token priced
               </span>
             </div>
 
-            <div class="premium-top">
-              <div class="premium-headline">
+            <div class="credit-top">
+              <div class="credit-headline">
                 <span class="pct">{{ money(currentMonth.cost_usd) }}</span>
                 <span class="of">estimated this month</span>
               </div>
             </div>
 
-            <div class="premium-bar-foot">
+            <div class="credit-bar-foot">
               <span>1 AI credit = $0.01 USD</span>
               <span class="right">input · cached · output tokens</span>
             </div>
 
-            <div class="premium-stats">
-              <div class="premium-stat">
+            <div class="credit-stats">
+              <div class="credit-stat">
                 <div class="k">Today</div>
                 <div class="v">{{ money(todayUsage.cost_usd) }}</div>
                 <div class="sub">estimated</div>
               </div>
-              <div class="premium-stat">
+              <div class="credit-stat">
                 <div class="k">Avg/day</div>
                 <div class="v">{{ money(averageDailySpend) }}</div>
                 <div class="sub">last 7d</div>
               </div>
-              <div class="premium-stat">
+              <div class="credit-stat">
                 <div class="k">Tokens</div>
                 <div class="v">{{ compact(currentMonth.total_tokens) }}</div>
                 <div class="sub">this month</div>
               </div>
-              <div class="premium-stat">
+              <div class="credit-stat">
                 <div class="k">Projected</div>
                 <div class="v">{{ money(monthlySpendProjection) }}</div>
                 <div class="sub">month end</div>
               </div>
             </div>
 
-            <div class="premium-spark">
+            <div class="credit-spark">
               <div v-for="day in costLast7Days" :key="day.day_key" class="col" :class="{ 'is-today': day.is_today }">
                 <div class="bar"
                      :style="{ height: Math.max(2, day.fill_percent) + '%' }"
@@ -1868,7 +1393,7 @@
                 <div class="lbl">{{ day.weekday.charAt(0) }}</div>
               </div>
             </div>
-            <div class="premium-spark-foot">
+            <div class="credit-spark-foot">
               <span>7-day total <strong style="color:var(--text); font-weight:700;">{{ money(costWeekTotal) }}</strong></span>
               <a href="#" class="card-link" @click.prevent="activeView = 'usage'">Details →</a>
             </div>
@@ -1970,7 +1495,6 @@
               :all-time="allTime"
               :current-month="currentMonth"
               :today-usage="todayUsage"
-              :safeguard="safeguardStats"
               :tracked-months="trackedMonths"
               :updated-label="updatedLabel"
             ></summary-explorer-card>
@@ -2086,7 +1610,7 @@
             <table class="req-table">
               <thead>
                 <tr>
-                  <th>Time</th><th>Status</th><th>Model</th><th>Path</th><th>Initiator</th><th>Duration</th><th>Tokens (in/out)</th><th>Cost</th><th>Request ID</th>
+                  <th>Time</th><th>Status</th><th>Model</th><th>Path</th><th>Duration</th><th>Tokens (in/out)</th><th>Cost</th><th>Request ID</th>
                 </tr>
               </thead>
               <tbody>
@@ -2096,11 +1620,9 @@
                   <td>{{ shortStamp(row.finished_at || row.started_at) }}</td>
                   <td>
                     <span class="pill" :class="row.success === false ? 'pill-error' : 'pill-success'">{{ row.success === false ? 'ERROR' : 'SUCCESS' }}</span>
-                    <span v-if="row.safeguard_triggered" class="pill pill-safeguard">SAFEGUARDED</span>
                   </td>
                   <td>{{ row.resolved_model || row.requested_model || '—' }}</td>
                   <td><code>{{ row.path || '—' }}</code></td>
-                  <td><span class="muted">{{ row.initiator || '—' }}</span></td>
                   <td>{{ shortDuration(row.duration_ms) }}</td>
                   <td>{{ shortTokens(row) }}</td>
                   <td>{{ money(row.cost_usd) }}</td>
@@ -2111,7 +1633,7 @@
                     </span>
                   </td>
                 </tr>
-                <tr v-if="!selectedSessionRequests.length"><td colspan="9" class="empty">No proxied requests retained for this session yet.</td></tr>
+                <tr v-if="!selectedSessionRequests.length"><td colspan="8" class="empty">No proxied requests retained for this session yet.</td></tr>
               </tbody>
             </table>
           </div>
@@ -2129,16 +1651,6 @@
               <option value="codex">Codex (proxied)</option>
               <option value="codex_native">Codex (native)</option>
               <option value="proxy">Proxy</option>
-            </select>
-            <select v-model="initiatorFilter">
-              <option value="all">All initiators</option>
-              <option value="user">User only</option>
-              <option value="agent">Agent only</option>
-            </select>
-            <select v-model="safeguardFilter">
-              <option value="all">Any safeguard</option>
-              <option value="triggered">Safeguarded only</option>
-              <option value="clean">Not safeguarded</option>
             </select>
             <select v-model="sortMode">
               <option value="recent">Newest first</option>
@@ -2162,16 +1674,11 @@
                         @click="selectedRequestKey = requestKey(row)">
                   <div class="request-row-head">
                     <div style="display:flex; gap:6px; flex-wrap:wrap; align-items:center">
-                      <span class="badge">{{ row.initiator || 'unknown' }}</span>
                       <span v-if="requestFastModeLabel(row)" :class="['badge', requestServiceTierBadgeClass(row)]">{{ requestFastModeLabel(row) }}</span>
                       <span v-if="requestEffortLabel(row)" :class="['badge', requestEffortBadgeClass(row)]">{{ requestEffortLabel(row) }}</span>
                     </div>
                     <div class="request-title">{{ row.resolved_model || row.requested_model || '-' }}</div>
                     <div class="subtle">{{ stamp(row.finished_at || row.started_at) }}</div>
-                  </div>
-                  <div v-if="row.safeguard_triggered" class="safeguard-banner">
-                    <span class="badge badge-safeguard">Safeguarded</span>
-                    <span class="subtle">{{ row.safeguard_reason }}</span>
                   </div>
                   <div class="request-meta subtle">
                     <div><span class="mono">{{ row.path || '-' }}</span></div>
@@ -2194,14 +1701,12 @@
                 </div>
                 <div class="debug-toolbar">
                   <button type="button" class="debug-btn" @click="openDebugModal(selectedRequest)">Debug · view raw JSON</button>
-                  <span v-if="selectedRequest.safeguard_triggered" class="badge badge-safeguard">Safeguarded</span>
                 </div>
                 <div class="detail-grid">
                   <div><div class="detail-label">Path</div><div class="detail-value mono">{{ selectedRequest.path || '-' }}</div></div>
                   <div><div class="detail-label">Upstream Path</div><div class="detail-value mono">{{ selectedRequest.upstream_path || '-' }}</div></div>
                   <div><div class="detail-label">Requested Model</div><div class="detail-value">{{ selectedRequest.requested_model || '-' }}</div></div>
                   <div><div class="detail-label">Resolved Model</div><div class="detail-value">{{ selectedRequest.response_model || selectedRequest.resolved_model || '-' }}</div></div>
-                  <div><div class="detail-label">Initiator</div><div class="detail-value">{{ selectedRequest.initiator || '-' }}</div></div>
                   <div><div class="detail-label">Estimated cost</div><div class="detail-value">{{ money(selectedRequest.cost_usd) }}</div></div>
                   <div><div class="detail-label">Duration</div><div class="detail-value">{{ selectedRequest.duration_ms != null ? `${selectedRequest.duration_ms} ms` : '-' }}</div></div>
                   <div><div class="detail-label">Cost</div><div class="detail-value">{{ money(selectedRequest.cost_usd) }}</div></div>
@@ -2242,275 +1747,6 @@
           </div>
           <div v-else class="empty">No requests match the current filter.</div>
         </article>
-      </div>
-
-      <div v-show="activeView === 'safeguard'" class="legacy-section">
-        <article class="card">
-          <div class="card-head"><div><h3>Safeguard Cooldown</h3><div class="subtle">{{ safeguardConfigStatusLabel }}</div></div></div>
-          <div class="toolbar">
-            <input v-model.number="safeguardConfig.cooldownInput" type="number" :min="safeguardConfig.min" :max="safeguardConfig.max" step="1" placeholder="Seconds">
-            <button class="primary" @click="saveSafeguardConfig" :disabled="savingSafeguardConfig">Save</button>
-            <button @click="resetSafeguardConfig" :disabled="savingSafeguardConfig">Reset to default</button>
-          </div>
-          <div class="subtle" style="margin-top: 10px;">
-            After any proxied request, the safeguard flips follow-up user turns to agent traffic for this many seconds.
-            Default is {{ integer(safeguardConfig.defaultSeconds) }}s. Allowed range {{ integer(safeguardConfig.min) }}–{{ integer(safeguardConfig.max) }}s.
-          </div>
-          <div v-if="safeguardConfig.error" class="status error" style="margin-top: 10px;">{{ safeguardConfig.error }}</div>
-          <div v-else-if="safeguardConfig.statusMessage" class="status good" style="margin-top: 10px;">{{ safeguardConfig.statusMessage }}</div>
-        </article>
-      </div>
-
-
-      <!-- ─── Rate Limits (v2) ──────────────────────────────────── -->
-      <div v-show="activeView === 'limits'" class="legacy-section rl2" id="limit-impact">
-
-        <!-- Time-bucket pills -->
-        <div class="rl2-bucket-pills">
-          <button v-for="opt in rl2BucketOptions" :key="opt.minutes"
-                  class="rl2-bucket-pill" :class="{ active: burnBucketMinutes === opt.minutes }"
-                  @click="burnBucketMinutes = opt.minutes">{{ opt.label }}</button>
-        </div>
-
-        <!-- Two big window cards -->
-        <div class="rl2-windows">
-          <article v-for="win in rl2WindowCards" :key="win.key" class="rl2-card">
-            <div class="rl2-section-title">
-              <span class="label">{{ win.title }}</span>
-              <span class="info" title="Upstream-reported window">ⓘ</span>
-              <span class="meta">Resets in {{ win.resetCountdown }}<span v-if="win.resetWhen"> &nbsp;·&nbsp; {{ win.resetWhen }}</span></span>
-            </div>
-            <div class="rl2-window-tiles">
-              <!-- Donut: limit remaining -->
-              <div class="rl2-tile donut-tile">
-                <div class="rl2-mini-donut">
-                  <svg viewBox="0 0 36 36">
-                    <circle class="ring-bg" cx="18" cy="18" r="15.915" fill="none" stroke-width="3.6"/>
-                    <circle cx="18" cy="18" r="15.915" fill="none" :stroke="win.donutColor" stroke-width="3.6"
-                            :stroke-dasharray="win.donutDashArray" stroke-linecap="round"/>
-                  </svg>
-                </div>
-                <div>
-                  <div class="tval">{{ win.percentRemainingLabel }}</div>
-                  <div class="tlabel">Limit Remaining</div>
-                  <div class="thint">{{ win.percentUsedLabel }} used</div>
-                </div>
-              </div>
-              <!-- Burn rate -->
-              <div class="rl2-tile tile-burn">
-                <div class="icon-row" style="margin-bottom:2px;"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 17l5-5 4 4 9-9"/></svg><span class="tval" style="font-size:1.05rem;">{{ win.burnLabel }}</span></div>
-                <div class="tlabel">Burn Rate</div>
-                <div :class="win.deltaPositive ? 'delta-up' : 'delta-down'">{{ win.burnDeltaLabel }}</div>
-              </div>
-              <!-- Time to cap -->
-              <div class="rl2-tile tile-ttc">
-                <div class="icon-row" style="margin-bottom:2px;"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg><span class="tval" style="font-size:1.05rem;">{{ win.timeToCapLabel }}</span></div>
-                <div class="tlabel">Time to Cap</div>
-                <div :class="'verdict-' + win.verdictTone" style="font-size:0.78rem; margin-top:4px;"><span class="dot" :class="win.verdictTone"></span>{{ win.verdictLabel }}</div>
-                <div class="ttsub" v-if="win.verdictDetail">({{ win.verdictDetail }})</div>
-              </div>
-              <!-- Reqs / tokens / duration -->
-              <div class="rl2-tile tile-reqs">
-                <div class="icon-row" style="margin-bottom:2px;"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M8 9h8M8 13h8M8 17h5"/></svg><span class="tval" style="font-size:1.05rem;">{{ win.requestsLabel }} <span class="vu" style="font-size:0.78rem;">reqs</span></span></div>
-                <div class="ttsub">{{ win.tokensLabel }} tokens</div>
-                <div class="ttsub">{{ win.durationLabel }} duration</div>
-              </div>
-            </div>
-          </article>
-        </div>
-
-        <!-- Time-to-cap vs reset + Window Summary -->
-        <div class="rl2-analysis-row">
-          <article class="rl2-card">
-            <div class="rl2-section-title">
-              <h3>TIME TO CAP VS RESET</h3>
-              <span class="info">(session uses live remaining limit)</span>
-            </div>
-            <div class="rl2-section-title" style="margin-top:-6px;">
-              <span class="sub">Session prediction combines live remaining limit with historical average burn.</span>
-            </div>
-            <div class="rl2-ttc-grid rl2-ttc-head">
-              <div>WINDOW</div><div>TIME TO CAP</div><div>TIME TO RESET</div><div>VERDICT</div>
-            </div>
-            <div v-for="row in rl2TtcRows" :key="row.key" class="rl2-ttc-grid">
-              <div>
-                <div style="font-weight:600;">{{ row.title }}</div>
-                <div style="color:var(--muted); font-size:0.74rem; margin-top:2px;">{{ row.ttcDetail }}</div>
-              </div>
-              <div>
-                <div class="rl2-ttc-bar">
-                  <span class="fill" :class="row.fillTone" :style="{ width: row.fillPercent + '%' }"></span>
-                </div>
-              </div>
-              <div style="font-variant-numeric: tabular-nums;">{{ row.resetLabel }}</div>
-              <div class="rl2-ttc-verdict" :class="row.verdictTone"><span class="dot" :class="row.verdictTone"></span>{{ row.verdictLabel }}</div>
-            </div>
-            <div class="rl2-ttc-scale">
-              <span>0%</span><span>25%</span><span>50%</span><span>75%</span><span>100%</span>
-            </div>
-            <div class="rl2-ttc-foot">Proportion of time to reset</div>
-          </article>
-
-          <article class="rl2-card">
-            <div class="rl2-section-title"><h3>WINDOW SUMMARY</h3></div>
-            <div class="rl2-section-title" style="margin-top:-6px;"><span class="sub">Historical average burn and usage across each bucket size.</span></div>
-            <div class="rl2-table-wrap">
-              <table class="rl2-summary-table">
-                <thead>
-                  <tr><th>Window</th><th>Used</th><th>Burn</th><th>Cap</th><th>Reset</th><th>Reqs</th><th>Tokens</th></tr>
-                </thead>
-                <tbody>
-                  <tr v-for="row in rl2WindowSummary" :key="row.minutes">
-                    <td>{{ row.label }}</td>
-                    <td><span :class="row.toneClass">{{ row.percentUsed }}</span></td>
-                    <td>{{ row.burnRate }}</td>
-                    <td>{{ row.timeToCap }}</td>
-                    <td>{{ row.timeToReset }}</td>
-                    <td>{{ row.requests }}</td>
-                    <td>{{ row.tokens }}</td>
-                  </tr>
-                </tbody>
-              </table>
-            </div>
-          </article>
-        </div>
-
-        <!-- Burn rate over time + Per-model burn + Budget -->
-        <div class="rl2-detail-row">
-          <article class="rl2-card">
-            <div class="rl2-section-title">
-              <h3>BURN RATE OVER TIME</h3>
-              <span class="info">({{ rl2BurnLine.unitLabel }})</span>
-              <div class="rl2-y-toolbar" style="margin-left:auto;">
-                <span style="color:var(--muted-2); font-size:0.72rem; letter-spacing:0.08em; text-transform:uppercase;">Y-Axis</span>
-                <select v-model="rl2YAxis"><option value="pct">% / min</option><option value="tok">tokens / min</option></select>
-              </div>
-            </div>
-            <div class="rl2-section-title" style="margin-top:-6px;"><span class="sub">Actual burn rate over the last 30 minutes. Lower is better.</span></div>
-            <svg class="rl2-line" :viewBox="`0 0 ${rl2BurnLine.viewW} ${rl2BurnLine.viewH}`" preserveAspectRatio="none">
-              <g>
-                <line v-for="g in rl2BurnLine.gridLines" :key="g.y" class="grid" :x1="0" :x2="rl2BurnLine.viewW" :y1="g.y" :y2="g.y"/>
-                <text v-for="g in rl2BurnLine.gridLines" :key="'t'+g.y" class="axis-text" :x="2" :y="g.y - 2">{{ g.label }}</text>
-                <polyline v-if="rl2BurnLine.session" fill="none" stroke="#34d399" stroke-width="1.4" :points="rl2BurnLine.session"/>
-                <polyline v-if="rl2BurnLine.weekly" fill="none" stroke="#b07cff" stroke-width="1.4" :points="rl2BurnLine.weekly"/>
-                <text v-for="t in rl2BurnLine.xLabels" :key="'x'+t.x" class="axis-text" :x="t.x" :y="rl2BurnLine.viewH - 2" text-anchor="middle">{{ t.label }}</text>
-              </g>
-            </svg>
-            <div class="rl2-line-legend"><span><span class="swatch" style="background:#34d399;"></span>Session ({{ rl2BurnLine.shortUnitLabel }})</span><span><span class="swatch" style="background:#b07cff;"></span>Weekly ({{ rl2BurnLine.shortUnitLabel }})</span></div>
-          </article>
-
-          <article class="rl2-card">
-            <div class="rl2-section-title">
-              <h3>PER-MODEL BURN</h3>
-              <span class="info">(Sample: {{ rl2SelectedBucketLabel }} · Reported: {{ rl2ReportingBucketLabel }})</span>
-              <div class="rl2-tabs" style="margin-left:auto;">
-                <button :class="{ active: rl2PmbView === 'table' }" @click="rl2PmbView = 'table'">Table</button>
-                <button :class="{ active: rl2PmbView === 'stacked' }" @click="rl2PmbView = 'stacked'">Stacked</button>
-              </div>
-            </div>
-            <div v-if="rl2PmbView === 'table'" class="rl2-table-wrap">
-              <table class="rl2-pmb-table">
-                <thead><tr><th>Model</th><th>Avg Reqs</th><th>Avg {{ rl2ReportingBucketLabel }} Burn</th><th>Share of Burn</th><th>Avg Tokens</th><th>Avg Duration</th></tr></thead>
-                <tbody>
-                  <tr v-for="row in rl2PerModelRows" :key="row.model">
-                    <td>{{ row.model }}</td>
-                    <td>{{ row.requests }}</td>
-                    <td>{{ row.deltaLabel }}</td>
-                    <td>
-                      <div class="rl2-pmb-bar-wrap">
-                        <span class="rl2-pmb-bar" :style="{ width: row.barPx + 'px', background: row.color }"></span>
-                        <span class="pct">{{ row.shareLabel }}</span>
-                      </div>
-                    </td>
-                    <td>{{ row.tokens }}</td>
-                    <td>{{ row.duration }}</td>
-                  </tr>
-                  <tr v-if="!rl2PerModelRows.length"><td colspan="6" style="color:var(--muted); text-align:center; padding:14px 0;">No historical burn observed for {{ rl2SelectedBucketLabel }} periods.</td></tr>
-                </tbody>
-                <tfoot v-if="rl2PerModelRows.length">
-                  <tr>
-                    <td>Total</td>
-                    <td>{{ rl2PerModelTotals.requests }}</td>
-                    <td>{{ rl2PerModelTotals.delta }}</td>
-                    <td style="text-align:right;">100%</td>
-                    <td>{{ rl2PerModelTotals.tokens }}</td>
-                    <td>{{ rl2PerModelTotals.duration }}</td>
-                  </tr>
-                </tfoot>
-              </table>
-            </div>
-            <div v-else>
-              <div class="rl2-pmb-stacked">
-                <span v-for="row in rl2PerModelRows" :key="row.model" :title="`${row.model} ${row.shareLabel}`" :style="{ width: row.sharePercent + '%', background: row.color }"></span>
-              </div>
-              <div class="rl2-pmb-stacked-legend">
-                <span v-for="row in rl2PerModelRows" :key="row.model"><span class="swatch" :style="{ background: row.color }"></span>{{ row.model }} · {{ row.shareLabel }}</span>
-                <span v-if="!rl2PerModelRows.length" style="color:var(--muted);">No per-model burn observed.</span>
-              </div>
-            </div>
-          </article>
-
-          <article class="rl2-card">
-            <div class="rl2-section-title"><h3>BUDGET &amp; LIMITS</h3></div>
-            <div class="rl2-section-title" style="margin-top:-6px;"><span class="sub">Limits are provided by upstream providers.</span></div>
-            <div v-for="b in rl2Budgets" :key="b.key" class="rl2-budget-row">
-              <div>
-                <div class="name">{{ b.name }}</div>
-                <div class="desc">{{ b.desc }}</div>
-              </div>
-              <div class="target">{{ b.targetLabel }}</div>
-              <div :class="['used', b.tone]">{{ b.usedLabel }}<div class="desc" style="font-weight:500; margin-top:2px;">{{ b.remainingLabel }}</div></div>
-              <div class="rl2-budget-bar"><span :class="b.tone" :style="{ width: b.fillPercent + '%' }"></span></div>
-            </div>
-            <a class="rl2-budget-foot" href="#" @click.prevent="rl2ToggleHeaders"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 18l6-6-6-6"/><path d="M8 6l-6 6 6 6"/></svg> View Raw Headers</a>
-            <pre v-if="rl2ShowHeaders" class="mono" style="background: var(--panel-soft); border: 1px solid var(--line); border-radius: 6px; padding: 8px; margin-top: 8px; max-height: 220px; overflow: auto; font-size: 0.74rem; color: var(--muted);">{{ rl2RawHeaders }}</pre>
-          </article>
-        </div>
-
-        <!-- Efficiency + Alerts -->
-        <div class="rl2-bottom">
-          <article class="rl2-card">
-            <div class="rl2-section-title"><h3>EFFICIENCY &amp; TRENDS</h3><span class="info">(Last 7 Days)</span></div>
-            <div class="rl2-eff-grid">
-              <div v-for="tile in rl2EfficiencyTiles" :key="tile.key" class="rl2-eff-tile">
-                <div class="lbl">{{ tile.label }}</div>
-                <div class="val">{{ tile.value }}<span class="vu" v-if="tile.unit">{{ tile.unit }}</span></div>
-                <div v-if="tile.delta" :class="tile.deltaTone === 'up' ? 'delta-up' : 'delta-down'">{{ tile.delta }}</div>
-                <div v-if="tile.sub" class="sub">{{ tile.sub }}</div>
-                <svg v-if="tile.spark" class="spark" viewBox="0 0 100 30" preserveAspectRatio="none">
-                  <polyline fill="none" :stroke="tile.color || 'var(--accent)'" stroke-width="1.2" :points="tile.spark"/>
-                </svg>
-              </div>
-              <div class="rl2-heat-tile">
-                <div class="head"><span>Historical Burn Heatmap</span></div>
-                <div class="rl2-heat-grid">
-                  <div v-for="cell in rl2Heatmap" :key="cell.idx" class="rl2-heat-cell" :style="{ background: cell.color }" :title="cell.title"></div>
-                </div>
-                <div class="rl2-heat-axis">
-                  <span v-for="(label, i) in rl2HeatmapXLabels" :key="i">{{ label }}</span>
-                </div>
-                <div class="rl2-heat-foot"><span>%/min</span><span class="rl2-heat-bar"><i></i></span><span>{{ rl2HeatmapMaxLabel }}</span></div>
-              </div>
-            </div>
-          </article>
-
-          <article class="rl2-card">
-            <div class="rl2-section-title"><h3>ALERTS</h3><span class="info">({{ rl2Alerts.length }})</span></div>
-            <div class="rl2-alerts-list">
-              <div v-for="(a, idx) in rl2Alerts" :key="idx" class="rl2-alert-row">
-                <div class="icon" :class="a.tone">!</div>
-                <div class="body">
-                  <div class="title">{{ a.title }}</div>
-                  <div class="detail">{{ a.detail }}</div>
-                </div>
-                <div class="stamp">{{ a.stamp }}</div>
-              </div>
-              <div v-if="!rl2Alerts.length" style="color: var(--muted); text-align:center; padding:8px 0;">No active alerts.</div>
-            </div>
-            <a class="rl2-manage" href="#" @click.prevent="rl2ManageTargets">⚙ Manage Limit Targets</a>
-          </article>
-        </div>
-
       </div>
 
       <div v-show="activeView === 'routing' || activeView === 'approvals'" class="legacy-section">
@@ -2837,10 +2073,6 @@
       <div class="modal-shell" role="dialog" aria-modal="true">
         <div class="modal-head">
           <div><h3>Request Debug</h3><div class="subtle mono">{{ debugModalRow.request_id || debugModalRow.server_request_id || '(no id)' }}</div></div>
-          <div style="display:flex; gap:8px; align-items:center;">
-            <span v-if="debugModalRow.safeguard_triggered" class="badge badge-safeguard">Safeguarded</span>
-            <span class="badge">{{ debugModalRow.initiator || 'unknown' }}</span>
-          </div>
         </div>
         <div class="modal-body"><pre class="json-block" v-html="debugModalJsonHighlighted()"></pre></div>
         <div class="modal-foot">
@@ -3188,12 +2420,6 @@
           <span class="summary-chip"><span class="chip-k">Month</span>{{ integer(currentMonth.request_count) }}</span>
           <span class="summary-chip"><span class="chip-k">All-Time</span>{{ integer(allTime.request_count) }}</span>
         </div>
-        <div class="summary-badge-row">
-          <span class="summary-label">Safeguard</span>
-          <span class="summary-chip"><span class="chip-k">Today</span>{{ integer(safeguard.today_count) }}</span>
-          <span class="summary-chip"><span class="chip-k">Month</span>{{ integer(safeguard.current_month_count) }}</span>
-          <span class="summary-chip"><span class="chip-k">All-Time</span>{{ integer(safeguard.all_time_count) }}</span>
-        </div>
       </div>
     </article>
   </template>
@@ -3332,7 +2558,6 @@
         cache_creation_tokens: 0,
         reasoning_output_tokens: 0,
         request_count: 0,
-        premium_requests: 0,
         cost_usd: 0,
         cost_breakdown: {
           input_fresh: 0,
@@ -3399,7 +2624,6 @@
       let cacheCreationTokens = 0;
       let outputTokens = 0;
       let reasoningOutputTokens = 0;
-      let premiumRequests = 0;
       const costBreakdown = {
         input_fresh: 0,
         cached_input: 0,
@@ -3417,7 +2641,6 @@
         cacheCreationTokens += Number(row.cache_creation_tokens || 0);
         outputTokens += Number(row.output_tokens || 0);
         reasoningOutputTokens += Number(row.reasoning_output_tokens || 0);
-        premiumRequests += Number(row.premium_requests || 0);
         costBreakdown.input_fresh += Number(row.cost_breakdown?.input_fresh || 0);
         costBreakdown.cached_input += Number(row.cost_breakdown?.cached_input || 0);
         costBreakdown.cache_creation += Number(row.cost_breakdown?.cache_creation || 0);
@@ -3457,7 +2680,6 @@
         cache_creation_tokens: cacheCreationTokens,
         output_tokens: outputTokens,
         reasoning_output_tokens: reasoningOutputTokens,
-        premium_requests: Number(premiumRequests.toFixed(2)),
         cost_breakdown: {
           input_fresh: Number(costBreakdown.input_fresh.toFixed(6)),
           cached_input: Number(costBreakdown.cached_input.toFixed(6)),
@@ -3484,7 +2706,6 @@
         allTime: { type: Object, default: () => ({}) },
         currentMonth: { type: Object, default: () => ({}) },
         todayUsage: { type: Object, default: () => ({}) },
-        safeguard: { type: Object, default: () => ({}) },
         trackedMonths: { type: Number, default: 0 },
         updatedLabel: { type: String, default: '' },
       },
@@ -4033,8 +3254,6 @@
           analysisScope: 'week',
           search: '',
           sourceFilter: 'all',
-          initiatorFilter: 'all',
-          safeguardFilter: 'all',
           sortMode: 'recent',
           requestPage: 1,
           selectedRequestKey: '',
@@ -4043,25 +3262,12 @@
           requestPromptStatus: {},
           debugModalRow: null,
           data: {
-            premium: {},
-            usage_ratelimits: { configured: false, source: 'awaiting-first-request', windows: {} },
-            safeguard: {},
             current_month: { usage: { sources: {} }, daily_history: [] },
             all_time: { usage: { sources: {} } },
             recent_sessions: [],
             recent_requests: [],
             month_history: [],
           },
-          safeguardConfig: {
-            cooldownSeconds: 15,
-            cooldownInput: 15,
-            defaultSeconds: 15,
-            min: 0,
-            max: 600,
-            error: '',
-            statusMessage: '',
-          },
-          savingSafeguardConfig: false,
           modelRouting: {
             enabled: false,
             mappings: [],
@@ -4089,10 +3295,6 @@
           activeView: 'overview',
           overviewRange: '7d',
           overviewActivityTab: 'sessions',
-          burnBucketMinutes: 30,
-          rl2YAxis: 'pct',
-          rl2PmbView: 'table',
-          rl2ShowHeaders: false,
           selectedSessionKey: '',
         };
       },
@@ -4106,6 +3308,7 @@
           if (this.authStatus.state === 'pending') return 'Sign-in requested';
           return 'Start GitHub Sign-In';
         },
+        updatedLabel() { return `Updated ${this.stamp(this.data.generated_at)}`; },
         generatedAgoLabel() {
           const ts = this.data && this.data.generated_at;
           if (!ts) return '';
@@ -4120,675 +3323,6 @@
           if (hrs < 24) return hrs + 'h ago';
           const days = Math.floor(hrs / 24);
           return days + 'd ago';
-        },
-        premium() { return this.data.premium || {}; },
-        usageRatelimits() { return this.data.usage_ratelimits || { configured: false, windows: {} }; },
-        usageRatelimitsStatusLabel() {
-          if (!this.usageRatelimits.configured) return 'Awaiting first proxied request';
-          const captured = this.usageRatelimits.captured_at;
-          if (!captured) return 'Live from upstream headers';
-          try {
-            return `Captured ${new Date(captured).toLocaleString()}`;
-          } catch (err) { return 'Live from upstream headers'; }
-        },
-        usageRatelimitRows() {
-          const windows = this.usageRatelimits.windows || {};
-          const order = ['session', 'weekly'];
-          const seen = new Set();
-          const ordered = [];
-          for (const key of order) {
-            if (windows[key]) { ordered.push([key, windows[key]]); seen.add(key); }
-          }
-          for (const [key, value] of Object.entries(windows)) {
-            if (!seen.has(key)) ordered.push([key, value]);
-          }
-          return ordered.map(([key, value]) => {
-            const row = this._buildRatelimitRow(key, value);
-            return { ...row, ...this._buildCurrentBurnSnapshot(key) };
-          });
-        },
-        usageRatelimitBurnWindows() {
-          const burn = (this.usageRatelimits && this.usageRatelimits.burn_rate) || {};
-          const labels = { session: 'Session window', weekly: 'Weekly window' };
-          const order = ['session', 'weekly'];
-          const seen = new Set();
-          const ordered = [];
-          for (const key of order) {
-            if (burn[key]) { ordered.push([key, burn[key]]); seen.add(key); }
-          }
-          for (const [key, value] of Object.entries(burn)) {
-            if (!seen.has(key)) ordered.push([key, value]);
-          }
-          return ordered.map(([key, value]) => this._buildRecentBurnWindow(key, value, labels));
-        },
-        rateLimitOverview() {
-          // Combine live snapshot rows with historical burn averages. Only the
-          // session window uses live remaining percent for cap prediction.
-          const rows = this.usageRatelimitRows || [];
-          const burn = (this.usageRatelimits && this.usageRatelimits.burn_rate) || {};
-          return rows.map((row) => {
-            const win = burn[row.key] || {};
-            const buckets = (win.time_buckets && win.time_buckets.buckets) || [];
-            const selected = Number(this.burnBucketMinutes) || 30;
-            const active = buckets.find((b) => Number(b.minutes) === selected) || buckets[0] || null;
-            const projMinutes = active && Number(active.projected_minutes_to_full);
-            const secondsToReset = Number(row.secondsUntilReset);
-            const minutesToReset = Number.isFinite(secondsToReset) && secondsToReset > 0 ? secondsToReset / 60 : null;
-            const remN = Number(row.percentRemaining);
-
-            // Determine the verdict using *projected consumption at reset* rather than raw
-            // time-to-cap vs time-to-reset. Time-to-cap is a noisy ratio: any non-zero burn
-            // on a long window (e.g. weekly) extrapolates to "will hit cap eventually" even
-            // when actual usage is well within budget. Instead, project how much of the
-            // window will be consumed by reset time and apply clear headroom thresholds.
-            //
-            //   projectedAtReset = current_used + burn_rate_per_min * minutesToReset
-            //
-            // Buckets:
-            //   < 70%   → On track (good)        — comfortable headroom
-            //   70-95%  → Watch (warn)           — trending toward the cap, but room to spare
-            //   95-110% → Tight (warn-strong)    — will land near the cap; consider easing up
-            //   > 110%  → Will exceed (bad)      — projected to exhaust before reset
-            //
-            // The bar fill represents *projected window usage at reset*, capped at 100%, so
-            // it visually answers "where will I be when this window resets?"
-            const burnPerMin = active && Number(active.avg_delta_percent_per_minute);
-            const usedNow = Number.isFinite(remN) ? Math.max(0, Math.min(100, 100 - remN)) : null;
-            const hasBurn = Number.isFinite(burnPerMin) && burnPerMin > 0;
-            const allowLivePrediction = row.key === 'session';
-            const hasProjection = allowLivePrediction && Number.isFinite(projMinutes) && projMinutes > 0;
-            const projectedAtReset = (allowLivePrediction && usedNow != null && hasBurn && minutesToReset != null)
-              ? usedNow + burnPerMin * minutesToReset
-              : null;
-
-            let verdict = 'good';
-            let verdictLabel = 'No burn observed';
-            let fillPercent = 0;
-            let fillTone = 'good';
-            let metaLabel = '';
-
-            if (Number.isFinite(remN) && remN <= 0) {
-              verdict = 'bad';
-              verdictLabel = 'Already at cap';
-              fillPercent = 100;
-              fillTone = 'bad';
-              metaLabel = 'Wait for reset to recover.';
-            } else if (projectedAtReset != null) {
-              fillPercent = Math.max(2, Math.min(100, projectedAtReset));
-              const headroomPct = 100 - projectedAtReset; // negative if exceeding
-              const projectedAtResetLabel = `${projectedAtReset.toFixed(projectedAtReset >= 10 ? 0 : 1)}%`;
-              if (projectedAtReset < 70) {
-                verdict = 'good';
-                verdictLabel = 'On track';
-                fillTone = 'good';
-                metaLabel = `Projected ${projectedAtResetLabel} used by reset (${headroomPct.toFixed(0)}% headroom).`;
-              } else if (projectedAtReset < 95) {
-                verdict = 'warn';
-                verdictLabel = 'Watch';
-                fillTone = 'warn';
-                metaLabel = `Projected ${projectedAtResetLabel} used by reset — trending toward cap.`;
-              } else if (projectedAtReset <= 110) {
-                verdict = 'warn';
-                verdictLabel = 'Cuts close';
-                fillTone = 'warn';
-                metaLabel = `Projected ${projectedAtResetLabel} used by reset — little headroom left.`;
-              } else {
-                verdict = 'bad';
-                verdictLabel = 'Will exceed';
-                fillTone = 'bad';
-                const overflowAt = hasProjection ? this._formatRelativeMinutes(projMinutes) : '—';
-                metaLabel = `Projected ${projectedAtResetLabel} used by reset · cap in ${overflowAt}.`;
-              }
-            } else if (hasProjection && minutesToReset == null) {
-              // We have a burn projection but no reset signal: surface as a soft warning.
-              verdict = 'warn';
-              verdictLabel = 'Cap projected';
-              fillPercent = 100;
-              fillTone = 'warn';
-              metaLabel = 'Reset time unknown — projection only.';
-            } else if (!allowLivePrediction && hasBurn) {
-              verdict = 'good';
-              verdictLabel = 'Historical avg';
-              fillPercent = 0;
-              fillTone = 'good';
-              metaLabel = 'Live cap prediction is shown for the session window only.';
-            } else if (hasBurn && usedNow != null) {
-              // Burn observed but no reset window — show current usage level.
-              verdict = 'good';
-              verdictLabel = 'On track';
-              fillPercent = Math.max(2, Math.min(100, usedNow));
-              fillTone = 'good';
-              metaLabel = `${usedNow.toFixed(1)}% currently used.`;
-            } else {
-              verdict = 'good';
-              verdictLabel = 'No burn observed';
-              fillPercent = usedNow != null ? Math.max(2, Math.min(100, usedNow)) : 0;
-              fillTone = 'good';
-              metaLabel = minutesToReset != null
-                ? `Resets in ${this._formatRelativeMinutes(minutesToReset)} regardless.`
-                : 'No active burn.';
-            }
-            return {
-              ...row,
-              activeBucketMinutes: active ? Number(active.minutes) : null,
-              projectionMinutes: hasProjection ? projMinutes : null,
-              projectionLabel: hasProjection
-                ? this._formatProjectionLabel(projMinutes, remN)
-                : (allowLivePrediction ? 'No burn observed' : 'Historical avg'),
-              minutesToReset,
-              resetCountdownLabel: minutesToReset != null
-                ? this._formatRelativeMinutes(minutesToReset)
-                : 'unknown',
-              ttcFillPercent: fillPercent,
-              ttcFillTone: fillTone,
-              ttcVerdict: verdict,
-              ttcVerdictLabel: verdictLabel,
-              ttcMetaLabel: metaLabel,
-            };
-          });
-        },
-        safeguardStats() { return this.data.safeguard || {}; },
-        rl2BucketOptions() {
-          return [
-            { minutes: 15, label: '15m' },
-            { minutes: 30, label: '30m' },
-            { minutes: 45, label: '45m' },
-            { minutes: 60, label: '1h' },
-            { minutes: 120, label: '2h' },
-            { minutes: 360, label: '6h' },
-            { minutes: 720, label: '12h' },
-            { minutes: 1440, label: '24h' },
-          ];
-        },
-        rl2SelectedBucketLabel() {
-          const m = Number(this.burnBucketMinutes) || 30;
-          if (m < 60) return m + 'm';
-          if (m % 60 === 0) return (m / 60) + 'h';
-          return m + 'm';
-        },
-        rl2ReportingBucketLabel() {
-          const burn = (this.usageRatelimits && this.usageRatelimits.burn_rate) || {};
-          const win = burn.session || burn.weekly || {};
-          const buckets = (win.time_buckets && win.time_buckets.buckets) || [];
-          const selected = Number(this.burnBucketMinutes) || 30;
-          const active = buckets.find((b) => Number(b.minutes) === selected) || buckets[0] || null;
-          const m = Number(active && active.reporting_minutes) || 30;
-          if (m < 60) return `${m}m eq`;
-          if (m % 60 === 0) return `${m / 60}h eq`;
-          return `${m}m eq`;
-        },
-        rl2WindowCards() {
-          // Combine snapshot rows (session, weekly) with the active bucket's burn metrics.
-          const overview = this.rateLimitOverview || [];
-          const burn = (this.usageRatelimits && this.usageRatelimits.burn_rate) || {};
-          const titleMap = { session: 'SESSION WINDOW', weekly: 'WEEKLY WINDOW' };
-          return overview.map((row) => {
-            const win = burn[row.key] || {};
-            const buckets = (win.time_buckets && win.time_buckets.buckets) || [];
-            const selected = Number(this.burnBucketMinutes) || 30;
-            const active = buckets.find((b) => Number(b.minutes) === selected) || buckets[0] || null;
-            const totals = (active && active.totals) || {};
-            const requests = Number(active && active.request_count) || 0;
-            const billable = Number(totals.billable_tokens) || 0;
-            const durationMs = Number(totals.duration_ms) || 0;
-            const burnPm = Number(active && active.avg_delta_percent_per_minute) || 0;
-            // Compute prior bucket delta for the up/down indicator
-            let prior = null;
-            if (buckets.length >= 2) {
-              const sorted = buckets.slice().sort((a, b) => Number(a.minutes) - Number(b.minutes));
-              const idx = sorted.findIndex((b) => Number(b.minutes) === selected);
-              if (idx > 0) prior = sorted[idx - 1];
-            }
-            const priorPm = prior ? (Number(prior.avg_delta_percent_per_minute) || 0) : null;
-            let burnDeltaLabel = '';
-            let deltaPositive = false;
-            if (priorPm != null && priorPm > 0) {
-              const change = ((burnPm - priorPm) / priorPm) * 100;
-              const arrow = change >= 0 ? '↑' : '↓';
-              deltaPositive = change >= 0;
-              burnDeltaLabel = `${arrow} ${Math.abs(change).toFixed(1)}% vs prior ${this.rl2SelectedBucketLabel} sample`;
-            } else if (burnPm > 0) {
-              burnDeltaLabel = 'first observation';
-            } else {
-              burnDeltaLabel = 'no burn observed';
-            }
-            const percentRem = Number(row.percentRemaining);
-            const percentUsed = Number.isFinite(percentRem) ? Math.max(0, 100 - percentRem) : null;
-            const donutColor = row.toneClass === 'tone-red' ? 'var(--danger)'
-                             : row.toneClass === 'tone-yellow' ? 'var(--warn)'
-                             : 'var(--success)';
-            const remainingPct = Number.isFinite(percentRem) ? Math.max(0, Math.min(100, percentRem)) : 0;
-            const dash = `${remainingPct.toFixed(2)}, ${(100 - remainingPct).toFixed(2)}`;
-            return {
-              key: row.key,
-              title: titleMap[row.key] || (row.key.toUpperCase() + ' WINDOW'),
-              percentUsedLabel: percentUsed != null ? percentUsed.toFixed(percentUsed >= 10 ? 1 : 1) + '%' : '—',
-              percentRemainingLabel: Number.isFinite(percentRem) ? percentRem.toFixed(percentRem >= 10 ? 1 : 1) + '%' : '—',
-              donutColor,
-              donutDashArray: dash,
-              burnLabel: this._rl2FormatBurn(burnPm),
-              burnDeltaLabel,
-              deltaPositive,
-              timeToCapLabel: row.projectionLabel
-                ? row.projectionLabel.replace(/^~/, '~').replace(' to cap', '')
-                : 'No burn',
-              verdictTone: row.ttcVerdict || 'good',
-              verdictLabel: row.ttcVerdictLabel || '—',
-              verdictDetail: row.minutesToReset != null
-                ? `resets in ${this._formatRelativeMinutes(row.minutesToReset)}`
-                : '',
-              requestsLabel: this._formatAverageCount(requests),
-              tokensLabel: this.compact(billable),
-              durationLabel: this._rl2FormatDuration(durationMs),
-              resetCountdown: row.resetCountdownLabel || '—',
-              resetWhen: row.resetAt ? this._rl2FormatResetWhen(row.resetAt) : '',
-            };
-          });
-        },
-        rl2TtcRows() {
-          return (this.rl2WindowCards || []).map((w) => {
-            // Use the underlying overview row to get ttc fill metrics.
-            const overview = (this.rateLimitOverview || []).find((r) => r.key === w.key) || {};
-            const total = Number(overview.minutesToReset) || 0;
-            const cap = Number(overview.projectionMinutes);
-            const fillPercent = overview.ttcFillPercent != null ? overview.ttcFillPercent : 0;
-            const tone = overview.ttcFillTone || 'good';
-            const titleLabel = w.key === 'session' ? `Session (${this.rl2ReportingBucketLabel})` : (w.key.charAt(0).toUpperCase() + w.key.slice(1));
-            return {
-              key: w.key,
-              title: titleLabel,
-              fillTone: tone,
-              fillPercent: Math.max(2, Math.min(100, fillPercent || 2)),
-              ttcDetail: Number.isFinite(cap) && cap > 0 ? this._formatRelativeMinutes(cap) : '—',
-              resetLabel: overview.resetCountdownLabel || '—',
-              verdictTone: overview.ttcVerdict || 'good',
-              verdictLabel: overview.ttcVerdictLabel || '—',
-            };
-          });
-        },
-        rl2WindowSummary() {
-          const opts = this.rl2BucketOptions;
-          const burn = (this.usageRatelimits && this.usageRatelimits.burn_rate) || {};
-          // Collect every window's bucket entry per option and summarize by `minutes`.
-          // For each bucket, present aggregate across windows.
-          // We use the *session* window if present, else weekly, since they share request counts.
-          const primaryWin = burn.session || burn.weekly || {};
-          const buckets = (primaryWin.time_buckets && primaryWin.time_buckets.buckets) || [];
-          const sessionRow = (this.rateLimitOverview || []).find((r) => r.key === 'session') || {};
-          const sessionPctUsed = Number.isFinite(Number(sessionRow.percentUsed)) ? Number(sessionRow.percentUsed) : null;
-          return opts.map((opt) => {
-            const b = buckets.find((x) => Number(x.minutes) === opt.minutes) || null;
-            const totals = (b && b.totals) || {};
-            const burnPm = Number(b && b.avg_delta_percent_per_minute) || 0;
-            const proj = Number(b && b.projected_minutes_to_full);
-            const reqs = Number(b && b.request_count) || 0;
-            const tokens = Number(totals.billable_tokens) || 0;
-            const bucketDelta = Number(totals.delta_percent);
-            const pctUsedRaw = Number.isFinite(bucketDelta) ? bucketDelta : (sessionPctUsed != null ? sessionPctUsed : 0);
-            const pctUsed = pctUsedRaw;
-            const tone = pctUsed >= 90 ? 'pct-bad' : pctUsed >= 70 ? 'pct-warn' : 'pct-good';
-            return {
-              minutes: opt.minutes,
-              label: opt.label,
-              percentUsed: pctUsed != null ? pctUsed.toFixed(1) + '%' : '—',
-              toneClass: tone,
-              burnRate: burnPm.toFixed(burnPm >= 1 ? 2 : burnPm >= 0.1 ? 3 : 4),
-              timeToCap: Number.isFinite(proj) && proj > 0 ? '~' + this._formatRelativeMinutes(proj) : '—',
-              timeToReset: sessionRow.resetCountdownLabel || '—',
-              requests: this._formatAverageCount(reqs),
-              tokens: this.compact(tokens),
-            };
-          });
-        },
-        rl2BurnLine() {
-          const burn = (this.usageRatelimits && this.usageRatelimits.burn_rate) || {};
-          const viewW = 600, viewH = 180;
-          const padL = 32, padR = 8, padT = 8, padB = 18;
-          // Build an actual per-minute series for the last 30 minutes. The
-          // summary cards intentionally use historical bucket averages, but the
-          // line chart should show the current trailing-window burn and must not
-          // stretch older history across the chart.
-          const N = 48;
-          const chartWindowMs = 30 * 60 * 1000;
-
-          const metric = this.rl2YAxis === 'tok' ? 'tok' : 'pct';
-          const snapshotMs = Date.parse((this.data && this.data.generated_at) || '');
-          const maxMs = Number.isFinite(snapshotMs) ? snapshotMs : Date.now();
-          const minMs = maxMs - chartWindowMs;
-          const slotMs = chartWindowMs / N;
-
-          const buildSeries = (winKey) => {
-            const w = burn[winKey];
-            if (!w) return null;
-            const tb = w.time_buckets || {};
-            const timeline = Array.isArray(tb.timeline) ? tb.timeline : [];
-            if (!timeline.length) return null;
-            const samples = new Array(N).fill(0);
-            for (const seg of timeline) {
-              const ts = seg && seg.finished_at;
-              if (!ts) continue;
-              const t = new Date(ts).getTime();
-              if (Number.isNaN(t)) continue;
-              if (t < minMs || t > maxMs) continue;
-              const slot = Math.min(N - 1, Math.max(0, Math.floor((t - minMs) / slotMs)));
-              const value = metric === 'tok'
-                ? Math.max(0, Number(seg.billable_tokens) || 0)
-                : Math.max(0, Number(seg.delta_percent) || 0);
-              samples[slot] += value;
-            }
-            // Convert per-slot totals into the selected per-minute rate.
-            const slotMinutes = slotMs / 60000;
-            return samples.map((v) => v / Math.max(0.0001, slotMinutes));
-          };
-
-          const session = buildSeries('session');
-          const weekly = buildSeries('weekly');
-          const sSession = session;
-          const sWeekly = weekly;
-
-          const all = [].concat(sSession || [], sWeekly || []);
-          let maxY = Math.max(0.3, ...(all.length ? all : [0.3]));
-          maxY = Math.ceil(maxY * 100) / 100;
-          const xs = (arr) => arr ? arr.map((_, i) => padL + (i / Math.max(1, arr.length - 1)) * (viewW - padL - padR)) : [];
-          const yScale = (v) => padT + (1 - (Math.max(0, v) / maxY)) * (viewH - padT - padB);
-          const toPoints = (arr) => {
-            if (!arr) return '';
-            const xv = xs(arr);
-            return arr.map((v, i) => `${xv[i].toFixed(1)},${yScale(v).toFixed(1)}`).join(' ');
-          };
-          const formatAxisLabel = (v) => {
-            if (metric === 'tok') return this.compact(v) + '/m';
-            const n = Number(v) || 0;
-            const abs = Math.abs(n);
-            const digits = abs >= 1 ? 2 : abs >= 0.1 ? 3 : 4;
-            return n.toFixed(digits) + '%/m';
-          };
-          const gridLines = [0.25, 0.5, 0.75, 1.0].map((frac) => {
-            const v = maxY * frac;
-            return { y: yScale(v), label: formatAxisLabel(v) };
-          });
-          // Time-of-day x labels at evenly spaced points along the chart.
-          const xLabels = [];
-          const labelCount = 7;
-          for (let k = 0; k < labelCount; k++) {
-            const frac = k / (labelCount - 1);
-            const x = padL + frac * (viewW - padL - padR);
-            const d = new Date(minMs + chartWindowMs * frac);
-            let label = '';
-            try { label = d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }); } catch (_) {}
-            xLabels.push({ x, label });
-          }
-          return {
-            viewW, viewH,
-            unitLabel: metric === 'tok' ? 'TOKENS PER MINUTE' : '% PER MINUTE',
-            shortUnitLabel: metric === 'tok' ? 'tokens/min' : '%/min',
-            session: toPoints(sSession),
-            weekly: toPoints(sWeekly),
-            gridLines,
-            xLabels,
-          };
-        },
-                rl2PerModelRows() {
-          const burn = (this.usageRatelimits && this.usageRatelimits.burn_rate) || {};
-          const win = burn.session || burn.weekly || {};
-          const buckets = (win.time_buckets && win.time_buckets.buckets) || [];
-          const selected = Number(this.burnBucketMinutes) || 30;
-          const active = buckets.find((b) => Number(b.minutes) === selected) || null;
-          if (!active) return [];
-          const totalDelta = Number((active.totals || {}).delta_percent) || 0;
-          const palette = ['#34d399', '#b07cff', '#5ec8ff', '#f4b740', '#ff7a3a', '#8b8bff'];
-          const models = (active.models || []).slice();
-          return models.map((m, idx) => {
-            const delta = Number(m.delta_percent) || 0;
-            const sharePct = totalDelta > 0 ? Math.max(0, Math.min(100, (delta / totalDelta) * 100)) : 0;
-            const tokens = Number(m.billable_tokens) || 0;
-            const requests = Number(m.requests) || 0;
-            const dur = Number(m.duration_ms) || 0;
-            return {
-              model: m.model || 'unknown',
-              requests: this._formatAverageCount(requests),
-              deltaLabel: delta.toFixed(delta >= 1 ? 2 : 3) + '%',
-              sharePercent: sharePct,
-              shareLabel: sharePct > 0 ? sharePct.toFixed(sharePct >= 10 ? 0 : 1) + '%' : '—',
-              barPx: Math.max(4, Math.min(110, sharePct * 1.1)),
-              color: palette[idx % palette.length],
-              tokens: this.compact(tokens),
-              duration: this._rl2FormatDuration(dur),
-            };
-          });
-        },
-        rl2PerModelTotals() {
-          const rows = this.rl2PerModelRows;
-          const burn = (this.usageRatelimits && this.usageRatelimits.burn_rate) || {};
-          const win = burn.session || burn.weekly || {};
-          const buckets = (win.time_buckets && win.time_buckets.buckets) || [];
-          const selected = Number(this.burnBucketMinutes) || 30;
-          const active = buckets.find((b) => Number(b.minutes) === selected) || {};
-          const totals = active.totals || {};
-          return {
-            requests: this._formatAverageCount(Number(active.request_count) || 0),
-            delta: (Number(totals.delta_percent) || 0).toFixed(2) + '%',
-            tokens: this.compact(Number(totals.billable_tokens) || 0),
-            duration: this._rl2FormatDuration(Number(totals.duration_ms) || 0),
-          };
-        },
-        rl2Budgets() {
-          const out = [];
-          const windows = (this.usageRatelimits && this.usageRatelimits.windows) || {};
-          const titleMap = { session: 'Session Window Budget', weekly: 'Weekly Window Budget' };
-          for (const key of ['session', 'weekly']) {
-            const w = windows[key];
-            if (!w) continue;
-            const used = Number(w.percent_used);
-            const remaining = Number(w.percent_remaining);
-            const tone = remaining <= 10 ? 'bad' : remaining <= 30 ? 'warn' : '';
-            // Upstream limit is 100% per window — the "target" is a soft cap (here: 100%).
-            const target = 100;
-            // The reference design surfaces a per-window budget cap. Without explicit upstream budget metadata,
-            // use a sensible default per window: 4% (session) and 25% (weekly) — matching common Anthropic guidance.
-            const defaultTargets = { session: 4, weekly: 25 };
-            const targetSoft = defaultTargets[key] || 100;
-            out.push({
-              key,
-              name: titleMap[key] || key,
-              desc: 'Per window',
-              targetLabel: targetSoft.toFixed(2) + '%',
-              usedLabel: (Number.isFinite(used) ? used.toFixed(used >= 10 ? 1 : 1) : '—') + '% used',
-              remainingLabel: Number.isFinite(remaining) ? remaining.toFixed(remaining >= 10 ? 1 : 1) + '% remaining' : '',
-              tone,
-              fillPercent: Number.isFinite(remaining) ? Math.max(0, Math.min(100, remaining)) : 0,
-            });
-          }
-          return out;
-        },
-        rl2RawHeaders() {
-          const ratelimits = this.usageRatelimits || {};
-          return JSON.stringify({
-            captured_at: ratelimits.captured_at,
-            request_id: ratelimits.request_id,
-            windows: ratelimits.windows,
-          }, null, 2);
-        },
-        rl2EfficiencyTiles() {
-          const burn = (this.usageRatelimits && this.usageRatelimits.burn_rate) || {};
-          const win = burn.session || burn.weekly || {};
-          const buckets = (win.time_buckets && win.time_buckets.buckets) || [];
-          const sortedAsc = buckets.slice().sort((a, b) => Number(a.minutes) - Number(b.minutes));
-          const selected = Number(this.burnBucketMinutes) || 30;
-          const recent = sortedAsc.find((b) => Number(b.minutes) === selected) || sortedAsc[0] || {};
-          const recentTotals = recent.totals || {};
-          const recentTokens = Number(recentTotals.billable_tokens) || 0;
-          const recentDelta = Number(recentTotals.delta_percent) || 0;
-          const recentRequests = Number(recent.request_count) || 0;
-          const recentDuration = Number(recentTotals.duration_ms) || 0;
-          const tokensPerDrop = recentDelta > 0 ? recentTokens / recentDelta : null;
-          const avgTokensPerReq = recentRequests > 0 ? recentTokens / recentRequests : null;
-          const avgDurationPerReq = recentRequests > 0 ? recentDuration / recentRequests : null;
-          const peakBurn = sortedAsc.reduce((mx, b) => Math.max(mx, Number(b.avg_delta_percent_per_minute) || 0), 0);
-          // Spark builder — returns SVG points string (used directly in <polyline :points>).
-          const spark = (vals) => {
-            if (!vals || !vals.length) return '';
-            const arr = vals.map(v => Number.isFinite(Number(v)) ? Number(v) : 0);
-            if (arr.length === 1) arr.push(arr[0]);
-            const mx = Math.max(0.0001, ...arr);
-            return arr.map((v, i) => `${((i / Math.max(1, arr.length - 1)) * 100).toFixed(1)},${(30 - (Math.max(0, v) / mx) * 28).toFixed(1)}`).join(' ');
-          };
-          const burnSeries = sortedAsc.map((b) => Number(b.avg_delta_percent_per_minute) || 0);
-          // Quietest hour (synthetic from buckets — we have no per-hour, so degrade gracefully)
-          const quietest = sortedAsc.reduce((q, b) => {
-            const v = Number(b.avg_delta_percent_per_minute) || 0;
-            if (q == null || v < q.v) return { v, label: 'last ' + (b.minutes < 60 ? b.minutes + 'm' : (b.minutes/60) + 'h') };
-            return q;
-          }, null);
-          return [
-            {
-              key: 'tpd', label: 'Tokens per % Drop',
-              value: tokensPerDrop != null ? this.compact(tokensPerDrop) : '—',
-              delta: '', sub: 'observed',
-              spark: spark(burnSeries.map(v => v > 0 ? 1/v : 0)),
-              color: '#f87272',
-            },
-            {
-              key: 'avgtpr', label: 'Avg Tokens per Req',
-              value: avgTokensPerReq != null ? this.compact(avgTokensPerReq) : '—',
-              delta: '', sub: 'historical average',
-              spark: spark(burnSeries.map((_, i) => sortedAsc[i] && sortedAsc[i].request_count ? (Number((sortedAsc[i].totals||{}).billable_tokens||0) / Math.max(1, Number(sortedAsc[i].request_count))) : 0)),
-              color: '#34d399',
-            },
-            {
-              key: 'avgdpr', label: 'Avg Duration per Req',
-              value: avgDurationPerReq != null ? this._rl2FormatDuration(avgDurationPerReq) : '—',
-              delta: '', sub: 'historical average',
-              spark: spark(sortedAsc.map((b) => b.request_count ? Number((b.totals||{}).duration_ms||0)/Math.max(1, Number(b.request_count)) : 0)),
-              color: '#5ec8ff',
-            },
-            {
-              key: 'peak', label: 'Peak Avg Burn',
-              value: peakBurn.toFixed(peakBurn >= 1 ? 2 : 3), unit: '/min',
-              delta: '', sub: 'across all buckets',
-              spark: spark(burnSeries),
-              color: '#ff7a3a',
-            },
-            {
-              key: 'quietest', label: 'Quietest Hour (Avg)',
-              value: quietest ? quietest.v.toFixed(quietest.v >= 1 ? 2 : 3) : '0',
-              unit: '/min',
-              delta: '', sub: quietest ? quietest.label : '—',
-              spark: spark(burnSeries),
-              color: '#b07cff',
-            },
-          ];
-        },
-        rl2Heatmap() {
-          // Heatmap: rows × 24 hour columns aggregating burn over the last 24 hours.
-          // Each row represents a 4-hour offset slice, giving a denser visual texture.
-          const burn = (this.usageRatelimits && this.usageRatelimits.burn_rate) || {};
-          const win = burn.session || burn.weekly || {};
-          const tb = (win.time_buckets) || {};
-          const timeline = Array.isArray(tb.timeline) ? tb.timeline : [];
-          const ROWS = 6;
-          const COLS = 24;
-          // Bin segments into hour-of-day, accumulating delta_percent per hour, plus burn per request as a refinement row.
-          const hourSums = new Array(COLS).fill(0);
-          const hourCounts = new Array(COLS).fill(0);
-          const hourTokens = new Array(COLS).fill(0);
-          const hourDurations = new Array(COLS).fill(0);
-          for (const seg of timeline) {
-            const ts = seg && seg.finished_at;
-            if (!ts) continue;
-            const d = new Date(ts);
-            if (Number.isNaN(d.getTime())) continue;
-            const col = d.getHours();
-            hourSums[col] += Math.max(0, Number(seg.delta_percent) || 0);
-            hourCounts[col] += 1;
-            hourTokens[col] += Math.max(0, Number(seg.billable_tokens) || 0);
-            hourDurations[col] += Math.max(0, Number(seg.duration_ms) || 0);
-          }
-          const grid = Array.from({ length: ROWS * COLS }, () => 0);
-          for (let c = 0; c < COLS; c++) {
-            const total = hourSums[c];
-            const cnt = hourCounts[c];
-            const tok = hourTokens[c];
-            const dur = hourDurations[c];
-            // Distribute the column's intensity across rows in a faux-vertical pattern proportional to per-request rate.
-            const perReq = cnt > 0 ? total / cnt : 0;
-            const tokenIntensity = cnt > 0 ? tok / cnt / 100000 : 0;
-            const durIntensity = cnt > 0 ? dur / cnt / 60000 : 0;
-            const rowVals = [total, perReq * 5, tokenIntensity, durIntensity, total / Math.max(1, cnt) * 3, total];
-            for (let r = 0; r < ROWS; r++) grid[r * COLS + c] = rowVals[r] || 0;
-          }
-          const max = Math.max(0.0001, ...grid);
-          return grid.map((v, idx) => {
-            const t = max > 0 ? v / max : 0;
-            let color;
-            if (v <= 0) color = 'rgba(255,255,255,0.04)';
-            else if (t < 0.20) color = '#1f3a36';
-            else if (t < 0.40) color = '#2f7a5d';
-            else if (t < 0.60) color = '#34d399';
-            else if (t < 0.80) color = '#f4b740';
-            else color = '#ef4444';
-            return { idx, color, title: `${v.toFixed(3)}` };
-          });
-        },
-        rl2HeatmapXLabels() {
-          return ['12 AM', '6 AM', '12 PM', '6 PM'];
-        },
-                rl2HeatmapMaxLabel() {
-          const burn = (this.usageRatelimits && this.usageRatelimits.burn_rate) || {};
-          const win = burn.session || burn.weekly || {};
-          const tb = (win.time_buckets) || {};
-          const timeline = Array.isArray(tb.timeline) ? tb.timeline : [];
-          const max = timeline.reduce((m, s) => Math.max(m, Number(s.delta_percent) || 0), 0);
-          return max > 0 ? max.toFixed(max >= 1 ? 2 : 3) + '%' : '—';
-        },
-        rl2Alerts() {
-          const out = [];
-          const overview = this.rateLimitOverview || [];
-          for (const row of overview) {
-            // Alerts now key off the verdict produced by `rateLimitOverview`, which is based
-            // on *projected window usage at reset* — not raw time-to-cap. This avoids noisy
-            // "weekly will exhaust" alerts whenever any non-zero burn is observed.
-            const verdict = row.ttcVerdict;
-            const verdictLabel = row.ttcVerdictLabel || '';
-            const stamp = this.stamp(this.data.generated_at).split(',').pop().trim();
-            if (verdict === 'bad' && verdictLabel === 'Already at cap') {
-              out.push({
-                tone: 'warn',
-                title: `${row.label} window is at the cap.`,
-                detail: `Wait for reset in ${row.resetCountdownLabel}.`,
-                stamp,
-              });
-            } else if (verdict === 'bad') {
-              out.push({
-                tone: 'warn',
-                title: `${row.label} window projected to exceed cap before reset.`,
-                detail: row.ttcMetaLabel || `Projected to exceed before reset in ${row.resetCountdownLabel}.`,
-                stamp,
-              });
-            } else if (verdict === 'warn' && verdictLabel === 'Cuts close') {
-              out.push({
-                tone: 'alert',
-                title: `${row.label} window will land near the cap.`,
-                detail: row.ttcMetaLabel || `Projected to land near the cap by reset in ${row.resetCountdownLabel}.`,
-                stamp,
-              });
-            }
-            // 'Watch' verdict is informational only — do not raise an alert for it.
-          }
-          // Stale snapshot info
-          const captured = this.usageRatelimits && this.usageRatelimits.captured_at;
-          if (captured) {
-            const ageMin = (Date.now() - new Date(captured).getTime()) / 60000;
-            if (Number.isFinite(ageMin) && ageMin > 5) {
-              out.push({
-                tone: 'info',
-                title: `Last meter snapshot is ${Math.round(ageMin)} minutes old.`,
-                detail: 'Data may be delayed.',
-                stamp: this.stamp(captured).split(',').pop().trim(),
-              });
-            }
-          }
-          return out;
         },
         gptFallbackOptions() {
           return (this.modelRouting.available_models || []).filter((option) => option.provider === 'codex');
@@ -4917,277 +3451,6 @@
         costWeekTotal() {
           return this.costLast7Days.reduce((sum, row) => sum + Number(row.cost_usd || 0), 0);
         },
-        premiumSourceLabel() {
-          const source = String(this.premium.source || '').trim();
-          if (source === 'upstream-quota-snapshot') return 'Live quota from upstream response headers';
-          if (source === 'awaiting-first-request') return 'Awaiting first request to capture quota';
-          if (source) return source;
-          return 'Premium source pending';
-        },
-        premiumGaugePercent() {
-          if (this.premium.unlimited) return 100;
-          const percentRemaining = this._asPremiumNumber(this.premium.percent_remaining);
-          if (Number.isFinite(percentRemaining)) {
-            return Math.max(6, Math.min(100, percentRemaining));
-          }
-          const percentUsed = this._asPremiumNumber(this.premium.percent_used);
-          if (Number.isFinite(percentUsed)) {
-            return Math.max(6, Math.min(100, 100 - percentUsed));
-          }
-          const included = this._asPremiumNumber(this.premium.included);
-          const monthConsumed = Number(this.currentMonth?.premium_requests || 0);
-          if (Number.isFinite(included) && included > 0 && Number.isFinite(monthConsumed)) {
-            return Math.max(6, Math.min(100, ((included - monthConsumed) / included) * 100));
-          }
-          return 6;
-        },
-        premiumGaugeToneClass() {
-          if (this.premium.unlimited) return 'tone-unlimited';
-          const percent = this.premiumGaugePercent;
-          if (percent <= 15) return 'tone-red';
-          if (percent <= 40) return 'tone-yellow';
-          return 'tone-green';
-        },
-        premiumGaugeLabel() {
-          if (this.premium.unlimited) return 'Unlimited';
-          const percentRemaining = this._asPremiumNumber(this.premium.percent_remaining);
-          if (Number.isFinite(percentRemaining)) return `${this._formatPercent(percentRemaining)}% left`;
-          return this.premium.configured ? `${this.premiumCount(this.currentMonth?.premium_requests)} used` : 'Pending';
-        },
-        premiumGaugeMeta() {
-          if (!this.premium.configured) return 'Live quota appears after the first proxied request.';
-          if (this.premium.unlimited) return 'No premium ceiling is enforced for this plan.';
-          const used = this._asPremiumNumber(this.premium.used);
-          const remaining = this._asPremiumNumber(this.premium.remaining);
-          if (Number.isFinite(used) && Number.isFinite(remaining)) {
-            return `${this.premiumCount(used)} used · ${this.premiumCount(remaining)} left`;
-          }
-          return 'Using live upstream quota snapshots.';
-        },
-        premiumRemainingLabel() {
-          if (this.premium.unlimited) return 'Unlimited';
-          const percentUsed = this._asPremiumNumber(this.premium.percent_used);
-          if (!Number.isFinite(percentUsed)) return this.premium.configured ? '0%' : 'Pending';
-          return `${this._formatPercent(percentUsed)}%`;
-        },
-        premiumRemainingMetaLabel() {
-          if (!this.premium.configured) return 'Make a request to capture live quota';
-          if (this.premium.unlimited) return 'Unlimited plan — no premium quota cap';
-          const used = this._asPremiumNumber(this.premium.used);
-          const included = this._asPremiumNumber(this.premium.included);
-          const remaining = this._asPremiumNumber(this.premium.remaining);
-          const days = this._asPremiumNumber(this.premium.days_until_reset);
-          const parts = [];
-          if (Number.isFinite(used) && Number.isFinite(included)) {
-            parts.push(`${this._formatPremiumValue(used)} of ${this._formatPremiumValue(included)} used`);
-          } else if (Number.isFinite(remaining)) {
-            parts.push(`${this._formatPremiumValue(remaining)} remaining`);
-          }
-          if (Number.isFinite(days)) {
-            const resetDate = this._formatResetDate(this.premium.reset_at);
-            parts.push(`resets in ${this.integer(days)} day${days === 1 ? '' : 's'}${resetDate ? ` (${resetDate})` : ''}`);
-          }
-          return parts.join(' · ') || 'No premium quota data yet';
-        },
-        premiumUsageLine() {
-          const used = this._asPremiumNumber(this.premium.used);
-          const included = this._asPremiumNumber(this.premium.included);
-          const percentUsed = this._asPremiumNumber(this.premium.percent_used);
-          const pieces = [];
-          if (Number.isFinite(used) && Number.isFinite(included)) {
-            pieces.push(`${this._formatPremiumValue(used)} of ${this._formatPremiumValue(included)} legacy quota units used`);
-          }
-          if (Number.isFinite(percentUsed)) {
-            pieces.push(`${this._formatPercent(percentUsed)}% used`);
-          }
-          return pieces.join(' · ') || 'No usage data yet';
-        },
-        premiumResetLine() {
-          const days = this._asPremiumNumber(this.premium.days_until_reset);
-          const resetDate = this._formatResetDate(this.premium.reset_at);
-          if (Number.isFinite(days) && resetDate) {
-            return `Resets in ${this.integer(days)} day${days === 1 ? '' : 's'} (${resetDate})`;
-          }
-          if (Number.isFinite(days)) {
-            return `Resets in ${this.integer(days)} day${days === 1 ? '' : 's'}`;
-          }
-          if (resetDate) return `Resets ${resetDate}`;
-          return 'Reset date pending';
-        },
-        premiumOverageLine() {
-          const overage = this._asPremiumNumber(this.premium.overage);
-          if (!Number.isFinite(overage) || overage <= 0) return '';
-          const permitted = this.premium.overage_permitted ? 'permitted' : 'not permitted';
-          return `Overage: ${this._formatPremiumValue(overage)} (${permitted})`;
-        },
-        updatedLabel() { return `Updated ${this.stamp(this.data.generated_at)}`; },
-        premiumPlanStatusLabel() {
-          if (!this.premium.configured) return 'Awaiting first proxied request to capture upstream quota';
-          if (this.premium.unlimited) return 'Unlimited plan';
-          const included = this._asPremiumNumber(this.premium.included);
-          if (Number.isFinite(included)) return `${this.integer(included)} legacy quota units included this period`;
-          return 'Live premium quota from upstream headers';
-        },
-        premiumConsumedCards() {
-          const todayConsumed = Number(this.premiumLast7Days[this.premiumLast7Days.length - 1]?.premium_requests || 0);
-          return [
-            { key: 'today', label: 'Today', value: this.premiumCount(todayConsumed), meta: 'Same local day shown in the expanded view' },
-            { key: 'last_7_days', label: '7 Days', value: this.premiumCount(this.premiumWeekTotal), meta: 'Rolling seven-day total' },
-            { key: 'current_month', label: 'Month', value: this.premiumCount(this.currentMonth?.premium_requests), meta: 'Current month so far' },
-            { key: 'all_time', label: 'All-Time', value: this.premiumCount(this.allTime?.premium_requests), meta: 'All recorded legacy quota units' },
-          ];
-        },
-        premiumLast7Days() {
-          const byDay = new Map((this.dailyHistory || []).map((row) => [String(row?.day_key || ''), row]));
-          const today = new Date();
-          const days = [];
-          for (let offset = 6; offset >= 0; offset -= 1) {
-            const date = addCalendarDays(today, -offset);
-            const dayKey = dayKeyFromDate(date);
-            const row = byDay.get(dayKey) || emptyUsageRow(dayKey);
-            const premiumRequests = Number(row?.premium_requests || 0);
-            days.push({
-              ...row,
-              day_key: dayKey,
-              is_today: offset === 0,
-              weekday: date ? date.toLocaleDateString([], { weekday: 'short' }) : '-',
-              dayNumber: date ? date.toLocaleDateString([], { month: 'short', day: 'numeric' }) : dayKey,
-              premium_requests: Number(premiumRequests.toFixed(2)),
-            });
-          }
-          const maxPremium = Math.max(...days.map((row) => Number(row.premium_requests || 0)), 0);
-          return days.map((row) => ({
-            ...row,
-            fill_percent: maxPremium > 0 ? Math.max(8, (Number(row.premium_requests || 0) / maxPremium) * 100) : 0,
-            requestLabel: Number(row.premium_requests || 0) > 0
-              ? `${this.integer(row.request_count || 0)} proxy call${Number(row.request_count || 0) === 1 ? '' : 's'}`
-              : 'No premium activity',
-          }));
-        },
-        premiumWeekTotal() {
-          return this.premiumLast7Days.reduce((sum, row) => sum + Number(row.premium_requests || 0), 0);
-        },
-        premiumWeekAverage() {
-          return this.premiumLast7Days.length ? this.premiumWeekTotal / this.premiumLast7Days.length : 0;
-        },
-        premiumWeekPeakDay() {
-          return this.premiumLast7Days.reduce((best, row) => (
-            Number(row.premium_requests || 0) > Number(best?.premium_requests || 0) ? row : best
-          ), null);
-        },
-        premiumWeekPeakLabel() {
-          const peak = this.premiumWeekPeakDay;
-          if (!peak || Number(peak.premium_requests || 0) <= 0) return 'Quiet';
-          return this.premiumCount(peak.premium_requests);
-        },
-        premiumWeekPeakMeta() {
-          const peak = this.premiumWeekPeakDay;
-          if (!peak || Number(peak.premium_requests || 0) <= 0) return 'No legacy quota activity this week';
-          return `${peak.weekday} ${peak.dayNumber} · ${this.integer(peak.request_count || 0)} proxy call${Number(peak.request_count || 0) === 1 ? '' : 's'}`;
-        },
-        premiumWeekSummaryLine() {
-          return `${this.premiumCount(this.premiumWeekTotal)} total · ${this.premiumCount(this.premiumWeekAverage)} avg/day`;
-        },
-        premiumTodayCount() {
-          const last = this.premiumLast7Days[this.premiumLast7Days.length - 1];
-          return Number(last?.premium_requests || 0);
-        },
-        premiumCycleProgress() {
-          // Fraction (0-1) of the way through the current premium cycle.
-          // Inferred from days_until_reset assuming a 30-day cycle when nothing else known.
-          const days = this._asPremiumNumber(this.premium.days_until_reset);
-          const cycleLen = this._asPremiumNumber(this.premium.cycle_length_days)
-            || this._asPremiumNumber(this.premium.cycle_days)
-            || 30;
-          if (!Number.isFinite(days) || !Number.isFinite(cycleLen) || cycleLen <= 0) return null;
-          const elapsed = Math.max(0, Math.min(cycleLen, cycleLen - days));
-          return elapsed / cycleLen;
-        },
-        premiumPaceTickPercent() {
-          if (this.premium.unlimited) return null;
-          const p = this.premiumCycleProgress;
-          if (p === null) return null;
-          return Math.max(0, Math.min(100, p * 100));
-        },
-        premiumProjectedTotal() {
-          // Legacy compatibility projection retained for old dashboard payloads.
-          if (this.premium.unlimited) return null;
-          const used = this._asPremiumNumber(this.premium.used);
-          const p = this.premiumCycleProgress;
-          if (Number.isFinite(used) && p && p > 0.02) {
-            return used / p;
-          }
-          // Fallback: use last-7-day average extrapolated to a 30-day cycle.
-          const avg = Number(this.premiumWeekAverage || 0);
-          const cycleLen = this._asPremiumNumber(this.premium.cycle_length_days)
-            || this._asPremiumNumber(this.premium.cycle_days)
-            || 30;
-          if (avg > 0 && Number.isFinite(cycleLen)) return avg * cycleLen;
-          return null;
-        },
-        premiumProjectedLabel() {
-          const projected = this.premiumProjectedTotal;
-          if (projected === null) return '—';
-          if (this.premium.unlimited) return '∞';
-          return this.premiumCount(projected);
-        },
-        premiumProjectedSubLabel() {
-          const projected = this.premiumProjectedTotal;
-          const included = this._asPremiumNumber(this.premium.included);
-          if (this.premium.unlimited) return 'no cap';
-          if (projected === null || !Number.isFinite(included) || included <= 0) return 'end of cycle';
-          const pct = (projected / included) * 100;
-          if (pct > 105) return `${pct.toFixed(0)}% of cap`;
-          if (pct < 95) return `${pct.toFixed(0)}% of cap`;
-          return 'at cap';
-        },
-        premiumProjectionStatClass() {
-          const projected = this.premiumProjectedTotal;
-          const included = this._asPremiumNumber(this.premium.included);
-          if (this.premium.unlimited) return 'proj-green';
-          if (projected === null || !Number.isFinite(included) || included <= 0) return '';
-          const pct = (projected / included) * 100;
-          if (pct >= 100) return 'proj-red';
-          if (pct >= 85) return 'proj-yellow';
-          return 'proj-green';
-        },
-        premiumPaceTone() {
-          // Combine cycle-position pace and projected total for a single status pill.
-          if (this.premium.unlimited) {
-            return { label: 'Unlimited', pillClass: 'tone-cyan', fillClass: 'tone-cyan',
-                     tooltip: 'Unlimited plan — no premium ceiling.' };
-          }
-          if (!this.premium.configured) {
-            return { label: 'Pending', pillClass: 'tone-cyan', fillClass: 'tone-cyan',
-                     tooltip: 'Awaiting first proxied request.' };
-          }
-          const used = this.premiumUsedPercent;
-          const paceP = this.premiumPaceTickPercent;
-          const projected = this.premiumProjectedTotal;
-          const included = this._asPremiumNumber(this.premium.included);
-          const projPct = (projected !== null && Number.isFinite(included) && included > 0)
-            ? (projected / included) * 100 : null;
-
-          // Severity: red if already >90% used or projecting >100% of cap.
-          if (used >= 90 || (projPct !== null && projPct >= 100)) {
-            return { label: 'Over pace', pillClass: 'tone-red', fillClass: 'tone-red',
-                     tooltip: `Projected ${projPct ? projPct.toFixed(0) + '% of cap' : 'overage'} by reset.` };
-          }
-          // Yellow if used > pace + 8 pts, or projecting >85%.
-          if ((paceP !== null && used - paceP > 8) || (projPct !== null && projPct >= 85)) {
-            return { label: 'Ahead of pace', pillClass: 'tone-yellow', fillClass: 'tone-yellow',
-                     tooltip: `Using faster than expected for this point in the cycle.` };
-          }
-          // Otherwise green.
-          return { label: 'On pace', pillClass: '', fillClass: '',
-                   tooltip: 'Usage is tracking with the cycle.' };
-        },
-        safeguardConfigStatusLabel() {
-          const seconds = Number(this.safeguardConfig.cooldownSeconds);
-          if (!Number.isFinite(seconds)) return 'Cooldown not configured';
-          if (seconds <= 0) return 'Cooldown disabled (0s)';
-          return `Cooldown of ${this.integer(seconds)}s after each proxied request`;
-        },
         sessionRequestIndex() {
           // Map session_id -> [requests], plus aggregates incl. duration
           const map = new Map();
@@ -5260,9 +3523,6 @@
           })).filter((row) => {
             if (!this.allowRequestSource(row.source)) return false;
             if (!this.matches(row)) return false;
-            if (this.initiatorFilter !== 'all' && String(row.initiator || '').toLowerCase() !== this.initiatorFilter) return false;
-            if (this.safeguardFilter === 'triggered' && !row.safeguard_triggered) return false;
-            if (this.safeguardFilter === 'clean' && row.safeguard_triggered) return false;
             return true;
           });
           return this.sortRows(rows, 'finished_at');
@@ -5435,8 +3695,6 @@
             { key: 'usage', label: 'Usage Explorer', icon: ico('<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><path d="M7 15l4-4 3 3 5-6"/></svg>') },
             { key: 'requests', label: 'Requests', icon: ico('<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M3 12h18"/><path d="M3 18h12"/></svg>') },
             { key: 'sessions', label: 'Sessions', icon: ico('<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/></svg>') },
-            { key: 'limits', label: 'Rate Limits', icon: ico('<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg>') },
-            { key: 'safeguard', label: 'Safeguard', icon: ico('<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>') },
             { key: 'routing', label: 'Model Routing', icon: ico('<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="6" r="2.5"/><circle cx="18" cy="6" r="2.5"/><circle cx="12" cy="18" r="2.5"/><path d="M8 7l3 9M16 7l-3 9"/></svg>') },
             { key: 'approvals', label: 'Approvals', icon: ico('<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12l4 4 10-10"/></svg>') },
             { key: 'storage', label: 'Storage & Costs', icon: ico('<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.7 4 3 9 3s9-1.3 9-3V5"/></svg>') },
@@ -5446,12 +3704,10 @@
         },
         activeViewMeta() {
           const map = {
-            overview: { title: 'Overview', subtitle: 'Live spend, usage, and quota at a glance.' },
+            overview: { title: 'Overview', subtitle: 'Live spend, token usage, and request activity at a glance.' },
             usage: { title: 'Usage Analytics', subtitle: 'Spend, tokens, and source breakdowns.' },
             requests: { title: 'Request Explorer', subtitle: 'Inspect any recent proxied request in full detail.' },
             sessions: { title: 'Sessions', subtitle: 'Recent sessions across all upstream sources.' },
-            limits: { title: 'Rate Limits', subtitle: 'Monitor token burn rate and duration consumption across time windows.' },
-            safeguard: { title: 'Safeguards', subtitle: 'Configure cooldowns and view safeguard activity.' },
             routing: { title: 'Model Routing', subtitle: 'Map requested models to provider models.' },
             approvals: { title: 'Approval Routing', subtitle: 'Routes for approval prompts and fallbacks.' },
             storage: { title: 'Storage & Data', subtitle: 'Spend by provider and storage activity.' },
@@ -5531,39 +3787,6 @@
               ...buildSpark(allTime),
               xStart: allStart, xMid: (all.length > 2 ? (all[Math.floor(all.length/2)].label || all[Math.floor(all.length/2)].month_label || '') : ''), xEnd: allEnd },
           ];
-        },
-        premiumUsedPercent() {
-          if (this.premium.unlimited) return 0;
-          const pUsed = this._asPremiumNumber(this.premium.percent_used);
-          if (Number.isFinite(pUsed)) return Math.max(0, Math.min(100, pUsed));
-          const used = this._asPremiumNumber(this.premium.used);
-          const included = this._asPremiumNumber(this.premium.included);
-          if (Number.isFinite(used) && Number.isFinite(included) && included > 0) {
-            return Math.max(0, Math.min(100, (used / included) * 100));
-          }
-          return 0;
-        },
-        premiumUsedLabel() {
-          if (this.premium.unlimited) return 'Unlimited';
-          const used = this._asPremiumNumber(this.premium.used);
-          if (Number.isFinite(used)) return this._formatPremiumValue(used);
-          const month = Number(this.currentMonth?.premium_requests || 0);
-          return this._formatPremiumValue(month);
-        },
-        premiumIncludedLabel() {
-          if (this.premium.unlimited) return '∞';
-          const included = this._asPremiumNumber(this.premium.included);
-          if (Number.isFinite(included)) return this._formatPremiumValue(included);
-          return '—';
-        },
-        premiumWeekChart() {
-          const peak = Math.max(0, ...this.premiumLast7Days.map(d => Number(d.premium_requests || 0)));
-          const ymax = peak > 0 ? Math.ceil(peak * 1.1) : 1;
-          return {
-            yMaxLabel: this.premiumCount(ymax),
-            yMidLabel: this.premiumCount(ymax * 0.66),
-            yMinLabel: this.premiumCount(ymax * 0.33),
-          };
         },
         providerRows() {
           const sources = this._sourcesForOverviewRange();
@@ -5652,385 +3875,6 @@
         money(value) {
           const numeric = Number(value);
           return Number.isFinite(numeric) ? new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 2 }).format(numeric) : '-';
-        },
-        _asPremiumNumber(value) {
-          const numeric = Number(value);
-          return Number.isFinite(numeric) ? numeric : NaN;
-        },
-        _formatPremiumValue(value) {
-          const numeric = Number(value);
-          if (!Number.isFinite(numeric)) return 'Unknown';
-          return new Intl.NumberFormat('en-US', { maximumFractionDigits: 3 }).format(numeric);
-        },
-        premiumCount(value) {
-          const numeric = Number(value);
-          if (!Number.isFinite(numeric)) return '-';
-          return new Intl.NumberFormat('en-US', {
-            minimumFractionDigits: numeric % 1 === 0 ? 0 : 2,
-            maximumFractionDigits: 2,
-          }).format(numeric);
-        },
-        _formatPercent(value) {
-          const numeric = Number(value);
-          if (!Number.isFinite(numeric)) return 'Unknown';
-          return new Intl.NumberFormat('en-US', { maximumFractionDigits: 3 }).format(numeric);
-        },
-        _formatResetDate(value) {
-          if (!value) return '';
-          const date = new Date(value);
-          if (Number.isNaN(date.getTime())) return '';
-          return date.toLocaleDateString();
-        },
-        _asRatelimitNumber(value) {
-          const n = Number(value);
-          return Number.isFinite(n) ? n : null;
-        },
-        _ratelimitToneClass(percentRemaining) {
-          if (percentRemaining == null) return 'tone-green';
-          if (percentRemaining <= 10) return 'tone-red';
-          if (percentRemaining <= 30) return 'tone-yellow';
-          return 'tone-green';
-        },
-        _formatRatelimitReset(resetAt, secondsUntilReset) {
-          if (!resetAt && (secondsUntilReset == null)) return 'Reset time unknown';
-          let absolute = '';
-          if (resetAt) {
-            try { absolute = new Date(resetAt).toLocaleString(); } catch (err) { absolute = resetAt; }
-          }
-          const seconds = this._asRatelimitNumber(secondsUntilReset);
-          if (seconds == null) return absolute ? `Resets ${absolute}` : 'Reset time unknown';
-          if (seconds <= 0) return absolute ? `Reset due (${absolute})` : 'Reset due';
-          const days = Math.floor(seconds / 86400);
-          const hours = Math.floor((seconds % 86400) / 3600);
-          const mins = Math.floor((seconds % 3600) / 60);
-          let rel;
-          if (days > 0) rel = `${days}d ${hours}h`;
-          else if (hours > 0) rel = `${hours}h ${mins}m`;
-          else rel = `${Math.max(1, mins)}m`;
-          return absolute ? `Resets in ${rel} · ${absolute}` : `Resets in ${rel}`;
-        },
-        _buildRatelimitRow(key, value) {
-          const percentRemaining = this._asRatelimitNumber(value && value.percent_remaining);
-          const percentUsed = this._asRatelimitNumber(value && value.percent_used);
-          const fillPercent = percentRemaining == null ? 0 : Math.max(0, Math.min(100, percentRemaining));
-          const labels = { session: 'Session', weekly: 'Weekly' };
-          const subLabels = { session: 'Per-session throttle', weekly: 'Rolling weekly throttle' };
-          const overage = this._asRatelimitNumber(value && value.overage);
-          const overagePermitted = value && value.overage_permitted;
-          let percentLabel = 'unknown';
-          if (percentRemaining != null) {
-            percentLabel = `${percentRemaining.toFixed(percentRemaining >= 10 ? 0 : 1)}%`;
-          }
-          let usedLabel = '—';
-          if (percentUsed != null) usedLabel = `${percentUsed.toFixed(percentUsed >= 10 ? 0 : 1)}%`;
-          let resetLabel = this._formatRatelimitReset(value && value.reset_at, value && value.seconds_until_reset);
-          if (overage != null && overage > 0) {
-            resetLabel += ` · overage ${overage}${overagePermitted ? '' : ' (not permitted)'}`;
-          } else if (overagePermitted === false && percentRemaining != null && percentRemaining < 1) {
-            resetLabel += ' · no overage permitted';
-          }
-          return {
-            key,
-            label: labels[key] || (key.charAt(0).toUpperCase() + key.slice(1)),
-            subLabel: subLabels[key] || '',
-            percentLabel,
-            usedLabel,
-            fillPercent,
-            toneClass: this._ratelimitToneClass(percentRemaining),
-            resetLabel,
-            percentRemaining,
-            percentUsed,
-            secondsUntilReset: this._asRatelimitNumber(value && value.seconds_until_reset),
-            resetAt: (value && value.reset_at) || null,
-          };
-        },
-        _trailingBurnStats(winKey, minutes) {
-          const burn = (this.usageRatelimits && this.usageRatelimits.burn_rate) || {};
-          const win = burn[winKey] || {};
-          const tb = win.time_buckets || {};
-          const timeline = Array.isArray(tb.timeline) ? tb.timeline : [];
-          const windowMinutes = Number(minutes) || 5;
-          const snapshotMs = Date.parse((this.data && this.data.generated_at) || '');
-          const maxMs = Number.isFinite(snapshotMs) ? snapshotMs : Date.now();
-          const minMs = maxMs - windowMinutes * 60 * 1000;
-          let deltaPercent = 0;
-          let billableTokens = 0;
-          let requests = 0;
-          let latestMs = null;
-          for (const seg of timeline) {
-            const ts = seg && seg.finished_at;
-            if (!ts) continue;
-            const t = new Date(ts).getTime();
-            if (!Number.isFinite(t) || t < minMs || t > maxMs) continue;
-            deltaPercent += Math.max(0, Number(seg.delta_percent) || 0);
-            billableTokens += Math.max(0, Number(seg.billable_tokens) || 0);
-            requests += 1;
-            latestMs = latestMs == null ? t : Math.max(latestMs, t);
-          }
-          return {
-            minutes: windowMinutes,
-            deltaPercent,
-            billableTokens,
-            requests,
-            percentPerMinute: deltaPercent / Math.max(0.0001, windowMinutes),
-            tokensPerMinute: billableTokens / Math.max(0.0001, windowMinutes),
-            latestMs,
-            hasTimeline: timeline.length > 0,
-          };
-        },
-        _buildCurrentBurnSnapshot(winKey) {
-          // Keep the overview card intentionally more reactive than the
-          // historical "when in use" averages: use the last 5 minutes as the
-          // current slope, then project that slope across a 30-minute window.
-          const current = this._trailingBurnStats(winKey, 5);
-          const projected30 = current.percentPerMinute * 30;
-          const projectedTokens = current.tokensPerMinute * 30;
-          const hasHistory = current.hasTimeline;
-          const reqLabel = current.requests === 1 ? '1 req' : `${current.requests} reqs`;
-          const currentSub = hasHistory
-            ? `last 5m · ${reqLabel}`
-            : 'awaiting burn samples';
-          const projectedSub = hasHistory
-            ? `${this.compact(projectedTokens)} tokens if pace holds`
-            : 'needs two shared reset samples';
-          return {
-            currentBurnLabel: hasHistory ? this._rl2FormatBurn(current.percentPerMinute) : '—',
-            currentBurnSubLabel: currentSub,
-            projected30mBurnLabel: hasHistory ? this._formatBurnMixPercent(projected30) : '—',
-            projected30mBurnSubLabel: projectedSub,
-            currentBurnPerMinute: current.percentPerMinute,
-            projected30mBurnPercent: projected30,
-          };
-        },
-        _formatBurnMixPercent(value) {
-          if (value == null) return '—';
-          const n = Number(value);
-          if (!Number.isFinite(n)) return '—';
-          if (n === 0) return '0%';
-          return `${n.toFixed(n >= 10 ? 0 : 1)}%`;
-        },
-        _formatBurnRateLabel(value, suffix) {
-          const n = Number(value);
-          if (!Number.isFinite(n) || n === 0) return `0${suffix}`;
-          const abs = Math.abs(n);
-          let digits;
-          if (abs >= 10) digits = 1;
-          else if (abs >= 1) digits = 2;
-          else if (abs >= 0.1) digits = 3;
-          else digits = 4;
-          return `${n.toFixed(digits)}%${suffix}`;
-        },
-        _formatRelativeMinutes(minutes) {
-          const m = Number(minutes);
-          if (!Number.isFinite(m)) return 'unknown';
-          const abs = Math.abs(m);
-          if (abs < 1) return '<1m';
-          if (abs < 60) return `${Math.round(abs)}m`;
-          const totalMinutes = Math.round(abs);
-          if (abs < 60 * 24) {
-            const h = Math.floor(totalMinutes / 60);
-            const mm = totalMinutes - h * 60;
-            return mm > 0 ? `${h}h ${mm}m` : `${h}h`;
-          }
-          const totalHours = Math.round(abs / 60);
-          const d = Math.floor(totalHours / 24);
-          const hh = totalHours - d * 24;
-          return hh > 0 ? `${d}d ${hh}h` : `${d}d`;
-        },
-                _formatProjectionLabel(minutesToFull, remaining) {
-          const m = Number(minutesToFull);
-          if (!Number.isFinite(m) || m <= 0) return 'No burn observed';
-          const remN = Number(remaining);
-          if (Number.isFinite(remN) && remN <= 0) return 'Already at cap';
-          return `~${this._formatRelativeMinutes(m)} to cap`;
-        },
-        _formatProjectionDetail(minutesToFull, remaining, perMinute) {
-          const remN = Number(remaining);
-          const rate = Number(perMinute);
-          const parts = [];
-          if (Number.isFinite(remN)) parts.push(`${remN.toFixed(remN >= 10 ? 1 : 2)}% remaining`);
-          if (Number.isFinite(rate) && rate > 0) parts.push(`at ${this._formatBurnRateLabel(rate, '/min')}`);
-          else parts.push('no burn in window');
-          return parts.join(' · ');
-        },
-        _rl2FormatBurn(value) {
-          const n = Number(value);
-          if (!Number.isFinite(n) || n === 0) return '0.00%/min';
-          if (n >= 1) return n.toFixed(2) + '%/min';
-          if (n >= 0.1) return n.toFixed(2) + '%/min';
-          return n.toFixed(3) + '%/min';
-        },
-        _rl2FormatDuration(ms) {
-          const n = Number(ms);
-          if (!Number.isFinite(n) || n <= 0) return '0s';
-          const sec = n / 1000;
-          if (sec < 60) return sec.toFixed(sec < 10 ? 1 : 0) + 's';
-          const mins = sec / 60;
-          if (mins < 60) {
-            const m = Math.floor(mins);
-            const s = Math.round(sec - m * 60);
-            return s > 0 ? `${m}m ${s}s` : `${m}m`;
-          }
-          const hrs = mins / 60;
-          if (hrs < 48) {
-            const h = Math.floor(hrs);
-            const mr = Math.round(mins - h * 60);
-            return mr > 0 ? `${h}h ${mr}m` : `${h}h`;
-          }
-          const days = hrs / 24;
-          return days.toFixed(days < 10 ? 1 : 0) + 'd';
-        },
-        _rl2FormatResetWhen(iso) {
-          if (!iso) return '';
-          const d = new Date(iso);
-          if (Number.isNaN(d.getTime())) return '';
-          try {
-            return d.toLocaleString(undefined, { month: 'numeric', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit', second: '2-digit' });
-          } catch (err) { return iso; }
-        },
-        rl2ToggleHeaders() { this.rl2ShowHeaders = !this.rl2ShowHeaders; },
-        rl2ManageTargets() { this.activeView = 'safeguard'; },
-        _formatBurnImpactPercent(value) {
-          if (value == null) return '—';
-          const n = Number(value);
-          if (!Number.isFinite(n)) return '—';
-          if (n === 0) return '0%';
-          const abs = Math.abs(n);
-          let digits;
-          if (abs >= 10) digits = 1;
-          else if (abs >= 1) digits = 2;
-          else if (abs >= 0.1) digits = 3;
-          else digits = 4;
-          return `${n.toFixed(digits)}%`;
-        },
-        _buildRecentBurnWindow(key, value, labels) {
-          const tb = (value && value.time_buckets) || null;
-          const buckets = Array.isArray(tb && tb.buckets) ? tb.buckets : [];
-          const available = buckets.map((b) => Number(b.minutes)).filter((n) => Number.isFinite(n));
-          let selected = Number(this.burnBucketMinutes) || 30;
-          if (available.length && !available.includes(selected)) selected = available[0];
-          const active = buckets.find((b) => Number(b.minutes) === selected) || buckets[0] || null;
-          const totals = (active && active.totals) || {};
-          const segments = Number(active && active.segments_observed) || 0;
-          const requestCount = Number(active && active.request_count) || 0;
-          const totalDelta = Number(totals.delta_percent) || 0;
-          const billable = Number(totals.billable_tokens) || 0;
-          const inputTokens = Number(totals.input_tokens) || 0;
-          const outputTokens = Number(totals.output_tokens) || 0;
-          const cached = Number(totals.cached_input_tokens) || 0;
-          const perMinute = Number(active && active.avg_delta_percent_per_minute) || 0;
-          const perRequest = Number(active && active.avg_delta_percent_per_request) || 0;
-          const projMinutes = active && active.projected_minutes_to_full;
-          const remaining = Number(active && active.current_percent_remaining);
-          const models = Array.isArray(active && active.models) ? active.models : [];
-          const formatted = models.map((row, index) => this._buildRecentBurnRow(row, {
-            isLeader: index === 0 && models.length > 1,
-            totalDelta,
-          }));
-          const reportingMinutes = Number(active && active.reporting_minutes) || 30;
-          const reportingLabel = reportingMinutes < 60
-            ? `${reportingMinutes}m eq`
-            : (reportingMinutes % 60 === 0 ? `${reportingMinutes / 60}h eq` : `${reportingMinutes}m eq`);
-          const metaParts = [`Sample ${selected}m`, `report ${reportingLabel}`];
-          if (requestCount) metaParts.push(`${this._formatAverageCount(requestCount)} req${requestCount === 1 ? '' : 's'}`);
-          metaParts.push(`${this._formatBurnImpactPercent(totalDelta)} avg drop`);
-          if (models.length > 1) metaParts.push(`${this.integer(models.length)} models`);
-          return {
-            key,
-            label: labels[key] || (key.charAt(0).toUpperCase() + key.slice(1)),
-            metaLabel: metaParts.join(' · '),
-            hasData: segments > 0 || billable > 0,
-            selectedMinutes: selected,
-            availableMinutes: available,
-            totalDeltaLabel: this._formatBurnImpactPercent(totalDelta),
-            totalsBillableLabel: this.compact(billable),
-            totalsCachedLabel: this.compact(cached),
-            totalsInputLabel: this.compact(inputTokens),
-            totalsOutputLabel: this.compact(outputTokens),
-            segments,
-            requestCount,
-            avgPerMinuteLabel: this._formatBurnRateLabel(perMinute, '/min'),
-            avgPerRequestLabel: requestCount > 0 ? this._formatBurnRateLabel(perRequest, '/req') : '—',
-            projectionLabel: this._formatProjectionLabel(projMinutes, remaining),
-            projectionDetail: this._formatProjectionDetail(projMinutes, remaining, perMinute),
-            models: formatted,
-          };
-        },
-        _buildRecentBurnRow(row, options = {}) {
-          const totalDelta = Number(options.totalDelta) || 0;
-          const delta = Number(row && row.delta_percent) || 0;
-          const requests = Number(row && row.requests) || 0;
-          const inputTokens = Number(row && row.input_tokens) || 0;
-          const cachedTokens = Number(row && row.cached_input_tokens) || 0;
-          const outputTokens = Number(row && row.output_tokens) || 0;
-          const billable = Number(row && row.billable_tokens) || 0;
-          const sharePct = totalDelta > 0 ? Math.max(0, Math.min(100, (delta / totalDelta) * 100)) : 0;
-          return {
-            model: (row && row.model) || 'unknown',
-            isLeader: Boolean(options.isLeader),
-            badgeLabel: options.isLeader ? 'top burner' : '',
-            kickerLabel: 'Model',
-            requests,
-            requestsLabel: `${this._formatAverageCount(requests)} req${requests === 1 ? '' : 's'}`,
-            deltaLabel: this._formatBurnImpactPercent(delta),
-            shareLabel: sharePct > 0 ? `${sharePct.toFixed(sharePct >= 10 ? 0 : 1)}% of drop` : 'no observed drop',
-            sharePercent: sharePct,
-            inputLabel: this.compact(inputTokens),
-            cachedLabel: this.compact(cachedTokens),
-            outputLabel: this.compact(outputTokens),
-            billableLabel: this.compact(billable),
-          };
-        },
-        _buildBurnRow(row, options = {}) {
-          const rates = (row && row.burn_rates) || {};
-          const inputRate = rates.input || {};
-          const outputRate = rates.output || {};
-          const hasSplitRates = Boolean(rates.input || rates.output);
-          const inputDelta = Number(inputRate.limit_percent_per_target_tokens);
-          const outputDelta = Number(outputRate.limit_percent_per_target_tokens);
-          const fallbackDelta = Number(row && row.limit_percent_per_target_tokens);
-          const sampleTargetTokens = Number((row && row.sample_target_tokens) || inputRate.sample_target_tokens || outputRate.sample_target_tokens || options.sampleTargetTokens) || 100000;
-          const inputTokens = Number(inputRate.sampled_tokens) || 0;
-          const outputTokens = Number(outputRate.sampled_tokens) || 0;
-          const totalTokens = inputTokens + outputTokens;
-          const inputRequests = Number(inputRate.sampled_requests) || 0;
-          const outputRequests = Number(outputRate.sampled_requests) || 0;
-          const sampledRequests = Math.max(inputRequests, outputRequests, Number(row && row.sampled_requests) || 0);
-          const sampledTokens = Math.max(inputTokens, outputTokens, hasSplitRates ? 0 : (Number(row && row.sampled_tokens) || 0));
-          const coverage = sampleTargetTokens > 0 ? Math.max(0, Math.min(100, (sampledTokens / sampleTargetTokens) * 100)) : 0;
-          const shareSegments = [
-            { key: 'input', label: 'Input', tokens: inputTokens, toneClass: 'tone-input' },
-            { key: 'output', label: 'Output', tokens: outputTokens, toneClass: 'tone-output' },
-          ].map((segment) => {
-            const value = totalTokens > 0 ? (segment.tokens / totalTokens) * 100 : 0;
-            return {
-              ...segment,
-              value,
-              widthPercent: Math.max(0, Math.min(100, value)),
-              valueLabel: this._formatBurnMixPercent(value),
-              tokenLabel: this.compact(segment.tokens),
-            };
-          });
-          const primaryShare = shareSegments.reduce((best, segment) => (
-            segment.value > (best?.value || 0) ? segment : best
-          ), shareSegments[0]);
-          const bestDelta = [inputDelta, outputDelta, fallbackDelta].filter(Number.isFinite).sort((a, b) => b - a)[0];
-          return {
-            model: (row && row.model) || 'unknown',
-            kickerLabel: 'Model',
-            badgeLabel: options.isLeader ? 'highest impact' : '',
-            isLeader: Boolean(options.isLeader),
-            deltaLabel: this._formatBurnImpactPercent(bestDelta),
-            inputDeltaLabel: this._formatBurnImpactPercent(inputDelta),
-            outputDeltaLabel: this._formatBurnImpactPercent(outputDelta),
-            sampleLabel: `Input ${this.compact(inputTokens)} · Output ${this.compact(outputTokens)} of ${this.compact(sampleTargetTokens)}`,
-            requestLabel: `${this.integer(sampledRequests)} request${sampledRequests === 1 ? '' : 's'}`,
-            sampleProgress: coverage,
-            primaryShareLabel: primaryShare && primaryShare.value > 0
-              ? `${primaryShare.label} leads sampled tokens at ${primaryShare.valueLabel}`
-              : 'No non-cached sample yet',
-            shareSegments,
-          };
         },
         stamp(value) {
           if (!value) return '-';
@@ -6171,8 +4015,6 @@
           if (!identifier) return;
           this.selectedSessionKey = row.session_key || this.selectedSessionKey;
           this.search = String(identifier);
-          this.initiatorFilter = 'all';
-          this.safeguardFilter = 'all';
           this.requestPage = 1;
           if (selectFirst) {
             this.$nextTick(() => {
@@ -6913,92 +4755,6 @@
             this.savingModelRoutingConfig = false;
           }
         },
-        _applySafeguardConfigPayload(payload) {
-          if (!payload || typeof payload !== 'object') return;
-          const cooldown = Number(payload.cooldown_seconds);
-          const defaultCooldown = Number(payload.default_cooldown_seconds);
-          const minCooldown = Number(payload.min_cooldown_seconds);
-          const maxCooldown = Number(payload.max_cooldown_seconds);
-          if (Number.isFinite(cooldown)) {
-            this.safeguardConfig.cooldownSeconds = cooldown;
-            this.safeguardConfig.cooldownInput = cooldown;
-          }
-          if (Number.isFinite(defaultCooldown)) this.safeguardConfig.defaultSeconds = defaultCooldown;
-          if (Number.isFinite(minCooldown)) this.safeguardConfig.min = minCooldown;
-          if (Number.isFinite(maxCooldown)) this.safeguardConfig.max = maxCooldown;
-        },
-        async loadSafeguardConfig() {
-          try {
-            const response = await fetch('/api/config/safeguard');
-            if (!response.ok) throw new Error(`safeguard status request failed: ${response.status}`);
-            const payload = await response.json();
-            this._applySafeguardConfigPayload(payload);
-            this.safeguardConfig.error = '';
-          } catch (error) {
-            this.safeguardConfig.error = String(error?.message || error || '');
-            if (this.safeguardConfig.error.includes('404')) {
-              this.safeguardConfig.error += ' - restart the proxy so the new safeguard API route is available.';
-            }
-          }
-        },
-        async saveSafeguardConfig() {
-          if (this.savingSafeguardConfig) return;
-          this.savingSafeguardConfig = true;
-          this.safeguardConfig.statusMessage = '';
-          this.safeguardConfig.error = '';
-          try {
-            const response = await fetch('/api/config/safeguard', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ cooldown_seconds: Number(this.safeguardConfig.cooldownInput) }),
-            });
-            if (!response.ok) {
-              let message = `save request failed: ${response.status}`;
-              try {
-                const data = await response.json();
-                if (data?.detail) message = data.detail;
-                else if (data?.error) message = data.error;
-              } catch (_error) {}
-              throw new Error(message);
-            }
-            const payload = await response.json();
-            this._applySafeguardConfigPayload(payload);
-            this.safeguardConfig.statusMessage = 'Safeguard cooldown saved.';
-          } catch (error) {
-            this.safeguardConfig.error = String(error?.message || error || '');
-          } finally {
-            this.savingSafeguardConfig = false;
-          }
-        },
-        async resetSafeguardConfig() {
-          if (this.savingSafeguardConfig) return;
-          this.savingSafeguardConfig = true;
-          this.safeguardConfig.statusMessage = '';
-          this.safeguardConfig.error = '';
-          try {
-            const response = await fetch('/api/config/safeguard', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ reset: true }),
-            });
-            if (!response.ok) {
-              let message = `reset request failed: ${response.status}`;
-              try {
-                const data = await response.json();
-                if (data?.detail) message = data.detail;
-                else if (data?.error) message = data.error;
-              } catch (_error) {}
-              throw new Error(message);
-            }
-            const payload = await response.json();
-            this._applySafeguardConfigPayload(payload);
-            this.safeguardConfig.statusMessage = 'Safeguard cooldown reset to default.';
-          } catch (error) {
-            this.safeguardConfig.error = String(error?.message || error || '');
-          } finally {
-            this.savingSafeguardConfig = false;
-          }
-        },
         allowSource(source) { return this.sourceFilter === 'all' || this.sourceFilter === source; },
         // Mirror of util._usage_event_source for the JS side. Used by the
         // requests tab so each row carries its real source (claude / codex /
@@ -7276,9 +5032,7 @@
           // navigates to a tab that needs them. Each loader is idempotent — it
           // returns immediately if data is already loaded — so calling on every
           // view change is safe.
-          if (view === 'safeguard') {
-            this.loadSafeguardConfig();
-          } else if (view === 'settings' || view === 'integrations') {
+          if (view === 'settings' || view === 'integrations') {
             this.loadClientProxyStatus();
             this.loadBackgroundProxyStatus();
           } else if (view === 'routing' || view === 'approvals') {
