@@ -7,6 +7,7 @@ import uuid
 
 from fastapi import Request
 
+import codex_agent_compat
 from constants import (
     OPENCODE_VERSION, OPENCODE_INTEGRATION_ID,
     COPILOT_CLI_INTEGRATION_ID, COPILOT_CLI_USER_AGENT,
@@ -579,6 +580,8 @@ def build_responses_headers_for_request(
         else None
     )
     effective_subagent = inbound_subagent
+    if effective_subagent is None:
+        effective_subagent = codex_agent_compat.codex_subagent_identity(identity_source)
     if (
         effective_subagent is None
         and isinstance(synthetic_subagent, str)
@@ -673,6 +676,8 @@ def build_chat_headers_for_request(
         if isinstance(inbound_subagent, str) and inbound_subagent.strip()
         else None
     )
+    if effective_subagent is None:
+        effective_subagent = codex_agent_compat.codex_subagent_identity(identity_source)
     if (
         effective_subagent is None
         and isinstance(synthetic_subagent, str)

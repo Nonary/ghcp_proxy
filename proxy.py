@@ -55,6 +55,7 @@ import auth
 import atexit
 import auto_update
 import background_proxy
+import codex_agent_compat
 import dashboard as dashboard_module
 import format_translation
 import gzip
@@ -2277,6 +2278,9 @@ def _responses_effective_subagent(
     )
     if isinstance(inbound_subagent, str) and inbound_subagent.strip():
         return inbound_subagent.strip()
+    metadata_subagent = codex_agent_compat.codex_subagent_identity(body)
+    if metadata_subagent:
+        return metadata_subagent
     if approval_agent is None:
         approval_agent = is_approval_agent_request(
             inbound_protocol="responses",
@@ -2300,6 +2304,11 @@ def _build_anthropic_messages_passthrough_headers(
 ) -> dict:
     """Headers for native Anthropic Messages passthrough."""
     base_headers = format_translation.build_copilot_headers(api_key)
+    effective_subagent = _responses_effective_subagent(
+        request,
+        original_body,
+        approval_agent=bridge_plan.approval_agent,
+    )
 
     # Resolve initiator from the original Anthropic-shaped request (when the
     # caller is Claude Code) or from translated messages (when called via
@@ -2317,7 +2326,7 @@ def _build_anthropic_messages_passthrough_headers(
             messages,
             model_for_initiator,
             system=system,
-            subagent=request.headers.get("x-openai-subagent"),
+            subagent=effective_subagent,
             request_id=request_id,
             verdict_sink=verdict_sink,
         )
@@ -2329,7 +2338,7 @@ def _build_anthropic_messages_passthrough_headers(
             messages,
             bridge_plan.resolved_model,
             system=system,
-            subagent=request.headers.get("x-openai-subagent"),
+            subagent=effective_subagent,
             request_id=request_id,
             verdict_sink=verdict_sink,
         )
@@ -4139,6 +4148,13 @@ async def responses(request: Request):
             format_translation.http_exception_detail_to_message(exc.detail),
         )
 
+    agent_compat_diagnostics: list[dict] = []
+    body = codex_agent_compat.normalize_codex_agent_tools(
+        body,
+        diagnostics=agent_compat_diagnostics,
+    )
+    effective_subagent = _responses_effective_subagent(request, body)
+
     raw_input = body.get("input")
     has_compaction_input = format_translation.input_contains_compaction(raw_input)
     native_responses_passthrough = _responses_route_uses_native_responses_passthrough(body)
@@ -4182,7 +4198,7 @@ async def responses(request: Request):
             body,
             api_base=api_base,
             api_key=api_key,
-            subagent=request.headers.get("x-openai-subagent"),
+            subagent=effective_subagent,
         )
     except ValueError:
         return format_translation.openai_error_response(400, INVALID_BRIDGE_REQUEST_MESSAGE)
@@ -4192,6 +4208,8 @@ async def responses(request: Request):
         trace_metadata_extra["responses_input_sanitization"] = input_sanitization_trace
     if replay_id_repair_trace is not None:
         trace_metadata_extra["responses_replay_id_repair"] = replay_id_repair_trace
+    if agent_compat_diagnostics:
+        trace_metadata_extra["codex_agent_compat"] = agent_compat_diagnostics
 
     plan, error_response = _prepare_bridge_request(
         request,
