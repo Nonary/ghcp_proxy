@@ -1532,6 +1532,7 @@ def _trace_response_summary(
     upstream: httpx.Response | None = None,
     response_payload: dict | None = None,
     usage: dict | None = None,
+    status_code: int | None = None,
 ) -> dict:
     summary: dict = {}
     if upstream is not None:
@@ -1544,6 +1545,8 @@ def _trace_response_summary(
             if header_value:
                 summary["upstream_request_id"] = header_value
                 break
+    elif status_code is not None:
+        summary["status_code"] = status_code
 
     if isinstance(response_payload, dict):
         for key in ("id", "object", "model"):
@@ -2075,6 +2078,7 @@ def _finish_usage_and_trace(
                         upstream=upstream,
                         response_payload=response_payload,
                         usage=effective_usage,
+                        status_code=status_code,
                     ),
                     "response_text_present": isinstance(response_text, str) and bool(response_text),
                     "reasoning_text_present": isinstance(reasoning_text, str) and bool(reasoning_text),
