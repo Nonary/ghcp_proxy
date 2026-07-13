@@ -62,8 +62,24 @@ def _source_is_subagent(value) -> bool:
         return value.strip().lower() in {"subagent", "sub-agent", "agent"}
     if not isinstance(value, Mapping):
         return False
-    if "subagent" in value or "sub-agent" in value:
-        return True
+    for key in ("subagent", "sub-agent"):
+        if key in value:
+            candidate = value.get(key)
+            if isinstance(candidate, Mapping):
+                if _source_is_subagent(candidate):
+                    return True
+            elif isinstance(candidate, str):
+                if candidate.strip().lower() in {
+                    "subagent",
+                    "sub-agent",
+                    "agent",
+                    "true",
+                    "1",
+                    "yes",
+                }:
+                    return True
+            elif candidate is True:
+                return True
     for key in ("type", "kind", "name"):
         candidate = value.get(key)
         if isinstance(candidate, str) and candidate.strip().lower() in {
