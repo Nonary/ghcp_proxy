@@ -2874,64 +2874,18 @@ async def proxy_streaming_response(
         source_iter = _stream_with_update_notice(upstream.aiter_bytes(), stream_type, getattr(upstream, "headers", None))
         if stream_type == "responses":
             source_iter = ResponsesStreamIdSyncer(replay_id_state).sync(source_iter)
-        response_payload: dict | None = None
         finish_called = False
         try:
-            if stream_type == "responses":
-                text_buffer = ""
-                terminal_blocks: list[bytes] = []
-                holding_terminal = False
-                output_index = 0
-                content_index = 0
-
-                async for chunk in source_iter:
-                    if capture.feed(chunk):
-                        usage_tracker.mark_first_output(usage_event)
-                    if isinstance(chunk, bytes):
-                        text_buffer += chunk.decode("utf-8", errors="replace")
-                    else:
-                        text_buffer += str(chunk)
-                    normalized = text_buffer.replace("\r\n", "\n")
-                    while "\n\n" in normalized:
-                        raw_block, normalized = normalized.split("\n\n", 1)
-                        if not raw_block.strip():
-                            continue
-                        event_name, data = format_translation.parse_sse_block(raw_block)
-                        payload = None
-                        if data and data != "[DONE]":
-                            try:
-                                payload = json.loads(data)
-                            except json.JSONDecodeError:
-                                payload = None
-                        if isinstance(payload, dict):
-                            event_type = str(payload.get("type") or event_name or "").strip().lower()
-                            if event_type == "response.output_text.delta":
-                                if isinstance(payload.get("output_index"), int):
-                                    output_index = payload["output_index"]
-                                if isinstance(payload.get("content_index"), int):
-                                    content_index = payload["content_index"]
-                        block = f"{raw_block}\n\n".encode("utf-8")
-                        if holding_terminal or data == "[DONE]" or _is_response_completed_event(event_name, data):
-                            holding_terminal = True
-                            terminal_blocks.append(block)
-                        else:
-                            yield block
-                    text_buffer = normalized
-
-                if text_buffer:
-                    trailing = text_buffer.encode("utf-8")
-                    if holding_terminal:
-                        terminal_blocks.append(trailing)
-                    else:
-                        yield trailing
-
-                for block in terminal_blocks:
-                    yield block
-            else:
-                async for chunk in source_iter:
-                    if capture.feed(chunk):
-                        usage_tracker.mark_first_output(usage_event)
-                    yield chunk
+            # Relay complete SSE chunks immediately.  The old Responses-only
+            # path buffered response.completed/[DONE] until the upstream
+            # connection closed so it could append a cache-tripwire warning.
+            # That warning path no longer exists, and keeping the terminal
+            # events buffered can leave Codex waiting even though the model has
+            # already finished producing output.
+            async for chunk in source_iter:
+                if capture.feed(chunk):
+                    usage_tracker.mark_first_output(usage_event)
+                yield chunk
 
             _finish_usage_and_trace(
                 trace_plan,
