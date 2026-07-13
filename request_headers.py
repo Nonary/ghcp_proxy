@@ -116,14 +116,12 @@ def _apply_responses_isolated_subagent_context(
     subagent: str,
     affinity_value: str,
 ) -> None:
-    """Keep an affinity-bearing Codex worker out of its root cache family.
+    """Isolate a legacy worker that provides no explicit parent identity.
 
-    Copilot's parent-agent fields act as a mutable upstream cache family.  A
-    captured GPT-5.5 miss occurred when three Codex subagents shared that
-    family: an append-only follow-up lost its entire cache hit while a sibling
-    was still in flight.  Unlike a native CLI process, this proxy multiplexes
-    independent Codex workers, so each explicit worker affinity needs its own
-    client, parent, interaction, and task scope.
+    Modern Codex child metadata carries an authoritative parent-thread id and
+    must use that parent's hierarchy instead.  This synthetic family remains
+    a safe fallback for older workers that have a durable child affinity but
+    no way to identify their parent.
     """
     scope = _responses_subagent_affinity_scope(subagent, affinity_value)
     client_session_id = _responses_isolated_subagent_client_session_id(scope)
@@ -146,6 +144,7 @@ def _apply_responses_current_subagent_parent(
     subagent: str | None,
     affinity_value: str | None = None,
     *,
+    parent_affinity_value: str | None = None,
     request_scope: str | None = None,
 ) -> None:
     if not isinstance(subagent, str) or not subagent.strip():
@@ -156,6 +155,41 @@ def _apply_responses_current_subagent_parent(
         if isinstance(affinity_value, str) and affinity_value.strip()
         else None
     )
+    normalized_parent_affinity = (
+        parent_affinity_value.strip()
+        if isinstance(parent_affinity_value, str) and parent_affinity_value.strip()
+        else None
+    )
+
+    # Current Codex multi-agent requests explicitly identify their parent
+    # thread in client_metadata.  Native Copilot keeps the root client session,
+    # parent task, and interaction stable across all of those children while
+    # assigning each child its own task/cache lineage.  Reconstruct that same
+    # hierarchy from the inbound metadata before it is stripped from the body.
+    if normalized_affinity and normalized_parent_affinity:
+        parent_scope = (
+            _responses_task_affinity_scope(normalized_parent_affinity)
+            or normalized_parent_affinity
+        )
+        parent_client_session_id = _responses_client_session_id_for_affinity(
+            normalized_parent_affinity
+        )
+        if parent_client_session_id:
+            headers["x-client-session-id"] = parent_client_session_id
+        parent_task_id = _copilot_uuid(f"responses-task:{parent_scope}")
+        headers["x-parent-agent-id"] = parent_task_id
+        headers["x-interaction-id"] = _copilot_uuid(
+            f"responses-interaction:{parent_scope}"
+        )
+        child_task_id = _responses_subagent_task_id(
+            parent_scope,
+            sub,
+            normalized_affinity,
+        )
+        if child_task_id:
+            headers["x-agent-task-id"] = child_task_id
+        return
+
     worker_scope = normalized_affinity or _responses_request_local_subagent_affinity(
         request_scope
     )
@@ -631,10 +665,12 @@ def build_responses_headers_for_request(
         )
     )
     if effective_subagent:
+        parent_affinity_value = codex_agent_compat.codex_parent_affinity(identity_source)
         _apply_responses_current_subagent_parent(
             headers,
             effective_subagent,
             affinity_value,
+            parent_affinity_value=parent_affinity_value,
             request_scope=request_id,
         )
 

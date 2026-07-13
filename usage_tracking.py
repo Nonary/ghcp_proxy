@@ -17,6 +17,7 @@ from urllib.parse import parse_qs, unquote
 import httpx
 from fastapi import Request
 
+import codex_agent_compat
 from constants import (
     TOKEN_DIR, USAGE_LOG_FILE, REQUEST_ERROR_LOG_FILE,
     DETAILED_REQUEST_HISTORY_LIMIT,
@@ -229,6 +230,10 @@ def request_body_session_id(request_body: dict | None = None) -> str | None:
                     normalized = value.strip()
                     if normalized:
                         return normalized
+
+    codex_session_id = codex_agent_compat.codex_session_id(request_body)
+    if codex_session_id:
+        return codex_session_id
 
     return None
 

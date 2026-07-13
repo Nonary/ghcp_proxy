@@ -145,6 +145,49 @@ def codex_subagent_identity(body: dict | None) -> str | None:
     return "codex:subagent"
 
 
+def codex_parent_affinity(body: dict | None) -> str | None:
+    """Return the explicit parent-thread affinity for a current Codex child.
+
+    Current Codex child requests carry their worker identity and the real
+    parent thread in ``client_metadata``.  The metadata itself is not sent to
+    Copilot, but the parent reference must be retained long enough to derive
+    the same session/interaction hierarchy as the root request.  Do not infer
+    a parent from a generic session id: only use a concrete Codex parent-thread
+    marker, and only for requests that are actually marked as subagents.
+    """
+    if codex_subagent_identity(body) is None:
+        return None
+
+    for mapping in _metadata_mappings(body):
+        for key in (
+            "x-codex-parent-thread-id",
+            "x_codex_parent_thread_id",
+            "parent_thread_id",
+            "parentThreadId",
+        ):
+            value = _non_empty_string(mapping.get(key))
+            if value:
+                return value
+    return None
+
+
+def codex_session_id(body: dict | None) -> str | None:
+    """Return the root Codex session id carried in client metadata.
+
+    Codex's current Responses requests keep this identifier in
+    ``client_metadata`` rather than the top-level ``session_id`` field.  Both
+    root and child threads carry it, so it is suitable for usage grouping and
+    other local session bookkeeping; parent routing still requires the more
+    specific :func:`codex_parent_affinity` above.
+    """
+    for mapping in _metadata_mappings(body):
+        for key in ("session_id", "sessionId"):
+            value = _non_empty_string(mapping.get(key))
+            if value:
+                return value
+    return None
+
+
 def _patched_spawn_agent_tool(tool: dict) -> tuple[dict, bool]:
     if tool.get("name") != "spawn_agent":
         return tool, False
@@ -247,4 +290,9 @@ def normalize_codex_agent_tools(
     return patched_body
 
 
-__all__ = ["codex_subagent_identity", "normalize_codex_agent_tools"]
+__all__ = [
+    "codex_parent_affinity",
+    "codex_session_id",
+    "codex_subagent_identity",
+    "normalize_codex_agent_tools",
+]
