@@ -12,11 +12,12 @@ from constants import CLAUDE_MAX_OUTPUT_TOKENS
 
 _COPILOT_UNSUPPORTED_RESPONSES_TOOL_TYPES = {"image_generation"}
 
-# Native Responses fields are preserved by default. Fields that Copilot CLI
-# does not send for native /responses cache lineage stay local to the proxy and
-# are expressed upstream through Copilot affinity headers instead.
+# Native Responses fields are preserved by default. Current Copilot clients
+# send ``prompt_cache_key`` to /responses, so it must remain in the upstream
+# body; affinity headers alone are not a complete replacement for the API's
+# explicit prompt-cache routing hint. Fields that remain proxy-only are
+# expressed upstream through Copilot affinity headers instead.
 _COPILOT_LOCAL_ONLY_RESPONSES_BODY_KEYS = {
-    "prompt_cache_key",
     "promptCacheKey",
     "prompt_cache_retention",
     "previous_response_id",

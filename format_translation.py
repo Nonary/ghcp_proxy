@@ -2212,13 +2212,15 @@ def sanitize_input(
         if item_type != "reasoning":
             # GHCP's Responses API rejects a non-empty ``content`` array on
             # non-message items (e.g. function_call, function_call_output).
-            # Codex sometimes echoes a stray empty/legacy ``content`` field on
-            # these items; strip it defensively so upstream does not 400 with
-            # "Invalid 'input[N].content': array too long".
+            # ``agent_message`` is a message-like collaboration item used by
+            # current Codex multi-agent requests and requires its ``content``
+            # array. Codex sometimes echoes a stray empty/legacy ``content``
+            # field on other items; strip it defensively so upstream does not
+            # 400 with "Invalid 'input[N].content': array too long".
             if (
                 isinstance(item, dict)
                 and "content" in item
-                and item_type not in (None, "message")
+                and item_type not in (None, "message", "agent_message")
             ):
                 cleaned = {k: v for k, v in item.items() if k != "content"}
                 result.append(cleaned)
