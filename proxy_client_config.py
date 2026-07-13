@@ -30,10 +30,13 @@ _REASONING_LEVEL_DESCRIPTIONS = {
     "medium": "Balances speed and reasoning depth for everyday tasks",
     "high": "Greater reasoning depth for complex problems",
     "xhigh": "Extra high reasoning depth for complex problems",
+    "max": "Maximum reasoning depth for the most complex problems",
 }
 _DEFAULT_REASONING_EFFORTS = ["low", "medium", "high", "xhigh"]
-_REASONING_EFFORT_RANK = {"minimal": 0, "low": 1, "medium": 2, "high": 3, "xhigh": 4}
-_DEFAULT_PREFERRED_REASONING = ("medium", "low", "high", "xhigh", "minimal")
+_GPT_56_REASONING_EFFORTS = ["low", "medium", "high", "xhigh", "max"]
+_REASONING_EFFORT_RANK = {"minimal": 0, "low": 1, "medium": 2, "high": 3, "xhigh": 4, "max": 5}
+_DEFAULT_PREFERRED_REASONING = ("medium", "low", "high", "xhigh", "max", "minimal")
+_GPT_56_MODEL_PREFIX = "gpt-5.6-"
 
 
 def _format_token_rate(value: object) -> str:
@@ -946,7 +949,11 @@ class ProxyClientConfigService:
                 default_compact,
             )
             input_modalities = self._resolve_input_modalities(caps.get("input_modalities"), caps.get("vision"))
-            supported_levels, default_level = self._resolve_reasoning_levels(family, caps.get("reasoning_efforts"))
+            supported_levels, default_level = self._resolve_reasoning_levels(
+                family,
+                caps.get("reasoning_efforts"),
+                model_name=routed_model_name,
+            )
             supports_parallel_tool_calls = self._resolve_bool(
                 caps.get("parallel_tool_calls"),
                 default=family == "gpt",
@@ -1089,17 +1096,33 @@ class ProxyClientConfigService:
         self,
         family: str,
         raw_efforts: object,
+        *,
+        model_name: str | None = None,
     ) -> tuple[list[dict[str, str]], str | None]:
+        is_gpt_56 = self._normalize_model_name(model_name).startswith(_GPT_56_MODEL_PREFIX)
+        supports_max = is_gpt_56 or family == "claude"
         efforts: list[str] = []
         if isinstance(raw_efforts, (list, tuple)):
             for item in raw_efforts:
                 if isinstance(item, str) and item:
                     normalized = item.strip().lower()
+                    if normalized == "max" and not supports_max:
+                        # Keep capability payloads for models without a
+                        # supported max level from exposing it.
+                        continue
+                    if family == "claude" and normalized == "xhigh":
+                        normalized = "max"
                     if normalized in _REASONING_EFFORT_RANK and normalized not in efforts:
                         efforts.append(normalized)
+        if is_gpt_56 and efforts and ({"xhigh", "max"} & set(efforts)):
+            # GPT-5.6 exposes both levels. Some capability payloads only list
+            # one even though the client can request the other distinct level.
+            for gpt_56_effort in ("xhigh", "max"):
+                if gpt_56_effort not in efforts:
+                    efforts.append(gpt_56_effort)
         if not efforts:
             if family == "gpt":
-                efforts = list(_DEFAULT_REASONING_EFFORTS)
+                efforts = list(_GPT_56_REASONING_EFFORTS if is_gpt_56 else _DEFAULT_REASONING_EFFORTS)
             else:
                 # Without an upstream signal, only assume reasoning support for GPT.
                 return ([], None)
@@ -1113,6 +1136,12 @@ class ProxyClientConfigService:
         ]
         default_level = next((effort for effort in _DEFAULT_PREFERRED_REASONING if effort in efforts), efforts[0])
         return (levels, default_level)
+
+    def _normalize_model_name(self, model_name: str | None) -> str:
+        normalized = (model_name or "").strip().lower()
+        if "/" in normalized:
+            normalized = normalized.split("/", 1)[1]
+        return normalized
 
     def _sorted_catalog_model_names(
         self,

@@ -61,6 +61,15 @@ class GptStrategy(ModelEffortStrategy):
         return canonical_effort
 
 
+class Gpt56Strategy(ModelEffortStrategy):
+    def matches(self, normalized_model: str) -> bool:
+        return normalized_model.startswith("gpt-5.6-")
+
+    def map(self, canonical_effort: str) -> str | None:
+        # GPT-5.6 supports max independently from xhigh; do not collapse them.
+        return canonical_effort
+
+
 class ClaudeOpus47Strategy(ModelEffortStrategy):
     def matches(self, normalized_model: str) -> bool:
         return normalized_model == "claude-opus-4.7"
@@ -86,6 +95,7 @@ class PassthroughStrategy(ModelEffortStrategy):
 
 
 _STRATEGIES: list[ModelEffortStrategy] = [
+    Gpt56Strategy(),
     GptStrategy(),
     ClaudeOpus47Strategy(),
     ClaudeHaiku45Strategy(),
