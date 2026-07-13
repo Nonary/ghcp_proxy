@@ -2254,6 +2254,9 @@
                 <div v-else-if="selectedRequestPromptStatus === 'error'" class="status error" style="margin-top: 6px;">
                   Failed to load prompt: {{ selectedRequestPromptError }}
                 </div>
+                <div v-else-if="selectedRequestPromptStatus === 'ready' && !selectedRequestPrompt" class="subtle" style="margin-top: 6px;">
+                  Prompt trace is unavailable for this request.
+                </div>
                 <template v-else-if="selectedRequestPrompt">
                   <div v-if="selectedRequestPrompt.system">
                     <div class="subtle" style="margin-top:6px">System</div>
@@ -3996,9 +3999,8 @@
           // Map session_id -> [requests], plus aggregates incl. duration
           const map = new Map();
           for (const row of (this.data.recent_requests || [])) {
-            const sid = row?.session_id || row?.client_request_id || row?.request_id || '';
-            if (!sid) continue;
-            const key = `${this.deriveRequestSource(row)}::${sid}`;
+            const key = this.sessionRequestKey(row, this.deriveRequestSource(row));
+            if (!key) continue;
             if (!map.has(key)) map.set(key, []);
             map.get(key).push(row);
           }
@@ -4014,8 +4016,8 @@
         enrichedSessions() {
           const idx = this.sessionRequestIndex;
           return (this.data.recent_sessions || []).map((row) => {
-            const key = `${row.source}::${row.session_id || row.session_display_id || ''}`;
-            const reqs = idx.get(key) || [];
+            const key = this.sessionRequestKey(row, row.source);
+            const reqs = key ? (idx.get(key) || []) : [];
             let firstAt = null, lastAt = null, totalDuration = 0, durationCount = 0;
             for (const r of reqs) {
               const start = r.started_at ? new Date(r.started_at).getTime() : NaN;
@@ -4035,7 +4037,7 @@
               // Back-compat: keep `session_duration_ms` as the wall-clock span.
               session_duration_ms: wall_duration_ms != null ? wall_duration_ms : api_duration_ms,
               session_request_count: reqs.length,
-              session_key: `${row.source}::${row.session_id || row.session_display_id || row.last_activity || ''}`,
+              session_key: `${row.source}::${this.sessionIdentifier(row) || row.last_activity || ''}`,
             };
           });
         },
@@ -4053,8 +4055,8 @@
         selectedSessionRequests() {
           const sess = this.selectedSession;
           if (!sess) return [];
-          const key = `${sess.source}::${sess.session_id || sess.session_display_id || ''}`;
-          return this.sessionRequestIndex.get(key) || [];
+          const key = this.sessionRequestKey(sess, sess.source);
+          return key ? (this.sessionRequestIndex.get(key) || []) : [];
         },
         filteredRequests() {
           const rows = (this.data.recent_requests || []).map((row) => ({
@@ -4094,7 +4096,7 @@
         selectedRequestPromptKey() {
           const row = this.selectedRequest;
           if (!row || !row.request_prompt_available) return '';
-          return row.request_id || row.client_request_id || '';
+          return row.request_id || row.client_request_id || row.server_request_id || '';
         },
         selectedRequestPrompt() {
           const key = this.selectedRequestPromptKey;
@@ -4551,6 +4553,12 @@
             || row?.request_id
             || row?.server_request_id
             || '';
+        },
+        sessionRequestKey(row, source = null) {
+          const identifier = this.sessionIdentifier(row);
+          if (!identifier) return '';
+          const resolvedSource = source || row?.source || this.deriveRequestSource(row);
+          return `${resolvedSource}::${identifier}`;
         },
         applySessionSearch(row, selectFirst = true) {
           const identifier = this.sessionIdentifier(row);
@@ -5422,6 +5430,14 @@
             });
           }
         },
+        scheduleDashboardStreamReconnect() {
+          if (this.dashboardStreamReconnectTimer) return;
+          this.dashboardStreamReconnectDelay = Math.min(this.dashboardStreamReconnectDelay * 2, 15000);
+          this.dashboardStreamReconnectTimer = window.setTimeout(() => {
+            this.dashboardStreamReconnectTimer = null;
+            this.startDashboardStream();
+          }, this.dashboardStreamReconnectDelay);
+        },
         startDashboardStream() {
           if (this.dashboardStream) {
             return;
@@ -5447,7 +5463,7 @@
             } catch (error) {
               this.dashboardStreamError = error?.message || 'Failed to parse dashboard stream payload.';
               this.stopDashboardStream();
-              this.dashboardStreamReconnectDelay = Math.min(this.dashboardStreamReconnectDelay * 2, 15000);
+              this.scheduleDashboardStreamReconnect();
             }
           };
 
@@ -5460,6 +5476,7 @@
             } catch (error) {
               this.dashboardStreamError = error?.message || 'Failed to parse dashboard stream payload.';
               this.stopDashboardStream();
+              this.scheduleDashboardStreamReconnect();
             }
           });
 
@@ -5470,10 +5487,7 @@
           this.dashboardStream.onerror = () => {
             this.dashboardStreamConnected = false;
             this.stopDashboardStream();
-            this.dashboardStreamReconnectDelay = Math.min(this.dashboardStreamReconnectDelay * 2, 15000);
-            this.dashboardStreamReconnectTimer = window.setTimeout(() => {
-              this.startDashboardStream();
-            }, this.dashboardStreamReconnectDelay);
+            this.scheduleDashboardStreamReconnect();
           };
         },
         stopDashboardStream() {
@@ -5587,11 +5601,24 @@
           if (s.length <= 10) return s;
           return s.slice(0, 8) + '…';
         },
-        copyText(value) {
+        async copyText(value) {
           if (!value) return;
           try {
-            navigator.clipboard?.writeText(String(value));
-          } catch (_) {}
+            if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
+              await navigator.clipboard.writeText(String(value));
+              return;
+            }
+          } catch (_) {
+            // Fall through to the legacy textarea copy path.
+          }
+          const textarea = document.createElement('textarea');
+          textarea.value = String(value);
+          textarea.style.position = 'fixed';
+          textarea.style.opacity = '0';
+          document.body.appendChild(textarea);
+          textarea.select();
+          try { document.execCommand('copy'); } catch (_) { /* noop */ }
+          document.body.removeChild(textarea);
         },
         goToRequestPage(value) {
           if (value === '...' || value == null) return;

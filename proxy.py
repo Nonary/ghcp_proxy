@@ -3818,7 +3818,10 @@ def _load_request_prompt_payload(request_id: str) -> dict:
     _prune_request_prompt_archive()
     target = None
     for event in reversed(usage_tracker.snapshot_usage_events()):
-        if isinstance(event, dict) and event.get("request_id") == request_id:
+        if (
+            isinstance(event, dict)
+            and any(event.get(key) == request_id for key in ("request_id", "client_request_id", "server_request_id"))
+        ):
             target = event
             break
     if target is not None:
@@ -3829,8 +3832,15 @@ def _load_request_prompt_payload(request_id: str) -> dict:
                 return {"available": True, "request_prompt": prompt}
             return {"available": True, "locked": True}
 
-    archived_prompt = _load_request_prompt_record(request_id)
-    if isinstance(archived_prompt, dict):
+    archive_ids = [request_id]
+    if isinstance(target, dict):
+        target_request_id = target.get("request_id")
+        if isinstance(target_request_id, str) and target_request_id and target_request_id not in archive_ids:
+            archive_ids.append(target_request_id)
+    for archive_id in archive_ids:
+        archived_prompt = _load_request_prompt_record(archive_id)
+        if not isinstance(archived_prompt, dict):
+            continue
         prompt_text = archived_prompt.get("prompt_text")
         if isinstance(prompt_text, str) and prompt_text.strip():
             return {

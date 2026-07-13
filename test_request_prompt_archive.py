@@ -65,6 +65,33 @@ class RequestPromptArchiveTests(unittest.TestCase):
         self.assertIn("Archive this exact prompt.", payload["prompt_text"])
         self.assertIn("Archive this exact prompt.", payload["request_prompt"]["user"])
 
+    def test_request_prompt_api_resolves_client_request_id_to_archived_prompt(self):
+        body = {
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Resolve this client request."}],
+                }
+            ]
+        }
+        proxy._save_request_prompt_record("server-request-id", "/v1/responses", body)
+        original_snapshot = proxy.usage_tracker.snapshot_usage_events
+        proxy.usage_tracker.snapshot_usage_events = lambda: [
+            {
+                "request_id": "server-request-id",
+                "client_request_id": "client-request-id",
+            }
+        ]
+        try:
+            response = proxy.asyncio.run(proxy.request_prompt_api("client-request-id"))
+        finally:
+            proxy.usage_tracker.snapshot_usage_events = original_snapshot
+
+        payload = json.loads(response.body)
+        self.assertTrue(payload["available"])
+        self.assertIn("Resolve this client request.", payload["prompt_text"])
+
     def test_prune_request_prompt_archive_keeps_only_recent_request_ids(self):
         proxy._save_request_prompt_record("keep-me", "/v1/responses", {"input": "keep"})
         proxy._save_request_prompt_record("drop-me", "/v1/responses", {"input": "drop"})
