@@ -87,6 +87,7 @@
       font-weight: 500; font-size: 0.88rem;
       cursor: pointer; user-select: none;
       border: 1px solid transparent;
+      width: 100%; text-align: left; font-family: inherit;
       transition: background .15s, color .15s, border-color .15s;
     }
     .nav-item:hover { color: var(--text); background: rgba(255,255,255,0.03); }
@@ -1092,7 +1093,11 @@
       border-radius: 13px;
       color: #8ca2b1;
       font-size: 0.86rem;
-      border-color: transparent;
+      border: 1px solid transparent;
+      background: transparent;
+      font-family: inherit;
+      text-align: left;
+      width: 100%;
     }
     .nav-item svg { width: 17px; height: 17px; }
     .nav-item:hover {
@@ -1532,12 +1537,13 @@
       </div>
 
       <nav class="nav">
-        <div v-for="item in navItems" :key="item.key"
+        <button v-for="item in navItems" :key="item.key" type="button"
              class="nav-item" :class="{ active: activeView === item.key }"
+             :aria-current="activeView === item.key ? 'page' : undefined"
              @click="activeView = item.key">
           <span v-html="item.icon"></span>
           <span>{{ item.label }}</span>
-        </div>
+        </button>
       </nav>
 
       <div class="sidebar-foot">
@@ -1581,6 +1587,10 @@
           </label>
         </div>
       </header>
+      <div v-if="dashboardError" class="status error" role="alert" style="margin-bottom: 14px;">
+        {{ dashboardError }}
+        <button type="button" @click="load(true)" style="margin-left: 10px;">Retry</button>
+      </div>
 
       <!-- ─── Overview ─────────────────────────────────────────── -->
       <div v-show="activeView === 'overview'" class="work-grid">
@@ -1759,7 +1769,10 @@
                 </thead>
                 <tbody>
                   <tr v-for="row in pagedSessions" :key="row.session_key"
+                      tabindex="0"
                       @click="openSessionRequests(row)"
+                      @keydown.enter="openSessionRequests(row)"
+                      @keydown.space.prevent="openSessionRequests(row)"
                       style="cursor: pointer;">
                     <td><span class="pill">{{ sourceLabel(row.source) }}</span></td>
                     <td class="session-id-cell"><span class="session-id-full"><span>{{ row.session_display_id || row.session_id || '-' }}</span><button class="copy-btn" @click.stop="copyText(row.session_display_id || row.session_id)" title="Copy full session ID"><svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button></span></td>
@@ -1792,7 +1805,10 @@
                 </thead>
                 <tbody>
                   <tr v-for="row in pagedRequests" :key="requestKey(row)"
+                      tabindex="0"
                       @click="selectedRequestKey = requestKey(row); activeView = 'requests'"
+                      @keydown.enter="selectedRequestKey = requestKey(row); activeView = 'requests'"
+                      @keydown.space.prevent="selectedRequestKey = requestKey(row); activeView = 'requests'"
                       style="cursor: pointer;">
                     <td>{{ shortStamp(row.finished_at || row.started_at) }}</td>
                     <td>
@@ -2078,7 +2094,11 @@
               </thead>
               <tbody>
                 <tr v-for="row in filteredSessions" :key="row.session_key"
-                    @click="openSessionRequests(row)" style="cursor:pointer;">
+                    tabindex="0"
+                    @click="openSessionRequests(row)"
+                    @keydown.enter="openSessionRequests(row)"
+                    @keydown.space.prevent="openSessionRequests(row)"
+                    style="cursor:pointer;">
                   <td><span class="pill">{{ sourceLabel(row.source) }}</span></td>
                   <td class="session-id-cell"><span class="session-id-full"><span>{{ row.session_display_id || row.session_id || '-' }}</span><button class="copy-btn" @click.stop="copyText(row.session_display_id || row.session_id)" title="Copy full session ID"><svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button></span></td>
                   <td>{{ modelLabel(row.models) }}</td>
@@ -3654,10 +3674,14 @@
           if (!rows.length) {
             return [{ source: 'unknown', width: 100 }];
           }
-          return rows.map((row) => ({
+          const minimumWidth = rows.length * 6 <= 100 ? 6 : 0;
+          const segments = rows.map((row) => ({
             source: row.source,
-            width: total > 0 ? Math.max(6, (row.cost_usd / total) * 100) : 0,
+            width: total > 0 ? Math.max(minimumWidth, (row.cost_usd / total) * 100) : 0,
           }));
+          const widthTotal = segments.reduce((sum, row) => sum + row.width, 0);
+          if (widthTotal <= 100 || widthTotal === 0) return segments;
+          return segments.map((row) => ({ ...row, width: (row.width / widthTotal) * 100 }));
         },
         metricWidth(row, key) {
           const values = this.displayRows.map((entry) => Number(entry?.[key] || 0)).filter((value) => Number.isFinite(value) && value > 0);
@@ -3683,6 +3707,7 @@
           autoRefreshTimer: null,
           dashboardLoadPromise: null,
           dashboardLoadQueued: false,
+          dashboardError: '',
           authStatusTimer: null,
           loadingAuthStatus: false,
           startingAuthFlow: false,
@@ -4450,6 +4475,7 @@
           }
         },
         async loadAuthStatus() {
+          if (this.loadingAuthStatus) return;
           this.loadingAuthStatus = true;
           const wasAuthenticated = Boolean(this.authStatus.authenticated);
           try {
@@ -5375,7 +5401,7 @@
             // hundreds of unchanged request rows.
             return;
           }
-          const preserveScroll = this.activeTab === 'requests';
+          const preserveScroll = this.activeView === 'requests';
           const requestList = preserveScroll ? this.$refs.requestList : null;
           const previousScrollTop = requestList ? requestList.scrollTop : null;
           const incomingRequests = Array.isArray(payload?.recent_requests) ? payload.recent_requests : [];
@@ -5476,9 +5502,11 @@
               const response = await fetch(`/api/dashboard${suffix}`);
               if (!response.ok) throw new Error(`dashboard request failed: ${response.status}`);
               const payload = await response.json();
+              this.dashboardError = '';
               this._applyDashboardPayload(payload, { replaceRequests: forceRefresh });
             } catch (error) {
-              console.error('Dashboard load failed:', error.message);
+              this.dashboardError = error?.message || 'Failed to load dashboard data.';
+              console.error('Dashboard load failed:', this.dashboardError);
             }
           })();
           this.dashboardLoadPromise = request;
