@@ -1089,6 +1089,13 @@ def _normalize_usage_rollup(source: str, row: dict) -> dict:
         cost_breakdown["cached_input"] = _coerce_float(raw_cost_breakdown.get("cached_input"))
         cost_breakdown["cache_creation"] = _coerce_float(raw_cost_breakdown.get("cache_creation"))
         cost_breakdown["output"] = _coerce_float(raw_cost_breakdown.get("output"))
+    input_cost_usd = round(
+        cost_breakdown["input_fresh"]
+        + cost_breakdown["cached_input"]
+        + cost_breakdown["cache_creation"],
+        6,
+    )
+    output_cost_usd = round(cost_breakdown["output"], 6)
 
     return {
         "source": source,
@@ -1101,6 +1108,8 @@ def _normalize_usage_rollup(source: str, row: dict) -> dict:
         "request_count": _coerce_int(row.get("requestCount")),
         "cost_usd": cost_usd,
         "cost_breakdown": cost_breakdown,
+        "input_cost_usd": input_cost_usd,
+        "output_cost_usd": output_cost_usd,
         "models": models,
     }
 
@@ -1386,6 +1395,139 @@ def _latest_quota_snapshots(events: list[dict]) -> dict | None:
         "captured_at": best_at,
         "request_id": best_event_id,
         "snapshots": best,
+    }
+
+
+_AIC_QUOTA_BUCKET_ORDER = (
+    "ai_credits",
+    "aic",
+    "aic_credits",
+    "ai_credit",
+    "credits",
+    # Older Copilot responses called the allowance premium-interactions. Keep
+    # it as a compatibility fallback while the UI uses the current AIC unit.
+    "premium_interactions",
+    "premium_requests",
+)
+
+
+def _build_aic_quota_summary(usage_events: list[dict], *, now: datetime) -> dict:
+    """Build the latest AIC balance/limit snapshot for the dashboard.
+
+    Newer upstream responses may expose an explicitly named AI-credit bucket.
+    Older Copilot responses may still call the current allowance
+    ``premium_interactions``. Keep that bucket as a compatibility fallback and
+    expose its balance in the dashboard's AIC unit while retaining the source
+    bucket name for diagnostics.
+    """
+    empty = {
+        "configured": False,
+        "source": "awaiting-first-request",
+        "message": "Make a request through the proxy to capture the live AIC limit.",
+        "captured_at": None,
+        "request_id": None,
+        "bucket": None,
+        "unit": "AIC",
+        "legacy": False,
+        "buckets": {},
+        "included": None,
+        "remaining": None,
+        "used": None,
+        "percent_remaining": None,
+        "percent_used": None,
+        "overage": None,
+        "overage_permitted": None,
+        "reset_at": None,
+        "seconds_until_reset": None,
+        "days_until_reset": None,
+        "unlimited": None,
+    }
+    latest = _latest_quota_snapshots(usage_events)
+    if latest is None:
+        return empty
+
+    snapshots = latest.get("snapshots")
+    if not isinstance(snapshots, dict):
+        return {
+            **empty,
+            "source": "upstream-quota-snapshot",
+            "message": "The latest upstream response did not include an AIC limit.",
+            "captured_at": latest.get("captured_at"),
+            "request_id": latest.get("request_id"),
+        }
+
+    names_by_normalized = {
+        str(name).strip().lower(): name
+        for name in snapshots
+        if isinstance(name, str) and str(name).strip()
+    }
+    bucket_name = next(
+        (names_by_normalized[name] for name in _AIC_QUOTA_BUCKET_ORDER if name in names_by_normalized),
+        None,
+    )
+    if bucket_name is None:
+        # Preserve forward compatibility with a future bucket such as
+        # ``monthly_ai_credit_allowance`` without guessing at arbitrary quota
+        # buckets like chat/completions.
+        bucket_name = next(
+            (
+                original
+                for normalized, original in names_by_normalized.items()
+                if "credit" in normalized or normalized == "aic"
+            ),
+            None,
+        )
+    if bucket_name is None:
+        return {
+            **empty,
+            "source": "upstream-quota-snapshot",
+            "message": "The latest upstream response did not include an AIC limit.",
+            "captured_at": latest.get("captured_at"),
+            "request_id": latest.get("request_id"),
+            "buckets": snapshots,
+        }
+
+    primary = snapshots.get(bucket_name)
+    if not isinstance(primary, dict):
+        return {
+            **empty,
+            "source": "upstream-quota-snapshot",
+            "message": "The latest upstream AIC limit snapshot was malformed.",
+            "captured_at": latest.get("captured_at"),
+            "request_id": latest.get("request_id"),
+            "bucket": bucket_name,
+            "buckets": snapshots,
+        }
+
+    normalized_bucket = str(bucket_name).strip().lower()
+    legacy = normalized_bucket in {"premium_interactions", "premium_requests"}
+    unit = "AIC"
+    reset_at = primary.get("reset_at") if isinstance(primary.get("reset_at"), str) else None
+    return {
+        "configured": True,
+        "source": "upstream-quota-snapshot",
+        "message": (
+            "AIC limit from live upstream quota headers."
+            if legacy
+            else None
+        ),
+        "captured_at": latest.get("captured_at"),
+        "request_id": latest.get("request_id"),
+        "bucket": bucket_name,
+        "unit": unit,
+        "legacy": legacy,
+        "buckets": snapshots,
+        "included": primary.get("included"),
+        "remaining": primary.get("absolute_remaining"),
+        "used": primary.get("absolute_used"),
+        "percent_remaining": primary.get("percent_remaining"),
+        "percent_used": primary.get("percent_used"),
+        "overage": primary.get("overage"),
+        "overage_permitted": primary.get("overage_permitted"),
+        "reset_at": reset_at,
+        "seconds_until_reset": _seconds_until(reset_at, now),
+        "days_until_reset": _days_until(reset_at, now),
+        "unlimited": bool(primary.get("unlimited")),
     }
 
 
@@ -2120,6 +2262,7 @@ class DashboardService:
             if isinstance(event.get("usage_ratelimits"), dict) and event.get("usage_ratelimits")
         ]
         usage_ratelimits_summary = _build_usage_ratelimits_summary(ratelimit_events, now=now)
+        aic_quota_summary = _build_aic_quota_summary(usage_events, now=now)
         safeguard_stats = self.dependencies.load_safeguard_trigger_stats(now)
         if not isinstance(safeguard_stats, dict):
             safeguard_stats = {}
@@ -2145,6 +2288,7 @@ class DashboardService:
         return {
             "generated_at": now.isoformat(),
             "usage_ratelimits": usage_ratelimits_summary,
+            "aic_quota": aic_quota_summary,
             "safeguard": {
                 "today_count": int(safeguard_stats.get("today_count") or 0),
                 "current_month_count": int(safeguard_stats.get("current_month_count") or 0),
@@ -2184,6 +2328,27 @@ class DashboardService:
         if "request_prompt" in result:
             result.pop("request_prompt", None)
             result["request_prompt_available"] = True
+        prepared = _prepare_usage_event(event)
+        if isinstance(prepared, dict):
+            cost_breakdown = prepared.get("cost_breakdown")
+            if isinstance(cost_breakdown, dict):
+                normalized_breakdown = {
+                    "input_fresh": round(_coerce_float(cost_breakdown.get("input_fresh")), 6),
+                    "cached_input": round(_coerce_float(cost_breakdown.get("cached_input")), 6),
+                    "cache_creation": round(_coerce_float(cost_breakdown.get("cache_creation")), 6),
+                    "output": round(_coerce_float(cost_breakdown.get("output")), 6),
+                }
+                result.setdefault("cost_breakdown", normalized_breakdown)
+                result.setdefault(
+                    "input_cost_usd",
+                    round(
+                        normalized_breakdown["input_fresh"]
+                        + normalized_breakdown["cached_input"]
+                        + normalized_breakdown["cache_creation"],
+                        6,
+                    ),
+                )
+                result.setdefault("output_cost_usd", normalized_breakdown["output"])
         return result
 
     # ─── Stream broker delegation ─────────────────────────────────────────────

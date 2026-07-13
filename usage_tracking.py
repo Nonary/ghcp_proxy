@@ -1327,8 +1327,9 @@ class UsageTracker:
             if content_type:
                 finished_event["response_content_type"] = content_type
 
-            # Retain any legacy Copilot x-quota-snapshot headers for old-log
-            # compatibility even though current billing is token based.
+            # Retain Copilot x-quota-snapshot headers for dashboard limit
+            # reporting. Some upstream versions still use the legacy
+            # premium_interactions bucket name for the current AIC allowance.
             # with URL-encoded "ent=...&ov=...&ovPerm=...&rem=...&rst=..." values.
             # `rem` is a remaining percentage, not an absolute count. This is more
             # authoritative than the user-scoped /settings/billing endpoint because

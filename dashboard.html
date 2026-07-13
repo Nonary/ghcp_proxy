@@ -254,6 +254,41 @@
       margin-top: 2px;
       white-space: nowrap;
     }
+    .cost-secondary {
+      color: var(--muted);
+      font-size: 0.72rem;
+      font-weight: 500;
+      line-height: 1.25;
+    }
+    .kpi .cost-secondary { margin-top: 4px; }
+    .cost-inline {
+      color: var(--muted);
+      font-size: 0.78em;
+      font-weight: 500;
+      white-space: nowrap;
+    }
+    .cost-stack {
+      display: grid;
+      gap: 2px;
+      min-width: 118px;
+      line-height: 1.2;
+    }
+    .cost-stack strong {
+      color: var(--text);
+      font-size: 0.82rem;
+      white-space: nowrap;
+    }
+    .cost-stack .cost-secondary {
+      max-width: 230px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .cost-breakdown-inline {
+      color: var(--muted);
+      font-size: 0.74rem;
+      white-space: nowrap;
+    }
     .kpi-meta {
       margin-top: 12px; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px;
       font-size: 0.78rem; color: var(--muted);
@@ -549,6 +584,33 @@
       color: var(--muted); font-size: 0.72rem; margin-top: 6px;
     }
     .credit-bar-foot .right { color: var(--muted-2); }
+    .aic-limit {
+      display: grid;
+      gap: 6px;
+      padding: 9px 10px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel-soft);
+    }
+    .aic-limit-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      gap: 8px;
+      font-size: 0.76rem;
+    }
+    .aic-limit-head strong { font-size: 0.82rem; }
+    .aic-limit-note {
+      color: var(--muted);
+      font-size: 0.7rem;
+      line-height: 1.35;
+    }
+    .aic-limit-empty {
+      color: var(--muted);
+      font-size: 0.74rem;
+      line-height: 1.4;
+      padding: 8px 0 2px;
+    }
 
     .credit-stats {
       display: grid;
@@ -1655,16 +1717,17 @@
           <div class="kpi-grid">
             <article class="kpi">
               <div class="kpi-head">
-                <div class="eyebrow">Spend</div>
+                <div class="eyebrow">AIC Spend</div>
                 <div class="kpi-icon">
                   <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1v22"/><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg>
                 </div>
               </div>
-              <div class="value">{{ money(allTime.cost_usd) }}</div>
+              <div class="value">{{ aicLabel(allTime.cost_usd) }}</div>
+              <div class="cost-secondary">{{ money(allTime.cost_usd) }}</div>
               <div class="kpi-meta">
-                <div class="row"><span class="k">Today</span><span class="v">{{ money(todayUsage.cost_usd) }}</span></div>
-                <div class="row"><span class="k">Month</span><span class="v">{{ money(currentMonth.cost_usd) }}</span></div>
-                <div class="row"><span class="k">All-Time</span><span class="v">{{ money(allTime.cost_usd) }}</span></div>
+                <div class="row"><span class="k">Today</span><span class="v">{{ costLabel(todayUsage.cost_usd) }}</span></div>
+                <div class="row"><span class="k">Month</span><span class="v">{{ costLabel(currentMonth.cost_usd) }}</span></div>
+                <div class="row"><span class="k">All-Time</span><span class="v">{{ costLabel(allTime.cost_usd) }}</span></div>
               </div>
             </article>
 
@@ -1764,7 +1827,7 @@
                     <th>Duration</th>
                     <th>Proxy Calls</th>
                     <th>Tokens</th>
-                    <th>Cost</th>
+                    <th>Cost (AIC)</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -1781,7 +1844,12 @@
                     <td>{{ sessionDurationLabel(row) }}</td>
                     <td>{{ integer(row.session_request_count || row.request_count) }}</td>
                     <td>{{ compact(row.total_tokens) }}</td>
-                    <td>{{ money(row.cost_usd) }}</td>
+                    <td>
+                      <div class="cost-stack" :title="costLabel(row.cost_usd)">
+                        <strong>{{ aicLabel(row.cost_usd) }}</strong>
+                        <span class="cost-secondary">{{ money(row.cost_usd) }} · {{ costBreakdownLabel(row, true) }}</span>
+                      </div>
+                    </td>
                   </tr>
                   <tr v-if="!filteredSessions.length"><td colspan="8" class="empty">No sessions match the current filter.</td></tr>
                 </tbody>
@@ -1799,7 +1867,7 @@
                     <th>Path</th>
                     <th>Duration</th>
                     <th>Tokens (in/out)</th>
-                    <th>Cost</th>
+                    <th>Cost (AIC)</th>
                     <th>Request ID</th>
                   </tr>
                 </thead>
@@ -1820,7 +1888,12 @@
                     <td><code>{{ row.path || '—' }}</code></td>
                     <td>{{ shortDuration(row.duration_ms) }}</td>
                     <td>{{ shortTokens(row) }}</td>
-                    <td>{{ money(row.cost_usd) }}</td>
+                    <td>
+                      <div class="cost-stack" :title="costLabel(row.cost_usd)">
+                        <strong>{{ aicLabel(row.cost_usd) }}</strong>
+                        <span class="cost-secondary">{{ money(row.cost_usd) }} · {{ costBreakdownLabel(row, true) }}</span>
+                      </div>
+                    </td>
                     <td>
                       <span class="req-id">
                         <span>{{ shortHash(row.request_id || row.client_request_id) }}</span>
@@ -1861,7 +1934,7 @@
           <article class="card credit-card">
             <div class="card-head">
               <div>
-                <div class="eyebrow">▮ AI Credit Usage</div>
+                <div class="eyebrow">▮ AIC Usage</div>
               </div>
               <span class="credit-tone-pill tone-cyan" title="Estimated from recorded token usage and published model rates">
                 <span class="dot"></span>Token priced
@@ -1870,26 +1943,43 @@
 
             <div class="credit-top">
               <div class="credit-headline">
-                <span class="pct">{{ money(currentMonth.cost_usd) }}</span>
+                <span class="pct">{{ aicLabel(currentMonth.cost_usd) }}</span>
                 <span class="of">estimated this month</span>
               </div>
+              <span class="cost-inline">{{ money(currentMonth.cost_usd) }}</span>
             </div>
 
             <div class="credit-bar-foot">
-              <span>1 AI credit = $0.01 USD</span>
-              <span class="right">input · cached · output tokens</span>
+              <span>1 AIC = $0.01 USD</span>
+              <span class="right">input · cached · output cost</span>
             </div>
+
+            <div v-if="aicQuota.configured" class="aic-limit">
+              <div class="aic-limit-head">
+                <strong>{{ aicQuota.unit || 'AIC' }} limit remaining</strong>
+                <span>{{ aicQuotaPercentText }}</span>
+              </div>
+              <div class="credit-bar">
+                <span class="fill" :class="'tone-' + aicQuotaTone" :style="{ width: aicQuotaUsedPercent + '%' }"></span>
+              </div>
+              <div class="credit-bar-foot">
+                <span>{{ aicQuotaRemainingText }} of {{ aicQuotaIncludedText }}</span>
+                <span class="right">{{ aicQuotaResetText }}</span>
+              </div>
+              <div v-if="aicQuota.message" class="aic-limit-note">{{ aicQuota.message }}</div>
+            </div>
+            <div v-else class="aic-limit-empty">{{ aicQuota.message || 'Live AIC limit appears after the first upstream response.' }}</div>
 
             <div class="credit-stats">
               <div class="credit-stat">
                 <div class="k">Today</div>
-                <div class="v">{{ money(todayUsage.cost_usd) }}</div>
-                <div class="sub">estimated</div>
+                <div class="v">{{ aicLabel(todayUsage.cost_usd) }}</div>
+                <div class="sub">{{ money(todayUsage.cost_usd) }} estimated</div>
               </div>
               <div class="credit-stat">
                 <div class="k">Avg/day</div>
-                <div class="v">{{ money(averageDailySpend) }}</div>
-                <div class="sub">last 7d</div>
+                <div class="v">{{ aicLabel(averageDailySpend) }}</div>
+                <div class="sub">{{ money(averageDailySpend) }} · last 7d</div>
               </div>
               <div class="credit-stat">
                 <div class="k">Tokens</div>
@@ -1898,8 +1988,8 @@
               </div>
               <div class="credit-stat">
                 <div class="k">Projected</div>
-                <div class="v">{{ money(monthlySpendProjection) }}</div>
-                <div class="sub">month end</div>
+                <div class="v">{{ aicLabel(monthlySpendProjection) }}</div>
+                <div class="sub">{{ money(monthlySpendProjection) }} · month end</div>
               </div>
             </div>
 
@@ -1907,12 +1997,12 @@
               <div v-for="day in costLast7Days" :key="day.day_key" class="col" :class="{ 'is-today': day.is_today }">
                 <div class="bar"
                      :style="{ height: Math.max(2, day.fill_percent) + '%' }"
-                     :title="day.dayNumber + ': ' + money(day.cost_usd)"></div>
+                     :title="day.dayNumber + ': ' + costLabel(day.cost_usd)"></div>
                 <div class="lbl">{{ day.weekday.charAt(0) }}</div>
               </div>
             </div>
             <div class="credit-spark-foot">
-              <span>7-day total <strong style="color:var(--text); font-weight:700;">{{ money(costWeekTotal) }}</strong></span>
+              <span>7-day total <strong style="color:var(--text); font-weight:700;">{{ costLabel(costWeekTotal) }}</strong></span>
               <a href="#" class="card-link" @click.prevent="activeView = 'usage'">Details →</a>
             </div>
           </article>
@@ -1942,7 +2032,7 @@
                 </svg>
                 <div class="donut-label">
                   <div>
-                    <div class="big" style="font-size: 0.95rem;">{{ money(providerTotalCost) }}</div>
+                    <div class="big" style="font-size: 0.95rem;">{{ costLabel(providerTotalCost) }}</div>
                     <div class="tiny">Total</div>
                   </div>
                 </div>
@@ -1952,7 +2042,7 @@
                   <span class="swatch" :style="{ background: row.color }"></span>
                   <span class="name">{{ row.label }}</span>
                   <span class="pct">{{ row.percentLabel }}</span>
-                  <span class="val">{{ money(row.value) }}</span>
+                   <span class="val">{{ costLabel(row.value) }}</span>
                 </div>
                 <div v-if="!providerRows.length" class="subtle">No spend recorded yet.</div>
               </div>
@@ -2090,7 +2180,7 @@
           <div style="overflow-x:auto;">
             <table class="req-table">
               <thead>
-                <tr><th>Source</th><th>Session</th><th>Model</th><th>Last Activity</th><th>Duration</th><th>Proxy Calls</th><th>Tokens</th><th>Cost</th></tr>
+                <tr><th>Source</th><th>Session</th><th>Model</th><th>Last Activity</th><th>Duration</th><th>Proxy Calls</th><th>Tokens</th><th>Cost (AIC)</th></tr>
               </thead>
               <tbody>
                 <tr v-for="row in filteredSessions" :key="row.session_key"
@@ -2106,7 +2196,12 @@
                   <td>{{ sessionDurationLabel(row) }}</td>
                   <td>{{ integer(row.session_request_count || row.request_count) }}</td>
                   <td>{{ compact(row.total_tokens) }}</td>
-                  <td>{{ money(row.cost_usd) }}</td>
+                    <td>
+                      <div class="cost-stack" :title="costLabel(row.cost_usd)">
+                        <strong>{{ aicLabel(row.cost_usd) }}</strong>
+                        <span class="cost-secondary">{{ money(row.cost_usd) }} · {{ costBreakdownLabel(row, true) }}</span>
+                      </div>
+                    </td>
                 </tr>
                 <tr v-if="!filteredSessions.length"><td colspan="8" class="empty">No sessions match the current filter.</td></tr>
               </tbody>
@@ -2124,7 +2219,8 @@
             </div>
             <div class="subtle" style="text-align:right; line-height:1.5;">
               <div>{{ integer(selectedSession.session_request_count || selectedSession.request_count) }} requests · {{ shortDuration(selectedSession.wall_duration_ms) }} wall · {{ shortDuration(selectedSession.api_duration_ms) }} api</div>
-              <div>{{ compact(selectedSession.total_tokens) }} tokens · {{ money(selectedSession.cost_usd) }}</div>
+              <div>{{ compact(selectedSession.total_tokens) }} tokens · <span class="cost-inline">{{ aicLabel(selectedSession.cost_usd) }} · {{ money(selectedSession.cost_usd) }}</span></div>
+              <div class="cost-breakdown-inline">{{ costBreakdownLabel(selectedSession) }}</div>
               <div v-if="selectedSession.first_activity">First {{ shortStamp(selectedSession.first_activity) }} · Last {{ shortStamp(selectedSession.last_activity) }}</div>
             </div>
           </div>
@@ -2132,7 +2228,7 @@
             <table class="req-table">
               <thead>
                 <tr>
-                  <th>Time</th><th>Status</th><th>Model</th><th>Path</th><th>Duration</th><th>Tokens (in/out)</th><th>Cost</th><th>Request ID</th>
+                  <th>Time</th><th>Status</th><th>Model</th><th>Path</th><th>Duration</th><th>Tokens (in/out)</th><th>Cost (AIC)</th><th>Request ID</th>
                 </tr>
               </thead>
               <tbody>
@@ -2147,7 +2243,12 @@
                   <td><code>{{ row.path || '—' }}</code></td>
                   <td>{{ shortDuration(row.duration_ms) }}</td>
                   <td>{{ shortTokens(row) }}</td>
-                  <td>{{ money(row.cost_usd) }}</td>
+                  <td>
+                    <div class="cost-stack" :title="costLabel(row.cost_usd)">
+                      <strong>{{ aicLabel(row.cost_usd) }}</strong>
+                      <span class="cost-secondary">{{ money(row.cost_usd) }} · {{ costBreakdownLabel(row, true) }}</span>
+                    </div>
+                  </td>
                   <td>
                     <span class="req-id">
                       <span>{{ shortHash(row.request_id || row.client_request_id) }}</span>
@@ -2207,7 +2308,10 @@
                     <div>{{ row.success === false ? `HTTP ${row.status_code}` : `${row.duration_ms ?? '-'} ms` }}</div>
                     <div class="mono">{{ shortId(row.request_id || row.client_request_id) }}</div>
                     <div>{{ tokenSummary(row) }}</div>
-                    <div>{{ money(row.cost_usd) }}</div>
+                    <div class="cost-stack">
+                      <strong>{{ aicLabel(row.cost_usd) }}</strong>
+                      <span class="cost-secondary">{{ money(row.cost_usd) }} · {{ costBreakdownLabel(row, true) }}</span>
+                    </div>
                   </div>
                 </button>
               </div>
@@ -2229,9 +2333,9 @@
                   <div><div class="detail-label">Upstream Path</div><div class="detail-value mono">{{ selectedRequest.upstream_path || '-' }}</div></div>
                   <div><div class="detail-label">Requested Model</div><div class="detail-value">{{ selectedRequest.requested_model || '-' }}</div></div>
                   <div><div class="detail-label">Resolved Model</div><div class="detail-value">{{ selectedRequest.response_model || selectedRequest.resolved_model || '-' }}</div></div>
-                  <div><div class="detail-label">Estimated cost</div><div class="detail-value">{{ money(selectedRequest.cost_usd) }}</div></div>
+                  <div><div class="detail-label">Estimated AIC</div><div class="detail-value"><strong>{{ aicLabel(selectedRequest.cost_usd) }}</strong><span class="cost-inline"> · {{ money(selectedRequest.cost_usd) }}</span></div></div>
                   <div><div class="detail-label">Duration</div><div class="detail-value">{{ selectedRequest.duration_ms != null ? `${selectedRequest.duration_ms} ms` : '-' }}</div></div>
-                  <div><div class="detail-label">Cost</div><div class="detail-value">{{ money(selectedRequest.cost_usd) }}</div></div>
+                  <div><div class="detail-label">Cost breakdown</div><div class="detail-value">{{ costBreakdownLabel(selectedRequest) }}</div></div>
                   <div><div class="detail-label">Session ID</div><div class="detail-value mono">{{ selectedRequest.session_id || '-' }}</div></div>
                   <div><div class="detail-label">Request ID</div><div class="detail-value mono">{{ selectedRequest.request_id || '-' }}</div></div>
                   <div><div class="detail-label">Server Request ID</div><div class="detail-value mono">{{ selectedRequest.server_request_id || '-' }}</div></div>
@@ -2768,7 +2872,7 @@
             </span>
             <span class="breakdown-values">
               <span class="mono">{{ compact(row.tokens) }}</span>
-              <span class="subtle" style="margin-left: 8px;">{{ money(row.cost) }} · {{ row.costShareLabel }}</span>
+              <span class="subtle" style="margin-left: 8px;">{{ costLabel(row.cost) }} · {{ row.costShareLabel }}</span>
             </span>
           </div>
           <div class="bar"><span :style="{ width: row.percent + '%', background: row.color }"></span></div>
@@ -2798,7 +2902,7 @@
           @click="$emit('update:scope', 'all')"
         >
           <span class="subtle">All-time context</span>
-          <strong>{{ money(allTimeUsage.cost_usd) }}</strong>
+          <strong>{{ costLabel(allTimeUsage.cost_usd) }}</strong>
           <span class="subtle">{{ integer(allTimeUsage.request_count) }} proxy calls · {{ compact(allTimeUsage.total_tokens) }} tokens</span>
         </button>
       </div>
@@ -2818,7 +2922,7 @@
             </div>
             <span class="badge">{{ dominantSourceLabel(card.usage) }}</span>
           </div>
-          <div class="source-period-value">{{ money(card.usage.cost_usd) }}</div>
+          <div class="source-period-value">{{ costLabel(card.usage.cost_usd) }}</div>
           <div class="source-period-meta">{{ integer(card.usage.request_count) }} proxy calls · {{ compact(card.usage.total_tokens) }} tokens</div>
           <div class="source-period-track">
             <span
@@ -2870,17 +2974,17 @@
               </div>
               <div class="source-detail-share">{{ shareLabel(row) }} of spend</div>
             </div>
-            <div class="source-detail-value">{{ money(row.cost_usd) }}</div>
+              <div class="source-detail-value">{{ costLabel(row.cost_usd) }}</div>
             <div class="source-detail-meta">
               <span>{{ integer(row.request_count) }} requests</span>
               <span>{{ compact(row.total_tokens) }} tokens</span>
-              <span>{{ money(row.request_count ? row.cost_usd / row.request_count : 0) }}/request</span>
+              <span>{{ costLabel(row.request_count ? row.cost_usd / row.request_count : 0) }}/request</span>
             </div>
             <div class="source-detail-metrics">
               <div class="source-metric">
                 <div class="source-metric-head">
                   <span>Spend</span>
-                  <strong>{{ money(row.cost_usd) }}</strong>
+                    <strong>{{ costLabel(row.cost_usd) }}</strong>
                 </div>
                 <div class="source-metric-track">
                   <span
@@ -2929,7 +3033,7 @@
           <div class="subtle">Daily and monthly values are visible at the same time.</div>
         </div>
       </div>
-      <h1 class="summary-hero-value">{{ money(allTime.cost_usd) }}</h1>
+      <h1 class="summary-hero-value">{{ costLabel(allTime.cost_usd) }}</h1>
       <p class="summary-hero-meta">
         All-time spend across {{ integer(trackedMonths) }} tracked {{ trackedMonths === 1 ? 'month' : 'months' }}
         with live request detail and current-month pacing.
@@ -2941,9 +3045,9 @@
       <div class="summary-badges">
         <div class="summary-badge-row">
           <span class="summary-label">Spend</span>
-          <span class="summary-chip"><span class="chip-k">Today</span>{{ money(todayUsage.cost_usd) }}</span>
-          <span class="summary-chip"><span class="chip-k">Month</span>{{ money(currentMonth.cost_usd) }}</span>
-          <span class="summary-chip"><span class="chip-k">All-Time</span>{{ money(allTime.cost_usd) }}</span>
+            <span class="summary-chip"><span class="chip-k">Today</span>{{ costLabel(todayUsage.cost_usd) }}</span>
+            <span class="summary-chip"><span class="chip-k">Month</span>{{ costLabel(currentMonth.cost_usd) }}</span>
+            <span class="summary-chip"><span class="chip-k">All-Time</span>{{ costLabel(allTime.cost_usd) }}</span>
         </div>
         <div class="summary-badge-row">
           <span class="summary-label">Tokens</span>
@@ -2978,6 +3082,56 @@
         return Number.isFinite(numeric)
           ? new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 2 }).format(numeric)
           : '-';
+      },
+      aic(value) {
+        const numeric = Number(value);
+        return Number.isFinite(numeric)
+          ? new Intl.NumberFormat('en-US', { maximumFractionDigits: 2 }).format(numeric * 100)
+          : '-';
+      },
+      aicCompact(value) {
+        const numeric = Number(value);
+        return Number.isFinite(numeric)
+          ? new Intl.NumberFormat('en-US', { notation: 'compact', maximumFractionDigits: 1 }).format(numeric * 100)
+          : '-';
+      },
+      aicLabel(value) {
+        const formatted = this.aic(value);
+        return formatted === '-' ? formatted : `${formatted} AIC`;
+      },
+      aicCompactLabel(value) {
+        const formatted = this.aicCompact(value);
+        return formatted === '-' ? formatted : `${formatted} AIC`;
+      },
+      costLabel(value) {
+        const numeric = Number(value);
+        return Number.isFinite(numeric) ? `${this.aicLabel(numeric)} · ${this.money(numeric)}` : '-';
+      },
+      costBreakdownValues(row) {
+        const breakdown = row?.cost_breakdown || row?.costBreakdown || {};
+        const inputFresh = Number(breakdown.input_fresh ?? breakdown.inputFresh ?? 0);
+        const cachedInput = Number(breakdown.cached_input ?? breakdown.cachedInput ?? 0);
+        const cacheCreation = Number(breakdown.cache_creation ?? breakdown.cacheCreation ?? 0);
+        const output = Number(breakdown.output ?? 0);
+        const directInput = Number(row?.input_cost_usd);
+        const directOutput = Number(row?.output_cost_usd);
+        return {
+          input_usd: Number.isFinite(directInput)
+            ? directInput
+            : (Number.isFinite(inputFresh) ? inputFresh : 0)
+              + (Number.isFinite(cachedInput) ? cachedInput : 0)
+              + (Number.isFinite(cacheCreation) ? cacheCreation : 0),
+          output_usd: Number.isFinite(directOutput) ? directOutput : (Number.isFinite(output) ? output : 0),
+        };
+      },
+      costBreakdownLabel(row, concise = false) {
+        const values = this.costBreakdownValues(row);
+        const total = Number(row?.cost_usd);
+        if (!Number.isFinite(total)) return '-';
+        if (concise) {
+          return `in ${this.aicCompact(values.input_usd)} · out ${this.aicCompact(values.output_usd)} AIC`;
+        }
+        return `Input ${this.aicLabel(values.input_usd)} · Output ${this.aicLabel(values.output_usd)}`;
       },
       stamp(value) {
         if (!value) return '-';
@@ -3303,7 +3457,7 @@
       methods: {
         ...sharedFormatters,
         formatValue(value) {
-          return this.valueFormat === 'compact' ? this.compact(value) : this.money(value);
+          return this.valueFormat === 'compact' ? this.compact(value) : this.costLabel(value);
         },
         shortLabel(row) {
           const raw = this.period === 'month' ? row?.month_key : row?.day_key;
@@ -3386,7 +3540,7 @@
       methods: {
         ...sharedFormatters,
         formatValue(value) {
-          return this.valueFormat === 'money' ? this.money(value) : this.compact(value);
+          return this.valueFormat === 'money' ? this.costLabel(value) : this.compact(value);
         },
         shortLabel(row) {
           const raw = this.period === 'month' ? row?.month_key : row?.day_key;
@@ -3449,7 +3603,7 @@
             : (this.selectedScope === 'week'
               ? 'Last 7 days'
               : (this.selectedScope === 'today' ? 'Today' : 'This month'));
-          return `${range} · ${this.integer(u.request_count)} proxy calls · ${this.compact(u.total_tokens)} tokens · ${this.money(u.cost_usd)}`;
+          return `${range} · ${this.integer(u.request_count)} proxy calls · ${this.compact(u.total_tokens)} tokens · ${this.costLabel(u.cost_usd)}`;
         },
         rawRows() {
           const u = this.activeUsage || {};
@@ -3585,7 +3739,7 @@
         },
         activeSubtitle() {
           const u = this.activeUsage || {};
-          return `${this.spotlightTitle} · ${this.integer(u.request_count)} proxy calls · ${this.compact(u.total_tokens)} total tokens · ${this.money(u.cost_usd)}`;
+          return `${this.spotlightTitle} · ${this.integer(u.request_count)} proxy calls · ${this.compact(u.total_tokens)} total tokens · ${this.costLabel(u.cost_usd)}`;
         },
         spotlightTitle() {
           if (this.scope === 'all') return 'All-Time Split';
@@ -3618,7 +3772,7 @@
           if (Math.abs(costDelta) < 0.005 && Math.abs(shareDelta) < 0.2) {
             return `${this.sourceLabel(leader.source)} and ${this.sourceLabel(runnerUp.source)} are essentially even right now.`;
           }
-          return `${this.sourceLabel(leader.source)} leads ${this.sourceLabel(runnerUp.source)} by ${this.money(costDelta)} and ${this.percent(shareDelta)} of spend.`;
+          return `${this.sourceLabel(leader.source)} leads ${this.sourceLabel(runnerUp.source)} by ${this.costLabel(costDelta)} and ${this.percent(shareDelta)} of spend.`;
         },
       },
       methods: {
@@ -3806,6 +3960,11 @@
           requestPromptStatus: {},
           debugModalRow: null,
           data: {
+            aic_quota: {
+              configured: false,
+              unit: 'AIC',
+              message: 'Make a request through the proxy to capture the live AIC limit.',
+            },
             current_month: { usage: { sources: {} }, daily_history: [] },
             all_time: { usage: { sources: {} } },
             recent_sessions: [],
@@ -3873,6 +4032,63 @@
         },
         currentMonth() { return this.data.current_month?.usage || {}; },
         allTime() { return this.data.all_time?.usage || {}; },
+        aicQuota() {
+          return this.data.aic_quota || {
+            configured: false,
+            unit: 'AIC',
+            message: 'Live AIC limit appears after the first upstream response.',
+          };
+        },
+        aicQuotaUsedPercent() {
+          if (this.aicQuota.unlimited) return 0;
+          const used = Number(this.aicQuota.percent_used);
+          return Number.isFinite(used) ? Math.max(0, Math.min(100, used)) : 0;
+        },
+        aicQuotaTone() {
+          if (this.aicQuota.unlimited) return 'cyan';
+          const remaining = Number(this.aicQuota.percent_remaining);
+          if (!Number.isFinite(remaining)) return 'cyan';
+          if (remaining <= 10) return 'red';
+          if (remaining <= 25) return 'yellow';
+          return 'green';
+        },
+        aicQuotaPercentText() {
+          if (this.aicQuota.unlimited) return 'Unlimited';
+          const remaining = Number(this.aicQuota.percent_remaining);
+          return Number.isFinite(remaining)
+            ? `${new Intl.NumberFormat('en-US', { maximumFractionDigits: 1 }).format(remaining)}% left`
+            : 'Pending';
+        },
+        aicQuotaRemainingText() {
+          if (this.aicQuota.unlimited) return 'Unlimited';
+          const remaining = Number(this.aicQuota.remaining);
+          if (Number.isFinite(remaining)) {
+            return `${new Intl.NumberFormat('en-US', { maximumFractionDigits: 2 }).format(remaining)} ${this.aicQuota.unit || 'AIC'}`;
+          }
+          return 'Unknown balance';
+        },
+        aicQuotaIncludedText() {
+          if (this.aicQuota.unlimited) return 'no cap';
+          const included = Number(this.aicQuota.included);
+          if (Number.isFinite(included)) {
+            return `${new Intl.NumberFormat('en-US', { maximumFractionDigits: 2 }).format(included)} ${this.aicQuota.unit || 'AIC'}`;
+          }
+          return 'unknown limit';
+        },
+        aicQuotaResetText() {
+          if (this.aicQuota.unlimited) return 'No reset';
+          const resetAt = this.aicQuota.reset_at;
+          if (!resetAt) return 'Reset pending';
+          const days = Number(this.aicQuota.days_until_reset);
+          const date = new Date(resetAt);
+          const dateLabel = Number.isNaN(date.getTime())
+            ? ''
+            : date.toLocaleDateString([], { month: 'short', day: 'numeric' });
+          if (Number.isFinite(days)) {
+            return `Resets in ${this.integer(days)}d${dateLabel ? ` · ${dateLabel}` : ''}`;
+          }
+          return dateLabel ? `Resets ${dateLabel}` : 'Reset pending';
+        },
         dailyHistory() { return normalizeRowsToLocalToday(this.data.current_month?.daily_history || []); },
         monthHistoryChronological() { return [...((this.data.month_history || []).slice(0, 12))].reverse(); },
         todayUsage() { return this.dailyHistory[this.dailyHistory.length - 1] || {}; },
@@ -3912,7 +4128,7 @@
             return {
               title: 'Monthly Spend',
               subtitle: 'Recent history',
-              headline: this.money(this.allTime.cost_usd),
+              headline: this.costLabel(this.allTime.cost_usd),
               meta: this.monthlySpendMeta,
               rows: this.monthHistoryChronological,
               period: 'month',
@@ -3922,7 +4138,7 @@
           return {
             title: 'Daily Spend',
             subtitle: 'Month to date',
-            headline: this.money(this.currentMonth.cost_usd),
+            headline: this.costLabel(this.currentMonth.cost_usd),
             meta: this.dailySpendMeta,
             rows: this.dailyHistory,
             period: 'day',
@@ -3952,7 +4168,7 @@
           };
         },
         dailySpendMeta() {
-          return `${this.money(this.todayUsage.cost_usd)} today · ${this.money(this.averageDailySpend)} avg/day · ${this.money(this.monthlySpendProjection)} projected`;
+          return `${this.costLabel(this.todayUsage.cost_usd)} today · ${this.costLabel(this.averageDailySpend)} avg/day · ${this.costLabel(this.monthlySpendProjection)} projected`;
         },
         monthlySpendMeta() {
           return `${this.integer(this.trackedMonths)} months tracked · ${this.integer(this.allTime.request_count)} proxy calls overall`;
@@ -4313,19 +4529,19 @@
           const allEnd      = all.length ? (all[all.length-1].label || all[all.length-1].month_label || '') : '';
 
           return [
-            { key: 'today', title: 'Today', value: this.money(todayVal),
+            { key: 'today', title: 'Today', value: this.costLabel(todayVal),
               desc: 'Same local day shown in the expanded view',
               ...buildSpark(todaySeries),
               xStart: '12 AM', xMid: '12 PM', xEnd: '12 AM' },
-            { key: 'week', title: '7 Days', value: this.money(weekTotal),
+            { key: 'week', title: '7 Days', value: this.costLabel(weekTotal),
               desc: 'Rolling seven-day total',
               ...buildSpark(week),
               xStart: last7Start, xMid: (days7.length > 2 ? labelDate(dayKeyToDate(days7[Math.floor(days7.length/2)].day_key)) : ''), xEnd: last7End },
-            { key: 'month', title: 'Month', value: this.money(monthTotal),
+            { key: 'month', title: 'Month', value: this.costLabel(monthTotal),
               desc: 'Current month so far',
               ...buildSpark(month),
               xStart: monthStart, xMid: (monthRows.length > 2 ? labelDate(dayKeyToDate(monthRows[Math.floor(monthRows.length/2)].day_key)) : ''), xEnd: monthEnd },
-            { key: 'all', title: 'All-Time', value: this.money(allTotal),
+            { key: 'all', title: 'All-Time', value: this.costLabel(allTotal),
               desc: 'All recorded token cost',
               ...buildSpark(allTime),
               xStart: allStart, xMid: (all.length > 2 ? (all[Math.floor(all.length/2)].label || all[Math.floor(all.length/2)].month_label || '') : ''), xEnd: allEnd },
@@ -4400,6 +4616,7 @@
         },
       },
       methods: {
+        ...sharedFormatters,
         integer(value) { return new Intl.NumberFormat('en-US').format(Number(value || 0)); },
         _formatAverageCount(value) {
           const numeric = Number(value);
