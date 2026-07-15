@@ -208,20 +208,11 @@ _DEBUG_DETAIL_REQUEST_SNAPSHOTS_BY_ID: OrderedDict[str, dict] = OrderedDict()
 _DEBUG_DETAIL_SESSION_CAPTURED_REQUEST_IDS: OrderedDict[str, set[str]] = OrderedDict()
 _DEBUG_DETAIL_SNAPSHOT_SEQUENCE = 0
 
-# Upstream prompt-cache settle. Cross-lineage settling remains opt-in: ordinary
-# back-to-back turns in one append-only conversation should not be throttled.
-# The affected Responses models do need a narrow same-lineage guard, however:
-# native user steering can arrive immediately after a streamed agent turn and
-# has repeatedly fallen back to the small static prefix before the upstream
-# cache write settles. Keep this workaround limited to those models and that
-# safeguard-classified steering shape; GPT-5.6 does not show the regression.
-CACHE_SETTLE_DELAY_SECONDS = 0.0
-# The existing GHCP_PROXY_RESPONSES_CACHE_SETTLE_DELAY_SECONDS override also
-# controls this targeted delay; setting it to 0 disables the workaround.
-RESPONSES_STEERING_CACHE_SETTLE_DELAY_SECONDS = 2.0
-_RESPONSES_STEERING_CACHE_SETTLE_MODELS = frozenset(
-    {"gpt-5.4", "gpt-5.4-mini", "gpt-5.5"}
-)
+# Upstream Responses prompt-cache settle. Related lineage handoffs get a short
+# quiet window, while user-classified steering gets a longer one.
+# Ordinary same-lineage agent/tool continuations remain unthrottled.
+RESPONSES_CACHE_SETTLE_DELAY_SECONDS = 3.0
+RESPONSES_STEERING_CACHE_SETTLE_DELAY_SECONDS = 5.0
 _PROMPT_CACHE_SETTLE_LOCK = threading.Lock()
 _PROMPT_CACHE_LAST_FINISH_BY_FAMILY: dict[tuple[str, str], tuple[str, float]] = {}
 
@@ -799,26 +790,36 @@ def _responses_plan_is_user_steering(plan: "UpstreamRequestPlan | None") -> bool
     verdict = trace_context.get("initiator_verdict")
     if not isinstance(verdict, dict):
         return False
-    return (
-        str(verdict.get("candidate_initiator") or "").strip().lower() == "user"
-        and str(verdict.get("resolved_initiator") or "").strip().lower() == "agent"
-        and str(verdict.get("safeguard_reason") or "").strip().lower() == "cooldown"
-    )
+    # The candidate reflects the actual latest input shape. The resolved value
+    # may be forced back to ``agent`` during the cooldown safeguard, so keying
+    # only on the resolved initiator would miss the steering turns that most
+    # need the longer cache-settle window.
+    return str(verdict.get("candidate_initiator") or "").strip().lower() == "user"
 
 
 def _prompt_cache_settle_delay_seconds(plan: "UpstreamRequestPlan | None" = None) -> float:
-    raw_value = os.environ.get("GHCP_PROXY_RESPONSES_CACHE_SETTLE_DELAY_SECONDS")
+    steering = _responses_plan_is_user_steering(plan)
+    default = (
+        RESPONSES_STEERING_CACHE_SETTLE_DELAY_SECONDS
+        if steering
+        else RESPONSES_CACHE_SETTLE_DELAY_SECONDS
+    )
+    raw_value = None
+    if steering:
+        raw_value = os.environ.get(
+            "GHCP_PROXY_RESPONSES_STEERING_CACHE_SETTLE_DELAY_SECONDS"
+        )
+    # Preserve the original variable as the base Responses setting and as a
+    # backwards-compatible fallback for steering when no steering-specific
+    # override is present.
     if raw_value is None:
-        if (
-            _responses_plan_model(plan) in _RESPONSES_STEERING_CACHE_SETTLE_MODELS
-            and _responses_plan_is_user_steering(plan)
-        ):
-            return RESPONSES_STEERING_CACHE_SETTLE_DELAY_SECONDS
-        return CACHE_SETTLE_DELAY_SECONDS
+        raw_value = os.environ.get("GHCP_PROXY_RESPONSES_CACHE_SETTLE_DELAY_SECONDS")
+    if raw_value is None:
+        return default
     try:
         return max(0.0, float(str(raw_value).strip()))
     except (TypeError, ValueError):
-        return CACHE_SETTLE_DELAY_SECONDS
+        return default
 
 
 def _responses_plan_header_value(
@@ -854,13 +855,28 @@ def _responses_plan_lineage(plan: "UpstreamRequestPlan | None") -> str | None:
     return None
 
 
+def _responses_plan_uses_native_upstream(plan: "UpstreamRequestPlan | None") -> bool:
+    if not isinstance(plan, UpstreamRequestPlan) or not isinstance(plan.body, dict):
+        return False
+    trace_context = plan.trace_context if isinstance(plan.trace_context, dict) else {}
+    client_path = str(trace_context.get("client_path") or "").rstrip("/").lower()
+    if client_path.endswith("/responses/compact"):
+        return False
+    if format_translation.input_contains_compaction(plan.body.get("input")):
+        return False
+    upstream_path = str(trace_context.get("upstream_path") or "").strip()
+    if not upstream_path:
+        upstream_path = urlsplit(plan.upstream_url).path
+    return upstream_path.rstrip("/").lower().endswith("/responses")
+
+
 def _responses_cache_settle_identity(
     plan: "UpstreamRequestPlan | None",
 ) -> tuple[str, str, str] | None:
-    if not isinstance(plan, UpstreamRequestPlan) or not isinstance(plan.body, dict):
+    if not _responses_plan_uses_native_upstream(plan):
         return None
     model = _responses_plan_model(plan)
-    if model not in _RESPONSES_STEERING_CACHE_SETTLE_MODELS:
+    if not model:
         return None
     lineage = _responses_plan_lineage(plan)
     if not lineage:
@@ -875,19 +891,50 @@ async def _wait_for_responses_cache_settle(plan: "UpstreamRequestPlan | None") -
     if identity is None:
         return
     model, lineage, family = identity
+    steering = _responses_plan_is_user_steering(plan)
     delay_seconds = _prompt_cache_settle_delay_seconds(plan)
     if delay_seconds <= 0:
         return
-    with _PROMPT_CACHE_SETTLE_LOCK:
-        last = _PROMPT_CACHE_LAST_FINISH_BY_FAMILY.get((model, family))
-    if not last:
-        return
-    last_lineage, last_finished_at = last
-    if last_lineage == lineage and not _responses_plan_is_user_steering(plan):
-        return
-    wait_seconds = delay_seconds - (time.monotonic() - float(last_finished_at))
-    if wait_seconds > 0:
+    started_at = time.monotonic()
+    initial_last_lineage = None
+    initial_same_lineage = None
+    quiet_window_restarts = 0
+    waited = False
+    while True:
+        with _PROMPT_CACHE_SETTLE_LOCK:
+            last = _PROMPT_CACHE_LAST_FINISH_BY_FAMILY.get((model, family))
+        if not last:
+            break
+        last_lineage, last_finished_at = last
+        same_lineage = last_lineage == lineage
+        if same_lineage and not steering:
+            break
+        if initial_last_lineage is None:
+            initial_last_lineage = last_lineage
+            initial_same_lineage = same_lineage
+        wait_seconds = delay_seconds - (time.monotonic() - float(last_finished_at))
+        if wait_seconds <= 0:
+            break
+        observed_last = last
+        waited = True
         await asyncio.sleep(wait_seconds)
+        with _PROMPT_CACHE_SETTLE_LOCK:
+            latest = _PROMPT_CACHE_LAST_FINISH_BY_FAMILY.get((model, family))
+        if latest is not None and latest != observed_last:
+            quiet_window_restarts += 1
+
+    if waited:
+        trace_context = plan.trace_context if isinstance(plan.trace_context, dict) else None
+        if trace_context is not None:
+            trace_context["prompt_cache_settle"] = {
+                "configured_delay_seconds": delay_seconds,
+                "same_lineage": initial_same_lineage,
+                "steering": steering,
+                "wait_seconds": round(time.monotonic() - started_at, 6),
+                "quiet_window_restarts": quiet_window_restarts,
+                "previous_lineage_hash": _trace_hash(initial_last_lineage),
+                "current_lineage_hash": _trace_hash(lineage),
+            }
 
 
 def _remember_responses_cache_settle_finish(
