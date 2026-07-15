@@ -75,15 +75,17 @@ import usage_reminder
 import usage_tracking
 import util
 from collections import OrderedDict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from threading import Lock, Thread
 from urllib.parse import urlsplit
 from uuid import uuid4
 
 import httpx
 import uvicorn
+from anyio import CancelScope
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
+from starlette.requests import ClientDisconnect
 from anthropic_stream import AnthropicStreamTranslator
 from bridge_streams import (
     AnthropicToResponsesStreamTranslator,
@@ -208,11 +210,9 @@ _DEBUG_DETAIL_REQUEST_SNAPSHOTS_BY_ID: OrderedDict[str, dict] = OrderedDict()
 _DEBUG_DETAIL_SESSION_CAPTURED_REQUEST_IDS: OrderedDict[str, set[str]] = OrderedDict()
 _DEBUG_DETAIL_SNAPSHOT_SEQUENCE = 0
 
-# Upstream Responses prompt-cache settle. Related lineage handoffs get a short
-# quiet window, while user-classified steering gets a longer one.
-# Ordinary same-lineage agent/tool continuations remain unthrottled.
+# Upstream Responses prompt-cache settle for related cross-lineage handoffs.
+# Same-lineage traffic is coordinated directly and is never delayed here.
 RESPONSES_CACHE_SETTLE_DELAY_SECONDS = 3.0
-RESPONSES_STEERING_CACHE_SETTLE_DELAY_SECONDS = 5.0
 _PROMPT_CACHE_SETTLE_LOCK = threading.Lock()
 _PROMPT_CACHE_LAST_FINISH_BY_FAMILY: dict[tuple[str, str], tuple[str, float]] = {}
 
@@ -269,8 +269,17 @@ class GracefulStreamingResponse(StreamingResponse):
     async def __call__(self, scope, receive, send):
         try:
             await super().__call__(scope, receive, send)
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, ClientDisconnect):
             return
+        finally:
+            # ASGI 2.3 can return normally after its disconnect task cancels
+            # the streaming task, while ASGI 2.4 raises outside the iterator.
+            # Always close the body owner, including when response.start fails
+            # before the first body iteration.
+            close_iterator = getattr(self.body_iterator, "aclose", None)
+            if callable(close_iterator):
+                with CancelScope(shield=True):
+                    await close_iterator()
 
 
 def set_initiator_policy(policy: InitiatorPolicy):
@@ -774,6 +783,47 @@ class UpstreamRequestPlan:
     auto_update_request_tracked: bool = False
 
 
+@dataclass
+class _ActiveResponsesStream:
+    identity: tuple[str, str]
+    request_id: str
+    sequence: int
+    plan: UpstreamRequestPlan
+    task: asyncio.Task
+    upstream: httpx.Response | None = None
+    superseded_by: str | None = None
+    transport_cancel: str | None = None
+    cancel_requested: bool = False
+    send_started: bool = False
+    response_ready: asyncio.Event = field(default_factory=asyncio.Event)
+    stream_body: object | None = None
+    completed_event_seen: bool = False
+    transport_cancel_attempt: str | None = None
+    teardown_confirmed: bool = False
+    teardown_complete: asyncio.Event = field(default_factory=asyncio.Event)
+
+
+class _ResponsesSupersessionBlocked(RuntimeError):
+    def __init__(self, results: list[dict]):
+        super().__init__("prior same-lineage generation cancellation was not confirmed")
+        self.results = results
+
+
+_ACTIVE_RESPONSES_STREAMS_LOCK = threading.Lock()
+_ACTIVE_RESPONSES_STREAM_SEQUENCE = 0
+_ACTIVE_RESPONSES_STREAMS: dict[
+    tuple[str, str],
+    dict[str, _ActiveResponsesStream],
+] = {}
+
+
+def _task_is_cancelling(task: asyncio.Task | None) -> bool:
+    if task is None:
+        return False
+    cancelling = getattr(task, "cancelling", None)
+    return bool(cancelling()) if callable(cancelling) else False
+
+
 def _responses_plan_model(plan: "UpstreamRequestPlan | None") -> str:
     if not isinstance(plan, UpstreamRequestPlan):
         return ""
@@ -791,29 +841,14 @@ def _responses_plan_is_user_steering(plan: "UpstreamRequestPlan | None") -> bool
     if not isinstance(verdict, dict):
         return False
     # The candidate reflects the actual latest input shape. The resolved value
-    # may be forced back to ``agent`` during the cooldown safeguard, so keying
-    # only on the resolved initiator would miss the steering turns that most
-    # need the longer cache-settle window.
+    # may be forced back to ``agent`` during the cooldown safeguard.
     return str(verdict.get("candidate_initiator") or "").strip().lower() == "user"
 
 
 def _prompt_cache_settle_delay_seconds(plan: "UpstreamRequestPlan | None" = None) -> float:
-    steering = _responses_plan_is_user_steering(plan)
-    default = (
-        RESPONSES_STEERING_CACHE_SETTLE_DELAY_SECONDS
-        if steering
-        else RESPONSES_CACHE_SETTLE_DELAY_SECONDS
-    )
-    raw_value = None
-    if steering:
-        raw_value = os.environ.get(
-            "GHCP_PROXY_RESPONSES_STEERING_CACHE_SETTLE_DELAY_SECONDS"
-        )
-    # Preserve the original variable as the base Responses setting and as a
-    # backwards-compatible fallback for steering when no steering-specific
-    # override is present.
-    if raw_value is None:
-        raw_value = os.environ.get("GHCP_PROXY_RESPONSES_CACHE_SETTLE_DELAY_SECONDS")
+    del plan
+    default = RESPONSES_CACHE_SETTLE_DELAY_SECONDS
+    raw_value = os.environ.get("GHCP_PROXY_RESPONSES_CACHE_SETTLE_DELAY_SECONDS")
     if raw_value is None:
         return default
     try:
@@ -886,6 +921,620 @@ def _responses_cache_settle_identity(
     return model, lineage, f"family:{family_root}"
 
 
+def _responses_active_stream_identity(
+    plan: "UpstreamRequestPlan | None",
+) -> tuple[str, str] | None:
+    if not _responses_plan_uses_native_upstream(plan) or not isinstance(plan, UpstreamRequestPlan):
+        return None
+    # The fallback task ID hashes the latest user text and can collide across
+    # unrelated no-affinity requests. Only coordinate requests carrying a
+    # durable conversation affinity, then key by the derived task lineage
+    # without the model so steering across a model switch still stops the old
+    # generation.
+    explicit_affinity = None
+    for candidate in (plan.source_body, plan.body):
+        if not isinstance(candidate, dict):
+            continue
+        for key in ("prompt_cache_key", "promptCacheKey", "session_id", "sessionId"):
+            value = candidate.get(key)
+            if isinstance(value, str) and value.strip():
+                explicit_affinity = value.strip()
+                break
+        if explicit_affinity is None:
+            metadata = candidate.get("metadata")
+            if isinstance(metadata, dict):
+                for key in ("session_id", "sessionId"):
+                    value = metadata.get(key)
+                    if isinstance(value, str) and value.strip():
+                        explicit_affinity = value.strip()
+                        break
+        if explicit_affinity is not None:
+            break
+    if explicit_affinity is None and isinstance(plan.usage_event, dict):
+        event_session_id = plan.usage_event.get("session_id")
+        if isinstance(event_session_id, str) and event_session_id.strip():
+            explicit_affinity = event_session_id.strip()
+    if explicit_affinity is None:
+        return None
+    lineage = _responses_plan_lineage(plan)
+    return "responses", lineage or _trace_hash(explicit_affinity)
+
+
+def _httpcore_http2_stream(upstream: httpx.Response):
+    """Best-effort access to httpcore's HTTP/2 response stream.
+
+    httpx/httpcore currently release local HTTP/2 stream state on
+    ``Response.aclose()`` without sending RST_STREAM.  Keep this isolated and
+    defensive so a dependency layout change falls back to ordinary close.
+    """
+    http_version = upstream.extensions.get("http_version")
+    if http_version not in {b"HTTP/2", "HTTP/2"}:
+        return None
+    bound_stream = getattr(upstream, "stream", None)
+    transport_stream = getattr(bound_stream, "_stream", None)
+    pool_stream = getattr(transport_stream, "_httpcore_stream", None)
+    core_stream = getattr(pool_stream, "_stream", None)
+    if not all(
+        hasattr(core_stream, attr)
+        for attr in ("_connection", "_request", "_stream_id", "_closed")
+    ):
+        return None
+    connection = core_stream._connection
+    if not all(
+        hasattr(connection, attr)
+        for attr in ("_h2_state", "_write_outgoing_data")
+    ):
+        return None
+    return core_stream
+
+
+async def _reset_http2_upstream_stream(upstream: httpx.Response) -> tuple[bool, str]:
+    core_stream = _httpcore_http2_stream(upstream)
+    if core_stream is None:
+        return False, "unavailable"
+    if core_stream._closed:
+        return False, "already_closed"
+    try:
+        # RFC 7540 error code 0x8 is CANCEL. Sending it matters: httpcore's
+        # normal response close only forgets the local stream and can leave the
+        # model generating on the server.
+        core_stream._connection._h2_state.reset_stream(
+            core_stream._stream_id,
+            error_code=0x8,
+        )
+        await core_stream._connection._write_outgoing_data(core_stream._request)
+        return True, "sent"
+    except Exception:
+        return False, "failed"
+
+
+async def _close_upstream_response(
+    upstream: httpx.Response,
+    *,
+    cancel_generation: bool = False,
+) -> str:
+    """Close an upstream response even when its ASGI body task was cancelled."""
+    reset_sent = False
+    reset_status = None
+    close_failed = False
+    http_version = upstream.extensions.get("http_version")
+    with CancelScope(shield=True):
+        if cancel_generation:
+            reset_sent, reset_status = await _reset_http2_upstream_stream(upstream)
+        try:
+            await upstream.aclose()
+        except Exception:
+            # Finalization and trace bookkeeping still need to run if the
+            # transport itself is already broken.
+            close_failed = True
+    if reset_sent:
+        return "http2_rst_cancel"
+    if close_failed:
+        return "response_close_failed"
+    if cancel_generation and http_version in {b"HTTP/1.0", b"HTTP/1.1", "HTTP/1.0", "HTTP/1.1"}:
+        # httpcore closes an HTTP/1.x socket when a response body is abandoned,
+        # which is the wire-level cancellation mechanism for that protocol.
+        return "http1_connection_close"
+    if cancel_generation and http_version in {b"HTTP/2", "HTTP/2"}:
+        return f"http2_reset_{reset_status or 'unknown'}"
+    if cancel_generation:
+        return "cancel_transport_unconfirmed"
+    return "response_close"
+
+
+def _register_active_responses_stream(
+    plan: "UpstreamRequestPlan | None",
+) -> _ActiveResponsesStream | None:
+    global _ACTIVE_RESPONSES_STREAM_SEQUENCE
+    identity = _responses_active_stream_identity(plan)
+    task = asyncio.current_task()
+    if identity is None or task is None or not isinstance(plan, UpstreamRequestPlan):
+        return None
+    with _ACTIVE_RESPONSES_STREAMS_LOCK:
+        _ACTIVE_RESPONSES_STREAM_SEQUENCE += 1
+        entry = _ActiveResponsesStream(
+            identity=identity,
+            request_id=plan.request_id,
+            sequence=_ACTIVE_RESPONSES_STREAM_SEQUENCE,
+            plan=plan,
+            task=task,
+        )
+        _ACTIVE_RESPONSES_STREAMS.setdefault(identity, {})[plan.request_id] = entry
+    return entry
+
+
+def _unregister_active_responses_stream(entry: _ActiveResponsesStream | None) -> None:
+    if entry is None:
+        return
+    with _ACTIVE_RESPONSES_STREAMS_LOCK:
+        streams = _ACTIVE_RESPONSES_STREAMS.get(entry.identity)
+        if not streams or streams.get(entry.request_id) is not entry:
+            return
+        streams.pop(entry.request_id, None)
+        if not streams:
+            _ACTIVE_RESPONSES_STREAMS.pop(entry.identity, None)
+
+
+def _complete_active_responses_teardown(
+    entry: _ActiveResponsesStream | None,
+    *,
+    transport_cancel: str,
+    confirmed: bool,
+    completed: bool = False,
+) -> None:
+    if entry is None:
+        return
+    entry.transport_cancel = transport_cancel
+    entry.completed_event_seen = completed
+    entry.teardown_confirmed = confirmed
+    entry.response_ready.set()
+    entry.teardown_complete.set()
+    if confirmed:
+        _unregister_active_responses_stream(entry)
+
+
+def _responses_supersession_timeout_seconds() -> float:
+    raw_value = os.environ.get("GHCP_PROXY_RESPONSES_SUPERSESSION_TIMEOUT_SECONDS")
+    if raw_value is None:
+        return 2.0
+    try:
+        return max(0.1, float(str(raw_value).strip()))
+    except (TypeError, ValueError):
+        return 2.0
+
+
+def _cancel_active_responses_task(entry: _ActiveResponsesStream) -> None:
+    if (
+        not entry.task.done()
+        and not entry.cancel_requested
+        and not _task_is_cancelling(entry.task)
+    ):
+        entry.cancel_requested = True
+        entry.task.cancel()
+
+
+async def _wait_for_active_responses_event(
+    event: asyncio.Event,
+    timeout_seconds: float,
+) -> bool:
+    if event.is_set():
+        return True
+    try:
+        await asyncio.wait_for(event.wait(), timeout=timeout_seconds)
+        return True
+    except asyncio.TimeoutError:
+        return False
+
+
+async def _supersede_active_responses_streams(
+    plan: "UpstreamRequestPlan | None",
+    current_entry: _ActiveResponsesStream | None = None,
+) -> list[dict]:
+    """Stop active same-lineage generations before sending fresh steering."""
+    if not _responses_plan_is_user_steering(plan):
+        return []
+    identity = _responses_active_stream_identity(plan)
+    if identity is None or not isinstance(plan, UpstreamRequestPlan):
+        return []
+    current_task = asyncio.current_task()
+    with _ACTIVE_RESPONSES_STREAMS_LOCK:
+        prior_entries = [
+            entry
+            for entry in _ACTIVE_RESPONSES_STREAMS.get(identity, {}).values()
+            if entry.task is not current_task
+            and not (entry.teardown_complete.is_set() and entry.teardown_confirmed)
+            and (
+                current_entry is None
+                or entry.sequence < current_entry.sequence
+            )
+        ]
+        for entry in prior_entries:
+            entry.superseded_by = plan.request_id
+
+    timeout_seconds = _responses_supersession_timeout_seconds()
+
+    # Requests that have not entered httpx are safe to cancel immediately.
+    # A request awaiting response headers is different: cancellation at that
+    # point provides no Response stream handle with which to send HTTP/2
+    # RST_STREAM, so wait briefly for the handle instead of guessing that task
+    # cancellation stopped server-side generation.
+    for entry in prior_entries:
+        if not entry.send_started:
+            _cancel_active_responses_task(entry)
+
+    pre_response_timeouts: set[str] = set()
+    for entry in prior_entries:
+        if (
+            entry.send_started
+            and entry.upstream is None
+            and not entry.response_ready.is_set()
+            and not await _wait_for_active_responses_event(
+                entry.response_ready,
+                timeout_seconds,
+            )
+        ):
+            pre_response_timeouts.add(entry.request_id)
+
+    # Once a response handle exists, issue wire cancellation *before* task
+    # cancellation. Otherwise httpcore catches CancelledError first, drops its
+    # local HTTP/2 stream object without RST_STREAM, and removes our only handle
+    # for stopping server-side generation.
+    for entry in prior_entries:
+        if entry.upstream is not None:
+            request_cancel = getattr(entry.stream_body, "request_transport_cancel", None)
+            cancel_confirmed = False
+            if callable(request_cancel):
+                cancel_mode, cancel_confirmed = await request_cancel()
+                entry.transport_cancel_attempt = cancel_mode
+            if cancel_confirmed:
+                _cancel_active_responses_task(entry)
+
+    for entry in prior_entries:
+        if (
+            entry.task.done()
+            and not entry.teardown_complete.is_set()
+            and entry.stream_body is not None
+        ):
+            close_body = getattr(entry.stream_body, "aclose", None)
+            if callable(close_body):
+                await close_body()
+
+    results: list[dict] = []
+    for entry in prior_entries:
+        teardown_waited = await _wait_for_active_responses_event(
+            entry.teardown_complete,
+            timeout_seconds,
+        )
+        blocked_reason = None
+        if not teardown_waited:
+            blocked_reason = (
+                "response_handle_timeout"
+                if entry.request_id in pre_response_timeouts
+                else "teardown_timeout"
+            )
+        elif not entry.teardown_confirmed:
+            blocked_reason = "transport_cancel_unconfirmed"
+        results.append(
+            {
+                "request_id": entry.request_id,
+                "send_started": entry.send_started,
+                "response_ready": entry.response_ready.is_set(),
+                "task_done": entry.task.done(),
+                "completed_event_seen": entry.completed_event_seen,
+                "transport_cancel_attempt": entry.transport_cancel_attempt,
+                "transport_cancel": entry.transport_cancel,
+                "teardown_complete": entry.teardown_complete.is_set(),
+                "teardown_confirmed": entry.teardown_confirmed,
+                "blocked_reason": blocked_reason,
+            }
+        )
+    if results and isinstance(plan.trace_context, dict):
+        plan.trace_context["superseded_active_responses"] = results
+    if any(result.get("blocked_reason") for result in results):
+        for entry in prior_entries:
+            if (
+                entry.request_id in pre_response_timeouts
+                and not entry.cancel_requested
+                and entry.superseded_by == plan.request_id
+            ):
+                entry.superseded_by = None
+        raise _ResponsesSupersessionBlocked(results)
+    return results
+
+
+class _ManagedResponsesStreamBody:
+    """Own a Responses stream lifecycle independently of lazy iteration.
+
+    Starlette may observe a disconnect before it asks for the first body chunk.
+    An async generator's ``finally`` block does not run when an unstarted
+    generator is closed, so this concrete iterator owns teardown explicitly and
+    makes ``aclose()`` effective before, during, and after iteration.
+    """
+
+    def __init__(
+        self,
+        *,
+        upstream: httpx.Response,
+        body: dict,
+        headers: dict,
+        usage_event: dict | None,
+        stream_type: str,
+        trace_plan: UpstreamRequestPlan | None,
+        active_stream: _ActiveResponsesStream | None,
+    ):
+        self.upstream = upstream
+        self.usage_event = usage_event
+        self.stream_type = stream_type
+        self.trace_plan = trace_plan
+        self.active_stream = active_stream
+        self.capture = usage_tracker.create_sse_capture(stream_type)
+        self.source_loop_completed = False
+        self._finalizing = False
+        self._finalized = False
+        self._finalized_event = asyncio.Event()
+        self._preemptive_transport_cancel: str | None = None
+        self._transport_cancel_attempt: str | None = None
+        self._transport_cancel_task: asyncio.Task | None = None
+
+        replay_id_state = None
+        if stream_type == "responses":
+            replay_source_body = (
+                trace_plan.source_body
+                if isinstance(trace_plan, UpstreamRequestPlan)
+                else body
+            )
+            replay_headers = (
+                trace_plan.headers
+                if isinstance(trace_plan, UpstreamRequestPlan)
+                else headers
+            )
+            _, replay_id_state = responses_replay_ids.state_for_body(
+                replay_source_body,
+                headers=replay_headers,
+                subagent=(
+                    trace_plan.replay_subagent
+                    if isinstance(trace_plan, UpstreamRequestPlan)
+                    else None
+                ),
+            )
+        source_iter = _stream_with_update_notice(
+            upstream.aiter_bytes(),
+            stream_type,
+            getattr(upstream, "headers", None),
+        )
+        if stream_type == "responses":
+            source_iter = ResponsesStreamIdSyncer(replay_id_state).sync(source_iter)
+        self._source_iter = source_iter.__aiter__()
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        # Keep task cancellation from reaching httpcore before we can emit
+        # RST_STREAM. httpcore otherwise closes and discards its private stream
+        # state while leaving the server-side generation alive.
+        source_task = asyncio.create_task(self._source_iter.__anext__())
+        try:
+            chunk = await asyncio.shield(source_task)
+        except StopAsyncIteration:
+            self.source_loop_completed = True
+            await self._finalize("source_eof")
+            raise
+        except asyncio.CancelledError:
+            if self.active_stream is not None:
+                self.active_stream.cancel_requested = True
+            with CancelScope(shield=True):
+                await self.request_transport_cancel()
+                if not source_task.done():
+                    source_task.cancel()
+                try:
+                    await source_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+            await self._finalize("downstream_cancelled")
+            raise
+        except Exception as exc:
+            await self._finalize("upstream_error", error=exc)
+            raise
+
+        if self.capture.feed(chunk):
+            usage_tracker.mark_first_output(self.usage_event)
+        return chunk
+
+    async def aclose(self) -> None:
+        if not self._finalized and not self.capture.terminal_event_seen:
+            await self.request_transport_cancel()
+        await self._finalize("downstream_closed")
+        close_source = getattr(self._source_iter, "aclose", None)
+        if callable(close_source):
+            with CancelScope(shield=True):
+                try:
+                    await close_source()
+                except (asyncio.CancelledError, RuntimeError):
+                    pass
+
+    async def request_transport_cancel(self) -> tuple[str, bool]:
+        """Cancel the wire stream before the owning ASGI task is cancelled."""
+        if self._preemptive_transport_cancel is not None:
+            return self._preemptive_transport_cancel, True
+        if self._transport_cancel_attempt is not None:
+            return self._transport_cancel_attempt, False
+        if self._transport_cancel_task is None:
+            cancel_owner_on_success = (
+                self.active_stream is not None
+                and asyncio.current_task() is not self.active_stream.task
+            )
+            self._transport_cancel_task = asyncio.create_task(
+                self._perform_transport_cancel(
+                    cancel_owner_on_success=cancel_owner_on_success,
+                )
+            )
+        done, _pending = await asyncio.wait(
+            {self._transport_cancel_task},
+            timeout=_responses_supersession_timeout_seconds(),
+        )
+        if not done:
+            if self.active_stream is not None:
+                self.active_stream.transport_cancel_attempt = "transport_cancel_timeout"
+            return "transport_cancel_timeout", False
+        return self._transport_cancel_task.result()
+
+    async def _confirm_transport_cancel_after_finalize(self, mode: str) -> None:
+        await self._finalized_event.wait()
+        await _close_upstream_response(self.upstream)
+        _complete_active_responses_teardown(
+            self.active_stream,
+            transport_cancel=mode,
+            confirmed=True,
+        )
+
+    async def _perform_transport_cancel(
+        self,
+        *,
+        cancel_owner_on_success: bool,
+    ) -> tuple[str, bool]:
+        http_version = self.upstream.extensions.get("http_version")
+        if http_version in {b"HTTP/2", "HTTP/2"}:
+            reset_sent, reset_status = await _reset_http2_upstream_stream(self.upstream)
+            mode = "http2_rst_cancel" if reset_sent else f"http2_reset_{reset_status}"
+        elif http_version in {b"HTTP/1.0", b"HTTP/1.1", "HTTP/1.0", "HTTP/1.1"}:
+            mode = await _close_upstream_response(
+                self.upstream,
+                cancel_generation=True,
+            )
+            reset_sent = mode == "http1_connection_close"
+        else:
+            mode = "cancel_transport_unconfirmed"
+            reset_sent = False
+
+        self._transport_cancel_attempt = mode
+        if self.active_stream is not None:
+            self.active_stream.transport_cancel_attempt = mode
+        if reset_sent:
+            self._preemptive_transport_cancel = mode
+            if cancel_owner_on_success and self.active_stream is not None:
+                _cancel_active_responses_task(self.active_stream)
+            if self._finalized:
+                await _close_upstream_response(self.upstream)
+                _complete_active_responses_teardown(
+                    self.active_stream,
+                    transport_cancel=mode,
+                    confirmed=True,
+                )
+            elif self._finalizing:
+                asyncio.create_task(
+                    self._confirm_transport_cancel_after_finalize(mode)
+                )
+        return mode, reset_sent
+
+    async def _finalize(self, cause: str, *, error: Exception | None = None) -> None:
+        with CancelScope(shield=True):
+            if self._finalized:
+                return
+            if self._finalizing:
+                await self._finalized_event.wait()
+                return
+            self._finalizing = True
+
+            completed = self.capture.completed_event_seen
+            terminal_eof = (
+                self.capture.terminal_event_seen
+                and self.source_loop_completed
+                and cause == "source_eof"
+            )
+            generation_ended = completed or self.capture.terminal_event_seen
+            if completed:
+                trace_status = self.upstream.status_code
+            elif self.capture.terminal_event_seen:
+                # response.failed, response.incomplete, or a bare [DONE] prove
+                # the generation ended, but are not a successful Responses
+                # completion.
+                trace_status = 502
+            elif self.active_stream is not None and self.active_stream.superseded_by:
+                trace_status = 499
+            elif cause in {"downstream_cancelled", "downstream_closed"}:
+                trace_status = 499
+            elif isinstance(error, httpx.RequestError):
+                trace_status, _message = format_translation.upstream_request_error_status_and_message(error)
+            else:
+                trace_status = 502
+
+            try:
+                if self._preemptive_transport_cancel is not None:
+                    await _close_upstream_response(self.upstream)
+                    transport_close = self._preemptive_transport_cancel
+                elif (
+                    self._transport_cancel_task is not None
+                    and not self._transport_cancel_task.done()
+                ):
+                    # A single background owner is still attempting the wire
+                    # cancel. Do not race it with a second Response.aclose().
+                    transport_close = "transport_cancel_pending"
+                elif self._transport_cancel_task is not None:
+                    await _close_upstream_response(self.upstream)
+                    transport_close = (
+                        self._transport_cancel_attempt
+                        or "cancel_transport_unconfirmed"
+                    )
+                else:
+                    transport_close = await _close_upstream_response(
+                        self.upstream,
+                        cancel_generation=not generation_ended,
+                    )
+            except asyncio.CancelledError:
+                # Repeated task cancellation can pierce library-level shields.
+                # Lifecycle state still must be committed synchronously.
+                transport_close = "transport_close_cancelled"
+
+            transport_cancel_confirmed = transport_close in {
+                "http2_rst_cancel",
+                "http1_connection_close",
+            }
+            teardown_confirmed = generation_ended or transport_cancel_confirmed
+            lifecycle = {
+                "termination_cause": cause,
+                "terminal_event_seen": self.capture.terminal_event_seen,
+                "terminal_event_type": self.capture.terminal_event_type,
+                "completed_event_seen": completed,
+                "terminal_eof": terminal_eof,
+                "generation_end_confirmed": generation_ended,
+                "source_loop_completed": self.source_loop_completed,
+                "superseded_by": (
+                    self.active_stream.superseded_by
+                    if self.active_stream is not None
+                    else None
+                ),
+                "transport_close": transport_close,
+                "transport_cancel_confirmed": transport_cancel_confirmed,
+                "teardown_confirmed": teardown_confirmed,
+                "upstream_error_type": type(error).__name__ if error is not None else None,
+            }
+            if isinstance(self.trace_plan, UpstreamRequestPlan) and isinstance(self.trace_plan.trace_context, dict):
+                self.trace_plan.trace_context["responses_stream_lifecycle"] = lifecycle
+
+            try:
+                _finish_usage_and_trace(
+                    self.trace_plan,
+                    trace_status,
+                    upstream=self.upstream,
+                    usage=(
+                        self.capture.usage
+                        if isinstance(self.capture.usage, dict)
+                        else None
+                    ),
+                )
+            finally:
+                _complete_active_responses_teardown(
+                    self.active_stream,
+                    transport_cancel=transport_close,
+                    confirmed=teardown_confirmed,
+                    completed=completed,
+                )
+                self._finalized = True
+                self._finalizing = False
+                self._finalized_event.set()
+
+
 async def _wait_for_responses_cache_settle(plan: "UpstreamRequestPlan | None") -> None:
     identity = _responses_cache_settle_identity(plan)
     if identity is None:
@@ -907,7 +1556,7 @@ async def _wait_for_responses_cache_settle(plan: "UpstreamRequestPlan | None") -
             break
         last_lineage, last_finished_at = last
         same_lineage = last_lineage == lineage
-        if same_lineage and not steering:
+        if same_lineage:
             break
         if initial_last_lineage is None:
             initial_last_lineage = last_lineage
@@ -1617,8 +2266,13 @@ def _trace_response_summary(
     status_code: int | None = None,
 ) -> dict:
     summary: dict = {}
+    if status_code is not None:
+        summary["status_code"] = status_code
     if upstream is not None:
-        summary["status_code"] = upstream.status_code
+        if status_code is None:
+            summary["status_code"] = upstream.status_code
+        elif upstream.status_code != status_code:
+            summary["upstream_status_code"] = upstream.status_code
         content_type = upstream.headers.get("content-type")
         if content_type:
             summary["content_type"] = content_type
@@ -1627,9 +2281,6 @@ def _trace_response_summary(
             if header_value:
                 summary["upstream_request_id"] = header_value
                 break
-    elif status_code is not None:
-        summary["status_code"] = status_code
-
     if isinstance(response_payload, dict):
         for key in ("id", "object", "model"):
             value = response_payload.get(key)
@@ -2895,98 +3546,214 @@ async def proxy_streaming_response(
     If the upstream request fails before the stream starts, return the upstream
     error body as a normal HTTP response instead of masking it as 200 SSE.
     """
-    client = _get_upstream_client()
-    request = client.build_request("POST", upstream_url, headers=headers, json=body)
+    active_stream = _register_active_responses_stream(trace_plan)
     try:
+        await _supersede_active_responses_streams(trace_plan, active_stream)
+        client = _get_upstream_client()
+        request = client.build_request("POST", upstream_url, headers=headers, json=body)
         await _wait_for_responses_cache_settle(trace_plan)
-        upstream = await throttled_client_send(client, request, stream=True)
+        if active_stream is not None:
+            active_stream.send_started = True
+        try:
+            upstream = await throttled_client_send(client, request, stream=True)
+            if active_stream is not None:
+                active_stream.upstream = upstream
+        finally:
+            if active_stream is not None:
+                active_stream.response_ready.set()
+    except _ResponsesSupersessionBlocked:
+        status_code = 409
+        message = (
+            "The previous same-lineage generation could not be confirmed stopped; "
+            "this follow-up was not sent upstream to prevent duplicate token spend."
+        )
+        try:
+            _finish_usage_and_trace(trace_plan, status_code, response_text=message)
+        finally:
+            _complete_active_responses_teardown(
+                active_stream,
+                transport_cancel="not_sent_supersession_blocked",
+                confirmed=True,
+            )
+        return format_translation.openai_error_response(status_code, message)
+    except asyncio.CancelledError:
+        transport_cancel = "not_sent_task_cancel"
+        teardown_confirmed = active_stream is None or not active_stream.send_started
+        if active_stream is not None:
+            active_stream.cancel_requested = True
+            if active_stream.upstream is not None:
+                transport_cancel = await _close_upstream_response(
+                    active_stream.upstream,
+                    cancel_generation=True,
+                )
+                teardown_confirmed = transport_cancel in {
+                    "http2_rst_cancel",
+                    "http1_connection_close",
+                }
+            elif active_stream.send_started:
+                transport_cancel = "pre_response_cancel_unconfirmed"
+        try:
+            _finish_usage_and_trace(trace_plan, 499)
+        finally:
+            _complete_active_responses_teardown(
+                active_stream,
+                transport_cancel=transport_cancel,
+                confirmed=teardown_confirmed,
+            )
+        raise
     except httpx.RequestError as exc:
         status_code, message = format_translation.upstream_request_error_status_and_message(exc)
-        _finish_usage_and_trace(trace_plan, status_code, response_text=message)
+        teardown_confirmed = isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout))
+        try:
+            _finish_usage_and_trace(trace_plan, status_code, response_text=message)
+        finally:
+            _complete_active_responses_teardown(
+                active_stream,
+                transport_cancel=(
+                    "connect_failed_before_request"
+                    if teardown_confirmed
+                    else "pre_response_request_error_unconfirmed"
+                ),
+                confirmed=teardown_confirmed,
+            )
         return format_translation.openai_error_response(status_code, message)
     except Exception:
-        _finish_usage_and_trace(trace_plan, 599)
+        try:
+            _finish_usage_and_trace(trace_plan, 599)
+        finally:
+            _complete_active_responses_teardown(
+                active_stream,
+                transport_cancel=(
+                    "not_sent_setup_error"
+                    if active_stream is None or not active_stream.send_started
+                    else "pre_response_exception_unconfirmed"
+                ),
+                confirmed=active_stream is None or not active_stream.send_started,
+            )
         raise
 
     if upstream.status_code >= 400:
-        await upstream.aread()
-        if upstream.status_code >= 400:
+        try:
+            await upstream.aread()
+            return _handle_upstream_error(
+                upstream,
+                trace_plan=trace_plan,
+                caller_protocol=stream_type,
+                stream=True,
+                model=trace_plan.resolved_model if isinstance(trace_plan, UpstreamRequestPlan) else None,
+                fallback_error_response=proxy_non_streaming_response,
+            )
+        except asyncio.CancelledError:
+            transport_cancel = await _close_upstream_response(
+                upstream,
+                cancel_generation=True,
+            )
+            transport_confirmed = transport_cancel in {
+                "http2_rst_cancel",
+                "http1_connection_close",
+            }
+            if isinstance(trace_plan, UpstreamRequestPlan) and isinstance(trace_plan.trace_context, dict):
+                trace_plan.trace_context["responses_stream_lifecycle"] = {
+                    "termination_cause": "upstream_error_body_cancelled",
+                    "terminal_event_seen": False,
+                    "terminal_event_type": None,
+                    "completed_event_seen": False,
+                    "generation_end_confirmed": False,
+                    "transport_close": transport_cancel,
+                    "transport_cancel_confirmed": transport_confirmed,
+                    "teardown_confirmed": transport_confirmed,
+                }
             try:
-                await upstream.aread()
-                return _handle_upstream_error(
-                    upstream,
-                    trace_plan=trace_plan,
-                    caller_protocol=stream_type,
-                    stream=True,
-                    model=trace_plan.resolved_model if isinstance(trace_plan, UpstreamRequestPlan) else None,
-                    fallback_error_response=proxy_non_streaming_response,
+                _finish_usage_and_trace(trace_plan, 499, upstream=upstream)
+            finally:
+                _complete_active_responses_teardown(
+                    active_stream,
+                    transport_cancel=transport_cancel,
+                    confirmed=transport_confirmed,
+                )
+            raise
+        except httpx.RequestError as exc:
+            status_code, message = format_translation.upstream_request_error_status_and_message(exc)
+            transport_cancel = await _close_upstream_response(
+                upstream,
+                cancel_generation=True,
+            )
+            transport_confirmed = transport_cancel in {
+                "http2_rst_cancel",
+                "http1_connection_close",
+            }
+            if isinstance(trace_plan, UpstreamRequestPlan) and isinstance(trace_plan.trace_context, dict):
+                trace_plan.trace_context["responses_stream_lifecycle"] = {
+                    "termination_cause": "upstream_error_body_read",
+                    "terminal_event_seen": False,
+                    "terminal_event_type": None,
+                    "completed_event_seen": False,
+                    "generation_end_confirmed": False,
+                    "transport_close": transport_cancel,
+                    "transport_cancel_confirmed": transport_confirmed,
+                    "teardown_confirmed": transport_confirmed,
+                    "upstream_error_type": type(exc).__name__,
+                }
+            try:
+                _finish_usage_and_trace(
+                    trace_plan,
+                    status_code,
+                    upstream=upstream,
+                    response_text=message,
                 )
             finally:
-                await upstream.aclose()
+                _complete_active_responses_teardown(
+                    active_stream,
+                    transport_cancel=transport_cancel,
+                    confirmed=transport_confirmed,
+                )
+            return format_translation.openai_error_response(status_code, message)
+        finally:
+            if active_stream is None or not active_stream.teardown_complete.is_set():
+                transport_close = await _close_upstream_response(upstream)
+                _complete_active_responses_teardown(
+                    active_stream,
+                    transport_cancel=transport_close,
+                    confirmed=True,
+                )
 
     response_headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
     content_type = upstream.headers.get("content-type")
     if content_type:
         response_headers["content-type"] = content_type
 
-    async def stream_upstream():
-        capture = usage_tracker.create_sse_capture(stream_type)
-        replay_id_state = None
-        if stream_type == "responses":
-            replay_source_body = (
-                trace_plan.source_body
-                if isinstance(trace_plan, UpstreamRequestPlan)
-                else body
-            )
-            replay_headers = (
-                trace_plan.headers
-                if isinstance(trace_plan, UpstreamRequestPlan)
-                else headers
-            )
-            _, replay_id_state = responses_replay_ids.state_for_body(
-                replay_source_body,
-                headers=replay_headers,
-                subagent=(
-                    trace_plan.replay_subagent
-                    if isinstance(trace_plan, UpstreamRequestPlan)
-                    else None
-                ),
-            )
-        source_iter = _stream_with_update_notice(upstream.aiter_bytes(), stream_type, getattr(upstream, "headers", None))
-        if stream_type == "responses":
-            source_iter = ResponsesStreamIdSyncer(replay_id_state).sync(source_iter)
-        finish_called = False
+    try:
+        stream_body = _ManagedResponsesStreamBody(
+            upstream=upstream,
+            body=body,
+            headers=headers,
+            usage_event=usage_event,
+            stream_type=stream_type,
+            trace_plan=trace_plan,
+            active_stream=active_stream,
+        )
+    except Exception:
+        transport_cancel = await _close_upstream_response(
+            upstream,
+            cancel_generation=True,
+        )
         try:
-            # Relay complete SSE chunks immediately.  The old Responses-only
-            # path buffered response.completed/[DONE] until the upstream
-            # connection closed so it could append a cache-tripwire warning.
-            # That warning path no longer exists, and keeping the terminal
-            # events buffered can leave Codex waiting even though the model has
-            # already finished producing output.
-            async for chunk in source_iter:
-                if capture.feed(chunk):
-                    usage_tracker.mark_first_output(usage_event)
-                yield chunk
-
-            _finish_usage_and_trace(
-                trace_plan,
-                upstream.status_code,
-                upstream=upstream,
-                usage=capture.usage if isinstance(capture.usage, dict) else None,
-            )
-            finish_called = True
+            _finish_usage_and_trace(trace_plan, 599, upstream=upstream)
         finally:
-            if not finish_called:
-                _finish_usage_and_trace(
-                    trace_plan,
-                    upstream.status_code,
-                    upstream=upstream,
-                    usage=capture.usage if isinstance(capture.usage, dict) else None,
-                )
-            await upstream.aclose()
+            _complete_active_responses_teardown(
+                active_stream,
+                transport_cancel=transport_cancel,
+                confirmed=transport_cancel in {
+                    "http2_rst_cancel",
+                    "http1_connection_close",
+                },
+            )
+        raise
+    if active_stream is not None:
+        active_stream.stream_body = stream_body
 
     return GracefulStreamingResponse(
-        stream_upstream(),
+        stream_body,
         status_code=upstream.status_code,
         headers=response_headers,
     )

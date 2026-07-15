@@ -3164,12 +3164,9 @@
 
     function totalTokenConsumption(row) {
       const freshInput = Math.max(0, Number(row?.input_tokens || 0));
-      // Unify output accounting for display: OpenAI's output_tokens excludes reasoning
-      // (reported separately in reasoning_output_tokens); Anthropic's output_tokens already
-      // includes thinking and reasoning_output_tokens is 0. Summing gives the true billable
-      // output token count across both providers without changing API contracts.
-      const output = Math.max(0, Number(row?.output_tokens || 0))
-                   + Math.max(0, Number(row?.reasoning_output_tokens || 0));
+      // Reasoning/thinking is already included in output_tokens. Keep the
+      // reasoning field as a diagnostic breakdown without stacking it again.
+      const output = Math.max(0, Number(row?.output_tokens || 0));
       return {
         visible_output_tokens: output,
         stacked_total_tokens: freshInput + output,
@@ -3505,7 +3502,7 @@
         rawRows() {
           const u = this.activeUsage || {};
           const freshInput = Number(u.input_tokens || 0);
-          const outputTokens = Number(u.output_tokens || 0) + Number(u.reasoning_output_tokens || 0);
+          const outputTokens = Number(u.output_tokens || 0);
           const totalCost = Number(u.cost_usd || 0);
           const rows = [
             { label: 'Input (fresh)',    tokens: freshInput,                                     field: 'input_fresh',             color: '#ff8752' },
@@ -4732,13 +4729,10 @@
           return displayTotalTokensFromUsage(usage);
         },
         displayOutputTokens(usage) {
-          // Unified output for display: OpenAI separates reasoning from output, Anthropic
-          // folds it into output already. Summing gives the true billable output token
-          // count across both providers. Storage/API fields are unchanged.
+          // reasoning_output_tokens is a subset retained for diagnostics.
           if (!usage || typeof usage !== 'object') return 0;
           const output = Number(usage.output_tokens || 0);
-          const reasoning = Number(usage.reasoning_output_tokens || 0);
-          return (Number.isFinite(output) ? output : 0) + (Number.isFinite(reasoning) ? reasoning : 0);
+          return Number.isFinite(output) ? output : 0;
         },
         requestChainRows(row) {
           const chainId = row?.server_request_id;

@@ -477,6 +477,7 @@ class ResponsesStreamIdSyncer:
         self._output_items: dict[int, str] = {}
         self._output_item_ids_are_synthetic: dict[int, bool] = {}
         self._replay_id_state = replay_id_state
+        self._pending_replay_items: list[dict] = []
 
     @staticmethod
     def _encode(event_name: str | None, data: str) -> bytes:
@@ -527,7 +528,13 @@ class ResponsesStreamIdSyncer:
                         if function_item_id:
                             item["id"] = function_item_id
             if self._replay_id_state is not None and isinstance(response, dict):
+                # Commit replay identity only after the upstream confirms the
+                # response. IDs from an interrupted branch must not repair a
+                # later steering/follow-up branch.
+                for item in self._pending_replay_items:
+                    self._replay_id_state.observe_output_item(item)
                 self._replay_id_state.observe_response_payload(response)
+                self._pending_replay_items.clear()
             return json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
 
         output_index = payload.get("output_index")
@@ -547,8 +554,6 @@ class ResponsesStreamIdSyncer:
                     item["id"] = item_id
                 self._output_items[output_index] = item_id
                 self._output_item_ids_are_synthetic[output_index] = synthetic
-                if self._replay_id_state is not None and not synthetic:
-                    self._replay_id_state.observe_output_item(item)
         elif event_type == "response.output_item.done":
             item_id = self._output_items.get(output_index)
             synthetic = self._output_item_ids_are_synthetic.get(output_index, False)
@@ -562,14 +567,20 @@ class ResponsesStreamIdSyncer:
                     self._output_item_ids_are_synthetic[output_index] = False
                 upstream_item_id = item.get("id")
                 if (
-                    self._replay_id_state is not None
+                    function_item_id is None
+                    and synthetic
                     and isinstance(upstream_item_id, str)
                     and upstream_item_id
                 ):
-                    self._replay_id_state.observe_output_item(item)
-                elif self._replay_id_state is not None and not synthetic:
-                    self._replay_id_state.observe_output_item({**item, "id": item_id})
+                    # Prefer the real done-event ID over a placeholder created
+                    # for an earlier sparse added event.
+                    item_id = upstream_item_id
+                    self._output_items[output_index] = item_id
+                    synthetic = False
+                    self._output_item_ids_are_synthetic[output_index] = False
                 item["id"] = item_id
+                if self._replay_id_state is not None and item_id and not synthetic:
+                    self._pending_replay_items.append(dict(item))
         else:
             item_id = self._output_items.get(output_index)
             if item_id:

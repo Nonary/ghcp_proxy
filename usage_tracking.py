@@ -1,6 +1,7 @@
 """Usage event lifecycle, session/request tracking, persistence, archival, and SSE usage capture."""
 
 import hashlib
+import inspect
 import json
 import os
 import tempfile
@@ -28,7 +29,7 @@ from util import (
     utc_now, utc_now_iso,
     normalize_usage_payload, _normalize_model_name,
     _usage_event_model_name, _usage_event_source,
-    _usage_event_cost, _usage_event_estimated_cost,
+    _usage_event_estimated_cost,
     _server_request_chain_key, _codex_native_session_id_from_request_id, _codex_logs_service_tiers, _is_claude_request,
     extract_item_text, _parse_iso_datetime,
     _extract_payload_usage, _native_usage_event_dedupe_key, deduplicate_usage_events,
@@ -422,13 +423,14 @@ def _normalize_recorded_usage_event(
     normalized_usage = normalize_usage_payload(normalized_event.get("usage"))
     if isinstance(normalized_usage, dict):
         normalized_event["usage"] = normalized_usage
-        # codex_native cost always reflects the current service-tier multiplier
-        # (logs may have updated since archival); for non-native events, only
-        # backfill when missing.
-        if normalized_event.get("native_source") == "codex_native":
-            normalized_event["cost_usd"] = _usage_event_estimated_cost(normalized_event, usage=normalized_usage)
-        elif normalized_event.get("cost_usd") is None:
-            normalized_event["cost_usd"] = _usage_event_cost(_usage_event_model_name(normalized_event), normalized_usage)
+        # Costs are estimates derived from the normalized usage shape. Rebuild
+        # them on load so historical rows pick up accounting corrections (for
+        # example, reasoning tokens being a subset of output tokens) as well as
+        # current native service-tier metadata.
+        normalized_event["cost_usd"] = _usage_event_estimated_cost(
+            normalized_event,
+            usage=normalized_usage,
+        )
     _apply_missing_claude_session_context(normalized_event)
     return normalized_event
 
@@ -505,6 +507,9 @@ class SSEUsageCapture:
         self.stream_type = stream_type
         self.buffer = ""
         self.usage = None
+        self.terminal_event_seen = False
+        self.completed_event_seen = False
+        self.terminal_event_type = None
 
     def _has_text(self, value) -> bool:
         if not isinstance(value, str):
@@ -523,6 +528,11 @@ class SSEUsageCapture:
 
     def _consume_responses_payload(self, payload: dict) -> bool:
         event_type = str(payload.get("type", "")).strip().lower()
+        if event_type in {"response.completed", "response.failed", "response.incomplete"}:
+            self.terminal_event_seen = True
+            self.terminal_event_type = event_type
+        if event_type == "response.completed":
+            self.completed_event_seen = True
         response = payload.get("response")
         if isinstance(response, dict):
             if isinstance(response.get("usage"), dict):
@@ -561,7 +571,14 @@ class SSEUsageCapture:
             raw_block, normalized = normalized.split("\n\n", 1)
             from format_translation import parse_sse_block
             _event_name, data = parse_sse_block(raw_block)
-            if not data or data == "[DONE]":
+            if data == "[DONE]":
+                self.terminal_event_seen = True
+                if self.terminal_event_type is None:
+                    self.terminal_event_type = "done"
+                if self.stream_type != "responses":
+                    self.completed_event_seen = True
+                continue
+            if not data:
                 continue
             try:
                 payload = json.loads(data)
@@ -1301,7 +1318,29 @@ class UsageTracker:
             finished_at=finished_at,
         )
         if self.on_request_finished is not None:
-            self.on_request_finished(event.get("request_id"), finished_at=finished_at)
+            callback = self.on_request_finished
+            callback_kwargs = {"finished_at": finished_at}
+            try:
+                callback_parameters = inspect.signature(callback).parameters
+            except (TypeError, ValueError):
+                callback_parameters = {}
+            successful_parameter = callback_parameters.get("successful")
+            if (
+                (
+                    successful_parameter is not None
+                    and successful_parameter.kind
+                    in {
+                        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                        inspect.Parameter.KEYWORD_ONLY,
+                    }
+                )
+                or any(
+                    parameter.kind == inspect.Parameter.VAR_KEYWORD
+                    for parameter in callback_parameters.values()
+                )
+            ):
+                callback_kwargs["successful"] = status_code < 400
+            callback(event.get("request_id"), **callback_kwargs)
         finished_event = {
             **{key: value for key, value in event.items() if not str(key).startswith("_")},
             "finished_at": finished_at.isoformat(),

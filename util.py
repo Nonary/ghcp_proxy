@@ -622,8 +622,6 @@ def _usage_event_cost_breakdown(model_name: str | None, usage: dict | None) -> d
     cache_creation_input_tokens = _coerce_int(usage.get("pricing_cache_creation_input_tokens"), default=None)
     if cache_creation_input_tokens is None:
         cache_creation_input_tokens = _coerce_int(usage.get("cache_creation_input_tokens"))
-    reasoning_output_tokens = _coerce_int(usage.get("reasoning_output_tokens"))
-
     billed_input_tokens = input_tokens + cached_input_tokens + cache_creation_input_tokens
     long_context_threshold = _coerce_int(entry.get("long_context_threshold"), default=None)
     if long_context_threshold is not None and billed_input_tokens > long_context_threshold:
@@ -647,11 +645,13 @@ def _usage_event_cost_breakdown(model_name: str | None, usage: dict | None) -> d
     if str(entry.get("provider") or "").lower() == "anthropic":
         cache_creation_rate = _anthropic_cache_creation_rate_per_million(entry)
 
-    billable_output_tokens = output_tokens + reasoning_output_tokens
     breakdown["input_fresh"] = (input_tokens * input_rate) / 1_000_000.0
     breakdown["cached_input"] = (cached_input_tokens * cached_rate) / 1_000_000.0
     breakdown["cache_creation"] = (cache_creation_input_tokens * cache_creation_rate) / 1_000_000.0
-    breakdown["output"] = (billable_output_tokens * output_rate) / 1_000_000.0
+    # OpenAI/Responses and Anthropic both include reasoning/thinking in their
+    # reported output_tokens. reasoning_output_tokens is a diagnostic subset,
+    # not an additional billable bucket.
+    breakdown["output"] = (output_tokens * output_rate) / 1_000_000.0
     return breakdown
 
 
