@@ -1348,7 +1348,8 @@
     .card-link { color: var(--accent); opacity: 0.84; }
     .card-link:hover { opacity: 1; }
 
-    .button-link, button.primary, button.danger, button:not(.icon-btn):not(.copy-btn):not(.pgbtn):not(.tabbtn) {
+    .button-link,
+    button:not(.nav-item):not(.icon-btn):not(.copy-btn):not(.pgbtn):not(.tabbtn):not(.primary):not(.danger) {
       border-radius: 11px;
       border-color: rgba(171, 196, 220, 0.16);
       background: rgba(18, 34, 49, 0.78);
@@ -1479,6 +1480,56 @@
       .kpi-meta .row:last-child { grid-column: auto; }
       .card { padding: 16px; border-radius: 17px; }
       .workspace-header h1 { font-size: 1.9rem; }
+    }
+
+    /* Final contrast overrides: ensure every visible button reads clearly
+       against the dark dashboard surface, even if earlier rules inherit a
+       weak foreground color from the browser or another theme block. */
+    button:not(.nav-item) {
+      color: var(--text);
+      background: rgba(18, 34, 49, 0.92);
+      border: 1px solid rgba(171, 196, 220, 0.22);
+    }
+    button:not(.nav-item):hover:not(:disabled) {
+      background: rgba(29, 48, 68, 0.98);
+      border-color: rgba(171, 196, 220, 0.34);
+      color: var(--text);
+    }
+    button:not(.nav-item):disabled {
+      opacity: 0.55;
+      cursor: not-allowed;
+    }
+    button.primary {
+      color: #051b12;
+      background: linear-gradient(135deg, #b6f8dc, #79e7c2);
+      border-color: rgba(139, 240, 199, 0.52);
+    }
+    button.primary:hover:not(:disabled) {
+      background: linear-gradient(135deg, #c6fae4, #8af0cd);
+      color: #03140d;
+    }
+    button.danger {
+      color: var(--danger);
+      background: rgba(255, 142, 157, 0.12);
+      border-color: rgba(255, 142, 157, 0.28);
+    }
+    .tabbtn,
+    .pager .pgbtn,
+    .copy-btn,
+    .icon-btn,
+    .button-link {
+      color: var(--text);
+      border-color: rgba(171, 196, 220, 0.22);
+    }
+    .tabbtn.active,
+    .pager .pgbtn.active {
+      color: #eafff7;
+      background: rgba(139, 240, 199, 0.16);
+      border-color: rgba(139, 240, 199, 0.30);
+    }
+    .button-link,
+    button.primary {
+      color: #051b12;
     }
 
   </style>
