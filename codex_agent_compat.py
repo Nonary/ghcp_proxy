@@ -157,18 +157,13 @@ def codex_parent_affinity(body: dict | None) -> str | None:
     """
     if codex_subagent_identity(body) is None:
         return None
-
-    for mapping in _metadata_mappings(body):
-        for key in (
-            "x-codex-parent-thread-id",
-            "x_codex_parent_thread_id",
-            "parent_thread_id",
-            "parentThreadId",
-        ):
-            value = _non_empty_string(mapping.get(key))
-            if value:
-                return value
-    return None
+    return _codex_metadata_value(
+        body,
+        "x-codex-parent-thread-id",
+        "x_codex_parent_thread_id",
+        "parent_thread_id",
+        "parentThreadId",
+    )
 
 
 def codex_session_id(body: dict | None) -> str | None:
@@ -180,12 +175,45 @@ def codex_session_id(body: dict | None) -> str | None:
     other local session bookkeeping; parent routing still requires the more
     specific :func:`codex_parent_affinity` above.
     """
-    for mapping in _metadata_mappings(body):
-        for key in ("session_id", "sessionId"):
+    return _codex_metadata_value(body, "session_id", "sessionId")
+
+
+def _codex_metadata_value(body: dict | None, *keys: str) -> str | None:
+    """Return the first non-empty value from Codex turn metadata.
+
+    Current Codex builds duplicate some lifecycle fields at the outer
+    ``client_metadata`` level and inside ``x-codex-turn-metadata``.  Prefer the
+    nested turn record (it is the authoritative per-turn snapshot), while
+    retaining the outer mapping as a compatibility fallback.
+    """
+    mappings = _metadata_mappings(body)
+    for mapping in reversed(mappings):
+        for key in keys:
             value = _non_empty_string(mapping.get(key))
             if value:
                 return value
     return None
+
+
+def codex_thread_id(body: dict | None) -> str | None:
+    """Return the current root or child thread identifier."""
+    return _codex_metadata_value(body, "thread_id", "threadId")
+
+
+def codex_turn_id(body: dict | None) -> str | None:
+    """Return the current Codex turn identifier.
+
+    A turn id remains stable across model/tool continuations and in-turn
+    steering, then changes after completion or interruption.  That is the
+    lifecycle boundary Copilot uses for its task and interaction identities.
+    """
+    return _codex_metadata_value(body, "turn_id", "turnId")
+
+
+def codex_thread_source(body: dict | None) -> str | None:
+    """Return the normalized Codex lifecycle source (for example ``user``)."""
+    value = _codex_metadata_value(body, "thread_source", "threadSource")
+    return value.lower() if value else None
 
 
 def _patched_spawn_agent_tool(tool: dict) -> tuple[dict, bool]:
@@ -294,5 +322,8 @@ __all__ = [
     "codex_parent_affinity",
     "codex_session_id",
     "codex_subagent_identity",
+    "codex_thread_id",
+    "codex_thread_source",
+    "codex_turn_id",
     "normalize_codex_agent_tools",
 ]

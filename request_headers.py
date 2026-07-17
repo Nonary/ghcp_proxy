@@ -4,6 +4,8 @@ import hashlib
 import json
 import os
 import uuid
+from collections import OrderedDict
+from threading import Lock
 
 from fastapi import Request
 
@@ -16,6 +18,9 @@ from constants import (
 )
 
 _STABLE_ID_NAMESPACE = uuid.UUID("8fd22b32-4ce1-4af7-a3d6-7156a8f0ef9d")
+_MAX_CODEX_ROOT_TURN_SCOPES = 2048
+_CODEX_ROOT_TURN_SCOPE_LOCK = Lock()
+_CODEX_ROOT_TURN_SCOPE_BY_THREAD: OrderedDict[str, str] = OrderedDict()
 
 
 def _stable_uuid(value: str) -> str:
@@ -97,6 +102,31 @@ def _responses_subagent_affinity_scope(subagent: str, affinity_value: str) -> st
     return f"{subagent.strip().lower()}:{affinity_value.strip()}"
 
 
+def _remember_codex_root_turn_scope(thread_id: str | None, turn_id: str | None) -> None:
+    if not isinstance(thread_id, str) or not thread_id.strip():
+        return
+    if not isinstance(turn_id, str) or not turn_id.strip():
+        return
+    normalized_thread = thread_id.strip()
+    normalized_turn = turn_id.strip()
+    with _CODEX_ROOT_TURN_SCOPE_LOCK:
+        _CODEX_ROOT_TURN_SCOPE_BY_THREAD[normalized_thread] = normalized_turn
+        _CODEX_ROOT_TURN_SCOPE_BY_THREAD.move_to_end(normalized_thread)
+        while len(_CODEX_ROOT_TURN_SCOPE_BY_THREAD) > _MAX_CODEX_ROOT_TURN_SCOPES:
+            _CODEX_ROOT_TURN_SCOPE_BY_THREAD.popitem(last=False)
+
+
+def _codex_root_turn_scope(thread_id: str | None) -> str | None:
+    if not isinstance(thread_id, str) or not thread_id.strip():
+        return None
+    normalized_thread = thread_id.strip()
+    with _CODEX_ROOT_TURN_SCOPE_LOCK:
+        value = _CODEX_ROOT_TURN_SCOPE_BY_THREAD.get(normalized_thread)
+        if value is not None:
+            _CODEX_ROOT_TURN_SCOPE_BY_THREAD.move_to_end(normalized_thread)
+        return value
+
+
 def _responses_request_local_subagent_affinity(request_id: str | None) -> str:
     """Return a safe one-request worker scope when durable affinity is absent.
 
@@ -145,6 +175,9 @@ def _apply_responses_current_subagent_parent(
     affinity_value: str | None = None,
     *,
     parent_affinity_value: str | None = None,
+    parent_turn_scope: str | None = None,
+    child_turn_scope: str | None = None,
+    root_affinity_value: str | None = None,
     request_scope: str | None = None,
 ) -> None:
     if not isinstance(subagent, str) or not subagent.strip():
@@ -160,6 +193,21 @@ def _apply_responses_current_subagent_parent(
         if isinstance(parent_affinity_value, str) and parent_affinity_value.strip()
         else None
     )
+    normalized_parent_turn = (
+        parent_turn_scope.strip()
+        if isinstance(parent_turn_scope, str) and parent_turn_scope.strip()
+        else None
+    )
+    normalized_child_turn = (
+        child_turn_scope.strip()
+        if isinstance(child_turn_scope, str) and child_turn_scope.strip()
+        else None
+    )
+    normalized_root_affinity = (
+        root_affinity_value.strip()
+        if isinstance(root_affinity_value, str) and root_affinity_value.strip()
+        else None
+    )
 
     # Current Codex multi-agent requests explicitly identify their parent
     # thread in client_metadata.  Native Copilot keeps the root client session,
@@ -168,23 +216,32 @@ def _apply_responses_current_subagent_parent(
     # hierarchy from the inbound metadata before it is stripped from the body.
     if normalized_affinity and normalized_parent_affinity:
         parent_scope = (
-            _responses_task_affinity_scope(normalized_parent_affinity)
+            _responses_task_affinity_scope(normalized_parent_turn)
+            or _responses_task_affinity_scope(normalized_parent_affinity)
             or normalized_parent_affinity
         )
         parent_client_session_id = _responses_client_session_id_for_affinity(
-            normalized_parent_affinity
+            normalized_root_affinity or normalized_parent_affinity
         )
         if parent_client_session_id:
             headers["x-client-session-id"] = parent_client_session_id
         parent_task_id = _copilot_uuid(f"responses-task:{parent_scope}")
         headers["x-parent-agent-id"] = parent_task_id
+        child_scope = normalized_child_turn or _responses_subagent_affinity_scope(
+            sub,
+            normalized_affinity,
+        )
+        # Native Copilot shares the root client session and parent task with
+        # all children, but every child owns a distinct interaction.  Sharing
+        # the parent's interaction here makes concurrent workers overwrite the
+        # same upstream cache generation.
         headers["x-interaction-id"] = _copilot_uuid(
-            f"responses-interaction:{parent_scope}"
+            f"responses-interaction:{child_scope}"
         )
         child_task_id = _responses_subagent_task_id(
             parent_scope,
             sub,
-            normalized_affinity,
+            child_scope,
         )
         if child_task_id:
             headers["x-agent-task-id"] = child_task_id
@@ -472,12 +529,17 @@ def _responses_copilot_identity_headers(
     stable_affinity: bool = False,
     subagent: str | None = None,
     client_session_id: str | None = None,
+    task_affinity_value: str | None = None,
 ) -> dict[str, str]:
     del request_id
     if stable_affinity:
         affinity_value = _responses_affinity_value(payload, session_id)
         if affinity_value:
-            parent_scope = _responses_task_affinity_scope(affinity_value) or affinity_value
+            parent_scope = (
+                _responses_task_affinity_scope(task_affinity_value)
+                or _responses_task_affinity_scope(affinity_value)
+                or affinity_value
+            )
             interaction_id = _copilot_uuid(f"responses-interaction:{parent_scope}")
             parent_task_id = _copilot_uuid(f"responses-task:{parent_scope}")
             headers = {
@@ -655,12 +717,21 @@ def build_responses_headers_for_request(
     ):
         effective_subagent = synthetic_subagent.strip()
     headers.pop("x-openai-subagent", None)
+    codex_turn_id = codex_agent_compat.codex_turn_id(identity_source)
+    codex_thread_id = codex_agent_compat.codex_thread_id(identity_source)
+    codex_session_id = codex_agent_compat.codex_session_id(identity_source)
+    if not effective_subagent:
+        _remember_codex_root_turn_scope(codex_thread_id, codex_turn_id)
 
     had_input = "input" in body
     effective_input, initiator = initiator_policy.resolve_responses_input(
         body.get("input"),
         body.get("model"),
         subagent=effective_subagent,
+        trusted_user_turn=(
+            codex_turn_id is not None
+            and codex_agent_compat.codex_thread_source(identity_source) == "user"
+        ),
         force_initiator=force_initiator,
         request_id=request_id,
         verdict_sink=verdict_sink,
@@ -684,7 +755,7 @@ def build_responses_headers_for_request(
         or affinity_value is not None
     )
     affinity_client_session_id = _responses_client_session_id_for_affinity(
-        affinity_value, model=body.get("model")
+        codex_session_id or affinity_value, model=body.get("model")
     )
     if affinity_client_session_id and not effective_subagent:
         headers["x-client-session-id"] = affinity_client_session_id
@@ -696,15 +767,20 @@ def build_responses_headers_for_request(
             stable_affinity=stable_affinity,
             subagent=effective_subagent,
             client_session_id=headers.get("x-client-session-id"),
+            task_affinity_value=codex_turn_id,
         )
     )
     if effective_subagent:
         parent_affinity_value = codex_agent_compat.codex_parent_affinity(identity_source)
+        parent_turn_scope = _codex_root_turn_scope(parent_affinity_value)
         _apply_responses_current_subagent_parent(
             headers,
             effective_subagent,
             affinity_value,
             parent_affinity_value=parent_affinity_value,
+            parent_turn_scope=parent_turn_scope,
+            child_turn_scope=codex_turn_id,
+            root_affinity_value=codex_session_id,
             request_scope=request_id,
         )
 

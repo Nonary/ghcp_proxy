@@ -1045,6 +1045,7 @@ class InitiatorPolicy:
         model_name: str | None,
         *,
         subagent: str | None = None,
+        trusted_user_turn: bool = False,
         force_initiator: str | None = None,
         now: datetime | None = None,
         request_id: str | None = None,
@@ -1064,6 +1065,7 @@ class InitiatorPolicy:
             candidate,
             model_name,
             subagent=subagent,
+            trusted_user_turn=trusted_user_turn,
             force_initiator=force_initiator,
             now=now,
             request_id=request_id,
@@ -1126,6 +1128,7 @@ class InitiatorPolicy:
         model_name: str | None,
         *,
         subagent: str | None = None,
+        trusted_user_turn: bool = False,
         force_initiator: str | None = None,
         now: datetime | None = None,
         request_id: str | None = None,
@@ -1139,6 +1142,7 @@ class InitiatorPolicy:
                 subagent,
                 resolved_now,
                 force_initiator,
+                trusted_user_turn,
             )
             if isinstance(request_id, str) and request_id:
                 self._record_request_started_locked(request_id, initiator, resolved_now)
@@ -1165,6 +1169,7 @@ class InitiatorPolicy:
                     "subagent": subagent if _is_subagent_request(subagent) else None,
                     "haiku_forced": _is_haiku_model(model_name),
                     "explicit_user_prefix": candidate_initiator == _EXPLICIT_USER_INITIATOR,
+                    "trusted_user_turn": bool(trusted_user_turn),
                     "active_requests_at_decision": active_count,
                     "seconds_since_last_activity": (
                         (resolved_now - last_finished_at).total_seconds()
@@ -1229,6 +1234,7 @@ class InitiatorPolicy:
         subagent: str | None,
         now: datetime,
         force_initiator: str | None,
+        trusted_user_turn: bool = False,
     ) -> tuple[str, str | None]:
         if force_initiator in {AGENT_INITIATOR, USER_INITIATOR}:
             return force_initiator, None
@@ -1242,7 +1248,10 @@ class InitiatorPolicy:
         initiator = _public_candidate_initiator(candidate_initiator)
         safeguard_reason = self._safeguard_reason_locked(now)
         if initiator == USER_INITIATOR and safeguard_reason is not None:
-            if _candidate_bypasses_safeguards(candidate_initiator):
+            # Codex's lifecycle metadata identifies a real user-owned turn.
+            # Do not let the legacy cooldown demote fresh steering or a quick
+            # follow-up; structural classification still rejects tool tails.
+            if trusted_user_turn or _candidate_bypasses_safeguards(candidate_initiator):
                 return USER_INITIATOR, None
             return AGENT_INITIATOR, safeguard_reason
         return initiator, None

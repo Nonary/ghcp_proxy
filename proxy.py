@@ -589,6 +589,117 @@ def _get_upstream_client() -> "httpx.AsyncClient":
     return _UPSTREAM_CLIENT
 
 
+class _DownstreamDisconnectedBeforeResponse(RuntimeError):
+    def __init__(self, transport_close: str):
+        super().__init__("downstream disconnected before the upstream response started")
+        self.transport_close = transport_close
+
+
+async def _wait_for_downstream_disconnect(request: Request) -> None:
+    """Wait on the ASGI receive channel after the request body was consumed."""
+    while True:
+        message = await request.receive()
+        if message.get("type") == "http.disconnect":
+            return
+
+
+async def _open_streaming_upstream(
+    client: httpx.AsyncClient,
+    request: httpx.Request,
+    *,
+    trace_plan: "UpstreamRequestPlan | None",
+    downstream_request: Request | None,
+    active_stream: "_ActiveResponsesStream | None" = None,
+) -> httpx.Response:
+    """Open an upstream stream while observing pre-response disconnects.
+
+    Starlette cannot monitor the downstream until a Response object is
+    returned.  Copilot commonly aborts the old turn while this function is
+    still waiting for upstream headers, so own that earlier ASGI window here.
+    Once the upstream send has begun, wait for its response handle and cancel
+    the actual wire stream instead of abandoning an untracked generation.
+    """
+    send_started = False
+
+    async def open_upstream() -> httpx.Response:
+        nonlocal send_started
+        await _wait_for_responses_cache_settle(trace_plan)
+        send_started = True
+        if active_stream is not None:
+            active_stream.send_started = True
+        upstream = await throttled_client_send(client, request, stream=True)
+        if active_stream is not None:
+            active_stream.upstream = upstream
+        return upstream
+
+    upstream_task = asyncio.create_task(open_upstream())
+    disconnect_task = (
+        asyncio.create_task(_wait_for_downstream_disconnect(downstream_request))
+        if downstream_request is not None
+        else None
+    )
+    try:
+        if disconnect_task is None:
+            return await asyncio.shield(upstream_task)
+        done, _pending = await asyncio.wait(
+            {upstream_task, disconnect_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if disconnect_task not in done:
+            disconnect_task.cancel()
+            with CancelScope(shield=True):
+                try:
+                    await disconnect_task
+                except asyncio.CancelledError:
+                    pass
+            return await upstream_task
+
+        if not send_started:
+            upstream_task.cancel()
+            with CancelScope(shield=True):
+                try:
+                    await upstream_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+            raise _DownstreamDisconnectedBeforeResponse("not_sent")
+
+        # Do not cancel httpx while it is waiting for headers.  On HTTP/2 that
+        # can discard the only object through which we can send RST_STREAM.
+        # Wait for the handle, then explicitly end the server-side generation.
+        try:
+            upstream = await asyncio.shield(upstream_task)
+        except httpx.RequestError:
+            raise _DownstreamDisconnectedBeforeResponse(
+                "pre_response_request_error"
+            )
+        transport_close = await _close_upstream_response(
+            upstream,
+            cancel_generation=True,
+        )
+        raise _DownstreamDisconnectedBeforeResponse(transport_close)
+    except asyncio.CancelledError:
+        # Preserve the same ownership guarantee if the ASGI server cancels the
+        # route task directly instead of delivering http.disconnect.
+        with CancelScope(shield=True):
+            if not send_started:
+                upstream_task.cancel()
+            try:
+                upstream = await upstream_task
+            except (asyncio.CancelledError, Exception):
+                upstream = None
+            if upstream is not None and active_stream is None:
+                await _close_upstream_response(upstream, cancel_generation=True)
+        raise
+    finally:
+        if disconnect_task is not None and not disconnect_task.done():
+            disconnect_task.cancel()
+            with CancelScope(shield=True):
+                try:
+                    await disconnect_task
+                except asyncio.CancelledError:
+                    pass
+
+
 def _shutdown_upstream_client() -> None:
     global _UPSTREAM_CLIENT
     client = _UPSTREAM_CLIENT
@@ -916,8 +1027,8 @@ def _responses_cache_settle_identity(
     lineage = _responses_plan_lineage(plan)
     if not lineage:
         return None
-    parent_task = _responses_plan_header_value(plan, "x-parent-agent-id")
-    family_root = parent_task or lineage
+    interaction = _responses_plan_header_value(plan, "x-interaction-id")
+    family_root = interaction or lineage
     return model, lineage, f"family:{family_root}"
 
 
@@ -1089,8 +1200,14 @@ def _complete_active_responses_teardown(
     entry.teardown_confirmed = confirmed
     entry.response_ready.set()
     entry.teardown_complete.set()
-    if confirmed:
-        _unregister_active_responses_stream(entry)
+    # This registry coordinates streams that this process can still stop; it
+    # must not become a permanent deny-list for a lineage.  In particular, a
+    # pre-response transport error can leave us unable to prove what happened
+    # upstream, but the owning route has already finished and there is no
+    # remaining stream handle on which a later follow-up could improve that
+    # outcome.  Keep ``teardown_confirmed`` for diagnostics while retiring all
+    # completed entries so retries are not rejected forever.
+    _unregister_active_responses_stream(entry)
 
 
 def _responses_supersession_timeout_seconds() -> float:
@@ -1269,6 +1386,7 @@ class _ManagedResponsesStreamBody:
         self.active_stream = active_stream
         self.capture = usage_tracker.create_sse_capture(stream_type)
         self.source_loop_completed = False
+        self._source_task: asyncio.Task | None = None
         self._finalizing = False
         self._finalized = False
         self._finalized_event = asyncio.Event()
@@ -1314,6 +1432,7 @@ class _ManagedResponsesStreamBody:
         # RST_STREAM. httpcore otherwise closes and discards its private stream
         # state while leaving the server-side generation alive.
         source_task = asyncio.create_task(self._source_iter.__anext__())
+        self._source_task = source_task
         try:
             chunk = await asyncio.shield(source_task)
         except StopAsyncIteration:
@@ -1336,6 +1455,9 @@ class _ManagedResponsesStreamBody:
         except Exception as exc:
             await self._finalize("upstream_error", error=exc)
             raise
+        finally:
+            if self._source_task is source_task:
+                self._source_task = None
 
         if self.capture.feed(chunk):
             usage_tracker.mark_first_output(self.usage_event)
@@ -1345,6 +1467,14 @@ class _ManagedResponsesStreamBody:
         if not self._finalized and not self.capture.terminal_event_seen:
             await self.request_transport_cancel()
         await self._finalize("downstream_closed")
+        source_task = self._source_task
+        if source_task is not None and not source_task.done():
+            source_task.cancel()
+            with CancelScope(shield=True):
+                try:
+                    await source_task
+                except (asyncio.CancelledError, Exception):
+                    pass
         close_source = getattr(self._source_iter, "aclose", None)
         if callable(close_source):
             with CancelScope(shield=True):
@@ -3539,6 +3669,7 @@ async def proxy_streaming_response(
     usage_event: dict | None = None,
     stream_type: str = "responses",
     trace_plan: UpstreamRequestPlan | None = None,
+    downstream_request: Request | None = None,
 ) -> Response:
     """
     Relay an upstream SSE response while preserving upstream error statuses.
@@ -3551,13 +3682,14 @@ async def proxy_streaming_response(
         await _supersede_active_responses_streams(trace_plan, active_stream)
         client = _get_upstream_client()
         request = client.build_request("POST", upstream_url, headers=headers, json=body)
-        await _wait_for_responses_cache_settle(trace_plan)
-        if active_stream is not None:
-            active_stream.send_started = True
         try:
-            upstream = await throttled_client_send(client, request, stream=True)
-            if active_stream is not None:
-                active_stream.upstream = upstream
+            upstream = await _open_streaming_upstream(
+                client,
+                request,
+                trace_plan=trace_plan,
+                downstream_request=downstream_request,
+                active_stream=active_stream,
+            )
         finally:
             if active_stream is not None:
                 active_stream.response_ready.set()
@@ -3576,6 +3708,38 @@ async def proxy_streaming_response(
                 confirmed=True,
             )
         return format_translation.openai_error_response(status_code, message)
+    except _DownstreamDisconnectedBeforeResponse as exc:
+        teardown_confirmed = exc.transport_close in {
+            "http2_rst_cancel",
+            "http1_connection_close",
+            "not_sent",
+        }
+        if active_stream is not None:
+            active_stream.cancel_requested = True
+        if isinstance(trace_plan, UpstreamRequestPlan) and isinstance(
+            trace_plan.trace_context,
+            dict,
+        ):
+            trace_plan.trace_context["responses_stream_lifecycle"] = {
+                "termination_cause": "downstream_disconnected_before_response",
+                "terminal_event_seen": False,
+                "terminal_event_type": None,
+                "completed_event_seen": False,
+                "generation_end_confirmed": False,
+                "source_loop_completed": False,
+                "transport_close": exc.transport_close,
+                "transport_cancel_confirmed": teardown_confirmed,
+                "teardown_confirmed": teardown_confirmed,
+            }
+        try:
+            _finish_usage_and_trace(trace_plan, 499)
+        finally:
+            _complete_active_responses_teardown(
+                active_stream,
+                transport_cancel=exc.transport_close,
+                confirmed=teardown_confirmed,
+            )
+        return Response(status_code=499)
     except asyncio.CancelledError:
         transport_cancel = "not_sent_task_cancel"
         teardown_confirmed = active_stream is None or not active_stream.send_started
@@ -4231,7 +4395,12 @@ async def proxy_responses_from_anthropic_streaming_response(
     )
 
 
-async def _proxy_bridge_streaming_response(plan: UpstreamRequestPlan, bridge_plan: BridgeExecutionPlan) -> Response:
+async def _proxy_bridge_streaming_response(
+    plan: UpstreamRequestPlan,
+    bridge_plan: BridgeExecutionPlan,
+    *,
+    downstream_request: Request | None = None,
+) -> Response:
     if bridge_plan.caller_protocol == "responses" and bridge_plan.upstream_protocol == "responses":
         return await proxy_streaming_response(
             plan.upstream_url,
@@ -4241,6 +4410,7 @@ async def _proxy_bridge_streaming_response(plan: UpstreamRequestPlan, bridge_pla
             usage_event=plan.usage_event,
             stream_type="responses",
             trace_plan=plan,
+            downstream_request=downstream_request,
         )
     if bridge_plan.caller_protocol == "responses" and bridge_plan.upstream_protocol == "chat":
         return await proxy_responses_from_chat_streaming_response(
@@ -5036,7 +5206,11 @@ async def responses(request: Request):
         return error_response
 
     if bridge_plan.stream:
-        return await _proxy_bridge_streaming_response(plan, bridge_plan)
+        return await _proxy_bridge_streaming_response(
+            plan,
+            bridge_plan,
+            downstream_request=request,
+        )
     return await _post_bridge_non_streaming_request(plan, bridge_plan)
 
 
@@ -5090,7 +5264,11 @@ async def responses_compact(request: Request):
         return error_response
 
     if bridge_plan.stream:
-        return await _proxy_bridge_streaming_response(plan, bridge_plan)
+        return await _proxy_bridge_streaming_response(
+            plan,
+            bridge_plan,
+            downstream_request=request,
+        )
     return await _post_bridge_non_streaming_request(plan, bridge_plan)
 
 
@@ -5148,6 +5326,7 @@ async def chat_completions(request: Request):
             usage_event=plan.usage_event,
             stream_type="chat",
             trace_plan=plan,
+            downstream_request=request,
         )
     return await _post_non_streaming_request(plan, error_response=format_translation.openai_error_response)
 
@@ -5201,7 +5380,11 @@ async def anthropic_messages(request: Request):
         return error_response
 
     if bridge_plan.stream:
-        return await _proxy_bridge_streaming_response(plan, bridge_plan)
+        return await _proxy_bridge_streaming_response(
+            plan,
+            bridge_plan,
+            downstream_request=request,
+        )
     return await _post_bridge_non_streaming_request(plan, bridge_plan)
 
 
