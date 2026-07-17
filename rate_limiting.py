@@ -13,18 +13,13 @@ _upstream_request_timestamps = deque()
 _TRANSIENT_UPSTREAM_RETRY_ATTEMPTS = 2
 _TRANSIENT_UPSTREAM_RETRY_DELAY_SECONDS = 0.1
 
-# These errors mean that httpx did not produce a response.  In particular,
-# RemoteProtocolError is commonly raised when the upstream/load balancer has
-# closed the pinned keep-alive HTTP/2 connection between requests.  Retrying
-# once lets httpx discard that connection and establish a fresh one instead of
-# surfacing a transient 502 to the client.
+# Only retry failures that happen while establishing the connection. Read,
+# write, close, and protocol failures can occur after a non-idempotent model
+# request was accepted; automatically replaying those POSTs can generate and
+# bill the same turn twice.
 _TRANSIENT_UPSTREAM_ERRORS = (
     httpx.ConnectError,
     httpx.ConnectTimeout,
-    httpx.CloseError,
-    httpx.RemoteProtocolError,
-    httpx.ReadError,
-    httpx.WriteError,
 )
 
 

@@ -1006,6 +1006,19 @@ class InitiatorPolicy:
             for event in events:
                 if not isinstance(event, dict):
                     continue
+                # A failed/cancelled request does not establish an assistant
+                # turn for cooldown purposes. Preserve compatibility with old
+                # rows that predate the explicit ``success`` field by checking
+                # their status code too.
+                if event.get("success") is False:
+                    continue
+                status_code = event.get("status_code")
+                if (
+                    isinstance(status_code, (int, float))
+                    and not isinstance(status_code, bool)
+                    and status_code >= 400
+                ):
+                    continue
                 finished_at = _parse_event_time(event.get("finished_at"))
                 if finished_at is None:
                     continue
@@ -1183,6 +1196,7 @@ class InitiatorPolicy:
         request_id: str | None,
         *,
         finished_at: datetime | None = None,
+        successful: bool = True,
     ):
         if not isinstance(request_id, str) or not request_id:
             return
@@ -1190,7 +1204,12 @@ class InitiatorPolicy:
         with self._lock:
             active = self._active_requests.pop(request_id, None)
             initiator = active.get("initiator") if isinstance(active, dict) else None
-            if active is not None:
+            # Failed, cancelled, and locally blocked requests must still leave
+            # the active set, but they did not produce an assistant turn that
+            # could legitimately trigger the post-finish cooldown.  Treating a
+            # steering cancellation (499) or fail-closed rejection (409) as
+            # completed activity can misclassify the user's retry as agent-led.
+            if active is not None and successful:
                 self._last_activity_at = event_time
                 self._last_finished_at = event_time
             self._events.append(
@@ -1199,6 +1218,7 @@ class InitiatorPolicy:
                     "initiator": initiator,
                     "request_id": request_id,
                     "type": "finished",
+                    "successful": bool(successful),
                 }
             )
 

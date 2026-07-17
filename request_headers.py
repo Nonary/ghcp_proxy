@@ -229,6 +229,38 @@ def _interaction_type_for_initiator(initiator: str) -> str:
     return "conversation-agent"
 
 
+def _responses_has_established_agent_history(input_value) -> bool:
+    """Return whether a Responses turn is continuing an agent conversation.
+
+    ``x-initiator`` describes who caused the current request, but
+    ``x-interaction-type`` is also part of Copilot's upstream interaction/cache
+    envelope.  Switching an established prompt-cache lineage back to
+    ``conversation-user`` on steering makes upstream fall back to the much
+    older user/static prefix.  Keep initial user-only requests in their native
+    shape, then keep the interaction type stable once agent output exists.
+    """
+    if not isinstance(input_value, list):
+        return False
+    agent_item_types = {
+        "reasoning",
+        "function_call",
+        "function_call_output",
+        "custom_tool_call",
+        "custom_tool_call_output",
+        "agent_message",
+        "item_reference",
+        "compaction",
+    }
+    for item in input_value:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("role", "")).strip().lower() == "assistant":
+            return True
+        if str(item.get("type", "")).strip().lower() in agent_item_types:
+            return True
+    return False
+
+
 def _interaction_id_for_session(session_id: str | None) -> str:
     if isinstance(session_id, str):
         normalized = session_id.strip()
@@ -641,6 +673,8 @@ def build_responses_headers_for_request(
     headers["x-interaction-type"] = (
         "conversation-subagent"
         if effective_subagent
+        else "conversation-agent"
+        if _responses_has_established_agent_history(effective_input)
         else _interaction_type_for_initiator(initiator)
     )
     affinity_value = _responses_affinity_value(identity_source, session_id)

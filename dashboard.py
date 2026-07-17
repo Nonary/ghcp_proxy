@@ -1584,7 +1584,7 @@ def _burn_event_tokens(event: dict) -> dict:
     # billing count.  Anthropic/Claude-style rows usually already store
     # input_tokens as fresh input.  Use the explicit fresh value when present so
     # cached prefill does not dominate burn-rate reporting.
-    output_tokens = tokens["output_tokens"] + tokens["reasoning_output_tokens"]
+    output_tokens = tokens["output_tokens"]
     explicit_fresh_input = usage.get("fresh_input_tokens")
     if explicit_fresh_input is None:
         explicit_fresh_input = usage.get("billable_input_tokens")
@@ -1595,16 +1595,16 @@ def _burn_event_tokens(event: dict) -> dict:
     else:
         fresh_input = tokens["input_tokens"]
     tokens["fresh_input_tokens"] = fresh_input
-    # "Billable" approximation: fresh input + output + reasoning output.
-    # Cached inputs are tracked elsewhere, but they are excluded from burn-rate
-    # normalization so cached prefill does not dominate the estimate.
-    tokens["billable_tokens"] = fresh_input + tokens["output_tokens"] + tokens["reasoning_output_tokens"]
+    # reasoning_output_tokens is a subset of output_tokens. Cached inputs are
+    # tracked elsewhere, but excluded from burn-rate normalization so cached
+    # prefill does not dominate the estimate.
+    tokens["billable_tokens"] = fresh_input + tokens["output_tokens"]
     return tokens
 
 
 def _burn_event_sample_tokens(event: dict) -> dict:
     tokens = _burn_event_tokens(event)
-    output_tokens = tokens["output_tokens"] + tokens["reasoning_output_tokens"]
+    output_tokens = tokens["output_tokens"]
     total_tokens = tokens["fresh_input_tokens"] + output_tokens
     return {
         "input_tokens": tokens["fresh_input_tokens"],
