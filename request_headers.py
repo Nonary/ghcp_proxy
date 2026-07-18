@@ -4,7 +4,6 @@ import hashlib
 import json
 import os
 import uuid
-from collections import OrderedDict
 from threading import Lock
 
 from fastapi import Request
@@ -18,9 +17,15 @@ from constants import (
 )
 
 _STABLE_ID_NAMESPACE = uuid.UUID("8fd22b32-4ce1-4af7-a3d6-7156a8f0ef9d")
-_MAX_CODEX_ROOT_TURN_SCOPES = 2048
 _CODEX_ROOT_TURN_SCOPE_LOCK = Lock()
-_CODEX_ROOT_TURN_SCOPE_BY_THREAD: OrderedDict[str, str] = OrderedDict()
+# Root observations and child pins intentionally live for the process lifetime.
+# Evicting either can reattach an idle but still-running worker to the wrong
+# root turn and recreate the cache-busting identity rotation these tables
+# prevent.
+_CODEX_ROOT_TURN_SCOPE_BY_THREAD: dict[tuple[str, str], str] = {}
+_CODEX_CHILD_PARENT_TURN_SCOPE_BY_LINEAGE: dict[
+    tuple[str, str, str], str
+] = {}
 
 
 def _stable_uuid(value: str) -> str:
@@ -94,37 +99,136 @@ def _responses_subagent_task_id(parent_scope, subagent, affinity_value=None) -> 
     else:
         child_scope = parent_scope.strip()
     return _copilot_uuid(
-        f"responses-subagent-task:{parent_scope.strip()}:{subagent.strip()}:{child_scope}"
+        _responses_identity_scope(
+            "responses-subagent-task",
+            parent_scope,
+            subagent,
+            child_scope,
+        )
+    )
+
+
+def _responses_identity_scope(kind: str, *parts: str) -> str:
+    """Encode typed identity fields without delimiter ambiguity."""
+    return json.dumps(
+        [kind.strip(), *(part.strip() for part in parts)],
+        ensure_ascii=True,
+        separators=(",", ":"),
     )
 
 
 def _responses_subagent_affinity_scope(subagent: str, affinity_value: str) -> str:
-    return f"{subagent.strip().lower()}:{affinity_value.strip()}"
+    return _responses_identity_scope(
+        "responses-subagent-affinity",
+        subagent.lower(),
+        affinity_value,
+    )
 
 
-def _remember_codex_root_turn_scope(thread_id: str | None, turn_id: str | None) -> None:
-    if not isinstance(thread_id, str) or not thread_id.strip():
-        return
-    if not isinstance(turn_id, str) or not turn_id.strip():
-        return
-    normalized_thread = thread_id.strip()
-    normalized_turn = turn_id.strip()
-    with _CODEX_ROOT_TURN_SCOPE_LOCK:
-        _CODEX_ROOT_TURN_SCOPE_BY_THREAD[normalized_thread] = normalized_turn
-        _CODEX_ROOT_TURN_SCOPE_BY_THREAD.move_to_end(normalized_thread)
-        while len(_CODEX_ROOT_TURN_SCOPE_BY_THREAD) > _MAX_CODEX_ROOT_TURN_SCOPES:
-            _CODEX_ROOT_TURN_SCOPE_BY_THREAD.popitem(last=False)
-
-
-def _codex_root_turn_scope(thread_id: str | None) -> str | None:
+def _codex_root_turn_key(
+    thread_id: str | None,
+    root_session_id: str | None,
+) -> tuple[str, str] | None:
     if not isinstance(thread_id, str) or not thread_id.strip():
         return None
-    normalized_thread = thread_id.strip()
+    session_scope = (
+        root_session_id.strip()
+        if isinstance(root_session_id, str) and root_session_id.strip()
+        else ""
+    )
+    return session_scope, thread_id.strip()
+
+
+def _remember_codex_root_turn_scope(
+    thread_id: str | None,
+    turn_id: str | None,
+    root_session_id: str | None,
+) -> None:
+    if not isinstance(turn_id, str) or not turn_id.strip():
+        return
+    root_key = _codex_root_turn_key(thread_id, root_session_id)
+    if root_key is None:
+        return
+    normalized_turn = turn_id.strip()
     with _CODEX_ROOT_TURN_SCOPE_LOCK:
-        value = _CODEX_ROOT_TURN_SCOPE_BY_THREAD.get(normalized_thread)
-        if value is not None:
-            _CODEX_ROOT_TURN_SCOPE_BY_THREAD.move_to_end(normalized_thread)
-        return value
+        _CODEX_ROOT_TURN_SCOPE_BY_THREAD[root_key] = normalized_turn
+
+
+def _codex_child_lineage_key(
+    *,
+    parent_thread_id: str | None,
+    child_thread_id: str | None,
+    subagent: str | None,
+    affinity_value: str | None,
+    root_session_id: str | None,
+) -> tuple[str, str, str] | None:
+    """Return a durable key for pinning a Codex child's spawn-time parent.
+
+    The child thread is authoritative when present.  Older request shapes may
+    expose only a child prompt-cache affinity or a concrete agent identity; do
+    not persist the generic ``codex:subagent`` fallback because it would merge
+    otherwise unrelated workers.
+    """
+    if not isinstance(parent_thread_id, str) or not parent_thread_id.strip():
+        return None
+    parent_thread = parent_thread_id.strip()
+    session_scope = (
+        root_session_id.strip()
+        if isinstance(root_session_id, str) and root_session_id.strip()
+        else ""
+    )
+
+    lineage_scope = None
+    if isinstance(child_thread_id, str) and child_thread_id.strip():
+        normalized_child_thread = child_thread_id.strip()
+        if normalized_child_thread != parent_thread:
+            lineage_scope = f"thread:{normalized_child_thread}"
+    if lineage_scope is None and isinstance(affinity_value, str) and affinity_value.strip():
+        normalized_affinity = affinity_value.strip()
+        if normalized_affinity != parent_thread:
+            lineage_scope = f"affinity:{normalized_affinity}"
+    if lineage_scope is None and isinstance(subagent, str) and subagent.strip():
+        normalized_subagent = subagent.strip()
+        if normalized_subagent.lower() != "codex:subagent":
+            lineage_scope = f"subagent:{normalized_subagent}"
+    if lineage_scope is None:
+        return None
+    return session_scope, parent_thread, lineage_scope
+
+
+def _codex_child_parent_turn_scope(
+    lineage_key: tuple[str, str, str] | None,
+    parent_thread_id: str | None,
+    root_session_id: str | None,
+) -> str | None:
+    """Pin and return the first-observed parent turn for a child lineage.
+
+    A root can start a later turn while an already-spawned child is still
+    running.  Looking up the root's latest turn on every child continuation
+    changes both the parent task and the derived child task.  Snapshot the root
+    turn on the child's first request and retain it for the process lifetime.
+    Codex does not currently send the parent's turn id on the child request, so
+    the first observation is the earliest point at which it can be pinned.
+    """
+    root_key = _codex_root_turn_key(parent_thread_id, root_session_id)
+    if root_key is None:
+        return None
+    normalized_parent_thread = root_key[1]
+    with _CODEX_ROOT_TURN_SCOPE_LOCK:
+        if lineage_key is not None:
+            pinned = _CODEX_CHILD_PARENT_TURN_SCOPE_BY_LINEAGE.get(lineage_key)
+            if pinned is not None:
+                return pinned
+
+        parent_turn = _CODEX_ROOT_TURN_SCOPE_BY_THREAD.get(root_key)
+        if parent_turn is None:
+            # If the child arrives before this process observes its root, pin
+            # the explicit parent thread rather than changing identity later.
+            parent_turn = normalized_parent_thread
+
+        if lineage_key is not None:
+            _CODEX_CHILD_PARENT_TURN_SCOPE_BY_LINEAGE[lineage_key] = parent_turn
+        return parent_turn
 
 
 def _responses_request_local_subagent_affinity(request_id: str | None) -> str:
@@ -284,38 +388,6 @@ def _interaction_type_for_initiator(initiator: str) -> str:
     if initiator == "user":
         return "conversation-user"
     return "conversation-agent"
-
-
-def _responses_has_established_agent_history(input_value) -> bool:
-    """Return whether a Responses turn is continuing an agent conversation.
-
-    ``x-initiator`` describes who caused the current request, but
-    ``x-interaction-type`` is also part of Copilot's upstream interaction/cache
-    envelope.  Switching an established prompt-cache lineage back to
-    ``conversation-user`` on steering makes upstream fall back to the much
-    older user/static prefix.  Keep initial user-only requests in their native
-    shape, then keep the interaction type stable once agent output exists.
-    """
-    if not isinstance(input_value, list):
-        return False
-    agent_item_types = {
-        "reasoning",
-        "function_call",
-        "function_call_output",
-        "custom_tool_call",
-        "custom_tool_call_output",
-        "agent_message",
-        "item_reference",
-        "compaction",
-    }
-    for item in input_value:
-        if not isinstance(item, dict):
-            continue
-        if str(item.get("role", "")).strip().lower() == "assistant":
-            return True
-        if str(item.get("type", "")).strip().lower() in agent_item_types:
-            return True
-    return False
 
 
 def _interaction_id_for_session(session_id: str | None) -> str:
@@ -721,7 +793,11 @@ def build_responses_headers_for_request(
     codex_thread_id = codex_agent_compat.codex_thread_id(identity_source)
     codex_session_id = codex_agent_compat.codex_session_id(identity_source)
     if not effective_subagent:
-        _remember_codex_root_turn_scope(codex_thread_id, codex_turn_id)
+        _remember_codex_root_turn_scope(
+            codex_thread_id,
+            codex_turn_id,
+            codex_session_id,
+        )
 
     had_input = "input" in body
     effective_input, initiator = initiator_policy.resolve_responses_input(
@@ -744,8 +820,6 @@ def build_responses_headers_for_request(
     headers["x-interaction-type"] = (
         "conversation-subagent"
         if effective_subagent
-        else "conversation-agent"
-        if _responses_has_established_agent_history(effective_input)
         else _interaction_type_for_initiator(initiator)
     )
     affinity_value = _responses_affinity_value(identity_source, session_id)
@@ -772,7 +846,18 @@ def build_responses_headers_for_request(
     )
     if effective_subagent:
         parent_affinity_value = codex_agent_compat.codex_parent_affinity(identity_source)
-        parent_turn_scope = _codex_root_turn_scope(parent_affinity_value)
+        child_lineage_key = _codex_child_lineage_key(
+            parent_thread_id=parent_affinity_value,
+            child_thread_id=codex_thread_id,
+            subagent=effective_subagent,
+            affinity_value=affinity_value,
+            root_session_id=codex_session_id,
+        )
+        parent_turn_scope = _codex_child_parent_turn_scope(
+            child_lineage_key,
+            parent_affinity_value,
+            codex_session_id,
+        )
         _apply_responses_current_subagent_parent(
             headers,
             effective_subagent,

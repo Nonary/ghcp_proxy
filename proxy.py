@@ -210,11 +210,15 @@ _DEBUG_DETAIL_REQUEST_SNAPSHOTS_BY_ID: OrderedDict[str, dict] = OrderedDict()
 _DEBUG_DETAIL_SESSION_CAPTURED_REQUEST_IDS: OrderedDict[str, set[str]] = OrderedDict()
 _DEBUG_DETAIL_SNAPSHOT_SEQUENCE = 0
 
-# Upstream Responses prompt-cache settle for related cross-lineage handoffs.
-# Same-lineage traffic is coordinated directly and is never delayed here.
+# Upstream Responses prompt-cache settle. Successful agent/tool continuations
+# and related root-turn handoffs get a short quiet window so a just-written
+# upstream cache entry becomes visible. Same-turn user steering is deliberately
+# not delayed: native Copilot sends that shape immediately after cancelling or
+# completing the prior generation and keeps the task/interaction identity.
 RESPONSES_CACHE_SETTLE_DELAY_SECONDS = 3.0
 _PROMPT_CACHE_SETTLE_LOCK = threading.Lock()
 _PROMPT_CACHE_LAST_FINISH_BY_FAMILY: dict[tuple[str, str], tuple[str, float]] = {}
+_PROMPT_CACHE_LAST_PRUNE_AT = 0.0
 
 def _reset_debug_detail_capture_state() -> None:
     global _DEBUG_DETAIL_SNAPSHOT_SEQUENCE
@@ -892,6 +896,7 @@ class UpstreamRequestPlan:
     trace_context: dict | None = None
     debug_detail_session_key: str | None = None
     auto_update_request_tracked: bool = False
+    request_affinity: str | None = None
 
 
 @dataclass
@@ -1016,6 +1021,11 @@ def _responses_plan_uses_native_upstream(plan: "UpstreamRequestPlan | None") -> 
     return upstream_path.rstrip("/").lower().endswith("/responses")
 
 
+def _responses_cache_family(kind: str, *parts: str) -> str:
+    """Encode an unambiguous settle family from caller-controlled values."""
+    return f"family:{kind}:{json.dumps(parts, ensure_ascii=True, separators=(',', ':'))}"
+
+
 def _responses_cache_settle_identity(
     plan: "UpstreamRequestPlan | None",
 ) -> tuple[str, str, str] | None:
@@ -1027,9 +1037,93 @@ def _responses_cache_settle_identity(
     lineage = _responses_plan_lineage(plan)
     if not lineage:
         return None
-    interaction = _responses_plan_header_value(plan, "x-interaction-id")
-    family_root = interaction or lineage
-    return model, lineage, f"family:{family_root}"
+    parent_task = _responses_plan_header_value(plan, "x-parent-agent-id")
+    resolved_affinity = (
+        plan.request_affinity.strip()
+        if isinstance(plan.request_affinity, str) and plan.request_affinity.strip()
+        else None
+    )
+    for header_name in (
+        "session_id",
+        "session-id",
+        "x-claude-code-session-id",
+        "x-session-affinity",
+        "x-opencode-session",
+    ):
+        if resolved_affinity is not None:
+            break
+        resolved_affinity = _responses_plan_header_value(plan, header_name)
+        if resolved_affinity:
+            break
+    if resolved_affinity is None and isinstance(plan.usage_event, dict):
+        event_session_id = plan.usage_event.get("session_id")
+        if isinstance(event_session_id, str) and event_session_id.strip():
+            resolved_affinity = event_session_id.strip()
+
+    # A task and interaction identify one Copilot generation, so both rotate
+    # on a fresh user turn. Cache settling instead needs the durable root or
+    # child conversation affinity that survives that rotation. Derive it only
+    # from explicit request metadata; falling back to the process-wide Copilot
+    # interaction would serialize unrelated no-affinity API callers.
+    for candidate in (plan.source_body, plan.body):
+        if not isinstance(candidate, dict):
+            continue
+        codex_session = codex_agent_compat.codex_session_id(candidate)
+        codex_thread = codex_agent_compat.codex_thread_id(candidate)
+        codex_parent = codex_agent_compat.codex_parent_affinity(candidate)
+        direct_affinity = (
+            _request_headers_module.responses_affinity_value(candidate)
+            or resolved_affinity
+        )
+        rollout_memory = (
+            isinstance(direct_affinity, str)
+            and direct_affinity.startswith("codex-rollout-memory:")
+        )
+
+        # Normal Codex traffic uses its explicit session/thread hierarchy.
+        # Rollout-memory writers deliberately reuse the interactive
+        # prompt_cache_key, so retain the isolated affinity produced by the
+        # same helper that builds their upstream identity.
+        root_affinity = (
+            direct_affinity
+            if rollout_memory
+            else codex_session or direct_affinity
+        )
+        if parent_task:
+            child_affinity = (
+                direct_affinity
+                if rollout_memory
+                else codex_thread or direct_affinity
+            )
+            if child_affinity:
+                parent_affinity = (
+                    direct_affinity
+                    if rollout_memory
+                    else codex_parent or codex_session or parent_task
+                )
+                return (
+                    model,
+                    lineage,
+                    _responses_cache_family(
+                        "child",
+                        root_affinity or parent_affinity,
+                        parent_affinity,
+                        child_affinity,
+                    ),
+                )
+            continue
+        if root_affinity:
+            root_thread = (
+                direct_affinity
+                if rollout_memory
+                else codex_thread or direct_affinity or root_affinity
+            )
+            return (
+                model,
+                lineage,
+                _responses_cache_family("root", root_affinity, root_thread),
+            )
+    return None
 
 
 def _responses_active_stream_identity(
@@ -1042,8 +1136,14 @@ def _responses_active_stream_identity(
     # durable conversation affinity, then key by the derived task lineage
     # without the model so steering across a model switch still stops the old
     # generation.
-    explicit_affinity = None
+    explicit_affinity = (
+        plan.request_affinity.strip()
+        if isinstance(plan.request_affinity, str) and plan.request_affinity.strip()
+        else None
+    )
     for candidate in (plan.source_body, plan.body):
+        if explicit_affinity is not None:
+            break
         if not isinstance(candidate, dict):
             continue
         for key in ("prompt_cache_key", "promptCacheKey", "session_id", "sessionId"):
@@ -1378,14 +1478,20 @@ class _ManagedResponsesStreamBody:
         stream_type: str,
         trace_plan: UpstreamRequestPlan | None,
         active_stream: _ActiveResponsesStream | None,
+        stream_transform=None,
+        trace_details_factory=None,
+        sync_replay_ids: bool | None = None,
     ):
         self.upstream = upstream
         self.usage_event = usage_event
         self.stream_type = stream_type
         self.trace_plan = trace_plan
         self.active_stream = active_stream
+        self.trace_details_factory = trace_details_factory
+        self._stream_transform_enabled = callable(stream_transform)
         self.capture = usage_tracker.create_sse_capture(stream_type)
         self.source_loop_completed = False
+        self.presentation_loop_completed = False
         self._source_task: asyncio.Task | None = None
         self._finalizing = False
         self._finalized = False
@@ -1395,7 +1501,9 @@ class _ManagedResponsesStreamBody:
         self._transport_cancel_task: asyncio.Task | None = None
 
         replay_id_state = None
-        if stream_type == "responses":
+        if sync_replay_ids is None:
+            sync_replay_ids = stream_type == "responses"
+        if stream_type == "responses" and sync_replay_ids:
             replay_source_body = (
                 trace_plan.source_body
                 if isinstance(trace_plan, UpstreamRequestPlan)
@@ -1415,13 +1523,26 @@ class _ManagedResponsesStreamBody:
                     else None
                 ),
             )
-        source_iter = _stream_with_update_notice(
+        raw_source_iter = _stream_with_update_notice(
             upstream.aiter_bytes(),
             stream_type,
             getattr(upstream, "headers", None),
         )
-        if stream_type == "responses":
-            source_iter = ResponsesStreamIdSyncer(replay_id_state).sync(source_iter)
+        if stream_type == "responses" and sync_replay_ids:
+            raw_source_iter = ResponsesStreamIdSyncer(replay_id_state).sync(
+                raw_source_iter
+            )
+
+        async def capture_source():
+            async for chunk in raw_source_iter:
+                if self.capture.feed(chunk):
+                    usage_tracker.mark_first_output(self.usage_event)
+                yield chunk
+            self.source_loop_completed = True
+
+        source_iter = capture_source()
+        if self._stream_transform_enabled:
+            source_iter = stream_transform(source_iter)
         self._source_iter = source_iter.__aiter__()
 
     def __aiter__(self):
@@ -1436,7 +1557,7 @@ class _ManagedResponsesStreamBody:
         try:
             chunk = await asyncio.shield(source_task)
         except StopAsyncIteration:
-            self.source_loop_completed = True
+            self.presentation_loop_completed = True
             await self._finalize("source_eof")
             raise
         except asyncio.CancelledError:
@@ -1459,29 +1580,33 @@ class _ManagedResponsesStreamBody:
             if self._source_task is source_task:
                 self._source_task = None
 
-        if self.capture.feed(chunk):
-            usage_tracker.mark_first_output(self.usage_event)
         return chunk
 
     async def aclose(self) -> None:
-        if not self._finalized and not self.capture.terminal_event_seen:
-            await self.request_transport_cancel()
-        await self._finalize("downstream_closed")
-        source_task = self._source_task
-        if source_task is not None and not source_task.done():
-            source_task.cancel()
-            with CancelScope(shield=True):
-                try:
-                    await source_task
-                except (asyncio.CancelledError, Exception):
-                    pass
-        close_source = getattr(self._source_iter, "aclose", None)
-        if callable(close_source):
-            with CancelScope(shield=True):
-                try:
-                    await close_source()
-                except (asyncio.CancelledError, RuntimeError):
-                    pass
+        try:
+            if not self._finalized and not self.capture.terminal_event_seen:
+                await self.request_transport_cancel()
+
+            # Wire cancellation must happen first. Then stop the presentation
+            # adapter before reading its partial payload for tracing so it
+            # cannot mutate translator state concurrently with finalization.
+            source_task = self._source_task
+            if source_task is not None and not source_task.done():
+                source_task.cancel()
+                with CancelScope(shield=True):
+                    try:
+                        await source_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+            close_source = getattr(self._source_iter, "aclose", None)
+            if callable(close_source):
+                with CancelScope(shield=True):
+                    try:
+                        await close_source()
+                    except (asyncio.CancelledError, Exception):
+                        pass
+        finally:
+            await self._finalize("downstream_closed")
 
     async def request_transport_cancel(self) -> tuple[str, bool]:
         """Cancel the wire stream before the owning ASGI task is cancelled."""
@@ -1573,12 +1698,29 @@ class _ManagedResponsesStreamBody:
                 and cause == "source_eof"
             )
             generation_ended = completed or self.capture.terminal_event_seen
-            if completed:
+            if (
+                self._stream_transform_enabled
+                and cause in {"downstream_cancelled", "downstream_closed"}
+                and not self.presentation_loop_completed
+            ):
+                trace_status = 499
+            elif cause == "upstream_error" and self._stream_transform_enabled:
+                if isinstance(error, httpx.RequestError):
+                    trace_status, _message = (
+                        format_translation.upstream_request_error_status_and_message(error)
+                    )
+                else:
+                    trace_status = 502
+            elif completed:
+                trace_status = self.upstream.status_code
+            elif self.capture.terminal_event_type == "response.incomplete":
+                # Max-output/content-filter termination is a valid HTTP 200
+                # Responses outcome. The presentation adapter maps its reason
+                # to Anthropic's max_tokens/refusal stop reason.
                 trace_status = self.upstream.status_code
             elif self.capture.terminal_event_seen:
-                # response.failed, response.incomplete, or a bare [DONE] prove
-                # the generation ended, but are not a successful Responses
-                # completion.
+                # response.failed or a bare [DONE] prove the generation ended,
+                # but not successfully.
                 trace_status = 502
             elif self.active_stream is not None and self.active_stream.superseded_by:
                 trace_status = 499
@@ -1629,6 +1771,7 @@ class _ManagedResponsesStreamBody:
                 "terminal_eof": terminal_eof,
                 "generation_end_confirmed": generation_ended,
                 "source_loop_completed": self.source_loop_completed,
+                "presentation_loop_completed": self.presentation_loop_completed,
                 "superseded_by": (
                     self.active_stream.superseded_by
                     if self.active_stream is not None
@@ -1638,21 +1781,76 @@ class _ManagedResponsesStreamBody:
                 "transport_cancel_confirmed": transport_cancel_confirmed,
                 "teardown_confirmed": teardown_confirmed,
                 "upstream_error_type": type(error).__name__ if error is not None else None,
+                "presentation_transform": self._stream_transform_enabled,
             }
+            trace_details = {}
+            if callable(self.trace_details_factory):
+                try:
+                    candidate = self.trace_details_factory()
+                    if isinstance(candidate, dict):
+                        trace_details = candidate
+                except Exception as exc:
+                    # Presentation adapters must never prevent the managed
+                    # stream owner from recording lifecycle state and
+                    # completing teardown.
+                    lifecycle["trace_details_error_type"] = type(exc).__name__
             if isinstance(self.trace_plan, UpstreamRequestPlan) and isinstance(self.trace_plan.trace_context, dict):
                 self.trace_plan.trace_context["responses_stream_lifecycle"] = lifecycle
 
             try:
+                captured_usage = (
+                    self.capture.usage
+                    if isinstance(self.capture.usage, dict)
+                    else None
+                )
+                trace_usage = trace_details.get("usage")
+                if (
+                    self._stream_transform_enabled
+                    and cause
+                    in {"upstream_error", "downstream_cancelled", "downstream_closed"}
+                    and not self.presentation_loop_completed
+                    and captured_usage is not None
+                ):
+                    trace_usage = captured_usage
+                elif not isinstance(trace_usage, dict):
+                    trace_usage = captured_usage
                 _finish_usage_and_trace(
                     self.trace_plan,
                     trace_status,
                     upstream=self.upstream,
-                    usage=(
-                        self.capture.usage
-                        if isinstance(self.capture.usage, dict)
+                    response_payload=(
+                        trace_details.get("response_payload")
+                        if isinstance(trace_details.get("response_payload"), dict)
                         else None
                     ),
+                    response_text=(
+                        trace_details.get("response_text")
+                        if isinstance(trace_details.get("response_text"), str)
+                        else None
+                    ),
+                    reasoning_text=(
+                        trace_details.get("reasoning_text")
+                        if isinstance(trace_details.get("reasoning_text"), str)
+                        else None
+                    ),
+                    usage=trace_usage,
                 )
+                cache_terminal_seen = completed or (
+                    self.capture.terminal_event_type == "response.incomplete"
+                )
+                if (
+                    cache_terminal_seen
+                    and trace_status >= 400
+                    and self.upstream.status_code < 400
+                ):
+                    # A presentation adapter can fail after the raw Responses
+                    # generation has completed. Report that downstream failure
+                    # without losing the cache-write quiet window proven by the
+                    # upstream terminal event.
+                    _remember_responses_cache_settle_finish(
+                        self.trace_plan,
+                        self.upstream.status_code,
+                    )
             finally:
                 _complete_active_responses_teardown(
                     self.active_stream,
@@ -1686,7 +1884,7 @@ async def _wait_for_responses_cache_settle(plan: "UpstreamRequestPlan | None") -
             break
         last_lineage, last_finished_at = last
         same_lineage = last_lineage == lineage
-        if same_lineage:
+        if same_lineage and steering:
             break
         if initial_last_lineage is None:
             initial_last_lineage = last_lineage
@@ -1720,6 +1918,7 @@ def _remember_responses_cache_settle_finish(
     plan: "UpstreamRequestPlan | None",
     status_code: int,
 ) -> None:
+    global _PROMPT_CACHE_LAST_PRUNE_AT
     if status_code >= 400:
         return
     identity = _responses_cache_settle_identity(plan)
@@ -1729,6 +1928,27 @@ def _remember_responses_cache_settle_finish(
     now = time.monotonic()
     with _PROMPT_CACHE_SETTLE_LOCK:
         _PROMPT_CACHE_LAST_FINISH_BY_FAMILY[(model, family)] = (lineage, now)
+        prune_interval = (
+            1.0
+            if len(_PROMPT_CACHE_LAST_FINISH_BY_FAMILY) > 4096
+            else 30.0
+        )
+        if now - _PROMPT_CACHE_LAST_PRUNE_AT >= prune_interval:
+            retention_seconds = max(
+                60.0,
+                _prompt_cache_settle_delay_seconds(plan) * 2.0,
+            )
+            stale_before = now - retention_seconds
+            stale_keys = [
+                key
+                for key, (_stored_lineage, finished_at) in (
+                    _PROMPT_CACHE_LAST_FINISH_BY_FAMILY.items()
+                )
+                if finished_at < stale_before
+            ]
+            for key in stale_keys:
+                _PROMPT_CACHE_LAST_FINISH_BY_FAMILY.pop(key, None)
+            _PROMPT_CACHE_LAST_PRUNE_AT = now
 
 
 def _env_flag(name: str) -> bool:
@@ -3099,6 +3319,10 @@ def _prepare_upstream_request(
             requested_model=requested_model,
             resolved_model=resolved_model,
             source_body=source_body if isinstance(source_body, dict) else body,
+            request_affinity=usage_tracking.request_session_id(
+                request,
+                source_body if isinstance(source_body, dict) else body,
+            ),
             replay_subagent=(
                 replay_subagent.strip()
                 if isinstance(replay_subagent, str) and replay_subagent.strip()
@@ -3670,6 +3894,11 @@ async def proxy_streaming_response(
     stream_type: str = "responses",
     trace_plan: UpstreamRequestPlan | None = None,
     downstream_request: Request | None = None,
+    caller_protocol: str | None = None,
+    caller_model: str | None = None,
+    stream_transform=None,
+    trace_details_factory=None,
+    sync_replay_ids: bool | None = None,
 ) -> Response:
     """
     Relay an upstream SSE response while preserving upstream error statuses.
@@ -3677,6 +3906,13 @@ async def proxy_streaming_response(
     If the upstream request fails before the stream starts, return the upstream
     error body as a normal HTTP response instead of masking it as 200 SSE.
     """
+    presentation_protocol = caller_protocol or stream_type
+
+    def local_error_response(status_code: int, message: str) -> Response:
+        if presentation_protocol == "anthropic":
+            return format_translation.anthropic_error_response(status_code, message)
+        return format_translation.openai_error_response(status_code, message)
+
     active_stream = _register_active_responses_stream(trace_plan)
     try:
         await _supersede_active_responses_streams(trace_plan, active_stream)
@@ -3707,7 +3943,7 @@ async def proxy_streaming_response(
                 transport_cancel="not_sent_supersession_blocked",
                 confirmed=True,
             )
-        return format_translation.openai_error_response(status_code, message)
+        return local_error_response(status_code, message)
     except _DownstreamDisconnectedBeforeResponse as exc:
         teardown_confirmed = exc.transport_close in {
             "http2_rst_cancel",
@@ -3780,7 +4016,7 @@ async def proxy_streaming_response(
                 ),
                 confirmed=teardown_confirmed,
             )
-        return format_translation.openai_error_response(status_code, message)
+        return local_error_response(status_code, message)
     except Exception:
         try:
             _finish_usage_and_trace(trace_plan, 599)
@@ -3797,15 +4033,33 @@ async def proxy_streaming_response(
         raise
 
     if upstream.status_code >= 400:
+        fallback_trace = (
+            _anthropic_upstream_error_trace
+            if presentation_protocol == "anthropic"
+            else None
+        )
+        fallback_error_response = (
+            format_translation.anthropic_error_response_from_upstream
+            if presentation_protocol == "anthropic"
+            else proxy_non_streaming_response
+        )
         try:
             await upstream.aread()
             return _handle_upstream_error(
                 upstream,
                 trace_plan=trace_plan,
-                caller_protocol=stream_type,
+                caller_protocol=presentation_protocol,
                 stream=True,
-                model=trace_plan.resolved_model if isinstance(trace_plan, UpstreamRequestPlan) else None,
-                fallback_error_response=proxy_non_streaming_response,
+                model=(
+                    caller_model
+                    or (
+                        trace_plan.resolved_model
+                        if isinstance(trace_plan, UpstreamRequestPlan)
+                        else None
+                    )
+                ),
+                fallback_trace=fallback_trace,
+                fallback_error_response=fallback_error_response,
             )
         except asyncio.CancelledError:
             transport_cancel = await _close_upstream_response(
@@ -3871,7 +4125,7 @@ async def proxy_streaming_response(
                     transport_cancel=transport_cancel,
                     confirmed=transport_confirmed,
                 )
-            return format_translation.openai_error_response(status_code, message)
+            return local_error_response(status_code, message)
         finally:
             if active_stream is None or not active_stream.teardown_complete.is_set():
                 transport_close = await _close_upstream_response(upstream)
@@ -3885,6 +4139,8 @@ async def proxy_streaming_response(
     content_type = upstream.headers.get("content-type")
     if content_type:
         response_headers["content-type"] = content_type
+    if presentation_protocol == "anthropic":
+        response_headers["content-type"] = "text/event-stream; charset=utf-8"
 
     try:
         stream_body = _ManagedResponsesStreamBody(
@@ -3895,6 +4151,9 @@ async def proxy_streaming_response(
             stream_type=stream_type,
             trace_plan=trace_plan,
             active_stream=active_stream,
+            stream_transform=stream_transform,
+            trace_details_factory=trace_details_factory,
+            sync_replay_ids=sync_replay_ids,
         )
     except Exception:
         transport_cancel = await _close_upstream_response(
@@ -4074,65 +4333,44 @@ async def proxy_anthropic_from_responses_streaming_response(
     timeout: int = 300,
     usage_event: dict | None = None,
     trace_plan: UpstreamRequestPlan | None = None,
+    downstream_request: Request | None = None,
 ) -> Response:
-    client = _get_upstream_client()
-    request = client.build_request("POST", upstream_url, headers=headers, json=body)
-    try:
-        upstream = await throttled_client_send(client, request, stream=True)
-    except httpx.RequestError as exc:
-        status_code, message = format_translation.upstream_request_error_status_and_message(exc)
-        _finish_usage_and_trace(trace_plan, status_code, response_text=message)
-        return format_translation.anthropic_error_response(status_code, message)
-    except Exception:
-        _finish_usage_and_trace(trace_plan, 599)
-        raise
+    """Translate Responses SSE while retaining the managed wire lifecycle."""
+    translator = ResponsesToAnthropicStreamTranslator(
+        fallback_model,
+        mark_first_output=lambda: usage_tracker.mark_first_output(usage_event),
+    )
 
-    if upstream.status_code >= 400:
-        try:
-            await upstream.aread()
-            return _handle_upstream_error(
-                upstream,
-                trace_plan=trace_plan,
-                caller_protocol="anthropic",
-                stream=True,
-                model=fallback_model,
-                fallback_trace=_anthropic_upstream_error_trace,
-                fallback_error_response=format_translation.anthropic_error_response_from_upstream,
-            )
-        finally:
-            await upstream.aclose()
+    def translate_stream(source_iter):
+        return translator.translate(source_iter)
 
-    response_headers = {
-        "Cache-Control": "no-cache",
-        "X-Accel-Buffering": "no",
-        "content-type": "text/event-stream; charset=utf-8",
-    }
+    def translated_trace_details() -> dict:
+        response_payload = translator.build_response_payload()
+        return {
+            "response_payload": response_payload,
+            "response_text": (
+                translator.terminal_error_message or translator.response_text
+            ),
+            "reasoning_text": translator.thinking_text,
+            "usage": response_payload.get("usage"),
+        }
 
-    async def stream_translated():
-        translator = ResponsesToAnthropicStreamTranslator(
-            fallback_model,
-            mark_first_output=lambda: usage_tracker.mark_first_output(usage_event),
-        )
-        try:
-            async for event in translator.translate(_stream_with_update_notice(upstream.aiter_bytes(), "responses", getattr(upstream, "headers", None))):
-                yield event
-        finally:
-            response_payload = translator.build_response_payload()
-            _finish_usage_and_trace(
-                trace_plan,
-                upstream.status_code,
-                upstream=upstream,
-                response_payload=response_payload,
-                response_text=translator.response_text,
-                reasoning_text=translator.thinking_text,
-                usage=response_payload["usage"],
-            )
-            await upstream.aclose()
-
-    return GracefulStreamingResponse(
-        stream_translated(),
-        status_code=upstream.status_code,
-        headers=response_headers,
+    return await proxy_streaming_response(
+        upstream_url,
+        headers,
+        body,
+        timeout=timeout,
+        usage_event=usage_event,
+        stream_type="responses",
+        trace_plan=trace_plan,
+        downstream_request=downstream_request,
+        caller_protocol="anthropic",
+        caller_model=fallback_model,
+        stream_transform=translate_stream,
+        trace_details_factory=translated_trace_details,
+        # Anthropic callers never observe Responses item IDs. Keep the bridge's
+        # prior wire behavior and avoid mutating IDs solely for translation.
+        sync_replay_ids=False,
     )
 
 
@@ -4460,6 +4698,7 @@ async def _proxy_bridge_streaming_response(
         timeout=300,
         usage_event=plan.usage_event,
         trace_plan=plan,
+        downstream_request=downstream_request,
     )
 
 

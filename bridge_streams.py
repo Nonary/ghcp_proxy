@@ -624,6 +624,9 @@ class ResponsesToAnthropicStreamTranslator:
         self._tool_blocks: dict[int, _ToolItemState] = {}
         self._text_parts: list[str] = []
         self._thinking_parts: list[str] = []
+        self._terminal_event_type: str | None = None
+        self._stop_reason: str | None = None
+        self._terminal_error_payload: dict | None = None
 
     @property
     def response_text(self) -> str | None:
@@ -637,7 +640,41 @@ class ResponsesToAnthropicStreamTranslator:
             return None
         return "".join(self._thinking_parts)
 
+    @property
+    def terminal_error_message(self) -> str | None:
+        if not isinstance(self._terminal_error_payload, dict):
+            return None
+        error = self._terminal_error_payload.get("error")
+        if not isinstance(error, dict):
+            return None
+        message = error.get("message")
+        return message if isinstance(message, str) and message else None
+
+    def _set_terminal_error(self, payload: dict | None, fallback_message: str) -> None:
+        response = (
+            payload.get("response")
+            if isinstance(payload, dict) and isinstance(payload.get("response"), dict)
+            else {}
+        )
+        error = response.get("error") if isinstance(response.get("error"), dict) else None
+        if error is None and isinstance(payload, dict) and isinstance(payload.get("error"), dict):
+            error = payload["error"]
+        message = error.get("message") if isinstance(error, dict) else None
+        self._terminal_error_payload = {
+            "type": "error",
+            "error": {
+                "type": "api_error",
+                "message": (
+                    message
+                    if isinstance(message, str) and message
+                    else fallback_message
+                ),
+            },
+        }
+
     def build_response_payload(self) -> dict:
+        if isinstance(self._terminal_error_payload, dict):
+            return self._terminal_error_payload
         content = []
         if self.thinking_text:
             content.append({"type": "thinking", "thinking": self.thinking_text})
@@ -658,7 +695,10 @@ class ResponsesToAnthropicStreamTranslator:
             "type": "message",
             "role": "assistant",
             "model": self._model_name,
-            "stop_reason": "tool_use" if self._tool_blocks else "end_turn",
+            "stop_reason": (
+                self._stop_reason
+                or ("tool_use" if self._tool_blocks else "end_turn")
+            ),
             "content": content or [{"type": "text", "text": ""}],
             "usage": self._usage,
         }
@@ -787,6 +827,16 @@ class ResponsesToAnthropicStreamTranslator:
     async def translate(self, byte_iter) -> AsyncIterator[bytes]:
         async for _event_name, data in format_translation.iter_sse_messages(byte_iter):
             if data == "[DONE]":
+                if self._terminal_event_type is None:
+                    self._set_terminal_error(
+                        None,
+                        "Upstream Responses stream ended without a terminal event",
+                    )
+                    yield format_translation.sse_encode(
+                        "error",
+                        self._terminal_error_payload,
+                    )
+                    return
                 break
             try:
                 payload = json.loads(data)
@@ -805,6 +855,37 @@ class ResponsesToAnthropicStreamTranslator:
 
             if isinstance(payload.get("usage"), dict):
                 self._apply_response_usage(payload["usage"])
+
+            if event_type == "response.failed":
+                self._terminal_event_type = event_type
+                self._set_terminal_error(
+                    payload,
+                    "Upstream Responses generation failed",
+                )
+                yield format_translation.sse_encode(
+                    "error",
+                    self._terminal_error_payload,
+                )
+                return
+            if event_type == "response.incomplete":
+                self._terminal_event_type = event_type
+                incomplete_details = (
+                    response.get("incomplete_details")
+                    if isinstance(response, dict)
+                    and isinstance(response.get("incomplete_details"), dict)
+                    else {}
+                )
+                incomplete_reason = str(
+                    incomplete_details.get("reason") or ""
+                ).strip().lower()
+                self._stop_reason = (
+                    "refusal"
+                    if incomplete_reason in {"content_filter", "refusal"}
+                    else "max_tokens"
+                )
+                break
+            if event_type == "response.completed":
+                self._terminal_event_type = event_type
 
             for event in self._ensure_message_started():
                 yield event
@@ -902,6 +983,17 @@ class ResponsesToAnthropicStreamTranslator:
                     },
                 )
 
+        if self._terminal_event_type is None:
+            self._set_terminal_error(
+                None,
+                "Upstream Responses stream ended without a terminal event",
+            )
+            yield format_translation.sse_encode(
+                "error",
+                self._terminal_error_payload,
+            )
+            return
+
         for event in self._ensure_message_started():
             yield event
         for event in self._refresh_message_started_usage():
@@ -938,7 +1030,10 @@ class ResponsesToAnthropicStreamTranslator:
             {
                 "type": "message_delta",
                 "delta": {
-                    "stop_reason": "tool_use" if self._tool_blocks else "end_turn",
+                    "stop_reason": (
+                        self._stop_reason
+                        or ("tool_use" if self._tool_blocks else "end_turn")
+                    ),
                     "stop_sequence": None,
                 },
                 "usage": self._usage,

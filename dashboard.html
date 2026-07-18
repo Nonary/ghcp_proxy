@@ -1768,13 +1768,13 @@
           <div class="kpi-grid">
             <article class="kpi">
               <div class="kpi-head">
-                <div class="eyebrow">AIC Spend</div>
+                <div class="eyebrow">Today's Spend</div>
                 <div class="kpi-icon">
                   <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1v22"/><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg>
                 </div>
               </div>
-              <div class="value">{{ aicLabel(allTime.cost_usd) }}</div>
-              <div class="cost-secondary">{{ money(allTime.cost_usd) }}</div>
+              <div class="value" :title="costLabel(todayUsage.cost_usd)">{{ headlineAicLabel(todayUsage.cost_usd) }}</div>
+              <div class="cost-secondary">{{ money(todayUsage.cost_usd) }}</div>
               <div class="kpi-meta">
                 <div class="row"><span class="k">Today</span><span class="v">{{ costLabel(todayUsage.cost_usd) }}</span></div>
                 <div class="row"><span class="k">Month</span><span class="v">{{ costLabel(currentMonth.cost_usd) }}</span></div>
@@ -1994,7 +1994,7 @@
 
             <div class="credit-top">
               <div class="credit-headline">
-                <span class="pct">{{ aicLabel(currentMonth.cost_usd) }}</span>
+                <span class="pct" :title="costLabel(currentMonth.cost_usd)">{{ headlineAicLabel(currentMonth.cost_usd) }}</span>
                 <span class="of">estimated this month</span>
               </div>
               <span class="cost-inline">{{ money(currentMonth.cost_usd) }}</span>
@@ -2024,12 +2024,12 @@
             <div class="credit-stats">
               <div class="credit-stat">
                 <div class="k">Today</div>
-                <div class="v">{{ aicLabel(todayUsage.cost_usd) }}</div>
+                <div class="v" :title="costLabel(todayUsage.cost_usd)">{{ headlineAicLabel(todayUsage.cost_usd) }}</div>
                 <div class="sub">{{ money(todayUsage.cost_usd) }} estimated</div>
               </div>
               <div class="credit-stat">
                 <div class="k">Avg/day</div>
-                <div class="v">{{ aicLabel(averageDailySpend) }}</div>
+                <div class="v" :title="costLabel(averageDailySpend)">{{ headlineAicLabel(averageDailySpend) }}</div>
                 <div class="sub">{{ money(averageDailySpend) }} · last 7d</div>
               </div>
               <div class="credit-stat">
@@ -2039,7 +2039,7 @@
               </div>
               <div class="credit-stat">
                 <div class="k">Projected</div>
-                <div class="v">{{ aicLabel(monthlySpendProjection) }}</div>
+                <div class="v" :title="costLabel(monthlySpendProjection)">{{ headlineAicLabel(monthlySpendProjection) }}</div>
                 <div class="sub">{{ money(monthlySpendProjection) }} · month end</div>
               </div>
             </div>
@@ -2149,7 +2149,7 @@
       <div v-show="activeView === 'usage'" class="legacy-section">
         <div class="stack">
           <article class="card">
-            <div class="card-head"><div><h3>Summary Snapshot</h3><div class="subtle">Daily and monthly values are visible at the same time.</div></div></div>
+            <div class="card-head"><div><h3>Summary Snapshot</h3><div class="subtle">Today's spend comes first.</div></div></div>
             <summary-explorer-card
               :all-time="allTime"
               :current-month="currentMonth"
@@ -3081,13 +3081,12 @@
       <div>
         <div>
           <h3>Summary Snapshot</h3>
-          <div class="subtle">Daily and monthly values are visible at the same time.</div>
+          <div class="subtle">Today's spend is the headline; month and all-time totals stay visible below.</div>
         </div>
       </div>
-      <h1 class="summary-hero-value">{{ costLabel(allTime.cost_usd) }}</h1>
+      <h1 class="summary-hero-value" :title="costLabel(todayUsage.cost_usd)">{{ headlineAicLabel(todayUsage.cost_usd) }}</h1>
       <p class="summary-hero-meta">
-        All-time spend across {{ integer(trackedMonths) }} tracked {{ trackedMonths === 1 ? 'month' : 'months' }}
-        with live request detail and current-month pacing.
+        Today's spend is shown first, with month and all-time totals below across {{ integer(trackedMonths) }} tracked {{ trackedMonths === 1 ? 'month' : 'months' }}.
       </p>
       <div class="chips hero-chips">
         <span class="chip">{{ updatedLabel }}</span>
@@ -3153,6 +3152,12 @@
       aicCompactLabel(value) {
         const formatted = this.aicCompact(value);
         return formatted === '-' ? formatted : `${formatted} AIC`;
+      },
+      headlineAicLabel(value) {
+        const numeric = Number(value);
+        if (!Number.isFinite(numeric)) return '-';
+        const exact = this.aicLabel(numeric);
+        return exact.length > 10 ? this.aicCompactLabel(numeric) : exact;
       },
       costLabel(value) {
         const numeric = Number(value);
@@ -4176,7 +4181,7 @@
             return {
               title: 'Monthly Spend',
               subtitle: 'Recent history',
-              headline: this.costLabel(this.allTime.cost_usd),
+              headline: this.headlineAicLabel(this.allTime.cost_usd),
               meta: this.monthlySpendMeta,
               rows: this.monthHistoryChronological,
               period: 'month',
@@ -4186,7 +4191,7 @@
           return {
             title: 'Daily Spend',
             subtitle: 'Month to date',
-            headline: this.costLabel(this.currentMonth.cost_usd),
+            headline: this.headlineAicLabel(this.currentMonth.cost_usd),
             meta: this.dailySpendMeta,
             rows: this.dailyHistory,
             period: 'day',
