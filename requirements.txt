@@ -1,8 +1,8 @@
-fastapi>=0.136.1,<1
+fastapi>=0.139.2,<1
 # Stream-level steering cancellation uses the verified httpx/httpcore 0.28.1
 # response wrapper layout to emit HTTP/2 RST_STREAM(CANCEL).
 httpx[http2]==0.28.1
 httpcore==1.0.9
-uvicorn>=0.46.0,<1
+uvicorn>=0.51.0,<1
 zstandard>=0.25.0,<1
-cryptography>=48.0.0,<49
+cryptography>=49.0.0,<50
