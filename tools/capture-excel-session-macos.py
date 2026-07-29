@@ -23,6 +23,7 @@ from dataclasses import dataclass
 
 _NETWORKSETUP = "/usr/sbin/networksetup"
 _ROUTE = "/sbin/route"
+_IFCONFIG = "/sbin/ifconfig"
 _LSAPPINFO = "/usr/bin/lsappinfo"
 _PGREP = "/usr/bin/pgrep"
 _LISTEN_HOST = "127.0.0.1"
@@ -66,10 +67,34 @@ def _primary_interface() -> str:
 def _network_service(interface: str) -> str:
     output = _run([_NETWORKSETUP, "-listnetworkserviceorder"])
     lines = output.splitlines()
+    active_services: list[tuple[str, str]] = []
     for index, line in enumerate(lines[:-1]):
-        match = re.match(r"^\(\d+\)\s+(.+)$", line.strip())
-        if match and f"Device: {interface}" in lines[index + 1]:
-            return match.group(1)
+        match = re.match(r"^\(\d+\)\s+(\*?)(.+)$", line.strip())
+        if not match:
+            continue
+        device_match = re.search(r"\bDevice:\s*([^,)]+)", lines[index + 1])
+        if not device_match:
+            continue
+        service = match.group(2).strip()
+        device = device_match.group(1).strip()
+        if device == interface:
+            return service
+        if not match.group(1):
+            active_services.append((service, device))
+
+    # A full-tunnel VPN can make a transient utun device the default route.
+    # Those devices are not necessarily represented as networksetup services,
+    # but Secure Web Proxy settings still belong to the underlying active
+    # Wi-Fi/Ethernet service. Prefer service order when more than one physical
+    # interface is active.
+    if interface.startswith("utun"):
+        for service, device in active_services:
+            try:
+                device_state = _run([_IFCONFIG, device])
+            except RuntimeError:
+                continue
+            if re.search(r"^\s*status:\s*active\s*$", device_state, re.MULTILINE):
+                return service
     raise RuntimeError(
         f"Could not find the Mac network service for interface {interface}"
     )

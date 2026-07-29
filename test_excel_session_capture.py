@@ -40,6 +40,52 @@ An asterisk (*) denotes that a network service is disabled.
         with mock.patch.object(macos_capture, "_run", return_value=output):
             self.assertEqual(macos_capture._network_service("en0"), "Wi-Fi")
 
+    def test_network_service_uses_active_physical_service_for_utun(self):
+        output = """\
+An asterisk (*) denotes that a network service is disabled.
+(1) USB Ethernet
+(Hardware Port: USB Ethernet, Device: en5)
+
+(2) Wi-Fi
+(Hardware Port: Wi-Fi, Device: en0)
+"""
+
+        def run(command):
+            if command == [
+                macos_capture._NETWORKSETUP,
+                "-listnetworkserviceorder",
+            ]:
+                return output
+            if command == [macos_capture._IFCONFIG, "en5"]:
+                return "status: inactive"
+            if command == [macos_capture._IFCONFIG, "en0"]:
+                return "status: active"
+            raise AssertionError(command)
+
+        with mock.patch.object(macos_capture, "_run", side_effect=run):
+            self.assertEqual(macos_capture._network_service("utun8"), "Wi-Fi")
+
+    def test_network_service_does_not_use_a_disabled_service_for_utun(self):
+        output = """\
+An asterisk (*) denotes that a network service is disabled.
+(1) *USB Ethernet
+(Hardware Port: USB Ethernet, Device: en5)
+
+(2) Wi-Fi
+(Hardware Port: Wi-Fi, Device: en0)
+"""
+
+        with mock.patch.object(
+            macos_capture,
+            "_run",
+            side_effect=[output, "status: active"],
+        ) as run:
+            self.assertEqual(macos_capture._network_service("utun8"), "Wi-Fi")
+        self.assertEqual(
+            run.call_args_list[-1],
+            mock.call([macos_capture._IFCONFIG, "en0"]),
+        )
+
     def test_secure_proxy_state_is_parsed(self):
         output = """\
 Enabled: Yes
