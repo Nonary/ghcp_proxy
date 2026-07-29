@@ -381,6 +381,20 @@ MODEL_PRICING = {
         "cached_input_per_million": 0.50,
         "output_per_million": 30.00,
     },
+    # The Excel add-in backend routes gpt-excel to GPT-5.6 (observed as
+    # gpt-5.6-sol), so it bills at those token rates. OpenAI meters this
+    # consumption in Credits at $0.04 per Credit (not Copilot AIC).
+    "gpt-excel": {
+        "provider": "OpenAI Excel",
+        "credit_unit_usd": 0.04,
+        "input_per_million": 5.00,
+        "cached_input_per_million": 0.50,
+        "output_per_million": 30.00,
+        "long_context_threshold": 272_000,
+        "long_context_input_per_million": 10.00,
+        "long_context_cached_input_per_million": 1.00,
+        "long_context_output_per_million": 45.00,
+    },
     "gpt-5.6-luna": {
         "provider": "OpenAI",
         "input_per_million": 1.00,

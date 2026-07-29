@@ -134,6 +134,91 @@ The dashboard is:
 http://localhost:8000/
 ```
 
+## GPT Excel Upstream
+
+`gpt-excel` is a Responses-only model that sends requests to the official
+ChatGPT Excel add-in backend instead of GitHub Copilot. It is experimental and
+unofficial. The backend may change without notice, and using an add-in session
+outside the add-in may be unsupported by OpenAI. Use only your own account and
+session.
+
+The Excel credential is deliberately separate from GitHub authentication. On
+Windows it is encrypted with the current user's DPAPI key and reloaded after
+proxy restarts. The bearer token and account ID are never stored as plaintext
+or returned to the dashboard.
+
+Prerequisites:
+
+- Excel desktop with the official ChatGPT add-in open and signed in.
+- The add-in WebView2 launched with remote debugging on port `9222`.
+- Node.js 22 or newer for the one-shot session primer.
+
+The easiest setup is through the dashboard:
+
+1. Open **Integrations**.
+2. Under **GPT Excel**, click **Capture Excel session**.
+3. Send one message in the ChatGPT Excel add-in.
+4. Wait for the dashboard to report **Ready · encrypted with Windows DPAPI**.
+
+The command-line primer remains available:
+
+```powershell
+.\prime-excel-session.ps1
+```
+
+When prompted, send one message in the ChatGPT Excel add-in. The primer copies
+only the bearer/account/client header bundle to the loopback proxy endpoint; it
+does not print the token. GHCP Proxy encrypts the allowlisted bundle with DPAPI.
+Check non-secret status with:
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8000/api/config/excel-session
+```
+
+After priming, select `gpt-excel` in Codex. Requests for all other models still
+use GitHub Copilot. The Excel service currently accepts `gpt-5.5` on the wire
+but may report the actual routed model (observed as `gpt-5.6-sol`) in Responses
+events.
+
+Basispoints rejects client-supplied tool schemas and injects its own
+Excel-specific tools. GHCP Proxy therefore removes client tool declarations and
+describes the caller's function and custom tools through a constrained relay
+protocol. Tool requests are converted back into standard Responses
+`function_call` or `custom_tool_call` events, and Codex executes them locally
+under its normal approval policy. Tool outputs are accepted by Basispoints on
+the following turn, so shell inspection and file-editing loops work without
+sending unsupported tool schemas to the Excel service. The bridge intentionally
+requests one client tool at a time; parallel client tool calls are not exposed
+for `gpt-excel`.
+
+Replayed history keeps its native Responses shape: Basispoints accepts
+`function_call` / `function_call_output` items for tools it never declared
+(verified by live replays), and the model only maintains its tool state
+machine when it sees the standard item shapes. `update_plan` outputs carry an
+appended steering directive — without it the plan-happy upstream harness
+re-plans forever instead of working. Reasoning items with `encrypted_content`
+are replayed unchanged (GPT-5 models repeat their previous action without
+that continuity); bare reasoning items (which the stateless upstream would
+reject) are dropped. The tool catalog message sits at the end of the prompt —
+A/B replays showed the model ignores the marker protocol when the catalog is
+anywhere else. The rewrite is deterministic, and the
+instructions plus tool-catalog messages lead the prompt, so the upstream prompt
+cache sees a stable, growing prefix. Codex's `prompt_cache_key` is forwarded
+for cache routing (disable with `GHCP_EXCEL_FORWARD_PROMPT_CACHE_KEY=0`), and
+the `task_id` metadata is derived from it so one conversation keeps one task
+identity across turns.
+
+Cost tracking prices `gpt-excel` at GPT-5.6 token rates (the observed routed
+model), including the 272k long-context tier. The dashboard shows that spend
+in OpenAI Credits ($0.04 = 1 Credit) instead of Copilot AIC; aggregate totals
+that mix providers remain in AIC.
+
+Clear both the active and encrypted session without stopping the proxy:
+
+```powershell
+Invoke-RestMethod -Method Delete http://127.0.0.1:8000/api/config/excel-session
+```
+
 ## Troubleshooting
 
 Start here if setup does not work.

@@ -57,6 +57,8 @@ import auto_update
 import background_proxy
 import codex_agent_compat
 import dashboard as dashboard_module
+import excel_session_capture
+import excel_upstream
 import format_translation
 import gzip
 import hashlib
@@ -482,6 +484,14 @@ bridge_planner = ProtocolBridgePlanner(
     model_routing_config_service,
     capability_resolver=lambda model: model_supports_native_messages(model) if model else False,
 )
+excel_session_capture_manager = excel_session_capture.ExcelSessionCaptureManager(
+    script_path=os.path.join(
+        os.path.dirname(__file__),
+        "tools",
+        "prime-excel-session.js",
+    ),
+    session_status_provider=excel_upstream.excel_session_store.status,
+)
 
 
 def _debug_prompt_logging_settings() -> dict[str, object]:
@@ -764,12 +774,14 @@ except Exception as _codex_ingest_exc:  # pragma: no cover - best effort
 
 @app.on_event("startup")
 async def _app_startup_restore_client_proxy_configs():
+    excel_upstream.excel_session_store.load()
     restore_client_proxy_configs_on_startup()
     auto_update_runtime_controller.start_periodic_checks()
 
 
 @app.on_event("shutdown")
 async def _app_shutdown_revert_client_proxy_configs():
+    excel_session_capture_manager.stop()
     await auto_update_runtime_controller.stop_periodic_checks()
     revert_client_proxy_configs_on_shutdown()
 
@@ -4722,7 +4734,7 @@ def fetch_copilot_model_capabilities() -> dict[str, dict]:
     try:
         api_base = auth.get_api_base().rstrip("/")
     except Exception:
-        return {}
+        return excel_upstream.merge_local_model_capabilities({})
 
     now = time.monotonic()
     with _COPILOT_MODEL_CAPS_LOCK:
@@ -4733,12 +4745,12 @@ def fetch_copilot_model_capabilities() -> dict[str, dict]:
             and cache["data"]
             and (now - float(cache.get("ts", 0.0))) < _COPILOT_MODEL_CAPS_TTL_SECONDS
         ):
-            return dict(cache["data"])  # type: ignore[arg-type]
+            return excel_upstream.merge_local_model_capabilities(cache["data"])  # type: ignore[arg-type]
 
     try:
         api_key = auth.get_api_key()
     except Exception:
-        return {}
+        return excel_upstream.merge_local_model_capabilities({})
 
     headers = format_translation.build_copilot_headers(api_key)
     url = f"{api_base}/models"
@@ -4748,11 +4760,11 @@ def fetch_copilot_model_capabilities() -> dict[str, dict]:
             response.raise_for_status()
             payload = response.json()
     except Exception:
-        return {}
+        return excel_upstream.merge_local_model_capabilities({})
 
     raw_entries = payload.get("data") if isinstance(payload, dict) else None
     if not isinstance(raw_entries, list):
-        return {}
+        return excel_upstream.merge_local_model_capabilities({})
 
     result: dict[str, dict] = {}
     for entry in raw_entries:
@@ -4808,7 +4820,7 @@ def fetch_copilot_model_capabilities() -> dict[str, dict]:
         _COPILOT_MODEL_CAPS_CACHE["key"] = api_base
         _COPILOT_MODEL_CAPS_CACHE["ts"] = now
         _COPILOT_MODEL_CAPS_CACHE["data"] = result
-    return dict(result)
+    return excel_upstream.merge_local_model_capabilities(result)
 
 
 # Models known to natively support Anthropic /v1/messages upstream. This is a
@@ -4856,7 +4868,7 @@ async def _proxy_models_request() -> Response:
     try:
         api_key = auth.get_api_key()
     except Exception:
-        return format_translation.openai_error_response(401, AUTH_FAILURE_MESSAGE)
+        return JSONResponse(content=excel_upstream.merge_local_models_payload({}))
 
     upstream_url = f"{auth.get_api_base().rstrip('/')}/models"
     headers = format_translation.build_copilot_headers(api_key)
@@ -4869,6 +4881,13 @@ async def _proxy_models_request() -> Response:
         status_code, message = format_translation.upstream_request_error_status_and_message(exc)
         return format_translation.openai_error_response(status_code, message)
 
+    if upstream.status_code < 400:
+        payload = _extract_upstream_json_payload(upstream)
+        if isinstance(payload, dict):
+            return JSONResponse(
+                content=excel_upstream.merge_local_models_payload(payload),
+                status_code=upstream.status_code,
+            )
     return proxy_non_streaming_response(upstream)
 
 
@@ -5304,6 +5323,56 @@ async def auto_update_status_api():
     return JSONResponse(content=auto_update_runtime_controller.status_payload())
 
 
+@app.get("/api/config/excel-session")
+async def excel_session_status_api():
+    return JSONResponse(
+        content={
+            **excel_upstream.excel_session_store.status(),
+            "capture": excel_session_capture_manager.status(),
+        }
+    )
+
+
+@app.post("/api/config/excel-session")
+async def excel_session_config_api(request: Request):
+    payload = await parse_json_request(request)
+    action = str(payload.get("action") or "").strip().lower()
+    if action == "capture":
+        try:
+            capture = excel_session_capture_manager.start(
+                devtools_port=int(payload.get("devtools_port") or 9222),
+                timeout_seconds=int(payload.get("timeout_seconds") or 300),
+            )
+        except (RuntimeError, TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return JSONResponse(
+            content={
+                **excel_upstream.excel_session_store.status(),
+                "capture": capture,
+            }
+        )
+    try:
+        status = excel_upstream.excel_session_store.configure(payload.get("headers"))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return JSONResponse(
+        content={
+            **status,
+            "capture": excel_session_capture_manager.status(),
+        }
+    )
+
+
+@app.delete("/api/config/excel-session")
+async def excel_session_clear_api():
+    return JSONResponse(
+        content={
+            **excel_upstream.excel_session_store.clear(),
+            "capture": excel_session_capture_manager.status(),
+        }
+    )
+
+
 @app.post("/api/config/auto-update")
 async def auto_update_config_api(request: Request):
     payload = await parse_json_request(request)
@@ -5358,6 +5427,426 @@ async def background_proxy_config_api(request: Request):
     return JSONResponse(content={**result, "message": message})
 
 
+def _excel_tool_call_event_bytes(tool_call: dict, response_payload: dict) -> list[bytes]:
+    item = dict(tool_call)
+    item["status"] = "in_progress"
+    if tool_call["type"] == "function_call":
+        item["arguments"] = ""
+        value_key = "arguments"
+        delta_event = "response.function_call_arguments.delta"
+        done_event = "response.function_call_arguments.done"
+    else:
+        item["input"] = ""
+        value_key = "input"
+        delta_event = "response.custom_tool_call_input.delta"
+        done_event = "response.custom_tool_call_input.done"
+    return [
+        format_translation.sse_encode(
+            "response.output_item.added",
+            {
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": item,
+            },
+        ),
+        format_translation.sse_encode(
+            delta_event,
+            {
+                "type": delta_event,
+                "output_index": 0,
+                "item_id": tool_call["id"],
+                "delta": tool_call[value_key],
+            },
+        ),
+        format_translation.sse_encode(
+            done_event,
+            {
+                "type": done_event,
+                "output_index": 0,
+                "item_id": tool_call["id"],
+                value_key: tool_call[value_key],
+            },
+        ),
+        format_translation.sse_encode(
+            "response.output_item.done",
+            {
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {**tool_call, "status": "completed"},
+            },
+        ),
+        format_translation.sse_encode(
+            "response.completed",
+            {
+                "type": "response.completed",
+                "response": response_payload,
+            },
+        ),
+    ]
+
+
+def _excel_tool_stream_transform(source_body: dict):
+    allowed_tools = excel_upstream.client_tool_types(source_body)
+    if not allowed_tools:
+        return None
+    marker_open = excel_upstream.TOOL_CALL_MARKER_OPEN
+
+    def _marker_hold_length(text: str) -> int:
+        """Length of the text suffix that could still become a marker open tag."""
+        max_probe = min(len(marker_open) - 1, len(text))
+        for probe in range(max_probe, 0, -1):
+            if text.endswith(marker_open[:probe]):
+                return probe
+        return 0
+
+    async def transform(byte_iter):
+        full_text = ""
+        emitted_upto = 0
+        marker_mode = False
+        held_events: list[bytes] = []
+        delta_template: dict = {}
+        done_seen = False
+
+        def flush_text() -> list[bytes]:
+            nonlocal emitted_upto
+            pending = full_text[emitted_upto:]
+            if not pending:
+                return []
+            emitted_upto = len(full_text)
+            return [
+                format_translation.sse_encode(
+                    "response.output_text.delta",
+                    {**delta_template, "type": "response.output_text.delta", "delta": pending},
+                )
+            ]
+
+        async for event_name, data in format_translation.iter_sse_messages(byte_iter):
+            if data == "[DONE]":
+                done_seen = True
+                continue
+            try:
+                payload = json.loads(data)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            event_type = str(event_name or payload.get("type") or "").strip().lower()
+            encoded = format_translation.sse_encode(event_type or "message", payload)
+
+            if event_type == "response.output_text.delta":
+                delta = payload.get("delta")
+                if isinstance(delta, str):
+                    full_text += delta
+                delta_template = {
+                    key: payload[key]
+                    for key in ("item_id", "output_index", "content_index")
+                    if key in payload
+                }
+                if marker_mode:
+                    continue
+                search_start = max(0, emitted_upto - len(marker_open) + 1)
+                marker_pos = full_text.find(marker_open, search_start)
+                if marker_pos != -1:
+                    marker_mode = True
+                    pending = full_text[emitted_upto:marker_pos]
+                    emitted_upto = marker_pos
+                    if pending:
+                        yield format_translation.sse_encode(
+                            "response.output_text.delta",
+                            {
+                                **delta_template,
+                                "type": "response.output_text.delta",
+                                "delta": pending,
+                            },
+                        )
+                    continue
+                boundary = len(full_text) - _marker_hold_length(full_text)
+                if boundary > emitted_upto:
+                    pending = full_text[emitted_upto:boundary]
+                    emitted_upto = boundary
+                    yield format_translation.sse_encode(
+                        "response.output_text.delta",
+                        {
+                            **delta_template,
+                            "type": "response.output_text.delta",
+                            "delta": pending,
+                        },
+                    )
+                continue
+
+            if event_type == "response.output_text.done":
+                if marker_mode:
+                    held_events.append(encoded)
+                    continue
+                for chunk in flush_text():
+                    yield chunk
+                yield encoded
+                continue
+
+            # Native tool-call events must never reach Codex raw: their
+            # arguments follow the upstream's server-tool schema, and Codex
+            # executing the un-normalized call fails and provokes retry
+            # loops. Hold them until the conversion decision at completion.
+            if event_type in {
+                "response.function_call_arguments.delta",
+                "response.function_call_arguments.done",
+                "response.custom_tool_call_input.delta",
+                "response.custom_tool_call_input.done",
+            }:
+                held_events.append(encoded)
+                continue
+
+            if event_type in {"response.output_item.added", "response.output_item.done"}:
+                item = payload.get("item")
+                item_type = (
+                    item.get("type") if isinstance(item, dict) else None
+                )
+                if item_type in {"function_call", "custom_tool_call"}:
+                    held_events.append(encoded)
+                    continue
+                if (
+                    event_type == "response.output_item.done"
+                    and marker_mode
+                    and item_type == "message"
+                ):
+                    held_events.append(encoded)
+                    continue
+                yield encoded
+                continue
+
+            if event_type in {"response.completed", "response.failed", "response.incomplete"}:
+                response = payload.get("response")
+                response = response if isinstance(response, dict) else None
+                tool_call = None
+                if event_type == "response.completed":
+                    completed_text = full_text or (
+                        format_translation.extract_response_output_text(response)
+                        if response
+                        else ""
+                    )
+                    tool_call = excel_upstream.extract_client_tool_call(
+                        completed_text or "",
+                        allowed_tools,
+                    )
+                    if tool_call is None:
+                        tool_call = excel_upstream.extract_native_client_tool_call(
+                            response,
+                            source_body,
+                        )
+                if excel_upstream.is_plan_update_churn(tool_call, source_body):
+                    # Re-issued identical plan update: end the turn with text
+                    # instead of feeding Codex another tool call to loop on.
+                    held_events.clear()
+                    marker_mode = False
+                    cleaned_full = excel_upstream.strip_tool_call_markers(full_text)
+                    remaining = cleaned_full[emitted_upto:]
+                    if not cleaned_full.strip():
+                        cleaned_full = excel_upstream.DUPLICATE_PLAN_UPDATE_TEXT
+                        remaining = cleaned_full
+                    emitted_upto = len(full_text)
+                    if remaining:
+                        yield format_translation.sse_encode(
+                            "response.output_text.delta",
+                            {
+                                **delta_template,
+                                "type": "response.output_text.delta",
+                                "delta": remaining,
+                            },
+                        )
+                    yield format_translation.sse_encode(
+                        "response.output_text.done",
+                        {
+                            **delta_template,
+                            "type": "response.output_text.done",
+                            "text": cleaned_full,
+                        },
+                    )
+                    text_payload = excel_upstream.response_payload_with_text(
+                        response,
+                        cleaned_full,
+                    )
+                    yield format_translation.sse_encode(
+                        "response.output_item.done",
+                        {
+                            "type": "response.output_item.done",
+                            "output_index": 0,
+                            "item": text_payload["output"][0],
+                        },
+                    )
+                    yield format_translation.sse_encode(
+                        "response.completed",
+                        {
+                            "type": "response.completed",
+                            "response": text_payload,
+                        },
+                    )
+                    continue
+                if tool_call is not None:
+                    held_events.clear()
+                    emitted_upto = len(full_text)
+                    response_payload = excel_upstream.response_payload_with_tool_call(
+                        response,
+                        tool_call,
+                    )
+                    for chunk in _excel_tool_call_event_bytes(tool_call, response_payload):
+                        yield chunk
+                    continue
+                # Not a tool call after all: release everything that was held
+                # back so the client still receives the full assistant text.
+                for chunk in flush_text():
+                    yield chunk
+                for held in held_events:
+                    yield held
+                held_events.clear()
+                marker_mode = False
+                yield encoded
+                continue
+
+            yield encoded
+
+        for chunk in flush_text():
+            yield chunk
+        for held in held_events:
+            yield held
+        if done_seen:
+            yield b"data: [DONE]\n\n"
+
+    return transform
+
+
+async def _post_excel_non_streaming_request(
+    plan: UpstreamRequestPlan,
+    *,
+    client_body: dict,
+) -> Response:
+    try:
+        client = _get_upstream_client()
+        upstream = await throttled_client_post(
+            client,
+            plan.upstream_url,
+            headers=plan.headers,
+            json=plan.body,
+        )
+    except httpx.RequestError as exc:
+        status_code, message = format_translation.upstream_request_error_status_and_message(exc)
+        _finish_usage_and_trace(plan, status_code, response_text=message)
+        return format_translation.openai_error_response(status_code, message)
+    except Exception:
+        _finish_usage_and_trace(plan, 599)
+        raise
+
+    if upstream.status_code >= 400:
+        return _handle_upstream_error(
+            upstream,
+            trace_plan=plan,
+            caller_protocol="responses",
+            stream=False,
+            model=excel_upstream.MODEL_ID,
+            fallback_error_response=proxy_non_streaming_response,
+        )
+    response_payload = _extract_upstream_json_payload(upstream)
+    translated_payload = response_payload
+    if isinstance(response_payload, dict):
+        response_text = format_translation.extract_response_output_text(
+            response_payload
+        )
+        tool_call = excel_upstream.extract_client_tool_call(
+            response_text,
+            excel_upstream.client_tool_types(client_body),
+        )
+        if tool_call is None:
+            tool_call = excel_upstream.extract_native_client_tool_call(
+                response_payload,
+                client_body,
+            )
+        if excel_upstream.is_plan_update_churn(tool_call, client_body):
+            cleaned = (
+                excel_upstream.strip_tool_call_markers(response_text).strip()
+                or excel_upstream.DUPLICATE_PLAN_UPDATE_TEXT
+            )
+            translated_payload = excel_upstream.response_payload_with_text(
+                response_payload,
+                cleaned,
+            )
+        elif tool_call is not None:
+            translated_payload = excel_upstream.response_payload_with_tool_call(
+                response_payload,
+                tool_call,
+            )
+    _finish_usage_and_trace(
+        plan,
+        upstream.status_code,
+        upstream=upstream,
+        response_payload=(
+            translated_payload if isinstance(translated_payload, dict) else None
+        ),
+        response_text=(
+            format_translation.extract_response_output_text(translated_payload)
+            if isinstance(translated_payload, dict)
+            else _extract_upstream_text(upstream)
+        ),
+    )
+    if isinstance(translated_payload, dict):
+        return JSONResponse(
+            content=translated_payload,
+            status_code=upstream.status_code,
+        )
+    return proxy_non_streaming_response(upstream)
+
+
+async def _handle_excel_responses(
+    request: Request,
+    body: dict,
+    *,
+    source_body: dict | None = None,
+) -> Response:
+    upstream_body = excel_upstream.prepare_responses_body(body)
+    try:
+        excel_headers = excel_upstream.excel_session_store.request_headers(
+            stream=bool(upstream_body.get("stream")),
+        )
+    except RuntimeError as exc:
+        return format_translation.openai_error_response(401, str(exc))
+
+    plan, error_response = _prepare_upstream_request(
+        request,
+        body=upstream_body,
+        requested_model=excel_upstream.MODEL_ID,
+        resolved_model=excel_upstream.MODEL_ID,
+        upstream_path="/basispoints/api/responses",
+        upstream_url=excel_upstream.RESPONSES_URL,
+        header_builder=lambda _api_key, _request_id: dict(excel_headers),
+        error_response=format_translation.openai_error_response,
+        api_key="excel-session",
+        source_body=source_body if isinstance(source_body, dict) else body,
+        trace_metadata={
+            "bridge": True,
+            "strategy_name": "responses_to_excel_responses",
+            "caller_protocol": "responses",
+            "upstream_protocol": "responses",
+            "header_kind": "excel-session",
+        },
+    )
+    if error_response is not None:
+        return error_response
+    if bool(upstream_body.get("stream")):
+        return await proxy_streaming_response(
+            plan.upstream_url,
+            plan.headers,
+            plan.body,
+            timeout=300,
+            usage_event=plan.usage_event,
+            stream_type="responses",
+            trace_plan=plan,
+            downstream_request=request,
+            caller_protocol="responses",
+            caller_model=excel_upstream.MODEL_ID,
+            stream_transform=_excel_tool_stream_transform(body),
+            sync_replay_ids=False,
+        )
+    return await _post_excel_non_streaming_request(plan, client_body=body)
+
+
 @app.post("/responses")
 @app.post("/v1/responses")
 async def responses(request: Request):
@@ -5374,6 +5863,9 @@ async def responses(request: Request):
         body,
         diagnostics=agent_compat_diagnostics,
     )
+    if excel_upstream.is_excel_model(body.get("model")):
+        return await _handle_excel_responses(request, body)
+
     effective_subagent = _responses_effective_subagent(request, body)
 
     raw_input = body.get("input")
@@ -5464,6 +5956,7 @@ async def responses_compact(request: Request):
             format_translation.http_exception_detail_to_message(exc.detail),
         )
 
+    requested_excel = excel_upstream.is_excel_model(body.get("model"))
     resolved_target = model_routing_config_service.resolve_target_model(body.get("model"))
     force_responses_safe_transcript = (
         isinstance(resolved_target, str)
@@ -5473,6 +5966,13 @@ async def responses_compact(request: Request):
         body,
         force_responses_safe_transcript=force_responses_safe_transcript,
     )
+    if requested_excel:
+        return await _handle_excel_responses(
+            request,
+            summary_request,
+            source_body=body,
+        )
+
     try:
         api_key = auth.get_api_key()
     except Exception:

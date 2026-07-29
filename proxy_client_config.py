@@ -48,6 +48,8 @@ def _format_token_rate(value: object) -> str:
 
 
 def _model_token_pricing_description(model_name: str) -> str:
+    if model_name == "gpt-excel":
+        return "ChatGPT subscription usage; not API-token billing"
     pricing = MODEL_PRICING.get(model_name)
     if not isinstance(pricing, Mapping):
         return "Token pricing unavailable"
@@ -1150,6 +1152,7 @@ class ProxyClientConfigService:
     ) -> list[str]:
         family_order = {"gpt": 0, "claude": 1, "gemini": 2, "grok": 3}
         preferred_order = {
+            "gpt-excel": -24,
             "gpt-5.6-sol": -23,
             "gpt-5.6-terra": -22,
             "gpt-5.6-luna": -21,

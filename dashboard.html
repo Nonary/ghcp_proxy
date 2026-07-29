@@ -1878,7 +1878,7 @@
                     <th>Duration</th>
                     <th>Proxy Calls</th>
                     <th>Tokens</th>
-                    <th>Cost (AIC)</th>
+                    <th>Cost</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -1896,8 +1896,8 @@
                     <td>{{ integer(row.session_request_count || row.request_count) }}</td>
                     <td>{{ compact(row.total_tokens) }}</td>
                     <td>
-                      <div class="cost-stack" :title="costLabel(row.cost_usd)">
-                        <strong>{{ aicLabel(row.cost_usd) }}</strong>
+                      <div class="cost-stack" :title="rowCostTitle(row)">
+                        <strong>{{ rowCostLabel(row) }}</strong>
                         <span class="cost-secondary">{{ money(row.cost_usd) }} · {{ costBreakdownLabel(row, true) }}</span>
                       </div>
                     </td>
@@ -1918,7 +1918,7 @@
                     <th>Path</th>
                     <th>Duration</th>
                     <th>Tokens (in/out)</th>
-                    <th>Cost (AIC)</th>
+                    <th>Cost</th>
                     <th>Request ID</th>
                   </tr>
                 </thead>
@@ -1940,8 +1940,8 @@
                     <td>{{ shortDuration(row.duration_ms) }}</td>
                     <td>{{ shortTokens(row) }}</td>
                     <td>
-                      <div class="cost-stack" :title="costLabel(row.cost_usd)">
-                        <strong>{{ aicLabel(row.cost_usd) }}</strong>
+                      <div class="cost-stack" :title="rowCostTitle(row)">
+                        <strong>{{ rowCostLabel(row) }}</strong>
                         <span class="cost-secondary">{{ money(row.cost_usd) }} · {{ costBreakdownLabel(row, true) }}</span>
                       </div>
                     </td>
@@ -2231,7 +2231,7 @@
           <div style="overflow-x:auto;">
             <table class="req-table">
               <thead>
-                <tr><th>Source</th><th>Session</th><th>Model</th><th>Last Activity</th><th>Duration</th><th>Proxy Calls</th><th>Tokens</th><th>Cost (AIC)</th></tr>
+                <tr><th>Source</th><th>Session</th><th>Model</th><th>Last Activity</th><th>Duration</th><th>Proxy Calls</th><th>Tokens</th><th>Cost</th></tr>
               </thead>
               <tbody>
                 <tr v-for="row in filteredSessions" :key="row.session_key"
@@ -2248,8 +2248,8 @@
                   <td>{{ integer(row.session_request_count || row.request_count) }}</td>
                   <td>{{ compact(row.total_tokens) }}</td>
                     <td>
-                      <div class="cost-stack" :title="costLabel(row.cost_usd)">
-                        <strong>{{ aicLabel(row.cost_usd) }}</strong>
+                      <div class="cost-stack" :title="rowCostTitle(row)">
+                        <strong>{{ rowCostLabel(row) }}</strong>
                         <span class="cost-secondary">{{ money(row.cost_usd) }} · {{ costBreakdownLabel(row, true) }}</span>
                       </div>
                     </td>
@@ -2270,7 +2270,7 @@
             </div>
             <div class="subtle" style="text-align:right; line-height:1.5;">
               <div>{{ integer(selectedSession.session_request_count || selectedSession.request_count) }} requests · {{ shortDuration(selectedSession.wall_duration_ms) }} wall · {{ shortDuration(selectedSession.api_duration_ms) }} api</div>
-              <div>{{ compact(selectedSession.total_tokens) }} tokens · <span class="cost-inline">{{ aicLabel(selectedSession.cost_usd) }} · {{ money(selectedSession.cost_usd) }}</span></div>
+              <div>{{ compact(selectedSession.total_tokens) }} tokens · <span class="cost-inline">{{ rowCostLabel(selectedSession) }} · {{ money(selectedSession.cost_usd) }}</span></div>
               <div class="cost-breakdown-inline">{{ costBreakdownLabel(selectedSession) }}</div>
               <div v-if="selectedSession.first_activity">First {{ shortStamp(selectedSession.first_activity) }} · Last {{ shortStamp(selectedSession.last_activity) }}</div>
             </div>
@@ -2279,7 +2279,7 @@
             <table class="req-table">
               <thead>
                 <tr>
-                  <th>Time</th><th>Status</th><th>Model</th><th>Path</th><th>Duration</th><th>Tokens (in/out)</th><th>Cost (AIC)</th><th>Request ID</th>
+                  <th>Time</th><th>Status</th><th>Model</th><th>Path</th><th>Duration</th><th>Tokens (in/out)</th><th>Cost</th><th>Request ID</th>
                 </tr>
               </thead>
               <tbody>
@@ -2295,8 +2295,8 @@
                   <td>{{ shortDuration(row.duration_ms) }}</td>
                   <td>{{ shortTokens(row) }}</td>
                   <td>
-                    <div class="cost-stack" :title="costLabel(row.cost_usd)">
-                      <strong>{{ aicLabel(row.cost_usd) }}</strong>
+                    <div class="cost-stack" :title="rowCostTitle(row)">
+                      <strong>{{ rowCostLabel(row) }}</strong>
                       <span class="cost-secondary">{{ money(row.cost_usd) }} · {{ costBreakdownLabel(row, true) }}</span>
                     </div>
                   </td>
@@ -2360,7 +2360,7 @@
                     <div class="mono">{{ shortId(row.request_id || row.client_request_id) }}</div>
                     <div>{{ tokenSummary(row) }}</div>
                     <div class="cost-stack">
-                      <strong>{{ aicLabel(row.cost_usd) }}</strong>
+                      <strong>{{ rowCostLabel(row) }}</strong>
                       <span class="cost-secondary">{{ money(row.cost_usd) }} · {{ costBreakdownLabel(row, true) }}</span>
                     </div>
                   </div>
@@ -2384,7 +2384,7 @@
                   <div><div class="detail-label">Upstream Path</div><div class="detail-value mono">{{ selectedRequest.upstream_path || '-' }}</div></div>
                   <div><div class="detail-label">Requested Model</div><div class="detail-value">{{ selectedRequest.requested_model || '-' }}</div></div>
                   <div><div class="detail-label">Resolved Model</div><div class="detail-value">{{ selectedRequest.response_model || selectedRequest.resolved_model || '-' }}</div></div>
-                  <div><div class="detail-label">Estimated AIC</div><div class="detail-value"><strong>{{ aicLabel(selectedRequest.cost_usd) }}</strong><span class="cost-inline"> · {{ money(selectedRequest.cost_usd) }}</span></div></div>
+                  <div><div class="detail-label">Estimated {{ rowCostUnitName(selectedRequest) }}</div><div class="detail-value"><strong>{{ rowCostLabel(selectedRequest) }}</strong><span class="cost-inline"> · {{ money(selectedRequest.cost_usd) }}</span></div></div>
                   <div><div class="detail-label">Duration</div><div class="detail-value">{{ selectedRequest.duration_ms != null ? `${selectedRequest.duration_ms} ms` : '-' }}</div></div>
                   <div><div class="detail-label">Cost breakdown</div><div class="detail-value">{{ costBreakdownLabel(selectedRequest) }}</div></div>
                   <div><div class="detail-label">Session ID</div><div class="detail-value mono">{{ selectedRequest.session_id || '-' }}</div></div>
@@ -2606,6 +2606,39 @@
             <button class="primary" @click="enableAllClientProxy" :disabled="savingProxyConfig || allClientProxyConfigured || anyClientProxyError">Enable All</button>
             <button @click="disableAllClientProxy" :disabled="savingProxyConfig || noClientProxyConfigured || anyClientProxyError">Disable All</button>
           </div>
+          <article class="mini-card" style="margin-top: 12px;">
+            <div class="eyebrow">GPT Excel</div>
+            <div :class="['status', excelSessionStatusClass()]">{{ excelSessionStatusLabel() }}</div>
+            <div class="subtle" style="margin-top: 8px;">
+              Capture credentials from the official ChatGPT Excel add-in and store them encrypted for this Windows user with DPAPI.
+            </div>
+            <div class="subtle" style="margin-top: 4px;">
+              {{ excelSessionStatus.persisted ? 'Encrypted session will reload after proxy restarts.' : 'No encrypted session has been saved yet.' }}
+            </div>
+            <div class="subtle" style="margin-top: 4px;" v-if="excelSessionStatus.expires_at">
+              Token expires {{ excelSessionExpiryLabel() }}.
+            </div>
+            <div class="subtle" style="margin-top: 8px;" v-if="excelSessionStatus.capture?.capturing">
+              Send one message in the ChatGPT Excel add-in. This page will update automatically.
+            </div>
+            <div class="toolbar" style="margin-top: 10px;">
+              <button class="primary"
+                      @click="startExcelSessionCapture"
+                      :disabled="savingExcelSession || excelSessionStatus.capture?.capturing || !excelSessionStatus.capture?.available">
+                <span v-if="excelSessionStatus.capture?.capturing" class="spinner"></span>
+                {{ excelSessionStatus.capture?.capturing ? 'Waiting for Excel…' : (excelSessionStatus.configured ? 'Refresh Excel session' : 'Capture Excel session') }}
+              </button>
+              <button @click="clearExcelSession"
+                      :disabled="savingExcelSession || excelSessionStatus.capture?.capturing || (!excelSessionStatus.configured && !excelSessionStatus.persisted)">
+                Clear session
+              </button>
+              <button @click="loadExcelSessionStatus" :disabled="savingExcelSession">Refresh</button>
+            </div>
+            <div v-if="excelSessionStatus.error" class="status error" style="margin-top: 10px;">{{ excelSessionStatus.error }}</div>
+            <div v-else-if="excelSessionStatus.capture?.error" class="status error" style="margin-top: 10px;">{{ excelSessionStatus.capture.error }}</div>
+            <div v-else-if="excelSessionStatus.persistence_error" class="status error" style="margin-top: 10px;">{{ excelSessionStatus.persistence_error }}</div>
+            <div v-else-if="excelSessionStatus.statusMessage" class="status good" style="margin-top: 10px;">{{ excelSessionStatus.statusMessage }}</div>
+          </article>
           <article class="mini-card" style="margin-top: 12px;">
             <div class="eyebrow">Shutdown Behavior</div>
             <label style="display:flex; align-items:center; gap:10px; margin-top:6px;">
@@ -3163,6 +3196,41 @@
         const numeric = Number(value);
         return Number.isFinite(numeric) ? `${this.aicLabel(numeric)} · ${this.money(numeric)}` : '-';
       },
+      // OpenAI meters gpt-excel consumption in Credits: $0.04 = 1 Credit.
+      // Copilot AIC does not apply to that upstream.
+      isExcelCostRow(row) {
+        const isExcel = (name) => String(name || '').trim().toLowerCase() === 'gpt-excel';
+        if (typeof row === 'string') return isExcel(row);
+        if (!row || typeof row !== 'object') return false;
+        if ([row.requested_model, row.resolved_model, row.response_model, row.model].some(isExcel)) return true;
+        return Array.isArray(row.models) && row.models.length > 0 && row.models.every(isExcel);
+      },
+      credit(value) {
+        const numeric = Number(value);
+        return Number.isFinite(numeric)
+          ? new Intl.NumberFormat('en-US', { maximumFractionDigits: 2 }).format(numeric / 0.04)
+          : '-';
+      },
+      creditCompact(value) {
+        const numeric = Number(value);
+        return Number.isFinite(numeric)
+          ? new Intl.NumberFormat('en-US', { notation: 'compact', maximumFractionDigits: 1 }).format(numeric / 0.04)
+          : '-';
+      },
+      creditLabel(value) {
+        const formatted = this.credit(value);
+        return formatted === '-' ? formatted : `${formatted} Credits`;
+      },
+      rowCostUnitName(row) {
+        return this.isExcelCostRow(row) ? 'Credits' : 'AIC';
+      },
+      rowCostLabel(row) {
+        return this.isExcelCostRow(row) ? this.creditLabel(row?.cost_usd) : this.aicLabel(row?.cost_usd);
+      },
+      rowCostTitle(row) {
+        const numeric = Number(row?.cost_usd);
+        return Number.isFinite(numeric) ? `${this.rowCostLabel(row)} · ${this.money(numeric)}` : '-';
+      },
       costBreakdownValues(row) {
         const breakdown = row?.cost_breakdown || row?.costBreakdown || {};
         const inputFresh = Number(breakdown.input_fresh ?? breakdown.inputFresh ?? 0);
@@ -3184,6 +3252,12 @@
         const values = this.costBreakdownValues(row);
         const total = Number(row?.cost_usd);
         if (!Number.isFinite(total)) return '-';
+        if (this.isExcelCostRow(row)) {
+          if (concise) {
+            return `in ${this.creditCompact(values.input_usd)} · out ${this.creditCompact(values.output_usd)} Credits`;
+          }
+          return `Input ${this.creditLabel(values.input_usd)} · Output ${this.creditLabel(values.output_usd)}`;
+        }
         if (concise) {
           return `in ${this.aicCompact(values.input_usd)} · out ${this.aicCompact(values.output_usd)} AIC`;
         }
@@ -3926,6 +4000,8 @@
           savingClientProxySettings: false,
           savingClientProxySettingsDetail: '',
           savingBackgroundProxy: false,
+          savingExcelSession: false,
+          excelSessionPollTimer: null,
           loadingModelRoutingConfig: false,
           savingModelRoutingConfig: false,
           proxyConfigError: '',
@@ -3980,6 +4056,24 @@
             shell_profile_path: '',
             shell_profile_paths: [],
             commands: {},
+            error: '',
+            statusMessage: '',
+          },
+          excelSessionStatus: {
+            configured: false,
+            expired: false,
+            configured_at: null,
+            expires_at: null,
+            persisted: false,
+            persistence_supported: false,
+            persistence: '',
+            persistence_error: '',
+            capture: {
+              available: false,
+              capturing: false,
+              error: '',
+              message: '',
+            },
             error: '',
             statusMessage: '',
           },
@@ -5036,6 +5130,119 @@
           if (state.configured) return `Activated (${state.status_message})`;
           return `Not activated (${state.status_message})`;
         },
+        excelSessionStatusClass() {
+          if (this.excelSessionStatus.capture?.error || this.excelSessionStatus.persistence_error) return 'error';
+          if (this.excelSessionStatus.configured && !this.excelSessionStatus.expired) return 'good';
+          return 'warn';
+        },
+        excelSessionStatusLabel() {
+          if (this.excelSessionStatus.capture?.capturing) return 'Waiting for an Excel add-in request';
+          if (this.excelSessionStatus.expired) return 'Saved session expired; capture a fresh session';
+          if (this.excelSessionStatus.configured) {
+            return this.excelSessionStatus.persisted
+              ? 'Ready · encrypted with Windows DPAPI'
+              : 'Ready · memory only';
+          }
+          if (!this.excelSessionStatus.capture?.available) return 'Capture unavailable on this machine';
+          return 'Not configured';
+        },
+        excelSessionExpiryLabel() {
+          const timestamp = Number(this.excelSessionStatus.expires_at || 0) * 1000;
+          const date = new Date(timestamp);
+          return Number.isNaN(date.getTime()) ? 'at an unknown time' : date.toLocaleString();
+        },
+        _scheduleExcelSessionStatusPoll() {
+          if (this.excelSessionPollTimer) {
+            window.clearTimeout(this.excelSessionPollTimer);
+          }
+          this.excelSessionPollTimer = window.setTimeout(() => {
+            this.excelSessionPollTimer = null;
+            void this.loadExcelSessionStatus();
+          }, 1000);
+        },
+        async loadExcelSessionStatus() {
+          try {
+            const response = await fetch('/api/config/excel-session', { cache: 'no-store' });
+            if (!response.ok) {
+              throw new Error(`Excel session status request failed: ${response.status}`);
+            }
+            const previousCapturing = Boolean(this.excelSessionStatus.capture?.capturing);
+            const payload = await response.json();
+            this.excelSessionStatus = {
+              ...this.excelSessionStatus,
+              ...payload,
+              capture: {
+                ...this.excelSessionStatus.capture,
+                ...(payload.capture || {}),
+              },
+              error: '',
+            };
+            if (this.excelSessionStatus.capture?.capturing) {
+              this._scheduleExcelSessionStatusPoll();
+            } else if (previousCapturing && this.excelSessionStatus.configured) {
+              this.excelSessionStatus.statusMessage = 'Excel session captured and saved securely.';
+            }
+          } catch (error) {
+            this.excelSessionStatus.error = error.message;
+          }
+        },
+        async startExcelSessionCapture() {
+          if (this.savingExcelSession || this.excelSessionStatus.capture?.capturing) return;
+          this.savingExcelSession = true;
+          this.excelSessionStatus.statusMessage = '';
+          this.excelSessionStatus.error = '';
+          try {
+            const response = await fetch('/api/config/excel-session', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ action: 'capture', devtools_port: 9222 }),
+            });
+            const payload = await response.json().catch(() => ({}));
+            if (!response.ok) {
+              throw new Error(payload.detail || `Excel session capture request failed: ${response.status}`);
+            }
+            this.excelSessionStatus = {
+              ...this.excelSessionStatus,
+              ...payload,
+              capture: {
+                ...this.excelSessionStatus.capture,
+                ...(payload.capture || {}),
+              },
+              error: '',
+            };
+            this._scheduleExcelSessionStatusPoll();
+          } catch (error) {
+            this.excelSessionStatus.error = error.message;
+          } finally {
+            this.savingExcelSession = false;
+          }
+        },
+        async clearExcelSession() {
+          if (this.savingExcelSession) return;
+          this.savingExcelSession = true;
+          this.excelSessionStatus.statusMessage = '';
+          try {
+            const response = await fetch('/api/config/excel-session', { method: 'DELETE' });
+            const payload = await response.json().catch(() => ({}));
+            if (!response.ok) {
+              throw new Error(payload.detail || `Excel session clear request failed: ${response.status}`);
+            }
+            this.excelSessionStatus = {
+              ...this.excelSessionStatus,
+              ...payload,
+              capture: {
+                ...this.excelSessionStatus.capture,
+                ...(payload.capture || {}),
+              },
+              error: '',
+              statusMessage: 'Encrypted Excel session cleared.',
+            };
+          } catch (error) {
+            this.excelSessionStatus.error = error.message;
+          } finally {
+            this.savingExcelSession = false;
+          }
+        },
         async loadClientProxyStatus() {
           this.loadingClientProxyStatus = true;
           this.proxyConfigError = '';
@@ -5903,6 +6110,7 @@
           if (view === 'settings' || view === 'integrations') {
             this.loadClientProxyStatus();
             this.loadBackgroundProxyStatus();
+            this.loadExcelSessionStatus();
           } else if (view === 'routing' || view === 'approvals') {
             this.loadModelRoutingConfig();
           }
@@ -5986,6 +6194,10 @@
         if (this.authStatusTimer) {
           window.clearInterval(this.authStatusTimer);
           this.authStatusTimer = null;
+        }
+        if (this.excelSessionPollTimer) {
+          window.clearTimeout(this.excelSessionPollTimer);
+          this.excelSessionPollTimer = null;
         }
         this.stopDashboardStream();
         if (this._debugModalKeyHandler) {
