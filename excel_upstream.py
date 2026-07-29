@@ -8,6 +8,7 @@ in memory and expose only non-secret status information.
 from __future__ import annotations
 
 import base64
+import copy
 import ctypes
 from ctypes import wintypes
 import hashlib
@@ -18,6 +19,7 @@ import sys
 import tempfile
 import threading
 import time
+from collections import OrderedDict
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from app_paths import user_state_dir
@@ -32,8 +34,18 @@ EXTERNAL_CLIENT_INSTRUCTIONS = (
 )
 TOOL_CALL_MARKER_OPEN = "<codex_tool_call>"
 TOOL_CALL_MARKER_CLOSE = "</codex_tool_call>"
-TOOL_OUTPUT_MARKER_OPEN = "<codex_tool_output"
-TOOL_OUTPUT_MARKER_CLOSE = "</codex_tool_output>"
+# Kept only to replay calls produced by proxy versions that used the old text
+# marker protocol. New calls travel through Basispoints' declared
+# ``run_officejs`` function and are intercepted before any Office code runs.
+CLIENT_TOOL_RELAY_PREFIX = "codex_client__"
+CLIENT_MARKER_CALL_ID_PREFIX = "call_ghcp_excel_marker_"
+NATIVE_FALLBACK_CALL_ID_PREFIX = "call_ghcp_excel_native_"
+CLIENT_TOOL_TRANSPORT_NAME = "run_officejs"
+TOOLS_VERSION_METADATA_KEY = "bps_tools_version_id"
+_TOOLS_VERSION_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,160}$")
+_NATIVE_CALL_CACHE_LIMIT = 512
+_native_call_cache_lock = threading.Lock()
+_native_call_cache: OrderedDict[str, dict] = OrderedDict()
 _TOOL_CALL_PATTERN = re.compile(
     re.escape(TOOL_CALL_MARKER_OPEN)
     + r"\s*(\{.*?\})\s*"
@@ -51,7 +63,7 @@ FORWARD_PROMPT_CACHE_KEY = os.environ.get(
 ).strip().lower() not in {"0", "false", "no", "off"}
 # Escape hatch back to the pre-cache-fix layout (full catalog as the prompt
 # suffix) in case the compact trailing reminder ever stops holding the model to
-# the marker protocol.  See _client_tool_protocol_reminder for why it moved.
+# the client-tool transport protocol. See _client_tool_protocol_reminder.
 CATALOG_AT_PROMPT_END = os.environ.get(
     "GHCP_EXCEL_CATALOG_AT_PROMPT_END", "0"
 ).strip().lower() in {"1", "true", "yes", "on"}
@@ -175,6 +187,48 @@ def client_tool_types(source: dict) -> dict[str, str]:
     return result
 
 
+def relay_tool_name(name: str) -> str:
+    """Return the legacy non-colliding marker name used before run_officejs."""
+    return CLIENT_TOOL_RELAY_PREFIX + name
+
+
+def _original_client_tool_name(
+    name: object,
+    allowed_tools: dict[str, str],
+) -> str | None:
+    if not isinstance(name, str):
+        return None
+    if name.startswith(CLIENT_TOOL_RELAY_PREFIX):
+        candidate = name[len(CLIENT_TOOL_RELAY_PREFIX) :]
+        return candidate if candidate in allowed_tools else None
+    # Accept the old, unprefixed marker format for in-flight responses. Native
+    # Basispoints calls also arrive unprefixed; schema validation below decides
+    # whether one can safely stand in for a same-named client tool.
+    return name if name in allowed_tools else None
+
+
+def _remember_native_call(item: dict) -> None:
+    call_id = item.get("call_id")
+    if not isinstance(call_id, str) or not call_id:
+        return
+    with _native_call_cache_lock:
+        _native_call_cache[call_id] = copy.deepcopy(item)
+        _native_call_cache.move_to_end(call_id)
+        while len(_native_call_cache) > _NATIVE_CALL_CACHE_LIMIT:
+            _native_call_cache.popitem(last=False)
+
+
+def _remembered_native_call(call_id: object) -> dict | None:
+    if not isinstance(call_id, str) or not call_id:
+        return None
+    with _native_call_cache_lock:
+        item = _native_call_cache.get(call_id)
+        if item is None:
+            return None
+        _native_call_cache.move_to_end(call_id)
+        return copy.deepcopy(item)
+
+
 def _client_tool_specs(source: dict) -> dict[str, dict]:
     allowed_tools = client_tool_types(source)
     result: dict[str, dict] = {}
@@ -188,6 +242,46 @@ def _client_tool_specs(source: dict) -> dict[str, dict]:
         if isinstance(name, str) and name in allowed_tools:
             result[name] = tool
     return result
+
+
+def _transport_envelope(native: dict) -> dict | None:
+    if (
+        native.get("type") != "function_call"
+        or native.get("name") != CLIENT_TOOL_TRANSPORT_NAME
+    ):
+        return None
+    raw_arguments = native.get("arguments")
+    if not isinstance(raw_arguments, str):
+        return None
+    try:
+        arguments = json.loads(raw_arguments)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(arguments, dict):
+        return None
+    code = arguments.get("code")
+    if not isinstance(code, str):
+        return None
+    try:
+        envelope = json.loads(code)
+    except json.JSONDecodeError:
+        # Models occasionally wrap the requested JSON in a code fence or a
+        # one-line assignment despite the exact-format instruction. Decode the
+        # first complete JSON object without ever evaluating the surrounding
+        # text as JavaScript.
+        decoder = json.JSONDecoder()
+        envelope = None
+        for index, character in enumerate(code):
+            if character != "{":
+                continue
+            try:
+                candidate, _ = decoder.raw_decode(code[index:])
+            except json.JSONDecodeError:
+                continue
+            if isinstance(candidate, dict):
+                envelope = candidate
+                break
+    return envelope if isinstance(envelope, dict) else None
 
 
 def _value_matches_schema(value: object, schema: object) -> bool:
@@ -299,6 +393,47 @@ def _normalize_native_function_arguments(name: str, arguments: dict) -> dict:
     return normalized
 
 
+def _restore_native_function_arguments(name: str, arguments: object) -> object:
+    """Restore the Basispoints schema after a native call visits Codex."""
+    if name != "update_plan":
+        return arguments
+    parsed = arguments
+    if isinstance(parsed, str):
+        try:
+            parsed = json.loads(parsed)
+        except json.JSONDecodeError:
+            return arguments
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("plan"), list):
+        return arguments
+
+    native_plan: list[dict[str, str]] = []
+    for index, item in enumerate(parsed["plan"]):
+        if not isinstance(item, dict):
+            continue
+        step = item.get("step")
+        status = item.get("status")
+        if not isinstance(step, str) or not isinstance(status, str):
+            continue
+        native_plan.append(
+            {
+                "id": f"step{index + 1}",
+                "description": step,
+                "status": status,
+                "result": "",
+            }
+        )
+    explanation = parsed.get("explanation")
+    native = {
+        "summary": (
+            explanation
+            if isinstance(explanation, str) and explanation
+            else "Update task plan"
+        ),
+        "plan": native_plan,
+    }
+    return json.dumps(native, separators=(",", ":"), ensure_ascii=False)
+
+
 def extract_native_client_tool_call(
     response: dict | None,
     source: dict,
@@ -318,28 +453,56 @@ def extract_native_client_tool_call(
     if len(native_calls) != 1:
         return None
     native = native_calls[0]
-    name = native.get("name")
-    if not isinstance(name, str) or name not in specs:
+    allowed_tools = client_tool_types(source)
+    envelope = _transport_envelope(native)
+    name = (
+        _original_client_tool_name(envelope.get("name"), allowed_tools)
+        if envelope is not None
+        else _original_client_tool_name(native.get("name"), allowed_tools)
+    )
+    if name is None or name not in specs:
         return None
     spec = specs[name]
     expected_type = str(spec.get("type") or "").strip().lower()
-    if native.get("type") == "function_call" and expected_type == "function":
-        raw_arguments = native.get("arguments")
-        if not isinstance(raw_arguments, str):
-            return None
-        try:
-            arguments = json.loads(raw_arguments)
-        except json.JSONDecodeError:
-            return None
+    if expected_type == "function":
+        if envelope is not None:
+            arguments = envelope.get("arguments")
+            if isinstance(arguments, str):
+                try:
+                    arguments = json.loads(arguments)
+                except json.JSONDecodeError:
+                    return None
+        else:
+            if native.get("type") != "function_call":
+                return None
+            raw_arguments = native.get("arguments")
+            if not isinstance(raw_arguments, str):
+                return None
+            try:
+                arguments = json.loads(raw_arguments)
+            except json.JSONDecodeError:
+                return None
         if not isinstance(arguments, dict):
             return None
-        arguments = _normalize_native_function_arguments(name, arguments)
+        if envelope is None:
+            arguments = _normalize_native_function_arguments(name, arguments)
         if not _value_matches_schema(arguments, spec.get("parameters")):
             return None
-        call_id = f"call_{uuid4().hex}"
+        native_call_id = native.get("call_id")
+        call_id = (
+            native_call_id
+            if isinstance(native_call_id, str) and native_call_id
+            else f"{NATIVE_FALLBACK_CALL_ID_PREFIX}{uuid4().hex}"
+        )
+        native_item_id = native.get("id")
+        _remember_native_call(native)
         return {
             "type": "function_call",
-            "id": f"fc_{call_id}",
+            "id": (
+                native_item_id
+                if isinstance(native_item_id, str) and native_item_id
+                else f"fc_{call_id}"
+            ),
             "call_id": call_id,
             "name": name,
             "arguments": json.dumps(
@@ -348,14 +511,35 @@ def extract_native_client_tool_call(
                 ensure_ascii=False,
             ),
         }
-    if native.get("type") == "custom_tool_call" and expected_type == "custom":
-        custom_input = native.get("input")
+    if expected_type == "custom":
+        custom_input = (
+            envelope.get("input")
+            if envelope is not None
+            else native.get("input")
+        )
+        if envelope is None and native.get("type") != "custom_tool_call":
+            return None
         if not isinstance(custom_input, str):
             return None
-        call_id = f"call_{uuid4().hex}"
+        native_call_id = native.get("call_id")
+        call_id = (
+            native_call_id
+            if isinstance(native_call_id, str) and native_call_id
+            else f"{NATIVE_FALLBACK_CALL_ID_PREFIX}{uuid4().hex}"
+        )
+        native_item_id = native.get("id")
+        _remember_native_call(native)
         return {
             "type": "custom_tool_call",
-            "id": f"ctc_{call_id}",
+            "id": (
+                native_item_id
+                if (
+                    envelope is None
+                    and isinstance(native_item_id, str)
+                    and native_item_id
+                )
+                else f"ctc_{call_id}"
+            ),
             "call_id": call_id,
             "name": name,
             "input": custom_input,
@@ -399,35 +583,33 @@ def _client_tool_protocol_instructions(source: dict) -> str:
     )
     return (
         "This request is relayed by an external Codex Responses API client, not "
-        "by the live Excel workbook. Every native server-injected tool in this "
-        "environment is unavailable to this relayed request, including list_skills, "
-        "Excel, Office, connector, workbook, and web-search tools. Never emit a "
-        "native tool call. The only valid tool mechanism is the Codex client marker "
-        "protocol below. The Codex client has the local tools in the JSON catalog. "
+        "by the live Excel workbook. The native run_officejs function is a "
+        "transport endpoint owned by this proxy for this request. The proxy "
+        "intercepts it before execution, so it never runs Office code or changes "
+        "the workbook. Every client tool in the JSON catalog is available through "
+        "that transport. Other native server-injected Excel, Office, connector, "
+        "workbook, list_skills, and web-search tools are unavailable. "
         "Never claim shell, filesystem, or workspace access is unavailable when the "
-        "catalog contains a suitable tool. For local repository inspection, prefer "
-        "shell_command when it is present. When a client tool is needed, return "
-        "exactly one tool request and no other text. For a function tool, use "
-        f'{TOOL_CALL_MARKER_OPEN}{{"name":"TOOL_NAME","arguments":{{...}}}}'
-        f"{TOOL_CALL_MARKER_CLOSE}. For a custom tool, use "
-        f'{TOOL_CALL_MARKER_OPEN}{{"name":"TOOL_NAME","input":"RAW_INPUT"}}'
-        f"{TOOL_CALL_MARKER_CLOSE}. Arguments must follow the catalog schema. "
-        "The proxy converts the marker into a real Responses tool call, and the "
-        "next request will contain its tool output. In the conversation history, "
-        "your earlier tool requests and their results appear as standard "
-        "function_call and function_call_output items. Use each output and "
-        "continue, requesting another tool the same way when needed or "
-        "returning the final assistant answer normally. Never repeat a tool "
-        "request whose output is already present in the transcript. Plan or "
-        "status tools such as update_plan only record progress for the user: "
-        "never re-issue an unchanged plan, and after updating the plan take a "
-        "substantive action before updating it again. Available client tools:\n"
+        "catalog contains a suitable tool. For repository inspection, invoke "
+        "shell_command through run_officejs when shell_command is present. "
+        "To invoke a function client tool, call native run_officejs with: summary "
+        "and extended_summary describing the action; code containing exactly one "
+        'compact JSON object {"name":"TOOL_NAME","arguments":{...}}; '
+        "destructive=false; and references=[]. To invoke a custom client tool, "
+        'put {"name":"TOOL_NAME","input":"RAW_INPUT"} in code instead. Do not put '
+        "JavaScript or OfficeJS in code. TOOL_NAME and its payload must follow the "
+        "catalog exactly. The proxy converts this native function call into the "
+        "real client tool call, then replays the original run_officejs identity "
+        "with the client tool result on the next request. Interpret that result as "
+        "the named client tool's output. Native update_plan may be used normally "
+        "when update_plan is in the catalog, but after it succeeds take the next "
+        "substantive action through run_officejs. Do not stop at commentary saying "
+        "you will take an action: make the tool call in the same response. Never "
+        "repeat a tool request whose output is already present. Available client "
+        "tools:\n"
         + catalog_json
-        + "\nRemember: do not use native server tools. A client tool request must be "
-        + TOOL_CALL_MARKER_OPEN
-        + " JSON "
-        + TOOL_CALL_MARKER_CLOSE
-        + " and nothing else."
+        + "\nRemember: client tool use must be a native run_officejs function call "
+        "whose code field is the JSON transport envelope. It is not Office code."
     )
 
 
@@ -447,35 +629,22 @@ def _client_tool_protocol_reminder(source: dict) -> str:
     if not allowed_tools:
         return ""
     reminder = (
-        "Reminder: every native server-injected tool (list_skills, Excel, "
-        "Office, connector, workbook, web search) is unavailable to this "
-        "relayed request. Never emit a native tool call. To use a client tool, "
-        f"reply with exactly one {TOOL_CALL_MARKER_OPEN} JSON "
-        f"{TOOL_CALL_MARKER_CLOSE} marker and no other text, following the "
-        "catalog schema in the developer message above. Client tools: "
+        "Reminder: run_officejs is the proxy-owned client-tool transport and "
+        "never executes Office code for this request. To use a client tool, make "
+        "the native run_officejs call now with the JSON transport envelope in its "
+        "code field, following the catalog above. Do not merely say you will act "
+        "or that access is unavailable. Client tools: "
         + ", ".join(sorted(allowed_tools))
-        + "."
+        + ". Other native tools are unavailable."
     )
     if "shell_command" in allowed_tools:
-        reminder += " For repository inspection use shell_command."
+        reminder += " For repository inspection transport shell_command."
     if "update_plan" in allowed_tools:
         reminder += (
-            " Never re-issue an unchanged plan; after update_plan take a "
-            "substantive action before planning again."
+            " Native update_plan is allowed for progress; after its result, "
+            "take the next substantive action through run_officejs."
         )
     return reminder
-
-
-# Appended to every update_plan tool output. The upstream harness makes the
-# model plan-happy; live A/B replays against Basispoints showed a directive
-# inside the freshest tool output is what reliably moves it from re-planning
-# to substantive marker tool calls.
-PLAN_TOOL_OUTPUT_STEERING = (
-    "Do not call update_plan again now. Take the next step immediately using "
-    "a client tool from the catalog: reply with exactly one "
-    f"{TOOL_CALL_MARKER_OPEN} marker and no other text."
-)
-PLAN_TOOL_OUTPUT_SHELL_HINT = " For repository inspection use shell_command."
 
 
 def extract_client_tool_call(
@@ -493,10 +662,12 @@ def extract_client_tool_call(
         return None
     if not isinstance(marker, dict):
         return None
-    name = marker.get("name")
-    if not isinstance(name, str):
+    marker_name = marker.get("name")
+    if not isinstance(marker_name, str):
         return None
-    name = name.strip()
+    name = _original_client_tool_name(marker_name.strip(), allowed_tools)
+    if name is None:
+        return None
     tool_type = allowed_tools.get(name)
     if tool_type == "function":
         arguments = marker.get("arguments")
@@ -507,7 +678,7 @@ def extract_client_tool_call(
                 return None
         if not isinstance(arguments, dict):
             return None
-        call_id = f"call_{uuid4().hex}"
+        call_id = f"{CLIENT_MARKER_CALL_ID_PREFIX}{uuid4().hex}"
         return {
             "type": "function_call",
             "id": f"fc_{call_id}",
@@ -523,7 +694,7 @@ def extract_client_tool_call(
         custom_input = marker.get("input")
         if not isinstance(custom_input, str):
             return None
-        call_id = f"call_{uuid4().hex}"
+        call_id = f"{CLIENT_MARKER_CALL_ID_PREFIX}{uuid4().hex}"
         return {
             "type": "custom_tool_call",
             "id": f"ctc_{call_id}",
@@ -532,101 +703,6 @@ def extract_client_tool_call(
             "input": custom_input,
         }
     return None
-
-
-DUPLICATE_PLAN_UPDATE_TEXT = (
-    "Plan update skipped: the previous plan update is still current. "
-    "Continuing with the existing plan."
-)
-
-
-def _canonical_plan_arguments(arguments: object) -> str:
-    """Canonical form of update_plan arguments, ignoring the explanation.
-
-    Amnesiac re-plans repeat the same steps with trivially reworded
-    explanations; only the plan itself decides whether an update progresses.
-    """
-    if isinstance(arguments, str):
-        try:
-            arguments = json.loads(arguments)
-        except json.JSONDecodeError:
-            return arguments
-    if isinstance(arguments, dict) and isinstance(arguments.get("plan"), list):
-        arguments = arguments["plan"]
-    if isinstance(arguments, (dict, list)):
-        return json.dumps(arguments, sort_keys=True, separators=(",", ":"))
-    return str(arguments)
-
-
-def is_plan_update_churn(tool_call: dict | None, source: dict) -> bool:
-    """True when a plan update is stuck churning instead of progressing.
-
-    Codex legitimately issues two plan updates back to back (create the plan,
-    then mark the first step in progress), so a single consecutive update is
-    allowed unless it is an exact repeat of the previous one. A third
-    consecutive plan update with no substantive tool call in between is
-    churn. A user message resets the window: after human input the model may
-    always update the plan.
-    """
-    if not isinstance(tool_call, dict) or tool_call.get("name") != "update_plan":
-        return False
-    raw_input = source.get("input")
-    if not isinstance(raw_input, list):
-        return False
-
-    consecutive = 0
-    latest_plan_call: dict | None = None
-    for item in reversed(raw_input):
-        if not isinstance(item, dict):
-            continue
-        item_type = item.get("type")
-        if item_type in {"function_call", "custom_tool_call"}:
-            if item.get("name") != "update_plan":
-                break
-            consecutive += 1
-            if latest_plan_call is None:
-                latest_plan_call = item
-            continue
-        if item_type == "message" or (item_type is None and "role" in item):
-            if str(item.get("role") or "").strip().lower() == "user":
-                break
-            continue
-        # Tool outputs, reasoning, and other bookkeeping items neither break
-        # nor extend the consecutive-plan-update chain.
-    if consecutive == 0 or latest_plan_call is None:
-        return False
-    if consecutive >= 2:
-        return True
-    return _canonical_plan_arguments(
-        latest_plan_call.get("arguments")
-    ) == _canonical_plan_arguments(tool_call.get("arguments"))
-
-
-def strip_tool_call_markers(text: object) -> str:
-    if not isinstance(text, str):
-        return ""
-    return _TOOL_CALL_PATTERN.sub("", text)
-
-
-def response_payload_with_text(response: dict | None, text: str) -> dict[str, object]:
-    result = dict(response or {})
-    result.setdefault("id", f"resp_{uuid4().hex}")
-    result.setdefault("object", "response")
-    result.setdefault("created_at", int(time.time()))
-    result["status"] = "completed"
-    result["model"] = MODEL_ID
-    result["output"] = [
-        {
-            "type": "message",
-            "id": f"msg_{uuid4().hex}",
-            "role": "assistant",
-            "status": "completed",
-            "content": [{"type": "output_text", "text": text}],
-        }
-    ]
-    result["error"] = None
-    result["incomplete_details"] = None
-    return result
 
 
 def response_payload_with_tool_call(
@@ -742,14 +818,29 @@ class ExcelSessionStore:
     def __init__(self, persistence_file: str | None = None):
         self._lock = threading.Lock()
         self._headers: dict[str, str] = {}
+        self._tools_version_id: str | None = None
         self._configured_at: float | None = None
         self._expires_at: float | None = None
         self._persistence_file = persistence_file
         self._persistence_error = ""
 
-    def configure(self, raw_headers: object, *, persist: bool = True) -> dict[str, object]:
+    def configure(
+        self,
+        raw_headers: object,
+        *,
+        tools_version_id: object = None,
+        persist: bool = True,
+    ) -> dict[str, object]:
         if not isinstance(raw_headers, dict):
             raise ValueError("headers must be a JSON object")
+        if tools_version_id is not None and (
+            not isinstance(tools_version_id, str)
+            or not _TOOLS_VERSION_PATTERN.fullmatch(tools_version_id.strip())
+        ):
+            raise ValueError("tools_version_id is not a valid Basispoints version ID")
+        normalized_tools_version_id = (
+            tools_version_id.strip() if isinstance(tools_version_id, str) else None
+        )
 
         headers: dict[str, str] = {}
         for raw_name, raw_value in raw_headers.items():
@@ -784,6 +875,7 @@ class ExcelSessionStore:
 
         with self._lock:
             self._headers = headers
+            self._tools_version_id = normalized_tools_version_id
             self._configured_at = now
             self._expires_at = expires_at
             self._persistence_error = ""
@@ -798,6 +890,7 @@ class ExcelSessionStore:
     def clear(self) -> dict[str, object]:
         with self._lock:
             self._headers = {}
+            self._tools_version_id = None
             self._configured_at = None
             self._expires_at = None
             self._persistence_error = ""
@@ -820,10 +913,15 @@ class ExcelSessionStore:
             payload = json.loads(_unprotect_windows_data(protected))
             if not isinstance(payload, dict) or payload.get("version") != 1:
                 raise ValueError("unsupported encrypted Excel session format")
-            self.configure(payload.get("headers"), persist=False)
+            self.configure(
+                payload.get("headers"),
+                tools_version_id=payload.get("tools_version_id"),
+                persist=False,
+            )
         except (OSError, RuntimeError, ValueError, UnicodeError, json.JSONDecodeError) as exc:
             with self._lock:
                 self._headers = {}
+                self._tools_version_id = None
                 self._configured_at = None
                 self._expires_at = None
                 self._persistence_error = str(exc)
@@ -836,6 +934,7 @@ class ExcelSessionStore:
             payload = {
                 "version": 1,
                 "headers": dict(self._headers),
+                "tools_version_id": self._tools_version_id,
             }
         raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
         protected = _protect_windows_data(raw)
@@ -862,6 +961,7 @@ class ExcelSessionStore:
     def status(self) -> dict[str, object]:
         with self._lock:
             configured = bool(self._headers)
+            tools_version_id = self._tools_version_id
             configured_at = self._configured_at
             expires_at = self._expires_at
             persistence_error = self._persistence_error
@@ -874,6 +974,7 @@ class ExcelSessionStore:
             "model": MODEL_ID,
             "upstream_model": UPSTREAM_MODEL,
             "upstream_url": RESPONSES_URL,
+            "tools_version_id": tools_version_id,
             "storage": (
                 "memory-and-windows-dpapi"
                 if self._persistence_file and os.path.isfile(self._persistence_file)
@@ -887,6 +988,10 @@ class ExcelSessionStore:
             "persistence": "windows-dpapi" if sys.platform == "win32" else "unavailable",
             "persistence_error": persistence_error,
         }
+
+    def tools_version_id(self) -> str | None:
+        with self._lock:
+            return self._tools_version_id
 
     def request_headers(self, *, stream: bool) -> dict[str, str]:
         with self._lock:
@@ -933,25 +1038,74 @@ def _item_text(value: object) -> str:
     return ""
 
 
-def _steered_tool_output(
+def _normalized_tool_output(
     item: dict,
-    call_names: dict[str, str],
-    allowed_tools: dict[str, str],
+    call_origins: dict[str, str],
 ) -> dict:
     call_id = item.get("call_id")
-    name = call_names.get(call_id) if isinstance(call_id, str) else None
-    output_text = _item_text(item.get("output"))
-    if name == "update_plan":
-        steering = PLAN_TOOL_OUTPUT_STEERING
-        if "shell_command" in allowed_tools:
-            steering += PLAN_TOOL_OUTPUT_SHELL_HINT
-        prefix = f"{output_text.strip()}\n" if output_text.strip() else ""
-        return {**item, "output": prefix + steering}
-    if not output_text.strip() and isinstance(item.get("output"), (str, type(None))):
+    origin = call_origins.get(call_id) if isinstance(call_id, str) else None
+    if origin == "update_plan":
+        # The Basispoints update_plan executor returns this object. Codex's
+        # client-side status tool instead returns the display string
+        # "Plan updated"; replaying that string leaves the server-native tool
+        # state unresolved and makes the model plan again.
+        return {**item, "output": '{"status":"ok"}'}
+    normalized = (
+        {**item, "type": "function_call_output"}
+        if (
+            origin == CLIENT_TOOL_TRANSPORT_NAME
+            and item.get("type") == "custom_tool_call_output"
+        )
+        else item
+    )
+    output_text = _item_text(normalized.get("output"))
+    if not output_text.strip() and isinstance(
+        normalized.get("output"), (str, type(None))
+    ):
         # A blank body reads as a failed call and provokes retries; make
         # success explicit.
-        return {**item, "output": "(tool call succeeded with no output)"}
-    return item
+        return {**normalized, "output": "(tool call succeeded with no output)"}
+    return normalized
+
+
+def _fallback_transport_call(item: dict) -> dict:
+    """Rebuild a transport call if the proxy restarted between call and result."""
+    name = str(item.get("name") or "")
+    if item.get("type") == "custom_tool_call":
+        envelope: dict[str, object] = {
+            "name": name,
+            "input": item.get("input") if isinstance(item.get("input"), str) else "",
+        }
+    else:
+        arguments = item.get("arguments")
+        if isinstance(arguments, str):
+            try:
+                arguments = json.loads(arguments)
+            except json.JSONDecodeError:
+                arguments = {}
+        if not isinstance(arguments, dict):
+            arguments = {}
+        envelope = {"name": name, "arguments": arguments}
+    call_id = str(item.get("call_id") or f"{NATIVE_FALLBACK_CALL_ID_PREFIX}{uuid4().hex}")
+    native_arguments = {
+        "summary": f"Run client tool {name}",
+        "extended_summary": f"Relay {name} through the external Codex client",
+        "code": json.dumps(envelope, separators=(",", ":"), ensure_ascii=False),
+        "destructive": False,
+        "references": [],
+    }
+    return {
+        "type": "function_call",
+        "id": f"fc_{call_id}",
+        "call_id": call_id,
+        "name": CLIENT_TOOL_TRANSPORT_NAME,
+        "arguments": json.dumps(
+            native_arguments,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ),
+        "status": "completed",
+    }
 
 
 def translate_input_items(
@@ -960,39 +1114,74 @@ def translate_input_items(
 ) -> list:
     """Map Codex Responses input items onto the Excel wire vocabulary.
 
-    Tool-call history is replayed natively: live replays against Basispoints
-    confirmed it accepts ``function_call`` / ``function_call_output`` items
-    for tools that were never declared, and the model only maintains its tool
-    state machine (instead of re-issuing the previous call) when it sees the
-    standard item shapes.  ``update_plan`` outputs additionally carry a
-    steering directive - without it the plan-happy upstream harness updates
-    the plan forever instead of doing work.  Reasoning items that carry
-    ``encrypted_content`` (which the upstream issues by default) are replayed
-    unchanged for turn-to-turn continuity; bare reasoning items are dropped
-    because with ``store: false`` the upstream rejects them.  The rendering is
-    deterministic so replayed turns serialize identically on every request and
-    keep the upstream prompt-cache prefix stable.
+    Tool-call history keeps the native Responses items that Basispoints needs
+    for its state machine. New client calls use Basispoints' declared
+    ``run_officejs`` function as an intercepted transport. The original native
+    item is retained in a bounded cache because Codex drops its server item ID
+    when submitting the tool result; replaying only the name and call_id makes
+    encrypted reasoning treat the result as unrelated. Native update_plan
+    results are translated from Codex's display text to the ``{"status":"ok"}``
+    object returned by Excel's real executor. Calls created by older proxy
+    versions retain their namespaced marker representation.
+    Reasoning items that carry ``encrypted_content`` (which the upstream issues
+    by default) are replayed unchanged for turn-to-turn continuity; bare
+    reasoning items are dropped because with ``store: false`` the upstream
+    rejects them. The rendering is deterministic so replayed turns serialize
+    identically on every request and keep the upstream prompt-cache prefix
+    stable.
     """
     if isinstance(raw_input, str):
         return [_message_item("user", raw_input)]
     if not isinstance(raw_input, list):
         return []
 
-    call_names: dict[str, str] = {}
+    call_origins: dict[str, str] = {}
     result: list = []
     for item in raw_input:
         if not isinstance(item, dict):
             continue
         item_type = str(item.get("type") or "").strip().lower()
         if item_type in {"function_call", "custom_tool_call"}:
-            call_id = item.get("call_id")
             name = item.get("name")
-            if isinstance(call_id, str) and isinstance(name, str):
-                call_names[call_id] = name
-            result.append(item)
+            call_id = item.get("call_id")
+            marker_relay = (
+                isinstance(call_id, str)
+                and call_id.startswith(CLIENT_MARKER_CALL_ID_PREFIX)
+            )
+            remembered = _remembered_native_call(call_id)
+            if remembered is not None:
+                native_name = remembered.get("name")
+                if isinstance(call_id, str) and isinstance(native_name, str):
+                    call_origins[call_id] = native_name
+                result.append(remembered)
+            elif isinstance(name, str) and name and marker_relay:
+                upstream_name = relay_tool_name(name)
+                if isinstance(call_id, str):
+                    call_origins[call_id] = upstream_name
+                result.append({**item, "name": upstream_name})
+            elif isinstance(name, str) and name:
+                if name == "update_plan":
+                    if isinstance(call_id, str):
+                        call_origins[call_id] = name
+                    result.append(
+                        {
+                            **item,
+                            "arguments": _restore_native_function_arguments(
+                                name,
+                                item.get("arguments"),
+                            ),
+                        }
+                    )
+                else:
+                    fallback = _fallback_transport_call(item)
+                    if isinstance(call_id, str):
+                        call_origins[call_id] = CLIENT_TOOL_TRANSPORT_NAME
+                    result.append(fallback)
+            else:
+                result.append(item)
             continue
         if item_type in {"function_call_output", "custom_tool_call_output"}:
-            result.append(_steered_tool_output(item, call_names, allowed_tools or {}))
+            result.append(_normalized_tool_output(item, call_origins))
             continue
         if item_type == "reasoning":
             encrypted = item.get("encrypted_content")
@@ -1027,7 +1216,55 @@ def _cache_key(source: dict) -> str | None:
     return None
 
 
-def prepare_responses_body(source: dict) -> dict:
+def _agent_turn_state(raw_input: object) -> tuple[str, str]:
+    """Return a stable user-turn fingerprint and Excel agent iteration.
+
+    The Excel add-in holds ``turn_id`` constant while it executes any number of
+    tools for one user message. Only ``agent_iteration`` advances. Treating
+    every tool output as a new turn makes Basispoints discard the prior plan
+    state and start planning again.
+    """
+    if isinstance(raw_input, str):
+        rendered = json.dumps(raw_input, ensure_ascii=False)
+        return hashlib.sha256(rendered.encode("utf-8")).hexdigest(), "1"
+    if not isinstance(raw_input, list):
+        return "anonymous", "1"
+
+    last_user_index = -1
+    for index, item in enumerate(raw_input):
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role") or "").strip().lower()
+        if role == "user":
+            last_user_index = index
+
+    turn_prefix = (
+        raw_input[: last_user_index + 1]
+        if last_user_index >= 0
+        else raw_input[:1]
+    )
+    rendered = json.dumps(
+        turn_prefix,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    fingerprint = hashlib.sha256(rendered.encode("utf-8")).hexdigest()
+    iteration_outputs = sum(
+        1
+        for item in raw_input[last_user_index + 1 :]
+        if isinstance(item, dict)
+        and item.get("type")
+        in {"function_call_output", "custom_tool_call_output"}
+    )
+    return fingerprint, str(iteration_outputs + 1)
+
+
+def prepare_responses_body(
+    source: dict,
+    *,
+    tools_version_id: str | None = None,
+) -> dict:
     """Translate a standard Responses request to the Excel add-in wire shape."""
     output: dict[str, object] = {
         "model": UPSTREAM_MODEL,
@@ -1099,17 +1336,7 @@ def prepare_responses_body(source: dict) -> dict:
         for key, value in raw_metadata.items():
             if isinstance(key, str) and isinstance(value, (str, int, float, bool)):
                 metadata[key[:64]] = str(value)[:512]
-    tool_output_items = (
-        sum(
-            1
-            for item in raw_input
-            if isinstance(item, dict)
-            and item.get("type") in {"function_call_output", "custom_tool_call_output"}
-        )
-        if isinstance(raw_input, list)
-        else 0
-    )
-    iteration = str(tool_output_items + 1)
+    turn_fingerprint, iteration = _agent_turn_state(raw_input)
     metadata.setdefault("agent_iteration", iteration)
     # Identifiers are derived, never random: the same client request must
     # serialize to the same bytes every time. A conversation keeps one task
@@ -1122,8 +1349,15 @@ def prepare_responses_body(source: dict) -> dict:
     )
     metadata.setdefault(
         "turn_id",
-        str(uuid5(NAMESPACE_URL, f"ghcp-proxy/gpt-excel/{conversation}/turn/{iteration}")),
+        str(
+            uuid5(
+                NAMESPACE_URL,
+                f"ghcp-proxy/gpt-excel/{conversation}/turn/{turn_fingerprint}",
+            )
+        ),
     )
+    if tools_version_id and _TOOLS_VERSION_PATTERN.fullmatch(tools_version_id):
+        metadata[TOOLS_VERSION_METADATA_KEY] = tools_version_id
     output["metadata"] = metadata
     return output
 

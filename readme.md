@@ -167,8 +167,9 @@ The command-line primer remains available:
 ```
 
 When prompted, send one message in the ChatGPT Excel add-in. The primer copies
-only the bearer/account/client header bundle to the loopback proxy endpoint; it
-does not print the token. GHCP Proxy encrypts the allowlisted bundle with DPAPI.
+only the bearer/account/client header bundle and the add-in's non-secret tools
+version ID to the loopback proxy endpoint; it does not print the token. GHCP
+Proxy encrypts the allowlisted bundle with DPAPI.
 Check non-secret status with:
 
 ```powershell
@@ -182,24 +183,38 @@ events.
 
 Basispoints rejects client-supplied tool schemas and injects its own
 Excel-specific tools. GHCP Proxy therefore removes client tool declarations and
-describes the caller's function and custom tools through a constrained relay
-protocol. Tool requests are converted back into standard Responses
-`function_call` or `custom_tool_call` events, and Codex executes them locally
-under its normal approval policy. Tool outputs are accepted by Basispoints on
-the following turn, so shell inspection and file-editing loops work without
-sending unsupported tool schemas to the Excel service. The bridge intentionally
+describes the caller's function and custom tools in a constrained catalog. To
+make tool selection an actual function call instead of advisory text, the
+bridge uses Basispoints' declared `run_officejs` function as a transport. The
+proxy intercepts that call before execution, extracts the catalog tool request
+from its `code` field, and never runs Office code or touches the workbook. Codex
+receives a standard Responses `function_call` or `custom_tool_call` and executes
+it locally under its normal approval policy. The result is replayed under the
+original native call identity on the next request. The bridge intentionally
 requests one client tool at a time; parallel client tool calls are not exposed
 for `gpt-excel`.
 
 Replayed history keeps its native Responses shape: Basispoints accepts
 `function_call` / `function_call_output` items for tools it never declared
 (verified by live replays), and the model only maintains its tool state
-machine when it sees the standard item shapes. `update_plan` outputs carry an
-appended steering directive — without it the plan-happy upstream harness
-re-plans forever instead of working. Reasoning items with `encrypted_content`
-are replayed unchanged (GPT-5 models repeat their previous action without
-that continuity); bare reasoning items (which the stateless upstream would
-reject) are dropped.
+machine when it sees the standard item shapes. Actual Basispoints calls,
+including `update_plan` and the intercepted transport, retain the complete
+native item across the client round trip. This includes the server item ID,
+which Codex omits when it submits a tool result; a bounded in-memory call cache
+restores that item exactly. The adapter also restores the native plan argument
+schema after Codex consumes its normalized version and maps Codex's display-only
+`Plan updated` result to the native executor's actual `{"status":"ok"}` result.
+Finally, one `turn_id` is held constant throughout all tool iterations for a
+user message, while only `agent_iteration` advances, matching the Excel
+add-in's agent loop. Older versions changed `turn_id` after every tool result,
+so Basispoints treated a completed plan as a new turn and planned again.
+Preserving the native item and real turn boundary removes the loop without
+steering text or a fabricated assistant turn. Text markers and their
+`codex_client__` history namespace are accepted only to finish requests already
+in flight during an upgrade.
+Reasoning items with `encrypted_content` are replayed unchanged (GPT-5 models
+repeat their previous action without that continuity); bare reasoning items
+(which the stateless upstream would reject) are dropped.
 
 The rewrite is deterministic and the prompt is laid out for the upstream
 prompt cache: the instructions and the tool catalog lead, conversation history
@@ -221,10 +236,11 @@ affinity headers (`x-request-id`, `x-github-request-id`, `x-agent-task-id`) on
 outbound requests and strips them for Responses upstreams — but that check
 matched the path `/responses` exactly, so the Excel gateway's
 `/basispoints/api/responses` fell through to the Copilot branch and got a fresh
-identifier on every request. The check now matches by suffix. Separately, the
-`turn_id` metadata was a random UUID per request; it and `task_id` are now
-derived from the conversation identity and turn index, so a retried turn keeps
-its identity.
+identifier on every request. The check now matches by suffix. Separately,
+`task_id` is derived from the conversation identity and `turn_id` from the
+conversation history through the latest user message. Tool results advance
+`agent_iteration` without changing that turn identity, and a retried iteration
+serializes identically.
 
 Codex's `prompt_cache_key` is forwarded for cache routing (disable with
 `GHCP_EXCEL_FORWARD_PROMPT_CACHE_KEY=0`), and the `task_id` metadata is derived

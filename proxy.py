@@ -5352,7 +5352,10 @@ async def excel_session_config_api(request: Request):
             }
         )
     try:
-        status = excel_upstream.excel_session_store.configure(payload.get("headers"))
+        status = excel_upstream.excel_session_store.configure(
+            payload.get("headers"),
+            tools_version_id=payload.get("tools_version_id"),
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return JSONResponse(
@@ -5633,54 +5636,6 @@ def _excel_tool_stream_transform(source_body: dict):
                             response,
                             source_body,
                         )
-                if excel_upstream.is_plan_update_churn(tool_call, source_body):
-                    # Re-issued identical plan update: end the turn with text
-                    # instead of feeding Codex another tool call to loop on.
-                    held_events.clear()
-                    marker_mode = False
-                    cleaned_full = excel_upstream.strip_tool_call_markers(full_text)
-                    remaining = cleaned_full[emitted_upto:]
-                    if not cleaned_full.strip():
-                        cleaned_full = excel_upstream.DUPLICATE_PLAN_UPDATE_TEXT
-                        remaining = cleaned_full
-                    emitted_upto = len(full_text)
-                    if remaining:
-                        yield format_translation.sse_encode(
-                            "response.output_text.delta",
-                            {
-                                **delta_template,
-                                "type": "response.output_text.delta",
-                                "delta": remaining,
-                            },
-                        )
-                    yield format_translation.sse_encode(
-                        "response.output_text.done",
-                        {
-                            **delta_template,
-                            "type": "response.output_text.done",
-                            "text": cleaned_full,
-                        },
-                    )
-                    text_payload = excel_upstream.response_payload_with_text(
-                        response,
-                        cleaned_full,
-                    )
-                    yield format_translation.sse_encode(
-                        "response.output_item.done",
-                        {
-                            "type": "response.output_item.done",
-                            "output_index": 0,
-                            "item": text_payload["output"][0],
-                        },
-                    )
-                    yield format_translation.sse_encode(
-                        "response.completed",
-                        {
-                            "type": "response.completed",
-                            "response": text_payload,
-                        },
-                    )
-                    continue
                 if tool_call is not None:
                     held_events.clear()
                     emitted_upto = len(full_text)
@@ -5759,16 +5714,7 @@ async def _post_excel_non_streaming_request(
                 response_payload,
                 client_body,
             )
-        if excel_upstream.is_plan_update_churn(tool_call, client_body):
-            cleaned = (
-                excel_upstream.strip_tool_call_markers(response_text).strip()
-                or excel_upstream.DUPLICATE_PLAN_UPDATE_TEXT
-            )
-            translated_payload = excel_upstream.response_payload_with_text(
-                response_payload,
-                cleaned,
-            )
-        elif tool_call is not None:
+        if tool_call is not None:
             translated_payload = excel_upstream.response_payload_with_tool_call(
                 response_payload,
                 tool_call,
@@ -5800,13 +5746,16 @@ async def _handle_excel_responses(
     *,
     source_body: dict | None = None,
 ) -> Response:
-    upstream_body = excel_upstream.prepare_responses_body(body)
     try:
         excel_headers = excel_upstream.excel_session_store.request_headers(
-            stream=bool(upstream_body.get("stream")),
+            stream=bool(body.get("stream")),
         )
     except RuntimeError as exc:
         return format_translation.openai_error_response(401, str(exc))
+    upstream_body = excel_upstream.prepare_responses_body(
+        body,
+        tools_version_id=excel_upstream.excel_session_store.tools_version_id(),
+    )
 
     plan, error_response = _prepare_upstream_request(
         request,

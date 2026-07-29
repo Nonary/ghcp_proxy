@@ -85,6 +85,22 @@ function hasRequiredHeaders(headers) {
   );
 }
 
+function validToolsVersionId(value) {
+  return typeof value === "string" && /^[A-Za-z0-9._-]{1,160}$/.test(value);
+}
+
+function requestToolsVersionId(request) {
+  if (typeof request?.postData !== "string") {
+    return null;
+  }
+  try {
+    const value = JSON.parse(request.postData)?.metadata?.bps_tools_version_id;
+    return validToolsVersionId(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
+
 async function discoverTarget(port) {
   const response = await fetch(`http://127.0.0.1:${port}/json/list`);
   if (!response.ok) {
@@ -111,6 +127,7 @@ async function prime(options) {
   let submitting = false;
   let succeeded = false;
   let submitError = null;
+  let toolsVersionId = null;
 
   function send(method, params = {}) {
     const id = ++nextCommandId;
@@ -121,7 +138,7 @@ async function prime(options) {
     return promise;
   }
 
-  async function submit(headers) {
+  async function submit(headers, capturedToolsVersionId = toolsVersionId) {
     if (submitting || succeeded || !hasRequiredHeaders(headers)) {
       return;
     }
@@ -129,7 +146,12 @@ async function prime(options) {
     const response = await fetch(options.proxyUrl, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ headers }),
+      body: JSON.stringify({
+        headers,
+        tools_version_id: validToolsVersionId(capturedToolsVersionId)
+          ? capturedToolsVersionId
+          : null,
+      }),
     });
     const payload = await response.json().catch(() => ({}));
     if (!response.ok) {
@@ -161,9 +183,10 @@ async function prime(options) {
     if (payload.method === "Network.requestWillBeSent") {
       const request = payload.params?.request;
       if (request?.method === "POST" && request.url === RESPONSES_URL) {
+        toolsVersionId = requestToolsVersionId(request) ?? toolsVersionId;
         const headers = selectedHeaders(request.headers);
         requests.set(payload.params.requestId, headers);
-        submit(headers).catch((error) => {
+        submit(headers, toolsVersionId).catch((error) => {
           submitError = error;
           socket.close();
         });
@@ -189,6 +212,14 @@ async function prime(options) {
     socket.addEventListener("open", resolve, { once: true });
     socket.addEventListener("error", () => reject(new Error("Failed to connect to the Excel WebView")), { once: true });
   });
+  const runtimeResult = await send("Runtime.evaluate", {
+    expression: "document.querySelector('meta[name=\"bps-tools-version-id\"]')?.content ?? null",
+    returnByValue: true,
+  });
+  const metaToolsVersionId = runtimeResult?.result?.value;
+  if (validToolsVersionId(metaToolsVersionId)) {
+    toolsVersionId = metaToolsVersionId;
+  }
   await send("Network.enable", {
     maxTotalBufferSize: 1_000_000,
     maxResourceBufferSize: 1_000_000,
