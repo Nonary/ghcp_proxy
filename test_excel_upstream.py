@@ -560,6 +560,76 @@ class ExcelUpstreamTests(unittest.TestCase):
         self.assertEqual(second["input"][: len(first_prefix)], first_prefix)
         self.assertEqual(first["input"][-1], second["input"][-1])
 
+    def test_client_turn_ids_do_not_break_shared_prompt_prefix(self):
+        def source(turn_id, task, cache_key):
+            metadata = {
+                "internal_chat_message_metadata_passthrough": {
+                    "turn_id": turn_id,
+                }
+            }
+            return {
+                "model": "gpt-excel",
+                "instructions": "You are Codex.",
+                "prompt_cache_key": cache_key,
+                "tools": [{"type": "function", "name": "shell_command"}],
+                "input": [
+                    {
+                        "type": "message",
+                        "role": "developer",
+                        "content": [{"type": "input_text", "text": "Stable policy"}],
+                        **metadata,
+                    },
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "Stable environment"}],
+                        **metadata,
+                    },
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": task}],
+                        **metadata,
+                    },
+                ],
+            }
+
+        first = excel_upstream.prepare_responses_body(
+            source("turn-one", "First task", "conversation-one")
+        )
+        second = excel_upstream.prepare_responses_body(
+            source("turn-two", "Second task", "conversation-two")
+        )
+
+        # Instructions, the tool catalog, and the two shared source messages
+        # remain a byte-identical prefix across conversations. Only the real
+        # user task should be the first prompt divergence.
+        self.assertEqual(first["input"][:4], second["input"][:4])
+        for item in first["input"] + second["input"]:
+            self.assertNotIn("internal_chat_message_metadata_passthrough", item)
+
+    def test_client_turn_ids_stay_out_of_prompt_but_preserve_request_identity(self):
+        def request(turn_id):
+            return {
+                "model": "gpt-excel",
+                "input": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "hello"}],
+                        "internal_chat_message_metadata_passthrough": {
+                            "turn_id": turn_id,
+                        },
+                    }
+                ],
+            }
+
+        first = excel_upstream.prepare_responses_body(request("turn-one"))
+        second = excel_upstream.prepare_responses_body(request("turn-two"))
+        self.assertEqual(first["input"], second["input"])
+        self.assertNotEqual(first["metadata"]["task_id"], second["metadata"]["task_id"])
+        self.assertNotEqual(first["metadata"]["turn_id"], second["metadata"]["turn_id"])
+
     def test_catalog_position_escape_hatch_restores_suffix_layout(self):
         source = {
             "model": "gpt-excel",

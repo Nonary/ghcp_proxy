@@ -1112,6 +1112,27 @@ def _fallback_transport_call(item: dict) -> dict:
     }
 
 
+def _strip_client_only_item_metadata(item: dict) -> dict:
+    """Remove caller transport metadata that destabilizes prompt caching.
+
+    Codex stamps every input item with an
+    ``internal_chat_message_metadata_passthrough.turn_id``. The value is not
+    part of the Responses item vocabulary Basispoints needs, and identical
+    developer/environment messages receive a different value in every new
+    conversation. Forwarding it therefore makes byte-identical prompt content
+    diverge immediately after the cached tool catalog.
+
+    Native calls remembered from the Basispoints response bypass this helper
+    and are replayed exactly, preserving the server item identity required by
+    encrypted reasoning.
+    """
+    if "internal_chat_message_metadata_passthrough" not in item:
+        return item
+    sanitized = dict(item)
+    sanitized.pop("internal_chat_message_metadata_passthrough", None)
+    return sanitized
+
+
 def translate_input_items(
     raw_input: object,
     allowed_tools: dict[str, str] | None = None,
@@ -1144,6 +1165,7 @@ def translate_input_items(
     for item in raw_input:
         if not isinstance(item, dict):
             continue
+        item = _strip_client_only_item_metadata(item)
         item_type = str(item.get("type") or "").strip().lower()
         if item_type in {"function_call", "custom_tool_call"}:
             name = item.get("name")
@@ -1280,8 +1302,12 @@ def prepare_responses_body(
     input_items = translate_input_items(raw_input, client_tool_types(source))
     # Captured before the prologue is prepended: the injected instructions and
     # catalog are identical across conversations, so only the caller's own
-    # first history item identifies this conversation.
-    history_root = _conversation_fingerprint(input_items)
+    # first history item identifies this conversation. Use the raw items here
+    # so client turn metadata can still disambiguate otherwise identical
+    # no-cache-key conversations without leaking into the cached prompt.
+    history_root = _conversation_fingerprint(
+        raw_input if isinstance(raw_input, list) else input_items
+    )
 
     # Prompt layout is chosen for the upstream prompt cache: everything that is
     # stable across a conversation leads, so each turn only re-bills the newly
