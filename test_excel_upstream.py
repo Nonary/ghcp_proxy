@@ -98,6 +98,95 @@ class ExcelUpstreamTests(unittest.TestCase):
             first["metadata"]["task_id"], other["metadata"]["task_id"]
         )
 
+    def test_excel_upstream_path_counts_as_a_responses_api_path(self):
+        import usage_tracking
+
+        # Copilot's per-request affinity headers (x-request-id,
+        # x-github-request-id, x-agent-task-id) are stripped for Responses
+        # upstreams. The Excel gateway's path must take that branch too, or a
+        # fresh identifier is stamped on every otherwise identical request.
+        self.assertTrue(usage_tracking._is_responses_api_path("/basispoints/api/responses"))
+        self.assertTrue(usage_tracking._is_responses_api_path("/responses"))
+        self.assertTrue(usage_tracking._is_responses_api_path("/v1/responses"))
+        self.assertTrue(usage_tracking._is_responses_api_path("/responses/compact"))
+        self.assertFalse(usage_tracking._is_responses_api_path("/chat/completions"))
+        self.assertFalse(usage_tracking._is_responses_api_path("/messages"))
+
+        outbound = {
+            "authorization": "Bearer x",
+            "x-request-id": "per-request",
+            "x-github-request-id": "per-request",
+            "session_id": "per-session",
+        }
+        usage_tracking._prepare_responses_affinity_headers(outbound)
+        self.assertEqual(list(outbound), ["authorization"])
+
+    def test_identical_requests_serialize_to_identical_bytes(self):
+        source = {
+            "model": "gpt-excel",
+            "instructions": "Be terse.",
+            "prompt_cache_key": "conversation-1",
+            "tools": [{"type": "function", "name": "demo"}],
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "hello"}],
+                }
+            ],
+        }
+        first = json.dumps(excel_upstream.prepare_responses_body(source), sort_keys=True)
+        second = json.dumps(excel_upstream.prepare_responses_body(source), sort_keys=True)
+        # A retry of the same turn must not look like new work to the upstream.
+        self.assertEqual(first, second)
+
+    def test_turn_identity_is_derived_without_a_cache_key(self):
+        base = {
+            "model": "gpt-excel",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "hello"}],
+                }
+            ],
+        }
+        first = excel_upstream.prepare_responses_body(base)
+        self.assertEqual(
+            first["metadata"],
+            excel_upstream.prepare_responses_body(base)["metadata"],
+        )
+        # A different conversation must not collapse onto the same identity.
+        other = excel_upstream.prepare_responses_body(
+            {
+                **base,
+                "input": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "different"}],
+                    }
+                ],
+            }
+        )
+        self.assertNotEqual(first["metadata"]["task_id"], other["metadata"]["task_id"])
+        # Later turns of one conversation keep the task but advance the turn.
+        later = excel_upstream.prepare_responses_body(
+            {
+                **base,
+                "input": base["input"]
+                + [
+                    {
+                        "type": "function_call_output",
+                        "call_id": "call_1",
+                        "output": "done",
+                    }
+                ],
+            }
+        )
+        self.assertEqual(first["metadata"]["task_id"], later["metadata"]["task_id"])
+        self.assertNotEqual(first["metadata"]["turn_id"], later["metadata"]["turn_id"])
+
     def test_encrypted_reasoning_is_replayed_and_bare_reasoning_dropped(self):
         items = excel_upstream.translate_input_items(
             [

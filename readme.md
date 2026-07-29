@@ -214,6 +214,18 @@ model needs at a fraction of the cost. Set
 `GHCP_EXCEL_CATALOG_AT_PROMPT_END=1` to restore the old suffix layout if the
 reminder ever stops holding the model to the protocol.
 
+Byte-for-byte determinism is the other half of the cache story: the same
+client request must produce the same outbound bytes, or a retry looks like new
+work. Two things used to break that. The proxy stamps Copilot's per-request
+affinity headers (`x-request-id`, `x-github-request-id`, `x-agent-task-id`) on
+outbound requests and strips them for Responses upstreams — but that check
+matched the path `/responses` exactly, so the Excel gateway's
+`/basispoints/api/responses` fell through to the Copilot branch and got a fresh
+identifier on every request. The check now matches by suffix. Separately, the
+`turn_id` metadata was a random UUID per request; it and `task_id` are now
+derived from the conversation identity and turn index, so a retried turn keeps
+its identity.
+
 Codex's `prompt_cache_key` is forwarded for cache routing (disable with
 `GHCP_EXCEL_FORWARD_PROMPT_CACHE_KEY=0`), and the `task_id` metadata is derived
 from it so one conversation keeps one task identity across turns.

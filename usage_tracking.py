@@ -271,7 +271,16 @@ def _normalized_api_path(path: str | None) -> str | None:
 
 
 def _is_responses_api_path(path: str | None) -> bool:
-    return _normalized_api_path(path) in {"/responses", "/responses/compact"}
+    normalized = _normalized_api_path(path)
+    if normalized is None:
+        return False
+    # Matched by suffix, not equality: a Responses upstream that is not
+    # Copilot's own still speaks the Responses API and still must not carry
+    # Copilot's per-request affinity headers. The Excel add-in gateway at
+    # /basispoints/api/responses fell through to the Copilot branch and had
+    # x-request-id / x-github-request-id / x-agent-task-id stamped with a fresh
+    # value on every request, which is not what the add-in itself sends.
+    return normalized.endswith("/responses") or normalized.endswith("/responses/compact")
 
 
 def _is_messages_api_path(path: str | None) -> bool:

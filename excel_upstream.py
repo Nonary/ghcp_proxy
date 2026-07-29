@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 import ctypes
 from ctypes import wintypes
+import hashlib
 import json
 import os
 import re
@@ -1004,6 +1005,20 @@ def translate_input_items(
     return result
 
 
+def _conversation_fingerprint(input_items: list) -> str:
+    """Stable conversation identity for clients that send no cache key.
+
+    The first input item is the root of the conversation and does not change
+    as turns are appended, so hashing it keeps one identity per conversation
+    without inventing a random one per request.
+    """
+    for item in input_items:
+        if isinstance(item, dict):
+            rendered = json.dumps(item, sort_keys=True, separators=(",", ":"))
+            return hashlib.sha256(rendered.encode("utf-8")).hexdigest()
+    return "anonymous"
+
+
 def _cache_key(source: dict) -> str | None:
     for key in ("prompt_cache_key", "promptCacheKey", "session_id", "sessionId"):
         value = source.get(key)
@@ -1022,6 +1037,10 @@ def prepare_responses_body(source: dict) -> dict:
 
     raw_input = source.get("input")
     input_items = translate_input_items(raw_input, client_tool_types(source))
+    # Captured before the prologue is prepended: the injected instructions and
+    # catalog are identical across conversations, so only the caller's own
+    # first history item identifies this conversation.
+    history_root = _conversation_fingerprint(input_items)
 
     # Prompt layout is chosen for the upstream prompt cache: everything that is
     # stable across a conversation leads, so each turn only re-bills the newly
@@ -1090,16 +1109,21 @@ def prepare_responses_body(source: dict) -> dict:
         if isinstance(raw_input, list)
         else 0
     )
-    metadata.setdefault("agent_iteration", str(tool_output_items + 1))
-    # A conversation must keep one task identity across turns; random
-    # per-request identifiers make every request look like a new task.
+    iteration = str(tool_output_items + 1)
+    metadata.setdefault("agent_iteration", iteration)
+    # Identifiers are derived, never random: the same client request must
+    # serialize to the same bytes every time. A conversation keeps one task
+    # identity across turns, and a retried turn keeps its turn identity, so a
+    # retry is recognisable as the same turn rather than as new work.
+    conversation = cache_key or history_root
     metadata.setdefault(
         "task_id",
-        str(uuid5(NAMESPACE_URL, f"ghcp-proxy/gpt-excel/{cache_key}"))
-        if cache_key
-        else str(uuid4()),
+        str(uuid5(NAMESPACE_URL, f"ghcp-proxy/gpt-excel/{conversation}")),
     )
-    metadata.setdefault("turn_id", str(uuid4()))
+    metadata.setdefault(
+        "turn_id",
+        str(uuid5(NAMESPACE_URL, f"ghcp-proxy/gpt-excel/{conversation}/turn/{iteration}")),
+    )
     output["metadata"] = metadata
     return output
 
