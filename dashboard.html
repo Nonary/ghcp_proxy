@@ -888,6 +888,64 @@
     .command-list { display: grid; gap: 6px; margin-top: 4px; }
     .command-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 0.82rem; }
     .command-row code { color: var(--text); background: rgba(255,255,255,0.06); border: 1px solid var(--line); border-radius: 6px; padding: 2px 6px; }
+    .capture-command {
+      display: flex; align-items: flex-start; justify-content: space-between; gap: 8px;
+      margin-top: 6px; padding: 8px; border: 1px solid var(--line); border-radius: 8px;
+      background: rgba(255,255,255,0.035);
+    }
+    .capture-command code { color: var(--text); font-size: 0.72rem; overflow-wrap: anywhere; }
+    .capture-command button { flex: 0 0 auto; padding: 4px 8px; font-size: 0.72rem; }
+    .excel-capture-flow {
+      display: grid;
+      gap: 10px;
+      margin-top: 8px;
+      padding: 10px;
+      border: 1px solid var(--line);
+      border-radius: 9px;
+      background: rgba(255,255,255,0.025);
+    }
+    .excel-capture-flow-message { color: var(--text); font-size: 0.8rem; line-height: 1.45; }
+    .excel-capture-steps {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 8px;
+    }
+    .excel-capture-step {
+      display: flex;
+      align-items: flex-start;
+      gap: 7px;
+      min-width: 0;
+      color: var(--muted-2);
+      font-size: 0.72rem;
+      line-height: 1.35;
+    }
+    .excel-capture-step-marker {
+      display: inline-grid;
+      place-items: center;
+      flex: 0 0 auto;
+      width: 20px;
+      height: 20px;
+      border: 1px solid var(--line-strong);
+      border-radius: 50%;
+      color: var(--muted);
+      font-weight: 700;
+      font-size: 0.66rem;
+    }
+    .excel-capture-step.is-active { color: var(--text); }
+    .excel-capture-step.is-active .excel-capture-step-marker {
+      color: var(--accent);
+      border-color: rgba(255,122,58,0.6);
+      box-shadow: 0 0 0 2px rgba(255,122,58,0.12);
+    }
+    .excel-capture-step.is-done { color: var(--success); }
+    .excel-capture-step.is-done .excel-capture-step-marker {
+      color: var(--success);
+      border-color: rgba(52,211,153,0.45);
+      background: rgba(52,211,153,0.08);
+    }
+    @media (max-width: 720px) {
+      .excel-capture-steps { grid-template-columns: 1fr; }
+    }
     .control-secondary-grid { display: grid; gap: 12px; grid-column: 1 / -1; }
     .spacer { flex: 1; }
     .status-stack { display: grid; gap: 6px; }
@@ -2609,27 +2667,88 @@
           <article class="mini-card" style="margin-top: 12px;">
             <div class="eyebrow">GPT Excel</div>
             <div :class="['status', excelSessionStatusClass()]">{{ excelSessionStatusLabel() }}</div>
-            <div class="subtle" style="margin-top: 8px;">
+            <div class="subtle" style="margin-top: 8px;" v-if="excelSessionStatus.capture?.method === 'webview2-devtools'">
               Capture credentials from the official ChatGPT Excel add-in and store them encrypted for this Windows user with DPAPI.
             </div>
-            <div class="subtle" style="margin-top: 4px;">
+            <div class="subtle" style="margin-top: 8px;" v-else-if="isMacExcelCapture()">
+              Excel for Mac uses Safari WKWebView. Capture temporarily enables a local Secure Web Proxy restricted to bps.openai.com, then restores the previous proxy state automatically.
+            </div>
+            <div class="subtle" style="margin-top: 8px;" v-else>
+              Capture credentials from the official ChatGPT Excel add-in.
+            </div>
+            <div class="subtle" style="margin-top: 4px;" v-if="excelSessionStatus.persistence_supported">
               {{ excelSessionStatus.persisted ? 'Encrypted session will reload after proxy restarts.' : 'No encrypted session has been saved yet.' }}
+            </div>
+            <div class="subtle" style="margin-top: 4px;" v-else-if="isMacExcelCapture()">
+              On macOS the captured session is held in memory and must be refreshed after the proxy restarts.
             </div>
             <div class="subtle" style="margin-top: 4px;" v-if="excelSessionStatus.expires_at">
               Token expires {{ excelSessionExpiryLabel() }}.
             </div>
-            <div class="subtle" style="margin-top: 8px;" v-if="excelSessionStatus.capture?.capturing">
-              Send one message in the ChatGPT Excel add-in. This page will update automatically.
+            <div class="subtle" style="margin-top: 8px;" v-if="excelSessionStatus.capture?.process_running && excelSessionStatus.capture?.message">
+              {{ excelSessionStatus.capture.message }}
+            </div>
+            <div v-if="isOneClickMacExcelCapture()" class="excel-capture-flow">
+              <div class="excel-capture-flow-message">{{ excelCaptureFlowMessage() }}</div>
+              <div class="excel-capture-steps">
+                <div :class="['excel-capture-step', excelCaptureStepClass(1)]">
+                  <span class="excel-capture-step-marker">1</span>
+                  <span>Click Capture</span>
+                </div>
+                <div :class="['excel-capture-step', excelCaptureStepClass(2)]">
+                  <span class="excel-capture-step-marker">2</span>
+                  <span>Send any ChatGPT Excel message</span>
+                </div>
+                <div :class="['excel-capture-step', excelCaptureStepClass(3)]">
+                  <span class="excel-capture-step-marker">3</span>
+                  <span>Session ready; proxy restored</span>
+                </div>
+              </div>
+              <div class="subtle" v-if="excelSessionStatus.capture?.capturing && excelSessionStatus.capture?.deadline_at">
+                Listening {{ excelCaptureTimeRemainingLabel() }}.
+              </div>
+            </div>
+            <div v-if="excelSessionStatus.capture?.install_command" style="margin-top: 6px;">
+              <div class="subtle">Install mitmproxy, refresh this page, then start capture:</div>
+              <div class="capture-command">
+                <code>{{ excelSessionStatus.capture.install_command }}</code>
+                <button @click="copyText(excelSessionStatus.capture.install_command)">Copy</button>
+              </div>
+            </div>
+            <div v-else-if="excelSessionStatus.capture?.install_url" class="subtle" style="margin-top: 6px;">
+              Install the macOS package from
+              <a :href="excelSessionStatus.capture.install_url" target="_blank" rel="noopener">mitmproxy.org</a>,
+              refresh this page, then start capture.
+            </div>
+            <div v-if="excelSessionStatus.capture?.ca_install_command && !excelSessionStatus.capture?.ca_trusted" style="margin-top: 6px;">
+              <div class="subtle">
+                Run this once in Terminal to trust only the dedicated bps.openai.com capture certificate. macOS may ask for your keychain password.
+              </div>
+              <div class="capture-command">
+                <code>{{ excelSessionStatus.capture.ca_install_command }}</code>
+                <button @click="copyText(excelSessionStatus.capture.ca_install_command)">Copy</button>
+              </div>
             </div>
             <div class="toolbar" style="margin-top: 10px;">
-              <button class="primary"
+              <button v-if="!excelSessionStatus.capture?.process_running"
+                      class="primary"
                       @click="startExcelSessionCapture"
-                      :disabled="savingExcelSession || excelSessionStatus.capture?.capturing || !excelSessionStatus.capture?.available">
-                <span v-if="excelSessionStatus.capture?.capturing" class="spinner"></span>
-                {{ excelSessionStatus.capture?.capturing ? 'Waiting for Excel…' : (excelSessionStatus.configured ? 'Refresh Excel session' : 'Capture Excel session') }}
+                      :disabled="savingExcelSession || !excelSessionStatus.capture?.available">
+                <span v-if="savingExcelSession" class="spinner"></span>
+                {{ excelCaptureButtonLabel() }}
+              </button>
+              <button v-else-if="excelSessionStatus.capture?.cancel_supported"
+                      @click="cancelExcelSessionCapture"
+                      :disabled="savingExcelSession">
+                <span v-if="savingExcelSession" class="spinner"></span>
+                Cancel capture
+              </button>
+              <button v-else disabled>
+                <span class="spinner"></span>
+                Capture running…
               </button>
               <button @click="clearExcelSession"
-                      :disabled="savingExcelSession || excelSessionStatus.capture?.capturing || (!excelSessionStatus.configured && !excelSessionStatus.persisted)">
+                      :disabled="savingExcelSession || excelSessionStatus.capture?.process_running || (!excelSessionStatus.configured && !excelSessionStatus.persisted)">
                 Clear session
               </button>
               <button @click="loadExcelSessionStatus" :disabled="savingExcelSession">Refresh</button>
@@ -2637,6 +2756,7 @@
             <div v-if="excelSessionStatus.error" class="status error" style="margin-top: 10px;">{{ excelSessionStatus.error }}</div>
             <div v-else-if="excelSessionStatus.capture?.error" class="status error" style="margin-top: 10px;">{{ excelSessionStatus.capture.error }}</div>
             <div v-else-if="excelSessionStatus.persistence_error" class="status error" style="margin-top: 10px;">{{ excelSessionStatus.persistence_error }}</div>
+            <div v-else-if="excelSessionStatus.capture?.prerequisite_error" class="status warn" style="margin-top: 10px;">{{ excelSessionStatus.capture.prerequisite_error }}</div>
             <div v-else-if="excelSessionStatus.statusMessage" class="status good" style="margin-top: 10px;">{{ excelSessionStatus.statusMessage }}</div>
           </article>
           <article class="mini-card" style="margin-top: 12px;">
@@ -4071,6 +4191,26 @@
             capture: {
               available: false,
               capturing: false,
+              process_running: false,
+              method: '',
+              platform: '',
+              workflow_version: 0,
+              cancel_supported: false,
+              phase: '',
+              proxy_active: false,
+              proxy_port: null,
+              excel_helper_restarted: false,
+              timeout_seconds: null,
+              deadline_at: null,
+              network_service: '',
+              prerequisite_error: '',
+              setup_required: false,
+              ca_certificate_path: '',
+              ca_certificate_exists: false,
+              ca_trusted: false,
+              ca_install_command: '',
+              install_command: '',
+              install_url: '',
               error: '',
               message: '',
             },
@@ -5136,7 +5276,16 @@
           return 'warn';
         },
         excelSessionStatusLabel() {
-          if (this.excelSessionStatus.capture?.capturing) return 'Waiting for an Excel add-in request';
+          if (this.excelSessionStatus.capture?.capturing && this.excelSessionStatus.capture?.setup_required) {
+            return this.excelSessionStatus.capture?.ca_certificate_exists
+              ? 'Mac capture certificate must be trusted'
+              : 'Preparing Mac capture certificate';
+          }
+          if (this.excelSessionStatus.capture?.capturing) {
+            return this.excelSessionStatus.capture?.proxy_active
+              ? 'Ready · send one message in ChatGPT Excel'
+              : 'Starting protected Excel capture';
+          }
           if (this.excelSessionStatus.expired) return 'Saved session expired; capture a fresh session';
           if (this.excelSessionStatus.configured) {
             return this.excelSessionStatus.persisted
@@ -5145,6 +5294,89 @@
           }
           if (!this.excelSessionStatus.capture?.available) return 'Capture unavailable on this machine';
           return 'Not configured';
+        },
+        excelCaptureButtonLabel() {
+          if (this.excelSessionStatus.capture?.capturing) {
+            return this.excelSessionStatus.capture?.setup_required
+              ? 'Preparing Mac capture…'
+              : 'Waiting for Excel…';
+          }
+          if (this.excelSessionStatus.capture?.process_running) {
+            return 'Finishing capture…';
+          }
+          if (this.isOneClickMacExcelCapture()) {
+            return this.excelSessionStatus.configured
+              ? 'Refresh Excel session'
+              : 'Start one-click capture';
+          }
+          return this.excelSessionStatus.configured
+            ? 'Refresh Excel session'
+            : 'Capture Excel session';
+        },
+        isMacExcelCapture() {
+          return [
+            'mitmproxy-secure-web-proxy',
+            'mitmproxy-local',
+          ].includes(this.excelSessionStatus.capture?.method);
+        },
+        isOneClickMacExcelCapture() {
+          return (
+            this.isMacExcelCapture()
+            && Number(this.excelSessionStatus.capture?.workflow_version || 0) >= 2
+          );
+        },
+        excelCaptureFlowMessage() {
+          const capture = this.excelSessionStatus.capture || {};
+          if (capture.error) {
+            return 'Capture stopped. Review the error below, then try again.';
+          }
+          if (capture.process_running) {
+            if (capture.phase === 'restoring') {
+              return 'Restoring your previous Mac proxy settings…';
+            }
+            if (!capture.capturing) {
+              return 'Message captured. Finishing the response and restoring your Mac proxy settings…';
+            }
+            if (capture.setup_required) {
+              return capture.ca_certificate_exists
+                ? 'One-time setup: trust the dedicated bps.openai.com certificate below, then send one Excel message.'
+                : 'Creating the dedicated bps.openai.com capture certificate…';
+            }
+            if (capture.proxy_active) {
+              return capture.excel_helper_restarted
+                ? 'Excel has been reconnected. Send any message in the ChatGPT Excel task pane—everything else is automatic.'
+                : 'Open the ChatGPT task pane in Excel and send any message—everything else is automatic.';
+            }
+            return 'Starting the loopback-only capture and reconnecting Excel…';
+          }
+          if (this.excelSessionStatus.configured && !this.excelSessionStatus.expired) {
+            return 'Done. The Excel session is ready and the temporary Mac proxy is off.';
+          }
+          if (!capture.available) {
+            return 'Install mitmproxy once, then refresh this page.';
+          }
+          return 'Click once, send any message in ChatGPT Excel, and the session is captured automatically.';
+        },
+        excelCaptureStepClass(step) {
+          const capture = this.excelSessionStatus.capture || {};
+          const ready = this.excelSessionStatus.configured && !this.excelSessionStatus.expired;
+          if (capture.process_running) {
+            if (step === 1) return 'is-done';
+            if (step === 2) return capture.capturing ? 'is-active' : 'is-done';
+            if (step === 3) return capture.capturing ? '' : 'is-active';
+          }
+          if (ready) return 'is-done';
+          if (step === 1 && this.savingExcelSession) return 'is-active';
+          return '';
+        },
+        excelCaptureTimeRemainingLabel() {
+          const deadline = Number(this.excelSessionStatus.capture?.deadline_at || 0) * 1000;
+          const remainingSeconds = Math.max(0, Math.ceil((deadline - Date.now()) / 1000));
+          if (!deadline || remainingSeconds <= 0) return 'while capture finishes';
+          const minutes = Math.floor(remainingSeconds / 60);
+          const seconds = remainingSeconds % 60;
+          if (!minutes) return `for ${seconds}s`;
+          return `for ${minutes}m ${String(seconds).padStart(2, '0')}s`;
         },
         excelSessionExpiryLabel() {
           const timestamp = Number(this.excelSessionStatus.expires_at || 0) * 1000;
@@ -5167,6 +5399,7 @@
               throw new Error(`Excel session status request failed: ${response.status}`);
             }
             const previousCapturing = Boolean(this.excelSessionStatus.capture?.capturing);
+            const previousConfiguredAt = this.excelSessionStatus.configured_at;
             const payload = await response.json();
             this.excelSessionStatus = {
               ...this.excelSessionStatus,
@@ -5177,17 +5410,26 @@
               },
               error: '',
             };
-            if (this.excelSessionStatus.capture?.capturing) {
+            if (this.excelSessionStatus.capture?.process_running) {
               this._scheduleExcelSessionStatusPoll();
-            } else if (previousCapturing && this.excelSessionStatus.configured) {
-              this.excelSessionStatus.statusMessage = 'Excel session captured and saved securely.';
+            }
+            const capturedNow = Boolean(
+              this.excelSessionStatus.configured
+              && this.excelSessionStatus.configured_at
+              && this.excelSessionStatus.configured_at !== previousConfiguredAt
+            );
+            if (capturedNow || (previousCapturing && this.excelSessionStatus.configured)) {
+              this.excelSessionStatus.statusMessage = this.excelSessionStatus.capture?.message
+                || (this.excelSessionStatus.persisted
+                  ? 'Excel session captured and saved securely.'
+                  : 'Excel session captured in memory.');
             }
           } catch (error) {
             this.excelSessionStatus.error = error.message;
           }
         },
         async startExcelSessionCapture() {
-          if (this.savingExcelSession || this.excelSessionStatus.capture?.capturing) return;
+          if (this.savingExcelSession || this.excelSessionStatus.capture?.process_running) return;
           this.savingExcelSession = true;
           this.excelSessionStatus.statusMessage = '';
           this.excelSessionStatus.error = '';
@@ -5195,11 +5437,46 @@
             const response = await fetch('/api/config/excel-session', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ action: 'capture', devtools_port: 9222 }),
+              body: JSON.stringify({
+                action: 'capture',
+                devtools_port: 9222,
+                timeout_seconds: 600,
+              }),
             });
             const payload = await response.json().catch(() => ({}));
             if (!response.ok) {
               throw new Error(payload.detail || `Excel session capture request failed: ${response.status}`);
+            }
+            this.excelSessionStatus = {
+              ...this.excelSessionStatus,
+              ...payload,
+              capture: {
+                ...this.excelSessionStatus.capture,
+                ...(payload.capture || {}),
+              },
+              error: '',
+            };
+            this._scheduleExcelSessionStatusPoll();
+          } catch (error) {
+            this.excelSessionStatus.error = error.message;
+          } finally {
+            this.savingExcelSession = false;
+          }
+        },
+        async cancelExcelSessionCapture() {
+          if (this.savingExcelSession || !this.excelSessionStatus.capture?.process_running) return;
+          this.savingExcelSession = true;
+          this.excelSessionStatus.error = '';
+          this.excelSessionStatus.statusMessage = 'Stopping capture and restoring proxy settings…';
+          try {
+            const response = await fetch('/api/config/excel-session', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ action: 'cancel_capture' }),
+            });
+            const payload = await response.json().catch(() => ({}));
+            if (!response.ok) {
+              throw new Error(payload.detail || `Excel capture cancellation failed: ${response.status}`);
             }
             this.excelSessionStatus = {
               ...this.excelSessionStatus,

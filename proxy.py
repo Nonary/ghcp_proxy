@@ -490,6 +490,11 @@ excel_session_capture_manager = excel_session_capture.ExcelSessionCaptureManager
         "tools",
         "prime-excel-session.js",
     ),
+    macos_script_path=os.path.join(
+        os.path.dirname(__file__),
+        "tools",
+        "capture-excel-session-mitm.py",
+    ),
     session_status_provider=excel_upstream.excel_session_store.status,
 )
 
@@ -5337,6 +5342,14 @@ async def excel_session_status_api():
 async def excel_session_config_api(request: Request):
     payload = await parse_json_request(request)
     action = str(payload.get("action") or "").strip().lower()
+    if action == "cancel_capture":
+        excel_session_capture_manager.stop()
+        return JSONResponse(
+            content={
+                **excel_upstream.excel_session_store.status(),
+                "capture": excel_session_capture_manager.status(),
+            }
+        )
     if action == "capture":
         try:
             capture = excel_session_capture_manager.start(

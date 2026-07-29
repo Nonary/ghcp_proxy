@@ -67,7 +67,11 @@ FORWARD_PROMPT_CACHE_KEY = os.environ.get(
 CATALOG_AT_PROMPT_END = os.environ.get(
     "GHCP_EXCEL_CATALOG_AT_PROMPT_END", "0"
 ).strip().lower() in {"1", "true", "yes", "on"}
-SESSION_FILE = os.path.join(user_state_dir(), "excel-session.dpapi")
+SESSION_FILE = (
+    os.path.join(user_state_dir(), "excel-session.dpapi")
+    if sys.platform == "win32"
+    else None
+)
 
 _ALLOWED_CAPTURED_HEADERS = frozenset(
     {
