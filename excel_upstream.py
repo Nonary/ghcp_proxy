@@ -48,6 +48,12 @@ RESPONSES_URL = os.environ.get(
 FORWARD_PROMPT_CACHE_KEY = os.environ.get(
     "GHCP_EXCEL_FORWARD_PROMPT_CACHE_KEY", "1"
 ).strip().lower() not in {"0", "false", "no", "off"}
+# Escape hatch back to the pre-cache-fix layout (full catalog as the prompt
+# suffix) in case the compact trailing reminder ever stops holding the model to
+# the marker protocol.  See _client_tool_protocol_reminder for why it moved.
+CATALOG_AT_PROMPT_END = os.environ.get(
+    "GHCP_EXCEL_CATALOG_AT_PROMPT_END", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
 SESSION_FILE = os.path.join(user_state_dir(), "excel-session.dpapi")
 
 _ALLOWED_CAPTURED_HEADERS = frozenset(
@@ -422,6 +428,41 @@ def _client_tool_protocol_instructions(source: dict) -> str:
         + TOOL_CALL_MARKER_CLOSE
         + " and nothing else."
     )
+
+
+def _client_tool_protocol_reminder(source: dict) -> str:
+    """Compact recency cue that stands in for the full catalog at the tail.
+
+    The catalog itself is ~3.5k tokens.  While it sat at the end of the prompt
+    it re-billed as fresh input on *every* turn: the upstream prompt cache can
+    only extend to the point where the previous request diverged, and appending
+    new history in front of a trailing catalog puts that divergence right at
+    the catalog's first byte.  Wire captures showed a hard floor of ~3.8k fresh
+    input tokens per request for exactly that reason.  So the catalog moved
+    into the cached prefix and this reminder - a couple of hundred bytes -
+    carries the recency that the original A/B replays showed the model needs.
+    """
+    allowed_tools = client_tool_types(source)
+    if not allowed_tools:
+        return ""
+    reminder = (
+        "Reminder: every native server-injected tool (list_skills, Excel, "
+        "Office, connector, workbook, web search) is unavailable to this "
+        "relayed request. Never emit a native tool call. To use a client tool, "
+        f"reply with exactly one {TOOL_CALL_MARKER_OPEN} JSON "
+        f"{TOOL_CALL_MARKER_CLOSE} marker and no other text, following the "
+        "catalog schema in the developer message above. Client tools: "
+        + ", ".join(sorted(allowed_tools))
+        + "."
+    )
+    if "shell_command" in allowed_tools:
+        reminder += " For repository inspection use shell_command."
+    if "update_plan" in allowed_tools:
+        reminder += (
+            " Never re-issue an unchanged plan; after update_plan take a "
+            "substantive action before planning again."
+        )
+    return reminder
 
 
 # Appended to every update_plan tool output. The upstream harness makes the
@@ -982,16 +1023,25 @@ def prepare_responses_body(source: dict) -> dict:
     raw_input = source.get("input")
     input_items = translate_input_items(raw_input, client_tool_types(source))
 
+    # Prompt layout is chosen for the upstream prompt cache: everything that is
+    # stable across a conversation leads, so each turn only re-bills the newly
+    # appended history plus the short trailing reminder. Putting the ~3.5k-token
+    # catalog last instead (the old layout, still reachable through
+    # GHCP_EXCEL_CATALOG_AT_PROMPT_END) forced the cache prefix to end at the
+    # catalog's first byte and re-billed it on every request.
+    prologue: list = []
     instructions = source.get("instructions")
     if isinstance(instructions, str) and instructions.strip():
-        input_items.insert(0, _message_item("developer", instructions))
-    # The tool-protocol catalog goes last: live A/B replays showed the model
-    # ignores the marker protocol (refusing shell work or spamming plan
-    # updates) unless the catalog sits immediately before generation. The
-    # conversation prefix above it still caches; only this suffix re-bills.
-    input_items.append(
-        _message_item("developer", _client_tool_protocol_instructions(source))
-    )
+        prologue.append(_message_item("developer", instructions))
+    catalog = _message_item("developer", _client_tool_protocol_instructions(source))
+    if CATALOG_AT_PROMPT_END:
+        input_items = prologue + input_items + [catalog]
+    else:
+        prologue.append(catalog)
+        reminder = _client_tool_protocol_reminder(source)
+        input_items = prologue + input_items
+        if reminder:
+            input_items.append(_message_item("developer", reminder))
     output["input"] = input_items
 
     cache_key = _cache_key(source)

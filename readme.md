@@ -199,14 +199,24 @@ appended steering directive — without it the plan-happy upstream harness
 re-plans forever instead of working. Reasoning items with `encrypted_content`
 are replayed unchanged (GPT-5 models repeat their previous action without
 that continuity); bare reasoning items (which the stateless upstream would
-reject) are dropped. The tool catalog message sits at the end of the prompt —
-A/B replays showed the model ignores the marker protocol when the catalog is
-anywhere else. The rewrite is deterministic, and the
-instructions plus tool-catalog messages lead the prompt, so the upstream prompt
-cache sees a stable, growing prefix. Codex's `prompt_cache_key` is forwarded
-for cache routing (disable with `GHCP_EXCEL_FORWARD_PROMPT_CACHE_KEY=0`), and
-the `task_id` metadata is derived from it so one conversation keeps one task
-identity across turns.
+reject) are dropped.
+
+The rewrite is deterministic and the prompt is laid out for the upstream
+prompt cache: the instructions and the tool catalog lead, conversation history
+follows, and only a short protocol reminder trails. The catalog originally sat
+last, because A/B replays showed the model ignores the marker protocol when
+nothing restates it near generation — but a trailing ~3.5k-token catalog caps
+the cache prefix at its first byte and re-bills it on every single turn. Wire
+captures showed a floor of roughly 3.8k fresh input tokens per request from
+that alone; replaying those same captures through the current layout cuts
+fresh input by about 60%. The compact trailing reminder keeps the recency the
+model needs at a fraction of the cost. Set
+`GHCP_EXCEL_CATALOG_AT_PROMPT_END=1` to restore the old suffix layout if the
+reminder ever stops holding the model to the protocol.
+
+Codex's `prompt_cache_key` is forwarded for cache routing (disable with
+`GHCP_EXCEL_FORWARD_PROMPT_CACHE_KEY=0`), and the `task_id` metadata is derived
+from it so one conversation keeps one task identity across turns.
 
 Cost tracking prices `gpt-excel` at GPT-5.6 token rates (the observed routed
 model), including the 272k long-context tier. The dashboard shows that spend

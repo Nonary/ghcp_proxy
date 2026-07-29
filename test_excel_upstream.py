@@ -68,12 +68,12 @@ class ExcelUpstreamTests(unittest.TestCase):
         self.assertEqual(
             body["input"][0]["content"][0]["text"], "Use the client tools."
         )
-        self.assertEqual(body["input"][1]["role"], "user")
-        self.assertEqual(body["input"][2]["role"], "developer")
-        tool_prompt = body["input"][2]["content"][0]["text"]
+        self.assertEqual(body["input"][1]["role"], "developer")
+        tool_prompt = body["input"][1]["content"][0]["text"]
         self.assertIn("external Codex Responses API client", tool_prompt)
         self.assertIn("<codex_tool_call>", tool_prompt)
         self.assertIn('"name":"demo"', tool_prompt)
+        self.assertEqual(body["input"][2]["role"], "user")
         self.assertNotIn("tools", body)
         self.assertNotIn("include", body)
         self.assertNotIn("text", body)
@@ -175,24 +175,98 @@ class ExcelUpstreamTests(unittest.TestCase):
         self.assertIn(excel_upstream.PLAN_TOOL_OUTPUT_STEERING, output)
         self.assertIn("shell_command", output)
 
-    def test_catalog_message_is_last(self):
+    def test_catalog_leads_and_only_a_compact_reminder_trails(self):
         body = excel_upstream.prepare_responses_body(
             {
                 "model": "gpt-excel",
                 "input": "Hello",
-                "tools": [{"type": "function", "name": "demo"}],
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "demo",
+                        "parameters": {"type": "object", "properties": {}},
+                    }
+                ],
             }
         )
+        catalog = body["input"][0]["content"][0]["text"]
+        self.assertIn('"name":"demo"', catalog)
         last = body["input"][-1]
         self.assertEqual(last["role"], "developer")
-        self.assertIn('"name":"demo"', last["content"][0]["text"])
+        reminder = last["content"][0]["text"]
+        self.assertIn("<codex_tool_call>", reminder)
+        self.assertIn("demo", reminder)
+        # The trailing message re-bills on every turn, so it must stay small
+        # relative to the catalog it replaces.
+        self.assertLess(len(reminder), len(catalog) / 2)
+
+    def test_catalog_is_the_only_message_without_tools(self):
         without_tools = excel_upstream.prepare_responses_body(
             {"model": "gpt-excel", "input": "Hello"}
         )
         self.assertEqual(
-            without_tools["input"][-1]["content"][0]["text"],
+            without_tools["input"][0]["content"][0]["text"],
             excel_upstream.EXTERNAL_CLIENT_INSTRUCTIONS,
         )
+        self.assertEqual(without_tools["input"][-1]["role"], "user")
+
+    def test_growing_conversation_keeps_a_stable_cache_prefix(self):
+        source = {
+            "model": "gpt-excel",
+            "instructions": "Be terse.",
+            "prompt_cache_key": "conversation-1",
+            "tools": [{"type": "function", "name": "shell_command"}],
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "list files"}],
+                }
+            ],
+        }
+        first = excel_upstream.prepare_responses_body(source)
+        second = excel_upstream.prepare_responses_body(
+            {
+                **source,
+                "input": source["input"]
+                + [
+                    {
+                        "type": "function_call",
+                        "call_id": "call_1",
+                        "name": "shell_command",
+                        "arguments": '{"command":"ls"}',
+                    },
+                    {
+                        "type": "function_call_output",
+                        "call_id": "call_1",
+                        "output": "file.txt",
+                    },
+                ],
+            }
+        )
+
+        # Everything the first turn sent, minus its trailing reminder, must
+        # still be a byte-identical prefix of the second turn: that prefix is
+        # exactly what the upstream prompt cache can reuse.
+        first_prefix = first["input"][:-1]
+        self.assertEqual(second["input"][: len(first_prefix)], first_prefix)
+        self.assertEqual(first["input"][-1], second["input"][-1])
+
+    def test_catalog_position_escape_hatch_restores_suffix_layout(self):
+        source = {
+            "model": "gpt-excel",
+            "input": "Hello",
+            "tools": [{"type": "function", "name": "demo"}],
+        }
+        original = excel_upstream.CATALOG_AT_PROMPT_END
+        excel_upstream.CATALOG_AT_PROMPT_END = True
+        try:
+            body = excel_upstream.prepare_responses_body(source)
+        finally:
+            excel_upstream.CATALOG_AT_PROMPT_END = original
+        self.assertEqual(len(body["input"]), 2)
+        self.assertEqual(body["input"][0]["role"], "user")
+        self.assertIn('"name":"demo"', body["input"][-1]["content"][0]["text"])
 
     def test_empty_tool_output_is_rendered_as_explicit_success(self):
         items = excel_upstream.translate_input_items(
