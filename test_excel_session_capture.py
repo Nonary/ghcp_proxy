@@ -1,241 +1,182 @@
 from __future__ import annotations
 
-import importlib.util
+import base64
 import json
-import os
-import signal
-import stat
+import sqlite3
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
 from unittest import mock
 
-from excel_session_capture import ExcelSessionCaptureManager
+import excel_upstream
+from excel_session_capture import (
+    ExcelSessionCaptureManager,
+    load_macos_excel_session,
+    refresh_macos_excel_session,
+)
 
 
 ROOT = Path(__file__).resolve().parent
-WRAPPER_PATH = ROOT / "tools" / "capture-excel-session-macos.py"
-WRAPPER_SPEC = importlib.util.spec_from_file_location(
-    "capture_excel_session_macos",
-    WRAPPER_PATH,
-)
-assert WRAPPER_SPEC is not None and WRAPPER_SPEC.loader is not None
-macos_capture = importlib.util.module_from_spec(WRAPPER_SPEC)
-sys.modules[WRAPPER_SPEC.name] = macos_capture
-WRAPPER_SPEC.loader.exec_module(macos_capture)
+MACOS_SCRIPT_PATH = ROOT / "tools" / "prime-excel-session-macos.py"
 
 
-class MacCaptureWrapperTests(unittest.TestCase):
-    def test_network_service_matches_primary_interface(self):
-        output = """\
-An asterisk (*) denotes that a network service is disabled.
-(1) Thunderbolt Bridge
-(Hardware Port: Thunderbolt Bridge, Device: bridge0)
+def _jwt_with_exp(expiration: float) -> str:
+    def encode(value: object) -> str:
+        raw = json.dumps(value, separators=(",", ":")).encode()
+        return base64.urlsafe_b64encode(raw).decode().rstrip("=")
 
-(2) Wi-Fi
-(Hardware Port: Wi-Fi, Device: en0)
-"""
-        with mock.patch.object(macos_capture, "_run", return_value=output):
-            self.assertEqual(macos_capture._network_service("en0"), "Wi-Fi")
+    return f"{encode({'alg': 'none'})}.{encode({'exp': expiration})}."
 
-    def test_network_service_uses_active_physical_service_for_utun(self):
-        output = """\
-An asterisk (*) denotes that a network service is disabled.
-(1) USB Ethernet
-(Hardware Port: USB Ethernet, Device: en5)
 
-(2) Wi-Fi
-(Hardware Port: Wi-Fi, Device: en0)
-"""
-
-        def run(command):
-            if command == [
-                macos_capture._NETWORKSETUP,
-                "-listnetworkserviceorder",
-            ]:
-                return output
-            if command == [macos_capture._IFCONFIG, "en5"]:
-                return "status: inactive"
-            if command == [macos_capture._IFCONFIG, "en0"]:
-                return "status: active"
-            raise AssertionError(command)
-
-        with mock.patch.object(macos_capture, "_run", side_effect=run):
-            self.assertEqual(macos_capture._network_service("utun8"), "Wi-Fi")
-
-    def test_network_service_does_not_use_a_disabled_service_for_utun(self):
-        output = """\
-An asterisk (*) denotes that a network service is disabled.
-(1) *USB Ethernet
-(Hardware Port: USB Ethernet, Device: en5)
-
-(2) Wi-Fi
-(Hardware Port: Wi-Fi, Device: en0)
-"""
-
-        with mock.patch.object(
-            macos_capture,
-            "_run",
-            side_effect=[output, "status: active"],
-        ) as run:
-            self.assertEqual(macos_capture._network_service("utun8"), "Wi-Fi")
-        self.assertEqual(
-            run.call_args_list[-1],
-            mock.call([macos_capture._IFCONFIG, "en0"]),
+class MacLocalStorageCaptureTests(unittest.TestCase):
+    def _write_database(
+        self,
+        root: Path,
+        *,
+        expiration: float,
+        account_id: str = "account-id",
+    ) -> Path:
+        database = (
+            root
+            / "Default"
+            / "profile"
+            / "origin"
+            / "LocalStorage"
+            / "localstorage.sqlite3"
         )
-
-    def test_secure_proxy_state_is_parsed(self):
-        output = """\
-Enabled: Yes
-Server: proxy.example
-Port: 8443
-Authenticated Proxy Enabled: 1
-"""
-        with mock.patch.object(macos_capture, "_run", return_value=output):
-            self.assertEqual(
-                macos_capture._secure_proxy_state("Wi-Fi"),
-                macos_capture.SecureProxyState(
-                    enabled=True,
-                    server="proxy.example",
-                    port=8443,
-                    authenticated=True,
-                ),
+        database.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "authMode": "chatgpt",
+            "sessionInfo": {
+                "access_token": _jwt_with_exp(expiration),
+                "expires_at": expiration,
+            },
+            "userInfo": {
+                "chatgpt_account_id": account_id,
+                "chatgpt_account_user_id": "account-user-id",
+            },
+        }
+        connection = sqlite3.connect(database)
+        try:
+            connection.execute(
+                "CREATE TABLE ItemTable "
+                "(key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB NOT NULL)"
             )
-
-    def test_disabled_proxy_configuration_is_restored_exactly(self):
-        state = macos_capture.SecureProxyState(
-            enabled=False,
-            server="",
-            port=0,
-            authenticated=False,
-        )
-        with mock.patch.object(macos_capture, "_run") as run:
-            macos_capture._restore_proxy("Wi-Fi", state)
-        self.assertEqual(
-            run.call_args_list,
-            [
-                mock.call(
-                    [
-                        macos_capture._NETWORKSETUP,
-                        "-setsecurewebproxy",
-                        "Wi-Fi",
-                        "",
-                        "0",
-                    ]
-                ),
-                mock.call(
-                    [
-                        macos_capture._NETWORKSETUP,
-                        "-setsecurewebproxystate",
-                        "Wi-Fi",
-                        "off",
-                    ]
-                ),
-            ],
-        )
-
-    def test_excel_networking_helper_is_restarted(self):
-        with (
-            mock.patch.object(
-                macos_capture,
-                "_excel_networking_pids",
-                side_effect=[[101], [202]],
-            ),
-            mock.patch.object(macos_capture.os, "kill") as kill,
-        ):
-            restarted, replacement_pid = (
-                macos_capture._restart_excel_networking_helper()
+            connection.execute(
+                "INSERT INTO ItemTable (key, value) VALUES (?, ?)",
+                ("bps_auth_tokens", json.dumps(payload).encode("utf-16-le")),
             )
-        self.assertTrue(restarted)
-        self.assertEqual(replacement_pid, 202)
-        kill.assert_called_once_with(101, signal.SIGKILL)
+            connection.commit()
+        finally:
+            connection.close()
+        return database
 
-    def test_missing_excel_helper_is_not_an_error(self):
-        with mock.patch.object(
-            macos_capture,
-            "_excel_networking_pids",
-            return_value=[],
-        ):
-            self.assertEqual(
-                macos_capture._restart_excel_networking_helper(),
-                (False, None),
-            )
-
-    def test_status_file_is_private_and_atomic(self):
+    def test_load_session_reads_webkit_utf16_blob(self):
         with tempfile.TemporaryDirectory() as directory:
-            path = os.path.join(directory, "capture-status.json")
-            macos_capture._write_status(
-                path,
-                phase="waiting_for_excel",
-                service="Wi-Fi",
-                proxy_active=True,
-                excel_helper_restarted=True,
-                excel_helper_pid=202,
+            root = Path(directory)
+            self._write_database(root, expiration=time.time() + 600)
+            headers = load_macos_excel_session(root)
+        self.assertTrue(headers["authorization"].startswith("Bearer "))
+        self.assertEqual(headers["chatgpt-account-id"], "account-id")
+        self.assertEqual(headers["x-openai-account-id"], "account-id")
+        self.assertEqual(headers["x-openai-account-user-id"], "account-user-id")
+        self.assertEqual(headers["x-basispoints-auth-mode"], "chatgpt")
+
+    def test_load_session_reports_missing_sign_in(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "No signed-in ChatGPT Excel session",
+            ):
+                load_macos_excel_session(Path(directory))
+
+    def test_automatic_refresh_populates_session_store(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_database(root, expiration=time.time() + 600)
+            store = excel_upstream.ExcelSessionStore()
+            with mock.patch("excel_session_capture.sys.platform", "darwin"):
+                status = refresh_macos_excel_session(
+                    store,
+                    force=True,
+                    website_data=root,
+                )
+        self.assertTrue(status["configured"])
+        self.assertFalse(status["expired"])
+        self.assertEqual(
+            store.request_headers(stream=False)["chatgpt-account-id"],
+            "account-id",
+        )
+
+    def test_automatic_refresh_preserves_expired_status_and_message(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_database(root, expiration=time.time() - 60)
+            store = excel_upstream.ExcelSessionStore()
+            with mock.patch("excel_session_capture.sys.platform", "darwin"):
+                status = refresh_macos_excel_session(
+                    store,
+                    force=True,
+                    website_data=root,
+                )
+            self.assertTrue(status["configured"])
+            self.assertTrue(status["expired"])
+            with mock.patch("excel_upstream.sys.platform", "darwin"):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "Refresh the ChatGPT Excel task pane",
+                ):
+                    store.request_headers(stream=False)
+
+    def test_forced_refresh_picks_up_newer_excel_token(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = self._write_database(
+                root,
+                expiration=time.time() + 600,
+                account_id="account-one",
             )
-            with open(path, encoding="utf-8") as handle:
-                payload = json.load(handle)
-            self.assertEqual(payload["phase"], "waiting_for_excel")
-            self.assertEqual(payload["network_service"], "Wi-Fi")
-            self.assertTrue(payload["proxy_active"])
-            self.assertEqual(payload["excel_helper_pid"], 202)
-            self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
+            store = excel_upstream.ExcelSessionStore()
+            with mock.patch("excel_session_capture.sys.platform", "darwin"):
+                refresh_macos_excel_session(store, force=True, website_data=root)
+            database.unlink()
+            self._write_database(
+                root,
+                expiration=time.time() + 1200,
+                account_id="account-two",
+            )
+            with mock.patch("excel_session_capture.sys.platform", "darwin"):
+                refresh_macos_excel_session(store, force=True, website_data=root)
+        self.assertEqual(
+            store.request_headers(stream=False)["chatgpt-account-id"],
+            "account-two",
+        )
 
 
 class ExcelSessionCaptureManagerTests(unittest.TestCase):
-    def _manager(self, directory: str) -> ExcelSessionCaptureManager:
+    def _manager(self) -> ExcelSessionCaptureManager:
         return ExcelSessionCaptureManager(
             script_path=str(ROOT / "tools" / "prime-excel-session.js"),
-            macos_script_path=str(
-                ROOT / "tools" / "capture-excel-session-mitm.py"
-            ),
-            macos_conf_dir=directory,
+            macos_script_path=str(MACOS_SCRIPT_PATH),
             session_status_provider=lambda: {
                 "configured": False,
                 "configured_at": None,
             },
         )
 
-    def test_macos_command_uses_guarded_wrapper_and_status_file(self):
-        with tempfile.TemporaryDirectory() as directory:
-            manager = self._manager(directory)
-            with mock.patch.object(
-                manager,
-                "_mitmdump_path",
-                return_value="/usr/local/bin/mitmdump",
-            ):
-                command = manager._macos_command(timeout_seconds=600)
-            self.assertEqual(command[1], str(WRAPPER_PATH))
-            self.assertIn("--status-file", command)
-            self.assertEqual(
-                command[command.index("--status-file") + 1],
-                os.path.join(directory, "capture-status.json"),
-            )
-            self.assertEqual(
-                command[command.index("--timeout-seconds") + 1],
-                "600",
-            )
-
-    def test_runtime_status_rejects_a_stale_wrapper_pid(self):
-        with tempfile.TemporaryDirectory() as directory:
-            manager = self._manager(directory)
-            path = manager._macos_capture_status_path()
-            with open(path, "w", encoding="utf-8") as handle:
-                json.dump(
-                    {
-                        "wrapper_pid": 10,
-                        "phase": "waiting_for_excel",
-                        "proxy_active": True,
-                    },
-                    handle,
-                )
-            self.assertEqual(
-                manager._macos_capture_runtime_status(
-                    SimpleNamespace(pid=11)
-                ),
-                {},
-            )
+    def test_macos_status_requires_no_proxy_or_certificate(self):
+        manager = self._manager()
+        with mock.patch("excel_session_capture.sys.platform", "darwin"):
+            status = manager.status()
+        self.assertEqual(status["method"], "webkit-localstorage-sqlite")
+        self.assertTrue(status["available"])
+        self.assertFalse(status["proxy_active"])
+        self.assertFalse(status["setup_required"])
+        self.assertEqual(status["workflow_version"], 3)
+        self.assertEqual(status["ca_install_command"], "")
+        self.assertEqual(status["install_command"], "")
 
 
 if __name__ == "__main__":

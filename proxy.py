@@ -493,7 +493,7 @@ excel_session_capture_manager = excel_session_capture.ExcelSessionCaptureManager
     macos_script_path=os.path.join(
         os.path.dirname(__file__),
         "tools",
-        "capture-excel-session-mitm.py",
+        "prime-excel-session-macos.py",
     ),
     session_status_provider=excel_upstream.excel_session_store.status,
 )
@@ -780,6 +780,10 @@ except Exception as _codex_ingest_exc:  # pragma: no cover - best effort
 @app.on_event("startup")
 async def _app_startup_restore_client_proxy_configs():
     excel_upstream.excel_session_store.load()
+    excel_session_capture.refresh_macos_excel_session(
+        excel_upstream.excel_session_store,
+        force=True,
+    )
     restore_client_proxy_configs_on_startup()
     auto_update_runtime_controller.start_periodic_checks()
 
@@ -5330,6 +5334,9 @@ async def auto_update_status_api():
 
 @app.get("/api/config/excel-session")
 async def excel_session_status_api():
+    excel_session_capture.refresh_macos_excel_session(
+        excel_upstream.excel_session_store,
+    )
     return JSONResponse(
         content={
             **excel_upstream.excel_session_store.status(),
@@ -5759,6 +5766,10 @@ async def _handle_excel_responses(
     *,
     source_body: dict | None = None,
 ) -> Response:
+    excel_session_capture.refresh_macos_excel_session(
+        excel_upstream.excel_session_store,
+        force=True,
+    )
     try:
         excel_headers = excel_upstream.excel_session_store.request_headers(
             stream=bool(body.get("stream")),

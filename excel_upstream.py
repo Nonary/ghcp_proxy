@@ -248,22 +248,7 @@ def _client_tool_specs(source: dict) -> dict[str, dict]:
     return result
 
 
-def _transport_envelope(native: dict) -> dict | None:
-    if (
-        native.get("type") != "function_call"
-        or native.get("name") != CLIENT_TOOL_TRANSPORT_NAME
-    ):
-        return None
-    raw_arguments = native.get("arguments")
-    if not isinstance(raw_arguments, str):
-        return None
-    try:
-        arguments = json.loads(raw_arguments)
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(arguments, dict):
-        return None
-    code = arguments.get("code")
+def _decode_transport_code(code: object) -> dict | None:
     if not isinstance(code, str):
         return None
     try:
@@ -286,6 +271,39 @@ def _transport_envelope(native: dict) -> dict | None:
                 envelope = candidate
                 break
     return envelope if isinstance(envelope, dict) else None
+
+
+def _transport_envelope(native: dict) -> dict | None:
+    if (
+        native.get("type") != "function_call"
+        or native.get("name") != CLIENT_TOOL_TRANSPORT_NAME
+    ):
+        return None
+    raw_arguments = native.get("arguments")
+    if not isinstance(raw_arguments, str):
+        return None
+    try:
+        arguments = json.loads(raw_arguments)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(arguments, dict):
+        return None
+    envelope = _decode_transport_code(arguments.get("code"))
+    for _ in range(2):
+        if envelope is None or envelope.get("name") != CLIENT_TOOL_TRANSPORT_NAME:
+            break
+        nested_arguments = envelope.get("arguments")
+        if isinstance(nested_arguments, str):
+            try:
+                nested_arguments = json.loads(nested_arguments)
+            except json.JSONDecodeError:
+                return None
+        if not isinstance(nested_arguments, dict):
+            return None
+        envelope = _decode_transport_code(nested_arguments.get("code"))
+    if envelope is not None and envelope.get("name") == CLIENT_TOOL_TRANSPORT_NAME:
+        return None
+    return envelope
 
 
 def _value_matches_schema(value: object, schema: object) -> bool:
@@ -459,6 +477,8 @@ def extract_native_client_tool_call(
     native = native_calls[0]
     allowed_tools = client_tool_types(source)
     envelope = _transport_envelope(native)
+    if native.get("name") == CLIENT_TOOL_TRANSPORT_NAME and envelope is None:
+        return None
     name = (
         _original_client_tool_name(envelope.get("name"), allowed_tools)
         if envelope is not None
@@ -834,6 +854,7 @@ class ExcelSessionStore:
         *,
         tools_version_id: object = None,
         persist: bool = True,
+        allow_expired: bool = False,
     ) -> dict[str, object]:
         if not isinstance(raw_headers, dict):
             raise ValueError("headers must be a JSON object")
@@ -874,7 +895,7 @@ class ExcelSessionStore:
 
         expires_at = _decode_jwt_exp(authorization)
         now = time.time()
-        if expires_at is not None and expires_at <= now:
+        if expires_at is not None and expires_at <= now and not allow_expired:
             raise ValueError("the captured ChatGPT bearer token is already expired")
 
         with self._lock:
@@ -1002,10 +1023,18 @@ class ExcelSessionStore:
             headers = dict(self._headers)
             expires_at = self._expires_at
         if not headers:
+            if sys.platform == "darwin":
+                raise RuntimeError(
+                    "ChatGPT Excel sign-in was not found. Open the ChatGPT task pane in Excel and sign in."
+                )
             raise RuntimeError(
                 "GPT Excel is not primed. Run the Excel session primer and send one prompt in the Excel add-in."
             )
         if expires_at is not None and expires_at <= time.time():
+            if sys.platform == "darwin":
+                raise RuntimeError(
+                    "The ChatGPT Excel token has expired. Refresh the ChatGPT Excel task pane, then retry."
+                )
             raise RuntimeError(
                 "The GPT Excel session has expired. Run the Excel session primer again."
             )
@@ -1048,20 +1077,28 @@ def _normalized_tool_output(
 ) -> dict:
     call_id = item.get("call_id")
     origin = call_origins.get(call_id) if isinstance(call_id, str) else None
+    normalized = item
     if origin == "update_plan":
         # The Basispoints update_plan executor returns this object. Codex's
         # client-side status tool instead returns the display string
         # "Plan updated"; replaying that string leaves the server-native tool
         # state unresolved and makes the model plan again.
-        return {**item, "output": '{"status":"ok"}'}
-    normalized = (
-        {**item, "type": "function_call_output"}
-        if (
-            origin == CLIENT_TOOL_TRANSPORT_NAME
-            and item.get("type") == "custom_tool_call_output"
-        )
-        else item
-    )
+        normalized = {**normalized, "output": '{"status":"ok"}'}
+    if (
+        origin == CLIENT_TOOL_TRANSPORT_NAME
+        and isinstance(call_id, str)
+        and call_id
+        and normalized.get("type") == "custom_tool_call_output"
+    ):
+        normalized = {**normalized, "type": "function_call_output"}
+    if (
+        isinstance(call_id, str)
+        and call_id
+        and normalized.get("type") == "function_call_output"
+    ):
+        canonical_id = f"fc_{call_id}"
+        if normalized.get("id") != canonical_id:
+            normalized = {**normalized, "id": canonical_id}
     output_text = _item_text(normalized.get("output"))
     if not output_text.strip() and isinstance(
         normalized.get("output"), (str, type(None))

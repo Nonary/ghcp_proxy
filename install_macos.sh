@@ -53,10 +53,8 @@ Next steps:
 
 Notes:
   - Node.js and npx were detected successfully.
-  - GPT Excel capture needs mitmproxy once. Install the macOS package from
-    mitmproxy.org, or run: brew install --cask mitmproxy
-  - After the one-time certificate trust step, use Integrations in the dashboard:
-    click capture, send one ChatGPT Excel message, and it is done.
+  - GPT Excel authentication loads automatically from the signed-in Excel WebKit session.
+    If its token expires, refresh the ChatGPT Excel task pane.
   - Client activation for Codex and Claude is handled from the dashboard so backups stay intact.
   - The dashboard can install a macOS login item and zsh commands: start-ghproxy / stop-ghproxy.
   - Dashboard usage helpers are fetched lazily through npx when needed.

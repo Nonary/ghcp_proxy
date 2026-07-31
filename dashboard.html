@@ -2671,7 +2671,7 @@
               Capture credentials from the official ChatGPT Excel add-in and store them encrypted for this Windows user with DPAPI.
             </div>
             <div class="subtle" style="margin-top: 8px;" v-else-if="isMacExcelCapture()">
-              Excel for Mac uses Safari WKWebView. Capture temporarily enables a local Secure Web Proxy restricted to bps.openai.com, then restores the previous proxy state automatically.
+              Uses the current ChatGPT Excel sign-in automatically from macOS WebKit LocalStorage.
             </div>
             <div class="subtle" style="margin-top: 8px;" v-else>
               Capture credentials from the official ChatGPT Excel add-in.
@@ -2680,56 +2680,15 @@
               {{ excelSessionStatus.persisted ? 'Encrypted session will reload after proxy restarts.' : 'No encrypted session has been saved yet.' }}
             </div>
             <div class="subtle" style="margin-top: 4px;" v-else-if="isMacExcelCapture()">
-              On macOS the captured session is held in memory and must be refreshed after the proxy restarts.
+              The session is loaded automatically at startup and refreshed when needed.
             </div>
-            <div class="subtle" style="margin-top: 4px;" v-if="excelSessionStatus.expires_at">
+            <div class="subtle" style="margin-top: 4px;" v-if="excelSessionStatus.expires_at && !isMacExcelCapture()">
               Token expires {{ excelSessionExpiryLabel() }}.
             </div>
-            <div class="subtle" style="margin-top: 8px;" v-if="excelSessionStatus.capture?.process_running && excelSessionStatus.capture?.message">
+            <div class="subtle" style="margin-top: 8px;" v-if="!isMacExcelCapture() && excelSessionStatus.capture?.process_running && excelSessionStatus.capture?.message">
               {{ excelSessionStatus.capture.message }}
             </div>
-            <div v-if="isOneClickMacExcelCapture()" class="excel-capture-flow">
-              <div class="excel-capture-flow-message">{{ excelCaptureFlowMessage() }}</div>
-              <div class="excel-capture-steps">
-                <div :class="['excel-capture-step', excelCaptureStepClass(1)]">
-                  <span class="excel-capture-step-marker">1</span>
-                  <span>Click Capture</span>
-                </div>
-                <div :class="['excel-capture-step', excelCaptureStepClass(2)]">
-                  <span class="excel-capture-step-marker">2</span>
-                  <span>Send any ChatGPT Excel message</span>
-                </div>
-                <div :class="['excel-capture-step', excelCaptureStepClass(3)]">
-                  <span class="excel-capture-step-marker">3</span>
-                  <span>Session ready; proxy restored</span>
-                </div>
-              </div>
-              <div class="subtle" v-if="excelSessionStatus.capture?.capturing && excelSessionStatus.capture?.deadline_at">
-                Listening {{ excelCaptureTimeRemainingLabel() }}.
-              </div>
-            </div>
-            <div v-if="excelSessionStatus.capture?.install_command" style="margin-top: 6px;">
-              <div class="subtle">Install mitmproxy, refresh this page, then start capture:</div>
-              <div class="capture-command">
-                <code>{{ excelSessionStatus.capture.install_command }}</code>
-                <button @click="copyText(excelSessionStatus.capture.install_command)">Copy</button>
-              </div>
-            </div>
-            <div v-else-if="excelSessionStatus.capture?.install_url" class="subtle" style="margin-top: 6px;">
-              Install the macOS package from
-              <a :href="excelSessionStatus.capture.install_url" target="_blank" rel="noopener">mitmproxy.org</a>,
-              refresh this page, then start capture.
-            </div>
-            <div v-if="excelSessionStatus.capture?.ca_install_command && !excelSessionStatus.capture?.ca_trusted" style="margin-top: 6px;">
-              <div class="subtle">
-                Run this once in Terminal to trust only the dedicated bps.openai.com capture certificate. macOS may ask for your keychain password.
-              </div>
-              <div class="capture-command">
-                <code>{{ excelSessionStatus.capture.ca_install_command }}</code>
-                <button @click="copyText(excelSessionStatus.capture.ca_install_command)">Copy</button>
-              </div>
-            </div>
-            <div class="toolbar" style="margin-top: 10px;">
+            <div v-if="!isMacExcelCapture()" class="toolbar" style="margin-top: 10px;">
               <button v-if="!excelSessionStatus.capture?.process_running"
                       class="primary"
                       @click="startExcelSessionCapture"
@@ -2754,9 +2713,9 @@
               <button @click="loadExcelSessionStatus" :disabled="savingExcelSession">Refresh</button>
             </div>
             <div v-if="excelSessionStatus.error" class="status error" style="margin-top: 10px;">{{ excelSessionStatus.error }}</div>
-            <div v-else-if="excelSessionStatus.capture?.error" class="status error" style="margin-top: 10px;">{{ excelSessionStatus.capture.error }}</div>
+            <div v-else-if="!isMacExcelCapture() && excelSessionStatus.capture?.error" class="status error" style="margin-top: 10px;">{{ excelSessionStatus.capture.error }}</div>
             <div v-else-if="excelSessionStatus.persistence_error" class="status error" style="margin-top: 10px;">{{ excelSessionStatus.persistence_error }}</div>
-            <div v-else-if="excelSessionStatus.capture?.prerequisite_error" class="status warn" style="margin-top: 10px;">{{ excelSessionStatus.capture.prerequisite_error }}</div>
+            <div v-else-if="!isMacExcelCapture() && excelSessionStatus.capture?.prerequisite_error" class="status warn" style="margin-top: 10px;">{{ excelSessionStatus.capture.prerequisite_error }}</div>
             <div v-else-if="excelSessionStatus.statusMessage" class="status good" style="margin-top: 10px;">{{ excelSessionStatus.statusMessage }}</div>
           </article>
           <article class="mini-card" style="margin-top: 12px;">
@@ -5271,53 +5230,43 @@
           return `Not activated (${state.status_message})`;
         },
         excelSessionStatusClass() {
-          if (this.excelSessionStatus.capture?.error || this.excelSessionStatus.persistence_error) return 'error';
+          if (this.excelSessionStatus.persistence_error) return 'error';
+          if (!this.isMacExcelCapture() && this.excelSessionStatus.capture?.error) return 'error';
           if (this.excelSessionStatus.configured && !this.excelSessionStatus.expired) return 'good';
           return 'warn';
         },
         excelSessionStatusLabel() {
-          if (this.excelSessionStatus.capture?.capturing && this.excelSessionStatus.capture?.setup_required) {
-            return this.excelSessionStatus.capture?.ca_certificate_exists
-              ? 'Mac capture certificate must be trusted'
-              : 'Preparing Mac capture certificate';
+          if (this.isMacExcelCapture()) {
+            if (this.excelSessionStatus.expired) {
+              return 'Token expired - refresh the ChatGPT Excel task pane';
+            }
+            return this.excelSessionStatus.configured
+              ? 'Ready'
+              : 'Open ChatGPT Excel and sign in';
           }
-          if (this.excelSessionStatus.capture?.capturing) {
-            return this.excelSessionStatus.capture?.proxy_active
-              ? 'Ready · send one message in ChatGPT Excel'
-              : 'Starting protected Excel capture';
-          }
+          if (this.excelSessionStatus.capture?.capturing) return 'Waiting for ChatGPT Excel';
           if (this.excelSessionStatus.expired) return 'Saved session expired; capture a fresh session';
           if (this.excelSessionStatus.configured) {
             return this.excelSessionStatus.persisted
-              ? 'Ready · encrypted with Windows DPAPI'
-              : 'Ready · memory only';
+              ? 'Ready - encrypted with Windows DPAPI'
+              : 'Ready - memory only';
           }
           if (!this.excelSessionStatus.capture?.available) return 'Capture unavailable on this machine';
           return 'Not configured';
         },
         excelCaptureButtonLabel() {
           if (this.excelSessionStatus.capture?.capturing) {
-            return this.excelSessionStatus.capture?.setup_required
-              ? 'Preparing Mac capture…'
-              : 'Waiting for Excel…';
+            return this.excelSessionStatus.capture?.method === 'webkit-localstorage-sqlite'
+              ? 'Reading Excel session...'
+              : 'Waiting for Excel...';
           }
-          if (this.excelSessionStatus.capture?.process_running) {
-            return 'Finishing capture…';
-          }
-          if (this.isOneClickMacExcelCapture()) {
-            return this.excelSessionStatus.configured
-              ? 'Refresh Excel session'
-              : 'Start one-click capture';
-          }
+          if (this.excelSessionStatus.capture?.process_running) return 'Finishing capture...';
           return this.excelSessionStatus.configured
             ? 'Refresh Excel session'
             : 'Capture Excel session';
         },
         isMacExcelCapture() {
-          return [
-            'mitmproxy-secure-web-proxy',
-            'mitmproxy-local',
-          ].includes(this.excelSessionStatus.capture?.method);
+          return this.excelSessionStatus.capture?.method === 'webkit-localstorage-sqlite';
         },
         isOneClickMacExcelCapture() {
           return (
@@ -5327,35 +5276,22 @@
         },
         excelCaptureFlowMessage() {
           const capture = this.excelSessionStatus.capture || {};
-          if (capture.error) {
-            return 'Capture stopped. Review the error below, then try again.';
-          }
+          if (capture.error) return 'Capture stopped. Review the error below, then try again.';
           if (capture.process_running) {
-            if (capture.phase === 'restoring') {
-              return 'Restoring your previous Mac proxy settings…';
+            if (capture.method === 'webkit-localstorage-sqlite') {
+              return 'Reading the signed-in ChatGPT Excel session directly from macOS WebKit LocalStorage...';
             }
-            if (!capture.capturing) {
-              return 'Message captured. Finishing the response and restoring your Mac proxy settings…';
-            }
-            if (capture.setup_required) {
-              return capture.ca_certificate_exists
-                ? 'One-time setup: trust the dedicated bps.openai.com certificate below, then send one Excel message.'
-                : 'Creating the dedicated bps.openai.com capture certificate…';
-            }
-            if (capture.proxy_active) {
-              return capture.excel_helper_restarted
-                ? 'Excel has been reconnected. Send any message in the ChatGPT Excel task pane—everything else is automatic.'
-                : 'Open the ChatGPT task pane in Excel and send any message—everything else is automatic.';
-            }
-            return 'Starting the loopback-only capture and reconnecting Excel…';
+            return 'Waiting for the next ChatGPT Excel request...';
           }
           if (this.excelSessionStatus.configured && !this.excelSessionStatus.expired) {
-            return 'Done. The Excel session is ready and the temporary Mac proxy is off.';
+            return capture.method === 'webkit-localstorage-sqlite'
+              ? 'Done. The Excel session was loaded directly from macOS WebKit LocalStorage.'
+              : 'Done. The Excel session is ready.';
           }
-          if (!capture.available) {
-            return 'Install mitmproxy once, then refresh this page.';
-          }
-          return 'Click once, send any message in ChatGPT Excel, and the session is captured automatically.';
+          if (!capture.available) return 'The Excel session capture helper is unavailable.';
+          return capture.method === 'webkit-localstorage-sqlite'
+            ? 'Click once to load the current ChatGPT Excel sign-in from macOS WebKit LocalStorage.'
+            : 'Click once, send any message in ChatGPT Excel, and the session is captured automatically.';
         },
         excelCaptureStepClass(step) {
           const capture = this.excelSessionStatus.capture || {};

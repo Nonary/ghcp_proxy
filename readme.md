@@ -144,9 +144,9 @@ session.
 
 The Excel credential is deliberately separate from GitHub authentication. On
 Windows it is encrypted with the current user's DPAPI key and reloaded after
-proxy restarts. On macOS it remains in memory and must be recaptured after a
-proxy restart. The bearer token and account ID are never returned to the
-dashboard.
+proxy restarts. On macOS it is read automatically from Excel WebKit
+LocalStorage at startup and before `gpt-excel` requests. The bearer token and
+account ID are never returned to the dashboard.
 
 Windows prerequisites:
 
@@ -179,58 +179,24 @@ Invoke-RestMethod http://127.0.0.1:8000/api/config/excel-session
 
 ### Capturing from Excel for Mac
 
-Office add-ins use Edge WebView2 on Windows but Safari WKWebView on macOS, so
-the Windows DevTools primer cannot attach to Excel for Mac. The Mac capture
-path instead uses [mitmproxy's regular proxy mode][mitm-regular] as a
-short-lived HTTPS interceptor. It does not edit `/etc/hosts` or change Excel's
-URLs. While capture is active, it temporarily sets the current Mac network
-service's Secure Web Proxy to a loopback-only listener and restores the prior
-enabled/disabled state on success, timeout, signal, or error.
-
-[Microsoft documents the different Office webviews here][office-webviews].
+Excel for macOS stores the signed-in ChatGPT add-in session in WebKit
+LocalStorage. GHCP Proxy reads that SQLite database directly; it does not
+install a certificate, change macOS proxy settings, or require mitmproxy.
 
 Mac prerequisites:
 
 - Excel desktop with the official ChatGPT add-in open and signed in.
-- A current [mitmproxy macOS package][mitm-install]. Homebrew users can run
-  `brew install --cask mitmproxy`.
 
-Setup through the dashboard:
+GHCP Proxy loads the session automatically at startup and again whenever a
+`gpt-excel` request finds no session or an expired token. There is no macOS
+capture button or certificate/proxy setup.
 
-1. On the first run, open **Integrations** and click
-   **Start one-click capture**. mitmproxy creates a dedicated CA under
-   `~/Library/Application Support/ghcp_proxy/excel-capture-mitmproxy`.
-2. Copy the `security add-trusted-cert` command shown by the dashboard and run
-   it once in Terminal. Its trust setting is constrained to TLS for
-   `bps.openai.com`.
-3. For this and later captures, click **Start one-click capture** (or
-   **Refresh Excel session**) and send any message in the ChatGPT Excel task
-   pane. GHCP Proxy temporarily enables the loopback Secure Web Proxy,
-   reconnects Excel's disposable WebKit networking helper, captures the next
-   request, and restores the previous proxy state automatically.
-4. Wait for **Ready · memory only**. Recapture after GHCP Proxy restarts or
-   after the ChatGPT token expires.
-
-The capture process uses mitmproxy's regular mode with `allow_hosts` fixed to
-`bps.openai.com:443`. Using an explicit Secure Web Proxy forces Safari WKWebView
-off QUIC/HTTP/3 and through a TCP CONNECT tunnel; mitmproxy passes every other
-HTTPS host through without TLS interception. The capture add-on accepts only
-`POST /basispoints/api/responses`, copies the same allowlisted
-bearer/account/client header bundle as the Windows primer, extracts the
-non-secret tools version ID, and forwards the Excel request and response
-without modifying their content. It exits after the captured response completes
-(or after a bounded grace period). The dashboard also provides **Cancel
-capture**, which immediately begins restoring the prior Mac proxy state.
-
-The dedicated CA remains in the login keychain so later captures do not need
-another trust prompt. Removing it in Keychain Access disables future Mac
-captures until the dashboard's trust command is run again. Clearing the Excel
-session from GHCP Proxy does not remove the CA.
-
-[office-webviews]: https://learn.microsoft.com/office/dev/add-ins/concepts/browsers-used-by-office-web-add-ins
-[mitm-install]: https://docs.mitmproxy.org/stable/overview/installation/
-[mitm-regular]: https://docs.mitmproxy.org/stable/concepts/modes/#regular-proxy
-
+The reader searches Excel's WebKit `WebsiteData/Default` profiles for the
+`bps_auth_tokens` LocalStorage key. It extracts only the bearer token and
+account identifiers required by GHCP Proxy and submits them to the loopback
+session API. Token values are not printed or written to logs. The macOS session
+remains memory-only, but GHCP Proxy reloads it after restarts. If the token
+expires, refresh the ChatGPT Excel task pane so Excel writes a current token.
 After priming, select `gpt-excel` in Codex. Requests for all other models still
 use GitHub Copilot. The Excel service currently accepts `gpt-5.5` on the wire
 but may report the actual routed model (observed as `gpt-5.6-sol`) in Responses

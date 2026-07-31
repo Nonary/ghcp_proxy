@@ -418,6 +418,167 @@ class ExcelUpstreamTests(unittest.TestCase):
         self.assertEqual(replay[0], native)
         self.assertEqual(replay[1]["output"], "file.txt")
 
+    def test_run_officejs_transport_unwraps_single_nested_envelope(self):
+        source = {
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "exec_command",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"cmd": {"type": "string"}},
+                        "required": ["cmd"],
+                        "additionalProperties": False,
+                    },
+                }
+            ]
+        }
+        inner = {"name": "exec_command", "arguments": {"cmd": "pwd"}}
+        wrapper = {
+            "name": "run_officejs",
+            "arguments": {"code": json.dumps(inner, separators=(",", ":"))},
+        }
+        native = {
+            "type": "function_call",
+            "call_id": "call_single_nested_transport",
+            "name": "run_officejs",
+            "arguments": json.dumps(
+                {"code": json.dumps(wrapper, separators=(",", ":"))}
+            ),
+        }
+
+        tool_call = excel_upstream.extract_native_client_tool_call(
+            {"output": [native]}, source
+        )
+
+        self.assertEqual(tool_call["name"], "exec_command")
+        self.assertEqual(json.loads(tool_call["arguments"]), {"cmd": "pwd"})
+        replay = excel_upstream.translate_input_items(
+            [
+                tool_call,
+                {
+                    "type": "function_call_output",
+                    "call_id": native["call_id"],
+                    "output": "ok",
+                },
+            ],
+            {"exec_command": "function"},
+        )
+        self.assertEqual(replay[0], native)
+        self.assertEqual(replay[1]["output"], "ok")
+
+    def test_run_officejs_transport_unwraps_double_nested_envelope(self):
+        source = {
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "exec_command",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"cmd": {"type": "string"}},
+                        "required": ["cmd"],
+                        "additionalProperties": False,
+                    },
+                }
+            ]
+        }
+        envelope = {"name": "exec_command", "arguments": {"cmd": "pwd"}}
+        for _ in range(2):
+            envelope = {
+                "name": "run_officejs",
+                "arguments": {
+                    "code": json.dumps(envelope, separators=(",", ":"))
+                },
+            }
+        native = {
+            "type": "function_call",
+            "call_id": "call_double_nested_transport",
+            "name": "run_officejs",
+            "arguments": json.dumps(
+                {"code": json.dumps(envelope, separators=(",", ":"))}
+            ),
+        }
+
+        tool_call = excel_upstream.extract_native_client_tool_call(
+            {"output": [native]}, source
+        )
+
+        self.assertEqual(tool_call["name"], "exec_command")
+        self.assertEqual(json.loads(tool_call["arguments"]), {"cmd": "pwd"})
+
+    def test_run_officejs_transport_rejects_deeper_recursive_envelope(self):
+        source = {
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "exec_command",
+                    "parameters": {"type": "object"},
+                },
+                {
+                    "type": "function",
+                    "name": "run_officejs",
+                    "parameters": {"type": "object"},
+                },
+            ]
+        }
+        envelope = {"name": "exec_command", "arguments": {"cmd": "pwd"}}
+        for _ in range(3):
+            envelope = {
+                "name": "run_officejs",
+                "arguments": {
+                    "code": json.dumps(envelope, separators=(",", ":"))
+                },
+            }
+        native = {
+            "type": "function_call",
+            "call_id": "call_recursive_transport",
+            "name": "run_officejs",
+            "arguments": json.dumps(
+                {"code": json.dumps(envelope, separators=(",", ":"))}
+            ),
+        }
+
+        self.assertIsNone(
+            excel_upstream.extract_native_client_tool_call(
+                {"output": [native]}, source
+            )
+        )
+
+    def test_run_officejs_transport_validates_unwrapped_arguments(self):
+        source = {
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "exec_command",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"cmd": {"type": "string"}},
+                        "required": ["cmd"],
+                        "additionalProperties": False,
+                    },
+                }
+            ]
+        }
+        inner = {"name": "exec_command", "arguments": {"cmd": 123}}
+        wrapper = {
+            "name": "run_officejs",
+            "arguments": {"code": json.dumps(inner, separators=(",", ":"))},
+        }
+        native = {
+            "type": "function_call",
+            "call_id": "call_invalid_nested_transport",
+            "name": "run_officejs",
+            "arguments": json.dumps(
+                {"code": json.dumps(wrapper, separators=(",", ":"))}
+            ),
+        }
+
+        self.assertIsNone(
+            excel_upstream.extract_native_client_tool_call(
+                {"output": [native]}, source
+            )
+        )
+
     def test_custom_transport_result_returns_as_native_function_output(self):
         source = {
             "tools": [
@@ -457,6 +618,7 @@ class ExcelUpstreamTests(unittest.TestCase):
                 tool_call,
                 {
                     "type": "custom_tool_call_output",
+                    "id": "ctco_custom_transport",
                     "call_id": native["call_id"],
                     "output": "Done!",
                 },
@@ -465,6 +627,79 @@ class ExcelUpstreamTests(unittest.TestCase):
         )
         self.assertEqual(replay[0], native)
         self.assertEqual(replay[1]["type"], "function_call_output")
+        self.assertEqual(replay[1]["id"], "fc_call_custom_transport")
+        self.assertEqual(replay[1]["output"], "Done!")
+
+    def test_function_transport_result_repairs_incompatible_output_id(self):
+        replay = excel_upstream.translate_input_items(
+            [
+                {
+                    "type": "function_call",
+                    "id": "fc_client_exec",
+                    "call_id": "call_client_exec",
+                    "name": "exec_command",
+                    "arguments": '{"cmd":"pwd"}',
+                },
+                {
+                    "type": "function_call_output",
+                    "id": "ctco_wrong_prefix",
+                    "call_id": "call_client_exec",
+                    "output": "ok",
+                },
+            ],
+            {"exec_command": "function"},
+        )
+
+        self.assertEqual(replay[0]["type"], "function_call")
+        self.assertEqual(replay[0]["name"], "run_officejs")
+        self.assertEqual(replay[0]["id"], "fc_call_client_exec")
+        self.assertEqual(replay[1]["type"], "function_call_output")
+        self.assertEqual(replay[1]["id"], "fc_call_client_exec")
+        self.assertEqual(replay[1]["output"], "ok")
+
+    def test_prepare_body_repairs_custom_output_id_for_upstream(self):
+        call_id = "call_custom_prepare"
+        native = {
+            "type": "function_call",
+            "id": "fc_custom_prepare",
+            "call_id": call_id,
+            "name": "run_officejs",
+            "arguments": "{}",
+            "status": "completed",
+        }
+        excel_upstream._remember_native_call(native)
+
+        body = excel_upstream.prepare_responses_body(
+            {
+                "model": "gpt-excel",
+                "input": [
+                    {
+                        "type": "custom_tool_call",
+                        "id": "ctc_custom_prepare",
+                        "call_id": call_id,
+                        "name": "apply_patch",
+                        "input": "patch",
+                        "status": "completed",
+                    },
+                    {
+                        "type": "custom_tool_call_output",
+                        "id": "ctco_custom_prepare",
+                        "call_id": call_id,
+                        "output": "Done!",
+                    },
+                ],
+                "tools": [{"type": "custom", "name": "apply_patch"}],
+            }
+        )
+
+        replay = [
+            item
+            for item in body["input"]
+            if item.get("call_id") == call_id
+        ]
+        self.assertEqual(replay[0], native)
+        self.assertEqual(replay[1]["type"], "function_call_output")
+        self.assertEqual(replay[1]["id"], f"fc_{call_id}")
         self.assertEqual(replay[1]["output"], "Done!")
 
     def test_tools_version_is_forwarded_as_authoritative_metadata(self):
