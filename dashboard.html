@@ -4503,8 +4503,14 @@
               }
               if (Number.isFinite(d)) { totalDuration += d; durationCount += 1; }
             }
-            const wall_duration_ms = (Number.isFinite(firstAt) && Number.isFinite(lastAt)) ? Math.max(0, lastAt - firstAt) : null;
-            const api_duration_ms = durationCount ? totalDuration : null;
+            const fallbackWall = Number(row.wall_duration_ms);
+            const fallbackApi = Number(row.api_duration_ms);
+            const wall_duration_ms = (Number.isFinite(firstAt) && Number.isFinite(lastAt))
+              ? Math.max(0, lastAt - firstAt)
+              : (Number.isFinite(fallbackWall) && fallbackWall >= 0 ? fallbackWall : null);
+            const api_duration_ms = durationCount
+              ? totalDuration
+              : (Number.isFinite(fallbackApi) && fallbackApi >= 0 ? fallbackApi : null);
             return {
               ...row,
               first_activity: Number.isFinite(firstAt) ? new Date(firstAt).toISOString() : null,
@@ -5113,10 +5119,22 @@
         },
         requestDurationMs(row) {
           if (!row || typeof row !== 'object') return null;
-          const nativeDuration = Number(row.native_turn_duration_ms);
-          if (Number.isFinite(nativeDuration) && nativeDuration >= 0) return nativeDuration;
-          const duration = Number(row.duration_ms);
-          return Number.isFinite(duration) && duration >= 0 ? duration : null;
+          const parseDuration = (value) => {
+            if (value === null || value === undefined || value === '') return null;
+            const parsed = Number(value);
+            return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
+          };
+          const nativeDuration = parseDuration(row.native_turn_duration_ms);
+          if (nativeDuration != null) return nativeDuration;
+          const nativeStarted = Date.parse(row.native_turn_started_at || '');
+          if (
+            (this.deriveRequestSource(row) === 'codex_native' || row.native_source === 'codex_native')
+            && Number.isFinite(nativeStarted)
+            && !row.native_turn_completed_at
+          ) {
+            return Math.max(0, Date.now() - nativeStarted);
+          }
+          return parseDuration(row.duration_ms);
         },
         requestEffortLabel(row) {
           return this._lowerField(row, 'native_reasoning_effort') || this._lowerField(row, 'reasoning_effort');

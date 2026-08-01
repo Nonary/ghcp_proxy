@@ -598,6 +598,9 @@ def _new_usage_aggregate_bucket() -> dict:
         "_model_order": [],
         "_models": {},
         "_last_activity_dt": None,
+        "_first_activity_dt": None,
+        "_api_duration_ms": 0,
+        "_api_duration_keys": set(),
         "project_path": None,
         "request_count": 0,
         "session_id": None,
@@ -694,6 +697,30 @@ def _ingest_usage_event(bucket: dict, event: dict, prepared: dict | None = None)
     current_last = bucket.get("_last_activity_dt")
     if not isinstance(current_last, datetime) or event_time > current_last:
         bucket["_last_activity_dt"] = event_time
+    current_first = bucket.get("_first_activity_dt")
+    if not isinstance(current_first, datetime) or event_time < current_first:
+        bucket["_first_activity_dt"] = event_time
+
+    duration_value = event.get("native_turn_duration_ms")
+    if not isinstance(duration_value, (int, float)) or isinstance(duration_value, bool):
+        duration_value = event.get("duration_ms")
+    if isinstance(duration_value, (int, float)) and not isinstance(duration_value, bool):
+        duration_ms = max(0, int(round(float(duration_value))))
+        if duration_ms:
+            source = _usage_event_source(event)
+            if source == "codex_native" or event.get("native_source") == "codex_native":
+                duration_key = (
+                    event.get("native_turn_id")
+                    or event.get("native_source_event_key")
+                    or event.get("request_id")
+                )
+            else:
+                duration_key = event.get("request_id") or event.get("client_request_id")
+            duration_keys = bucket.setdefault("_api_duration_keys", set())
+            if duration_key is None or duration_key not in duration_keys:
+                if duration_key is not None:
+                    duration_keys.add(duration_key)
+                bucket["_api_duration_ms"] = bucket.get("_api_duration_ms", 0) + duration_ms
 
     project_path = prepared.get("project_path")
     if bucket.get("project_path") is None and isinstance(project_path, str) and project_path:
@@ -934,6 +961,10 @@ def _finalize_usage_bucket(bucket: dict, source: str, *, session_id: str | None 
 
     last_activity_dt = bucket.get("_last_activity_dt")
     last_activity = last_activity_dt.isoformat() if isinstance(last_activity_dt, datetime) else None
+    first_activity_dt = bucket.get("_first_activity_dt")
+    wall_duration_ms = None
+    if isinstance(first_activity_dt, datetime) and isinstance(last_activity_dt, datetime):
+        wall_duration_ms = max(0, int(round((last_activity_dt - first_activity_dt).total_seconds() * 1000)))
     models = bucket.get("_models") if isinstance(bucket.get("_models"), dict) else {}
     model_order = bucket.get("_model_order") if isinstance(bucket.get("_model_order"), list) else []
     effective_session_id = session_id if session_id is not None else bucket.get("session_id")
@@ -948,6 +979,8 @@ def _finalize_usage_bucket(bucket: dict, source: str, *, session_id: str | None 
         "sessionKind": bucket.get("session_kind") or "unknown",
         "sessionDisplayId": effective_display_id,
         "lastActivity": last_activity,
+        "wallDurationMs": wall_duration_ms,
+        "apiDurationMs": max(0, int(bucket.get("_api_duration_ms") or 0)),
         "projectPath": bucket.get("project_path"),
         "inputTokens": bucket.get("input_tokens", 0),
         "outputTokens": bucket.get("output_tokens", 0),
@@ -1121,6 +1154,8 @@ def normalize_session(source: str, session: dict) -> dict:
         "session_kind": session.get("sessionKind") or "unknown",
         "session_display_id": session.get("sessionDisplayId") or session.get("sessionId"),
         "last_activity": session.get("lastActivity"),
+        "wall_duration_ms": session.get("wallDurationMs"),
+        "api_duration_ms": session.get("apiDurationMs"),
         "project_path": session.get("projectPath"),
     }
 
