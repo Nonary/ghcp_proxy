@@ -56,6 +56,7 @@ import atexit
 import auto_update
 import background_proxy
 import codex_agent_compat
+import codex_native_ingest
 import dashboard as dashboard_module
 import excel_session_capture
 import excel_upstream
@@ -546,6 +547,9 @@ dashboard_service = dashboard_module.create_dashboard_service(
         load_api_key_payload=auth.load_api_key_payload,
         snapshot_all_usage_events=usage_tracker.snapshot_all_usage_events,
         snapshot_usage_events=usage_tracker.snapshot_usage_events,
+        native_lifecycle_revision=usage_tracker.native_lifecycle_revision,
+        snapshot_native_http_timings=codex_native_ingest.snapshot_native_http_timings,
+        native_http_timing_revision=codex_native_ingest.native_http_timing_revision,
         usage_snapshots_are_deduplicated=True,
         load_safeguard_trigger_stats=safeguard_event_store.load_stats,
         prompt_payload=_prompt_payload_for_dashboard,

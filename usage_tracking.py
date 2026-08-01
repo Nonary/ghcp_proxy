@@ -69,6 +69,7 @@ class UsageTrackingState:
     # browser refresh.
     all_usage_events_snapshot: list[dict] | None = None
     recent_usage_events_snapshot: list[dict] | None = None
+    native_lifecycle_revision: int = 0
     native_usage_event_dedupe_keys: OrderedDict[str, None] = field(default_factory=OrderedDict)
     session_request_id_lock: object = field(default_factory=Lock)
     latest_server_request_ids_by_chain: dict[tuple[str, str], str] = field(default_factory=dict)
@@ -697,6 +698,52 @@ class UsageTracker:
         for event in (*self.state.archived_usage_events, *self.state.recent_usage_events):
             self._register_native_usage_event_locked(event)
 
+    def _refresh_native_lifecycle_metadata_locked(self) -> None:
+        """Backfill lifecycle fields after a rollout finishes.
+
+        Native token observations are usually ingested before Codex appends
+        ``task_complete`` to the rollout file.  Those observations are
+        intentionally deduplicated, so the later file update does not produce
+        another usage event that could carry the completed duration.  Refresh
+        the existing in-memory rows from the rollout metadata before exposing
+        dashboard snapshots.
+        """
+        try:
+            from codex_native_ingest import native_turn_metadata_for_rollout
+        except Exception:
+            return
+
+        events = (*self.state.archived_usage_events, *self.state.recent_usage_events)
+        changed = False
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+            if _usage_event_source(event) != "codex_native":
+                continue
+            path = event.get("native_rollout_path")
+            turn_id = event.get("native_turn_id")
+            if not isinstance(path, str) or not path or not isinstance(turn_id, str) or not turn_id:
+                continue
+            # A completed timestamp or duration is sufficient for display.
+            if event.get("native_turn_completed_at") or event.get("native_turn_duration_ms") is not None:
+                continue
+            try:
+                metadata = native_turn_metadata_for_rollout(path, turn_id)
+            except Exception:
+                continue
+            for key, value in metadata.items():
+                if value is not None and event.get(key) != value:
+                    event[key] = value
+                    changed = True
+        if changed:
+            self.state.native_lifecycle_revision += 1
+
+    def native_lifecycle_revision(self) -> int:
+        """Refresh native lifecycle fields and return the current revision."""
+        with self.state.usage_log_lock:
+            self._refresh_native_lifecycle_metadata_locked()
+            return self.state.native_lifecycle_revision
+
     # ------------------------------------------------------------------
     # State management
     # ------------------------------------------------------------------
@@ -707,6 +754,7 @@ class UsageTracker:
             self.state.archived_usage_events.clear()
             self.state.all_usage_events_snapshot = None
             self.state.recent_usage_events_snapshot = None
+            self.state.native_lifecycle_revision += 1
             self.state.native_usage_event_dedupe_keys.clear()
         with self.state.session_request_id_lock:
             self.state.latest_server_request_ids_by_chain.clear()
@@ -741,6 +789,7 @@ class UsageTracker:
             for event in normalized_recent:
                 if self._register_native_usage_event_locked(event):
                     self.state.recent_usage_events.append(event)
+            self.state.native_lifecycle_revision += 1
 
     def snapshot_archived_usage_events(self) -> list[dict]:
         with self.state.usage_log_lock:
@@ -1478,12 +1527,14 @@ class UsageTracker:
 
     def snapshot_usage_events(self) -> list[dict]:
         with self.state.usage_log_lock:
+            self._refresh_native_lifecycle_metadata_locked()
             if self.state.recent_usage_events_snapshot is None:
                 self.state.recent_usage_events_snapshot = deduplicate_usage_events(self.state.recent_usage_events)
             return list(self.state.recent_usage_events_snapshot)
 
     def snapshot_all_usage_events(self) -> list[dict]:
         with self.state.usage_log_lock:
+            self._refresh_native_lifecycle_metadata_locked()
             if self.state.all_usage_events_snapshot is None:
                 self.state.all_usage_events_snapshot = deduplicate_usage_events(
                     [*self.state.archived_usage_events, *self.state.recent_usage_events]

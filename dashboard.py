@@ -50,6 +50,9 @@ class DashboardDependencies:
     load_api_key_payload: Callable[[], dict] = lambda: {}
     snapshot_all_usage_events: Callable[[], list[dict]] = lambda: []
     snapshot_usage_events: Callable[[], list[dict]] = lambda: []
+    native_lifecycle_revision: Callable[[], int] = lambda: 0
+    snapshot_native_http_timings: Callable[[], list[dict]] = lambda: []
+    native_http_timing_revision: Callable[[], int] = lambda: 0
     usage_snapshots_are_deduplicated: bool = False
     load_safeguard_trigger_stats: Callable[[datetime], dict] = lambda _now: {}
     prompt_payload: Callable[[object], object] = lambda value: value
@@ -2220,9 +2223,12 @@ class DashboardService:
         self._payload_cache_value: dict | None = None
         self._payload_cache_stream_version: int = -1
         self._payload_cache_calendar_key: tuple[int, int, int] | None = None
+        self._payload_cache_native_lifecycle_revision: int = -1
+        self._payload_cache_native_http_timing_revision: int = -1
         self._payload_cache_lock = Lock()
         self._payload_build_lock = Lock()
         self._usage_accumulator = _DashboardUsageAccumulator()
+        self._usage_accumulator_native_lifecycle_revision: int = -1
 
     def _resolved_thread_class(self):
         resolved_thread_class = self.thread_class
@@ -2232,17 +2238,23 @@ class DashboardService:
 
     def build_payload(self, force_refresh: bool = False, *, prefer_cached: bool = False) -> dict:
         stream_version = self._stream_broker.current_version()
+        native_lifecycle_revision = self.dependencies.native_lifecycle_revision()
+        native_http_timing_revision = self.dependencies.native_http_timing_revision()
         now = self.utc_now()
         calendar_key = (now.year, now.month, now.day)
         with self._payload_cache_lock:
             cached = self._payload_cache_value
             cached_version = self._payload_cache_stream_version
             cached_calendar_key = self._payload_cache_calendar_key
+            cached_native_lifecycle_revision = self._payload_cache_native_lifecycle_revision
+            cached_native_http_timing_revision = self._payload_cache_native_http_timing_revision
 
         if (
             cached is not None
             and cached_version == stream_version
             and cached_calendar_key == calendar_key
+            and cached_native_lifecycle_revision == native_lifecycle_revision
+            and cached_native_http_timing_revision == native_http_timing_revision
         ):
             if not force_refresh or prefer_cached:
                 return cached
@@ -2250,16 +2262,22 @@ class DashboardService:
             # A concurrent preload, API refresh, and SSE update should share
             # one expensive build rather than each scanning the archive.
             stream_version = self._stream_broker.current_version()
+            native_lifecycle_revision = self.dependencies.native_lifecycle_revision()
+            native_http_timing_revision = self.dependencies.native_http_timing_revision()
             now = self.utc_now()
             calendar_key = (now.year, now.month, now.day)
             with self._payload_cache_lock:
                 cached = self._payload_cache_value
                 cached_version = self._payload_cache_stream_version
                 cached_calendar_key = self._payload_cache_calendar_key
+                cached_native_lifecycle_revision = self._payload_cache_native_lifecycle_revision
+                cached_native_http_timing_revision = self._payload_cache_native_http_timing_revision
             if (
                 cached is not None
                 and cached_version == stream_version
                 and cached_calendar_key == calendar_key
+                and cached_native_lifecycle_revision == native_lifecycle_revision
+                and cached_native_http_timing_revision == native_http_timing_revision
             ):
                 if not force_refresh or prefer_cached:
                     return cached
@@ -2269,6 +2287,8 @@ class DashboardService:
                 self._payload_cache_value = result
                 self._payload_cache_stream_version = build_version
                 self._payload_cache_calendar_key = calendar_key
+                self._payload_cache_native_lifecycle_revision = native_lifecycle_revision
+                self._payload_cache_native_http_timing_revision = native_http_timing_revision
             return result
 
     def _build_payload_uncached(self) -> dict:
@@ -2278,6 +2298,11 @@ class DashboardService:
         current_day_start = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
         usage_events = self.dependencies.snapshot_all_usage_events()
         detailed_usage_events = self.dependencies.snapshot_usage_events()
+        native_lifecycle_revision = self.dependencies.native_lifecycle_revision()
+        native_http_timings = self.dependencies.snapshot_native_http_timings()
+        if self._usage_accumulator_native_lifecycle_revision != native_lifecycle_revision:
+            self._usage_accumulator.reset()
+            self._usage_accumulator_native_lifecycle_revision = native_lifecycle_revision
         if not self.dependencies.usage_snapshots_are_deduplicated:
             usage_events = deduplicate_usage_events(usage_events)
             detailed_usage_events = deduplicate_usage_events(detailed_usage_events)
@@ -2348,6 +2373,7 @@ class DashboardService:
             },
             "recent_sessions": local_usage.get("recent_sessions") or [],
             "recent_requests": recent_requests,
+            "native_http_timings": native_http_timings,
             "month_history": (local_usage.get("month_history") or [])[:12],
         }
 

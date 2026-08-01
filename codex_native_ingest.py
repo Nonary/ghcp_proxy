@@ -2,7 +2,10 @@
 
 Codex stores per-turn usage in `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`
 files, with `token_count` events that include the cumulative and per-turn
-input/cached/output/reasoning token counts plus rate-limit metadata. This
+input/cached/output/reasoning token counts plus rate-limit metadata. Codex
+also records request lifecycle telemetry in `~/.codex/logs_2.sqlite`; the
+dashboard uses that separate log to expose actual Responses API request
+durations without confusing them with turn-level usage snapshots. This
 module scans those files, converts each turn into a usage event compatible
 with `UsageTracker._persist_event`, and tags it with `native_source =
 "codex_native"` so the dashboard can break it out separately from proxied
@@ -20,9 +23,13 @@ import glob
 import hashlib
 import json
 import os
+import re
+import sqlite3
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Callable, Iterable
 
 from constants import TOKEN_DIR
@@ -35,10 +42,23 @@ from util import _codex_logs_service_tiers, _usage_event_estimated_cost, _normal
 
 CODEX_HOME = os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
 CODEX_SESSIONS_DIR = os.path.join(CODEX_HOME, "sessions")
+CODEX_LOGS_DB = os.path.join(CODEX_HOME, "logs_2.sqlite")
 CURSOR_FILE = os.path.join(TOKEN_DIR, "codex-native-cursor.json")
 
 # Source label written into emitted events (see util._usage_event_source).
 NATIVE_SOURCE_LABEL = "codex_native"
+NATIVE_HTTP_TIMING_SOURCE = "codex_logs_sqlite"
+
+_HTTP_LOG_SCAN_ROWS = 100_000
+_HTTP_TIMING_LIMIT = 2_000
+_TURN_ID_RE = re.compile(r"\bturn\.id=([0-9a-f-]{36})\b")
+_THREAD_ID_RE = re.compile(r"\bthread\.id=([0-9a-f-]{36})\b")
+_MODEL_RE = re.compile(r"\bmodel=([^\s}]+)")
+_POST_RE = re.compile(r"POST to\s+(https?://\S+?)(?=:\s)")
+_COMPLETED_RE = re.compile(
+    r"Request completed method=(?P<method>[A-Z]+) "
+    r"url=(?P<url>\S+) status=(?P<status>\d{3})\b"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -46,6 +66,27 @@ NATIVE_SOURCE_LABEL = "codex_native"
 # ---------------------------------------------------------------------------
 
 _cursor_lock = threading.Lock()
+
+
+@dataclass
+class _NativeHttpTimingState:
+    """Incremental parser state for Codex's local request telemetry database."""
+
+    initialized: bool = False
+    last_log_id: int = 0
+    db_identity: tuple | None = None
+    pending: dict[str, deque] = None
+    completed: deque = None
+
+    def __post_init__(self):
+        if self.pending is None:
+            self.pending = {}
+        if self.completed is None:
+            self.completed = deque(maxlen=_HTTP_TIMING_LIMIT)
+
+
+_http_timing_lock = threading.Lock()
+_http_timing_state = _NativeHttpTimingState()
 
 
 def _load_cursor() -> dict:
@@ -88,6 +129,222 @@ def _rollout_path_fingerprint(path: str) -> str:
 def _native_source_event_key(path: str, line_start: int) -> str:
     """Identify one append-only rollout-log record across scanner restarts."""
     return f"{_rollout_path_fingerprint(path)}:{line_start}"
+
+
+def _codex_log_db_identity() -> tuple | None:
+    try:
+        stat = os.stat(CODEX_LOGS_DB)
+    except OSError:
+        return None
+    # The database grows continuously, so size/mtime are not identity
+    # fields.  They would reset the parser on every dashboard refresh.
+    return int(stat.st_dev), int(stat.st_ino)
+
+
+def _open_codex_logs_db() -> sqlite3.Connection | None:
+    if not os.path.isfile(CODEX_LOGS_DB):
+        return None
+    try:
+        normalized = os.path.abspath(CODEX_LOGS_DB).replace("\\", "/")
+        connection = sqlite3.connect(
+            f"file:{normalized}?mode=ro",
+            uri=True,
+            timeout=0.5,
+        )
+        connection.row_factory = sqlite3.Row
+        return connection
+    except (OSError, sqlite3.Error):
+        return None
+
+
+def _codex_logs_max_id() -> int:
+    connection = _open_codex_logs_db()
+    if connection is None:
+        return 0
+    try:
+        row = connection.execute("SELECT COALESCE(MAX(id), 0) AS max_id FROM logs").fetchone()
+        return int(row["max_id"] or 0) if row is not None else 0
+    except sqlite3.Error:
+        return 0
+    finally:
+        connection.close()
+
+
+def native_http_timing_revision() -> int:
+    """Return a cheap revision for Codex's append-only request telemetry log."""
+    return _codex_logs_max_id()
+
+
+def _unix_log_timestamp(ts: object, ts_nanos: object) -> str | None:
+    try:
+        seconds = int(ts)
+        nanos = int(ts_nanos)
+        return datetime.fromtimestamp(
+            seconds + (nanos / 1_000_000_000),
+            tz=timezone.utc,
+        ).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    except (TypeError, ValueError, OSError, OverflowError):
+        return None
+
+
+def _native_http_log_context(body: str) -> tuple[str | None, str | None, str | None]:
+    turn_match = _TURN_ID_RE.search(body)
+    thread_match = _THREAD_ID_RE.search(body)
+    model_match = _MODEL_RE.search(body)
+    return (
+        turn_match.group(1) if turn_match else None,
+        thread_match.group(1) if thread_match else None,
+        model_match.group(1) if model_match else None,
+    )
+
+
+def _native_http_timing_event(
+    *,
+    start: dict,
+    completed: dict | None,
+) -> dict:
+    start_body = str(start.get("feedback_log_body") or "")
+    turn_id, thread_id, model = _native_http_log_context(start_body)
+    start_at = _unix_log_timestamp(start.get("ts"), start.get("ts_nanos"))
+    completed_at = (
+        _unix_log_timestamp(completed.get("ts"), completed.get("ts_nanos"))
+        if completed is not None
+        else None
+    )
+    start_ms = (
+        (int(start.get("ts")) * 1000) + (int(start.get("ts_nanos")) // 1_000_000)
+        if start.get("ts") is not None and start.get("ts_nanos") is not None
+        else None
+    )
+    completed_ms = (
+        (int(completed.get("ts")) * 1000) + (int(completed.get("ts_nanos")) // 1_000_000)
+        if completed is not None
+        and completed.get("ts") is not None
+        and completed.get("ts_nanos") is not None
+        else None
+    )
+    duration_ms = (
+        max(0, completed_ms - start_ms)
+        if start_ms is not None and completed_ms is not None
+        else None
+    )
+    start_match = _POST_RE.search(start_body)
+    completed_match = _COMPLETED_RE.search(str(completed.get("feedback_log_body") or "")) if completed else None
+    method = completed_match.group("method") if completed_match else "POST"
+    url = (
+        completed_match.group("url")
+        if completed_match
+        else (start_match.group(1) if start_match else None)
+    )
+    status_code = int(completed_match.group("status")) if completed_match else None
+    request_log_id = int(start["id"])
+    event = {
+        "request_id": f"codex-http:{request_log_id}",
+        "started_at": start_at,
+        "finished_at": completed_at,
+        "path": "/native/codex/responses",
+        "method": method,
+        "requested_model": model,
+        "resolved_model": model,
+        "response_model": model,
+        "initiator": "native_codex",
+        "session_id": thread_id,
+        "session_id_origin": "codex_logs_sqlite",
+        "project_path": None,
+        "client_request_id": None,
+        "subagent": None,
+        "server_request_id": thread_id,
+        "status_code": status_code,
+        "success": status_code is None or 200 <= status_code < 400,
+        "duration_ms": duration_ms,
+        "time_to_first_token_ms": None,
+        "usage": {},
+        "quota_snapshots": None,
+        "rate_limit": None,
+        "native_source": NATIVE_SOURCE_LABEL,
+        "native_origin": NATIVE_HTTP_TIMING_SOURCE,
+        "native_turn_id": turn_id,
+        "native_http_request_id": f"codex-http:{request_log_id}",
+        "native_http_url": url,
+        "native_http_timing_only": True,
+        "native_http_log_id": request_log_id,
+    }
+    if completed is not None:
+        event["native_http_completed_log_id"] = int(completed["id"])
+    return event
+
+
+def _refresh_native_http_timing_state_locked() -> None:
+    """Read Codex's request lifecycle logs without retaining request bodies."""
+    global _http_timing_state
+    identity = _codex_log_db_identity()
+    if identity is None:
+        return
+    connection = _open_codex_logs_db()
+    if connection is None:
+        return
+    try:
+        max_id = _codex_logs_max_id()
+        state = _http_timing_state
+        if (
+            not state.initialized
+            or state.db_identity != identity
+            or max_id < state.last_log_id
+        ):
+            state = _NativeHttpTimingState(
+                initialized=True,
+                last_log_id=max(0, max_id - _HTTP_LOG_SCAN_ROWS),
+                db_identity=identity,
+            )
+            _http_timing_state = state
+        if max_id <= state.last_log_id:
+            return
+        rows = connection.execute(
+            """
+            SELECT id, ts, ts_nanos, target, feedback_log_body
+            FROM logs
+            WHERE id > ?
+            ORDER BY id ASC
+            """,
+            (state.last_log_id,),
+        )
+        for row in rows:
+            state.last_log_id = int(row["id"])
+            target = str(row["target"] or "")
+            body = str(row["feedback_log_body"] or "")
+            turn_id, _thread_id, _model = _native_http_log_context(body)
+            if not turn_id:
+                continue
+            if target == "codex_http_client::transport" and "POST to " in body:
+                state.pending.setdefault(turn_id, deque()).append(dict(row))
+                continue
+            if target != "codex_http_client::client" or "Request completed" not in body:
+                continue
+            pending = state.pending.get(turn_id)
+            if not pending:
+                continue
+            start = pending.popleft()
+            state.completed.append(_native_http_timing_event(start=start, completed=dict(row)))
+            if not pending:
+                state.pending.pop(turn_id, None)
+    except sqlite3.Error:
+        return
+    finally:
+        connection.close()
+
+
+def snapshot_native_http_timings() -> list[dict]:
+    """Return recent per-Responses-request timings from Codex's local logs."""
+    with _http_timing_lock:
+        _refresh_native_http_timing_state_locked()
+        events = list(_http_timing_state.completed)
+        for pending in _http_timing_state.pending.values():
+            events.extend(
+                _native_http_timing_event(start=start, completed=None)
+                for start in pending
+            )
+    events.sort(key=lambda event: str(event.get("started_at") or ""), reverse=True)
+    return events[:_HTTP_TIMING_LIMIT]
 
 
 # In-process cache of parsed header state per rollout file. Lets a partial

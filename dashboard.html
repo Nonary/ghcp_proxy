@@ -1923,7 +1923,6 @@
                 <option value="tokens">Most Tokens</option>
               </select>
             </div>
-
             <!-- Sessions tab -->
             <div v-if="overviewActivityTab === 'sessions'" style="overflow-x: auto;">
               <table class="req-table">
@@ -1934,7 +1933,7 @@
                     <th>Model</th>
                     <th>Last Activity</th>
                     <th>Duration</th>
-                    <th>Proxy Calls</th>
+                    <th>Activity</th>
                     <th>Tokens</th>
                     <th>Cost</th>
                   </tr>
@@ -1951,7 +1950,7 @@
                     <td>{{ modelLabel(row.models) }}</td>
                     <td>{{ shortStamp(row.last_activity) }}</td>
                     <td>{{ sessionDurationLabel(row) }}</td>
-                    <td>{{ integer(row.session_request_count || row.request_count) }}</td>
+                    <td>{{ integer(row.session_request_count || row.request_count) }} {{ sessionActivityUnit(row) }}</td>
                     <td>{{ compact(row.total_tokens) }}</td>
                     <td>
                       <div class="cost-stack" :title="rowCostTitle(row)">
@@ -1974,7 +1973,7 @@
                     <th>Status</th>
                     <th>Model</th>
                     <th>Path</th>
-                    <th>Duration</th>
+                    <th>Timing</th>
                     <th>Tokens (in/out)</th>
                     <th>Cost</th>
                     <th>Request ID</th>
@@ -1998,7 +1997,7 @@
                       <span v-if="requestEffortLabel(row)" :class="['badge', requestEffortBadgeClass(row)]">{{ requestEffortLabel(row) }}</span>
                     </td>
                     <td><code>{{ row.path || '—' }}</code></td>
-                    <td>{{ shortDuration(requestDurationMs(row)) }}</td>
+                    <td>{{ requestDurationLabel(row) }}</td>
                     <td>{{ shortTokens(row) }}</td>
                     <td>
                       <div class="cost-stack" :title="rowCostTitle(row)">
@@ -2292,7 +2291,7 @@
           <div style="overflow-x:auto;">
             <table class="req-table">
               <thead>
-                <tr><th>Source</th><th>Session</th><th>Model</th><th>Last Activity</th><th>Duration</th><th>Proxy Calls</th><th>Tokens</th><th>Cost</th></tr>
+                <tr><th>Source</th><th>Session</th><th>Model</th><th>Last Activity</th><th>Duration</th><th>Activity</th><th>Tokens</th><th>Cost</th></tr>
               </thead>
               <tbody>
                 <tr v-for="row in filteredSessions" :key="row.session_key"
@@ -2306,7 +2305,7 @@
                   <td>{{ modelLabel(row.models) }}</td>
                   <td>{{ shortStamp(row.last_activity) }}</td>
                   <td>{{ sessionDurationLabel(row) }}</td>
-                  <td>{{ integer(row.session_request_count || row.request_count) }}</td>
+                  <td>{{ integer(row.session_request_count || row.request_count) }} {{ sessionActivityUnit(row) }}</td>
                   <td>{{ compact(row.total_tokens) }}</td>
                     <td>
                       <div class="cost-stack" :title="rowCostTitle(row)">
@@ -2330,7 +2329,7 @@
               <div class="subtle">{{ sourceLabel(selectedSession.source) }} · {{ modelLabel(selectedSession.models) }}</div>
             </div>
             <div class="subtle" style="text-align:right; line-height:1.5;">
-              <div>{{ integer(selectedSession.session_request_count || selectedSession.request_count) }} requests · {{ shortDuration(selectedSession.wall_duration_ms) }} wall · {{ shortDuration(selectedSession.api_duration_ms) }} api</div>
+              <div>{{ integer(selectedSession.session_request_count || selectedSession.request_count) }} {{ sessionActivityUnit(selectedSession) }} · {{ shortDuration(selectedSession.wall_duration_ms) }} wall · {{ shortDuration(selectedSession.api_duration_ms) }} {{ sessionDurationMetricLabel(selectedSession) }}</div>
               <div>{{ compact(selectedSession.total_tokens) }} tokens · <span class="cost-inline">{{ rowCostLabel(selectedSession) }} · {{ money(selectedSession.cost_usd) }}</span></div>
               <div class="cost-breakdown-inline">{{ costBreakdownLabel(selectedSession) }}</div>
               <div v-if="selectedSession.first_activity">First {{ shortStamp(selectedSession.first_activity) }} · Last {{ shortStamp(selectedSession.last_activity) }}</div>
@@ -2340,7 +2339,7 @@
             <table class="req-table">
               <thead>
                 <tr>
-                  <th>Time</th><th>Status</th><th>Model</th><th>Path</th><th>Duration</th><th>Tokens (in/out)</th><th>Cost</th><th>Request ID</th>
+                  <th>Time</th><th>Status</th><th>Model</th><th>Path</th><th>Timing</th><th>Tokens (in/out)</th><th>Cost</th><th>Request ID</th>
                 </tr>
               </thead>
               <tbody>
@@ -2356,7 +2355,7 @@
                     <span v-if="requestEffortLabel(row)" :class="['badge', requestEffortBadgeClass(row)]">{{ requestEffortLabel(row) }}</span>
                   </td>
                   <td><code>{{ row.path || '—' }}</code></td>
-                  <td>{{ shortDuration(requestDurationMs(row)) }}</td>
+                  <td>{{ requestDurationLabel(row) }}</td>
                   <td>{{ shortTokens(row) }}</td>
                   <td>
                     <div class="cost-stack" :title="rowCostTitle(row)">
@@ -2371,7 +2370,7 @@
                     </span>
                   </td>
                 </tr>
-                <tr v-if="!selectedSessionRequests.length"><td colspan="8" class="empty">No proxied requests retained for this session yet.</td></tr>
+                <tr v-if="!selectedSessionRequests.length"><td colspan="8" class="empty">No requests retained for this session yet.</td></tr>
               </tbody>
             </table>
           </div>
@@ -2380,7 +2379,7 @@
 
       <div v-show="activeView === 'requests'" class="legacy-section">
         <article class="card">
-          <div class="card-head"><div><h3>Request Explorer</h3><div class="subtle">Inspect any recent proxied request in full detail.</div></div></div>
+          <div class="card-head"><div><h3>Request Explorer</h3><div class="subtle">Inspect any recent request in full detail.</div></div></div>
           <div class="req-toolbar">
             <input v-model.trim="search" type="search" placeholder="Filter by model, source, path, request id…">
             <select v-model="sourceFilter">
@@ -2396,7 +2395,6 @@
               <option value="tokens">Most tokens</option>
             </select>
           </div>
-
           <div v-if="filteredRequests.length" class="request-layout">
             <div class="request-list-wrap">
               <div class="request-pager">
@@ -2420,7 +2418,7 @@
                   </div>
                   <div class="request-meta subtle">
                     <div><span class="mono">{{ row.path || '-' }}</span></div>
-                    <div>{{ row.success === false ? `HTTP ${row.status_code}` : `${requestDurationMs(row) ?? '-'} ms` }}</div>
+                    <div>{{ row.success === false ? `HTTP ${row.status_code}` : requestDurationLabel(row) }}</div>
                     <div class="mono">{{ shortId(row.request_id || row.client_request_id) }}</div>
                     <div>{{ tokenSummary(row) }}</div>
                     <div class="cost-stack">
@@ -2449,7 +2447,7 @@
                   <div><div class="detail-label">Requested Model</div><div class="detail-value">{{ selectedRequest.requested_model || '-' }}</div></div>
                   <div><div class="detail-label">Resolved Model</div><div class="detail-value">{{ selectedRequest.response_model || selectedRequest.resolved_model || '-' }}</div></div>
                   <div><div class="detail-label">Estimated {{ rowCostUnitName(selectedRequest) }}</div><div class="detail-value"><strong>{{ rowCostLabel(selectedRequest) }}</strong><span class="cost-inline"> · {{ money(selectedRequest.cost_usd) }}</span></div></div>
-                  <div><div class="detail-label">Duration</div><div class="detail-value">{{ requestDurationMs(selectedRequest) != null ? `${requestDurationMs(selectedRequest)} ms` : '-' }}</div></div>
+                  <div><div class="detail-label">{{ requestTimingName(selectedRequest) }}</div><div class="detail-value">{{ requestDurationDetail(selectedRequest) }}</div></div>
                   <div v-if="requestEffortLabel(selectedRequest)"><div class="detail-label">Reasoning level</div><div class="detail-value"><span :class="['badge', requestEffortBadgeClass(selectedRequest)]">{{ requestEffortLabel(selectedRequest) }}</span></div></div>
                   <div><div class="detail-label">Cost breakdown</div><div class="detail-value">{{ costBreakdownLabel(selectedRequest) }}</div></div>
                   <div><div class="detail-label">Session ID</div><div class="detail-value mono">{{ selectedRequest.session_id || '-' }}</div></div>
@@ -4075,6 +4073,8 @@
       data() {
         return {
           autoRefreshTimer: null,
+          nativeTimingTimer: null,
+          nowMs: Date.now(),
           dashboardLoadPromise: null,
           dashboardLoadQueued: false,
           dashboardError: '',
@@ -4222,6 +4222,7 @@
             all_time: { usage: { sources: {} } },
             recent_sessions: [],
             recent_requests: [],
+            native_http_timings: [],
             month_history: [],
           },
           modelRouting: {
@@ -4467,8 +4468,19 @@
         sessionRequestIndex() {
           // Map session_id -> [requests], plus aggregates incl. duration
           const map = new Map();
+          const nativeRows = this.nativeHttpRequestRows;
           for (const row of (this.data.recent_requests || [])) {
+            if (
+              this.deriveRequestSource(row) === 'codex_native'
+              && nativeRows.length
+            ) continue;
             const key = this.sessionRequestKey(row, this.deriveRequestSource(row));
+            if (!key) continue;
+            if (!map.has(key)) map.set(key, []);
+            map.get(key).push(row);
+          }
+          for (const row of nativeRows) {
+            const key = this.sessionRequestKey(row, 'codex_native');
             if (!key) continue;
             if (!map.has(key)) map.set(key, []);
             map.get(key).push(row);
@@ -4540,14 +4552,47 @@
           const key = this.sessionRequestKey(sess, sess.source);
           return key ? (this.sessionRequestIndex.get(key) || []) : [];
         },
+        nativeHttpRequestRows() {
+          return (Array.isArray(this.data.native_http_timings) ? this.data.native_http_timings : [])
+            .map((row) => {
+              let path = row.path || '/v1/responses';
+              try {
+                path = new URL(row.native_http_url || '', window.location.href).pathname || path;
+              } catch (_) {}
+              const statusCode = Number(row.status_code);
+              return {
+                ...row,
+                source: 'codex_native',
+                native_source: 'codex_native',
+                native_http_timing_only: true,
+                path,
+                requested_model: row.requested_model || row.resolved_model || '',
+                resolved_model: row.resolved_model || row.requested_model || '',
+                response_model: row.response_model || row.resolved_model || row.requested_model || '',
+                client_request_id: row.request_id,
+                success: Number.isFinite(statusCode) ? statusCode >= 200 && statusCode < 400 : null,
+                total_tokens: 0,
+                usage: null,
+                cost_usd: null,
+              };
+            });
+        },
         filteredRequests() {
-          const rows = (this.data.recent_requests || []).map((row) => ({
+          const rows = [
+            ...(this.data.recent_requests || []),
+            ...this.nativeHttpRequestRows,
+          ].map((row) => ({
             ...row,
-            source: this.deriveRequestSource(row),
+            source: row.source || this.deriveRequestSource(row),
             total_tokens: Number(row?.usage?.total_tokens || row?.total_tokens || 0),
           })).filter((row) => {
             if (!this.allowRequestSource(row.source)) return false;
             if (!this.matches(row)) return false;
+            if (
+              row.source === 'codex_native'
+              && !row.native_http_timing_only
+              && this.nativeHttpRequestRows.length
+            ) return false;
             return true;
           });
           return this.sortRows(rows, 'finished_at');
@@ -4731,7 +4776,7 @@
           const map = {
             overview: { title: 'Overview', subtitle: 'Live spend, token usage, and request activity at a glance.' },
             usage: { title: 'Usage Analytics', subtitle: 'Spend, tokens, and source breakdowns.' },
-            requests: { title: 'Request Explorer', subtitle: 'Inspect any recent proxied request in full detail.' },
+            requests: { title: 'Request Explorer', subtitle: 'Inspect any recent request in full detail.' },
             sessions: { title: 'Sessions', subtitle: 'Recent sessions across all upstream sources.' },
             routing: { title: 'Model Routing', subtitle: 'Map requested models to provider models.' },
             approvals: { title: 'Approval Routing', subtitle: 'Routes for approval prompts and fallbacks.' },
@@ -5117,6 +5162,103 @@
         requestServiceTierSourceLabel(row) {
           return this._tierSourceLabel(row?.native_service_tier_source);
         },
+        isNativeRequest(row) {
+          return Boolean(
+            row
+            && (this.deriveRequestSource(row) === 'codex_native' || row.native_source === 'codex_native')
+          );
+        },
+        nativeTurnKey(row) {
+          if (!row) return '';
+          return row.native_turn_id || row.native_source_event_key || row.request_id || '';
+        },
+        nativeTurnSummaryRow(row) {
+          if (!this.isNativeRequest(row)) return false;
+          const turnKey = this.nativeTurnKey(row);
+          if (!turnKey) return true;
+          const candidates = (this.data.recent_requests || []).filter((candidate) => (
+            this.isNativeRequest(candidate) && this.nativeTurnKey(candidate) === turnKey
+          ));
+          if (!candidates.length) return true;
+          const timestamp = (candidate) => {
+            const value = Date.parse(candidate?.finished_at || candidate?.started_at || '');
+            return Number.isFinite(value) ? value : -Infinity;
+          };
+          const observationOrder = (candidate) => {
+            const requestId = String(candidate?.request_id || '');
+            const suffix = requestId.slice(requestId.lastIndexOf(':') + 1);
+            const value = Number(suffix);
+            return Number.isFinite(value) ? value : -Infinity;
+          };
+          let latest = candidates[0];
+          for (const candidate of candidates.slice(1)) {
+            const candidateTime = timestamp(candidate);
+            const latestTime = timestamp(latest);
+            if (
+              candidateTime > latestTime
+              || (
+                candidateTime === latestTime
+                && observationOrder(candidate) > observationOrder(latest)
+              )
+            ) {
+              latest = candidate;
+            }
+          }
+          return this.requestKey(row) === this.requestKey(latest);
+        },
+        nativeTurnDurationMs(row) {
+          if (!row) return null;
+          const parseDuration = (value) => {
+            if (value === null || value === undefined || value === '') return null;
+            const parsed = Number(value);
+            return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
+          };
+          const turnKey = this.nativeTurnKey(row);
+          const candidates = turnKey
+            ? (this.data.recent_requests || []).filter((candidate) => (
+              this.isNativeRequest(candidate) && this.nativeTurnKey(candidate) === turnKey
+            ))
+            : [];
+          for (const candidate of [row, ...candidates]) {
+            const nativeDuration = parseDuration(candidate?.native_turn_duration_ms);
+            if (nativeDuration != null) return nativeDuration;
+            const nativeStarted = Date.parse(candidate?.native_turn_started_at || '');
+            const nativeCompleted = Date.parse(candidate?.native_turn_completed_at || '');
+            if (Number.isFinite(nativeStarted) && Number.isFinite(nativeCompleted)) {
+              return Math.max(0, nativeCompleted - nativeStarted);
+            }
+          }
+          return null;
+        },
+        nativeTurnElapsedMs(row) {
+          if (!row || !this.isNativeRequest(row)) return null;
+          const turnKey = this.nativeTurnKey(row);
+          const candidates = turnKey
+            ? (this.data.recent_requests || []).filter((candidate) => (
+              this.isNativeRequest(candidate) && this.nativeTurnKey(candidate) === turnKey
+            ))
+            : [];
+          const startedAt = [row, ...candidates]
+            .map((candidate) => Date.parse(candidate?.native_turn_started_at || ''))
+            .find((value) => Number.isFinite(value));
+          if (!Number.isFinite(startedAt)) return null;
+          return Math.max(0, this.nowMs - startedAt);
+        },
+        nativeTurnSnapshotElapsedMs(row) {
+          if (!row || !this.isNativeRequest(row)) return null;
+          const turnKey = this.nativeTurnKey(row);
+          const candidates = turnKey
+            ? (this.data.recent_requests || []).filter((candidate) => (
+              this.isNativeRequest(candidate) && this.nativeTurnKey(candidate) === turnKey
+            ))
+            : [];
+          const startedAt = [row, ...candidates]
+            .map((candidate) => Date.parse(candidate?.native_turn_started_at || ''))
+            .find((value) => Number.isFinite(value));
+          const observedAt = Date.parse(row.finished_at || row.started_at || '');
+          if (!Number.isFinite(startedAt) || !Number.isFinite(observedAt)) return null;
+          return Math.max(0, observedAt - startedAt);
+        },
         requestDurationMs(row) {
           if (!row || typeof row !== 'object') return null;
           const parseDuration = (value) => {
@@ -5124,17 +5266,56 @@
             const parsed = Number(value);
             return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
           };
-          const nativeDuration = parseDuration(row.native_turn_duration_ms);
-          if (nativeDuration != null) return nativeDuration;
-          const nativeStarted = Date.parse(row.native_turn_started_at || '');
-          if (
-            (this.deriveRequestSource(row) === 'codex_native' || row.native_source === 'codex_native')
-            && Number.isFinite(nativeStarted)
-            && !row.native_turn_completed_at
-          ) {
-            return Math.max(0, Date.now() - nativeStarted);
+          if (row.native_http_timing_only) return parseDuration(row.duration_ms);
+          if (this.isNativeRequest(row)) {
+            // Native rollout records expose whole-turn duration, not
+            // per-upstream-request latency. Only the latest observation for a
+            // turn may display that turn-level value.
+            if (!this.nativeTurnSummaryRow(row)) return null;
+            return this.nativeTurnDurationMs(row);
           }
           return parseDuration(row.duration_ms);
+        },
+        requestDurationLabel(row) {
+          const duration = this.requestDurationMs(row);
+          if (duration != null) {
+            return this.isNativeRequest(row)
+              ? this.shortDuration(duration)
+              : this.shortDuration(duration);
+          }
+          if (this.isNativeRequest(row)) {
+            if (!this.nativeTurnSummaryRow(row)) {
+              const snapshotElapsed = this.nativeTurnSnapshotElapsedMs(row);
+              return snapshotElapsed != null
+                ? `At +${this.shortDuration(snapshotElapsed)}`
+                : 'Not available';
+            }
+            const elapsed = this.nativeTurnElapsedMs(row);
+             return elapsed != null ? `In progress - ${this.shortDuration(elapsed)} elapsed` : 'In progress';
+          }
+          return '—';
+        },
+        requestTimingName(row) {
+          if (!this.isNativeRequest(row)) return 'Duration';
+          if (this.nativeTurnDurationMs(row) != null) return 'Duration';
+          return this.nativeTurnSummaryRow(row) ? 'Elapsed' : 'Duration';
+        },
+        requestDurationDetail(row) {
+          const duration = this.requestDurationMs(row);
+          if (duration != null) return `${duration} ms`;
+          if (this.isNativeRequest(row)) {
+            if (this.nativeTurnSummaryRow(row)) {
+              const elapsed = this.nativeTurnElapsedMs(row);
+              return elapsed != null
+                 ? `In progress - ${elapsed} ms elapsed`
+                : 'In progress';
+            }
+            const snapshotElapsed = this.nativeTurnSnapshotElapsedMs(row);
+            return snapshotElapsed != null
+              ? `At +${snapshotElapsed} ms`
+              : 'Not available';
+          }
+          return '-';
         },
         requestEffortLabel(row) {
           return this._lowerField(row, 'native_reasoning_effort') || this._lowerField(row, 'reasoning_effort');
@@ -6274,10 +6455,17 @@
           if (!row) return '—';
           const wall = row.wall_duration_ms;
           const api = row.api_duration_ms;
+          const metric = this.sessionDurationMetricLabel(row);
           if (wall == null && api == null) return '—';
-          if (wall == null) return `${this.shortDuration(api)} api`;
+          if (wall == null) return `${this.shortDuration(api)} ${metric}`;
           if (api == null) return `${this.shortDuration(wall)} wall`;
-          return `${this.shortDuration(wall)} wall · ${this.shortDuration(api)} api`;
+          return `${this.shortDuration(wall)} wall · ${this.shortDuration(api)} ${metric}`;
+        },
+        sessionActivityUnit(row) {
+          return 'requests';
+        },
+        sessionDurationMetricLabel(row) {
+          return 'api';
         },
         _sourcesForOverviewRange() {
           if (this.overviewRange === 'all') return this.allTime?.sources || {};
@@ -6423,6 +6611,9 @@
         // every view, so we still need it on mount.
         this.loadAutoUpdateStatus();
         this.startDashboardStream();
+        this.nativeTimingTimer = window.setInterval(() => {
+          this.nowMs = Date.now();
+        }, 1000);
         // Tab-specific config endpoints are lazy-loaded on view change via
         // the activeView watcher + ensureViewData(). The 5-minute timer is a
         // safety net for time-based aggregations and config drift; SSE pushes
@@ -6439,6 +6630,10 @@
         window.addEventListener('keydown', this._debugModalKeyHandler);
       },
       beforeUnmount() {
+        if (this.nativeTimingTimer) {
+          window.clearInterval(this.nativeTimingTimer);
+          this.nativeTimingTimer = null;
+        }
         if (this.autoRefreshTimer) {
           window.clearInterval(this.autoRefreshTimer);
           this.autoRefreshTimer = null;
