@@ -1993,9 +1993,12 @@
                         {{ row.success === false ? 'ERROR' : 'SUCCESS' }}
                       </span>
                     </td>
-                    <td>{{ row.resolved_model || row.requested_model || '—' }}</td>
+                    <td>
+                      <div>{{ row.resolved_model || row.requested_model || '—' }}</div>
+                      <span v-if="requestEffortLabel(row)" :class="['badge', requestEffortBadgeClass(row)]">{{ requestEffortLabel(row) }}</span>
+                    </td>
                     <td><code>{{ row.path || '—' }}</code></td>
-                    <td>{{ shortDuration(row.duration_ms) }}</td>
+                    <td>{{ shortDuration(requestDurationMs(row)) }}</td>
                     <td>{{ shortTokens(row) }}</td>
                     <td>
                       <div class="cost-stack" :title="rowCostTitle(row)">
@@ -2348,9 +2351,12 @@
                   <td>
                     <span class="pill" :class="row.success === false ? 'pill-error' : 'pill-success'">{{ row.success === false ? 'ERROR' : 'SUCCESS' }}</span>
                   </td>
-                  <td>{{ row.resolved_model || row.requested_model || '—' }}</td>
+                  <td>
+                    <div>{{ row.resolved_model || row.requested_model || '—' }}</div>
+                    <span v-if="requestEffortLabel(row)" :class="['badge', requestEffortBadgeClass(row)]">{{ requestEffortLabel(row) }}</span>
+                  </td>
                   <td><code>{{ row.path || '—' }}</code></td>
-                  <td>{{ shortDuration(row.duration_ms) }}</td>
+                  <td>{{ shortDuration(requestDurationMs(row)) }}</td>
                   <td>{{ shortTokens(row) }}</td>
                   <td>
                     <div class="cost-stack" :title="rowCostTitle(row)">
@@ -2414,7 +2420,7 @@
                   </div>
                   <div class="request-meta subtle">
                     <div><span class="mono">{{ row.path || '-' }}</span></div>
-                    <div>{{ row.success === false ? `HTTP ${row.status_code}` : `${row.duration_ms ?? '-'} ms` }}</div>
+                    <div>{{ row.success === false ? `HTTP ${row.status_code}` : `${requestDurationMs(row) ?? '-'} ms` }}</div>
                     <div class="mono">{{ shortId(row.request_id || row.client_request_id) }}</div>
                     <div>{{ tokenSummary(row) }}</div>
                     <div class="cost-stack">
@@ -2443,7 +2449,8 @@
                   <div><div class="detail-label">Requested Model</div><div class="detail-value">{{ selectedRequest.requested_model || '-' }}</div></div>
                   <div><div class="detail-label">Resolved Model</div><div class="detail-value">{{ selectedRequest.response_model || selectedRequest.resolved_model || '-' }}</div></div>
                   <div><div class="detail-label">Estimated {{ rowCostUnitName(selectedRequest) }}</div><div class="detail-value"><strong>{{ rowCostLabel(selectedRequest) }}</strong><span class="cost-inline"> · {{ money(selectedRequest.cost_usd) }}</span></div></div>
-                  <div><div class="detail-label">Duration</div><div class="detail-value">{{ selectedRequest.duration_ms != null ? `${selectedRequest.duration_ms} ms` : '-' }}</div></div>
+                  <div><div class="detail-label">Duration</div><div class="detail-value">{{ requestDurationMs(selectedRequest) != null ? `${requestDurationMs(selectedRequest)} ms` : '-' }}</div></div>
+                  <div v-if="requestEffortLabel(selectedRequest)"><div class="detail-label">Reasoning level</div><div class="detail-value"><span :class="['badge', requestEffortBadgeClass(selectedRequest)]">{{ requestEffortLabel(selectedRequest) }}</span></div></div>
                   <div><div class="detail-label">Cost breakdown</div><div class="detail-value">{{ costBreakdownLabel(selectedRequest) }}</div></div>
                   <div><div class="detail-label">Session ID</div><div class="detail-value mono">{{ selectedRequest.session_id || '-' }}</div></div>
                   <div><div class="detail-label">Request ID</div><div class="detail-value mono">{{ selectedRequest.request_id || '-' }}</div></div>
@@ -4481,12 +4488,19 @@
             const key = this.sessionRequestKey(row, row.source);
             const reqs = key ? (idx.get(key) || []) : [];
             let firstAt = null, lastAt = null, totalDuration = 0, durationCount = 0;
+            const countedNativeTurns = new Set();
             for (const r of reqs) {
               const start = r.started_at ? new Date(r.started_at).getTime() : NaN;
               const end = r.finished_at ? new Date(r.finished_at).getTime() : NaN;
               if (Number.isFinite(start)) firstAt = firstAt == null ? start : Math.min(firstAt, start);
               if (Number.isFinite(end)) lastAt = lastAt == null ? end : Math.max(lastAt, end);
-              const d = Number(r.duration_ms);
+              const d = this.requestDurationMs(r);
+              const isNative = this.deriveRequestSource(r) === 'codex_native' || r.native_source === 'codex_native';
+              if (isNative && Number.isFinite(d)) {
+                const nativeTurnKey = r.native_turn_id || r.native_source_event_key || r.request_id;
+                if (nativeTurnKey && countedNativeTurns.has(nativeTurnKey)) continue;
+                if (nativeTurnKey) countedNativeTurns.add(nativeTurnKey);
+              }
               if (Number.isFinite(d)) { totalDuration += d; durationCount += 1; }
             }
             const wall_duration_ms = (Number.isFinite(firstAt) && Number.isFinite(lastAt)) ? Math.max(0, lastAt - firstAt) : null;
@@ -5097,8 +5111,15 @@
         requestServiceTierSourceLabel(row) {
           return this._tierSourceLabel(row?.native_service_tier_source);
         },
+        requestDurationMs(row) {
+          if (!row || typeof row !== 'object') return null;
+          const nativeDuration = Number(row.native_turn_duration_ms);
+          if (Number.isFinite(nativeDuration) && nativeDuration >= 0) return nativeDuration;
+          const duration = Number(row.duration_ms);
+          return Number.isFinite(duration) && duration >= 0 ? duration : null;
+        },
         requestEffortLabel(row) {
-          return this._lowerField(row, 'native_reasoning_effort');
+          return this._lowerField(row, 'native_reasoning_effort') || this._lowerField(row, 'reasoning_effort');
         },
         requestEffortBadgeClass(row) {
           return this.requestEffortLabel(row) === 'fast' ? 'badge-effort-fast' : 'badge-effort-other';

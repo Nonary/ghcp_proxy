@@ -109,6 +109,115 @@ _file_state_cache: dict[str, _FileState] = {}
 _file_state_lock = threading.Lock()
 
 
+@dataclass(frozen=True)
+class NativeTurnMetadata:
+    """Lifecycle metadata emitted by Codex for one native turn."""
+
+    started_at: str | None = None
+    completed_at: str | None = None
+    duration_ms: int | None = None
+
+
+_turn_metadata_cache: dict[str, tuple[float, int, dict[str, NativeTurnMetadata]]] = {}
+_turn_metadata_lock = threading.Lock()
+
+
+def _optional_int(value) -> int | None:
+    try:
+        if value is None or isinstance(value, bool):
+            return None
+        return int(round(float(value)))
+    except (TypeError, ValueError):
+        return None
+
+
+def _load_turn_metadata(path: str) -> dict[str, NativeTurnMetadata]:
+    """Read task lifecycle records without retaining any prompt/message text.
+
+    ``token_count`` records are incremental usage observations, while the
+    ``task_complete`` record carries the duration for the whole Codex turn.
+    Keep that distinction explicit so the dashboard can sum one duration per
+    turn rather than multiplying a turn duration by every token observation.
+    """
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return {}
+
+    cache_key = (float(stat.st_mtime), int(stat.st_size))
+    with _turn_metadata_lock:
+        cached = _turn_metadata_cache.get(path)
+        if cached is not None and cached[:2] == cache_key:
+            return cached[2]
+
+    records: dict[str, dict[str, object]] = {}
+    current_turn_id: str | None = None
+    try:
+        with open(path, "rb") as f:
+            for raw_line in f:
+                try:
+                    record = json.loads(raw_line.decode("utf-8", errors="replace"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    continue
+                if not isinstance(record, dict) or record.get("type") != "event_msg":
+                    continue
+                inner = record.get("payload")
+                if not isinstance(inner, dict):
+                    continue
+                inner_type = inner.get("type")
+                if inner_type == "task_started":
+                    turn_id = inner.get("turn_id")
+                    if not isinstance(turn_id, str) or not turn_id:
+                        continue
+                    current_turn_id = turn_id
+                    entry = records.setdefault(turn_id, {})
+                    timestamp = record.get("timestamp")
+                    if isinstance(timestamp, str) and timestamp:
+                        entry["started_at"] = timestamp
+                    continue
+                if inner_type != "task_complete":
+                    continue
+
+                turn_id = inner.get("turn_id") or current_turn_id
+                if not isinstance(turn_id, str) or not turn_id:
+                    continue
+                entry = records.setdefault(turn_id, {})
+                timestamp = record.get("timestamp")
+                if isinstance(timestamp, str) and timestamp:
+                    entry["completed_at"] = timestamp
+                duration_ms = _optional_int(inner.get("duration_ms"))
+                if duration_ms is not None and duration_ms >= 0:
+                    entry["duration_ms"] = duration_ms
+    except OSError:
+        return {}
+
+    result = {
+        turn_id: NativeTurnMetadata(
+            started_at=values.get("started_at") if isinstance(values.get("started_at"), str) else None,
+            completed_at=values.get("completed_at") if isinstance(values.get("completed_at"), str) else None,
+            duration_ms=values.get("duration_ms") if isinstance(values.get("duration_ms"), int) else None,
+        )
+        for turn_id, values in records.items()
+    }
+    with _turn_metadata_lock:
+        _turn_metadata_cache[path] = (cache_key[0], cache_key[1], result)
+    return result
+
+
+def native_turn_metadata_for_rollout(path: str | None, turn_id: str | None) -> dict[str, object]:
+    """Return lifecycle metadata for a persisted native rollout observation."""
+    if not isinstance(path, str) or not path or not isinstance(turn_id, str) or not turn_id:
+        return {}
+    metadata = _load_turn_metadata(path).get(turn_id)
+    if metadata is None:
+        return {}
+    return {
+        "native_turn_started_at": metadata.started_at,
+        "native_turn_completed_at": metadata.completed_at,
+        "native_turn_duration_ms": metadata.duration_ms,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Per-file parser
 # ---------------------------------------------------------------------------
@@ -209,6 +318,8 @@ def _parse_rollout(
         size = os.path.getsize(path)
     except OSError:
         return events, start_offset
+
+    turn_metadata = _load_turn_metadata(path)
 
     if start_offset > size:
         # File rotated/truncated — drop cache and restart.
@@ -344,6 +455,7 @@ def _parse_rollout(
                 native_service_tiers = _codex_logs_service_tiers(meta.session_id, current_turn_id, ts)
                 native_requested_service_tier = native_service_tiers.get("requested")
                 native_service_tier = native_service_tiers.get("effective")
+                turn_lifecycle = turn_metadata.get(current_turn_id) if current_turn_id else None
 
                 event = {
                     "request_id": request_id,
@@ -382,6 +494,14 @@ def _parse_rollout(
                     "native_rollout_path": path,
                     "native_source_event_key": source_event_key,
                 }
+                if turn_lifecycle is not None:
+                    event.update(
+                        {
+                            "native_turn_started_at": turn_lifecycle.started_at,
+                            "native_turn_completed_at": turn_lifecycle.completed_at,
+                            "native_turn_duration_ms": turn_lifecycle.duration_ms,
+                        }
+                    )
                 event["cost_usd"] = round(
                     _usage_event_estimated_cost(event, model_name=normalized_model, usage=usage),
                     6,

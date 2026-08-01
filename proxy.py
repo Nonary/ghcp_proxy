@@ -2246,6 +2246,27 @@ def _trace_tools_deferred_count(tools) -> int:
     return count
 
 
+def _request_reasoning_effort(body: dict | None) -> str | None:
+    """Return the requested reasoning level from any supported request shape."""
+    if not isinstance(body, dict):
+        return None
+
+    candidates = [body.get("reasoning_effort")]
+    reasoning = body.get("reasoning")
+    if isinstance(reasoning, dict):
+        candidates.append(reasoning.get("effort"))
+    output_config = body.get("output_config")
+    if isinstance(output_config, dict):
+        candidates.append(output_config.get("effort"))
+
+    for candidate in candidates:
+        if isinstance(candidate, str):
+            normalized = candidate.strip().lower()
+            if normalized:
+                return normalized
+    return None
+
+
 def _trace_body_summary(body: dict | None) -> dict | None:
     if not isinstance(body, dict):
         return None
@@ -2256,14 +2277,9 @@ def _trace_body_summary(body: dict | None) -> dict | None:
         "stream": body.get("stream"),
     }
 
-    reasoning_effort = body.get("reasoning_effort")
-    if isinstance(reasoning_effort, str) and reasoning_effort:
+    reasoning_effort = _request_reasoning_effort(body)
+    if reasoning_effort is not None:
         summary["reasoning_effort"] = reasoning_effort
-    reasoning = body.get("reasoning")
-    if isinstance(reasoning, dict):
-        effort = reasoning.get("effort")
-        if isinstance(effort, str) and effort:
-            summary["reasoning_effort"] = effort
     thinking = body.get("thinking")
     if isinstance(thinking, dict):
         snapshot: dict = {}
@@ -3290,6 +3306,11 @@ def _prepare_upstream_request(
         prompt_preview=stored_prompt_preview,
         initiator_verdict=initiator_verdict if isinstance(initiator_verdict, dict) else None,
     )
+    reasoning_effort = _request_reasoning_effort(body)
+    if reasoning_effort is None:
+        reasoning_effort = _request_reasoning_effort(source_body)
+    if isinstance(reasoning_effort, str) and reasoning_effort:
+        usage_event["reasoning_effort"] = reasoning_effort
     _save_request_prompt_record(
         request_id,
         request.url.path,

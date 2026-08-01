@@ -429,6 +429,23 @@ def _normalize_recorded_usage_event(
             normalized_event.pop("native_service_tier", None)
             normalized_event.pop("native_service_tier_source", None)
 
+        if (
+            not isinstance(normalized_event.get("native_turn_duration_ms"), (int, float))
+            or not normalized_event.get("native_turn_started_at")
+        ):
+            try:
+                from codex_native_ingest import native_turn_metadata_for_rollout
+
+                native_turn_metadata = native_turn_metadata_for_rollout(
+                    normalized_event.get("native_rollout_path"),
+                    normalized_event.get("native_turn_id"),
+                )
+            except Exception:
+                native_turn_metadata = {}
+            for key, value in native_turn_metadata.items():
+                if value is not None and normalized_event.get(key) is None:
+                    normalized_event[key] = value
+
     normalized_usage = normalize_usage_payload(normalized_event.get("usage"))
     if isinstance(normalized_usage, dict):
         normalized_event["usage"] = normalized_usage
@@ -478,8 +495,13 @@ def _usage_event_archive_summary(event: dict) -> dict:
         "native_service_tier_source",
         "native_reasoning_effort",
         "native_turn_id",
+        "native_rollout_path",
+        "native_turn_started_at",
+        "native_turn_completed_at",
+        "native_turn_duration_ms",
         "native_source_event_key",
         "native_dedupe_key",
+        "reasoning_effort",
     ):
         value = event.get(native_key)
         if value is not None:
