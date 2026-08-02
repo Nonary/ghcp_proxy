@@ -143,45 +143,33 @@ outside the add-in may be unsupported by OpenAI. Use only your own account and
 session.
 
 The Excel credential is deliberately separate from GitHub authentication. On
-Windows it is encrypted with the current user's DPAPI key and reloaded after
-proxy restarts. On macOS it is read automatically from Excel WebKit
-LocalStorage at startup and before `gpt-excel` requests. The bearer token and
-account ID are never returned to the dashboard.
+Windows it is encrypted with the current user's DPAPI key. On both Windows and
+macOS it is read automatically from the Excel add-in cache at startup and
+before `gpt-excel` requests when a fresh session is needed. The bearer token
+and account ID are never returned to the dashboard.
 
 Windows prerequisites:
 
-- Excel desktop with the official ChatGPT add-in open and signed in.
-- The add-in WebView2 launched with remote debugging on port `9222`.
-- Node.js 22 or newer for the one-shot session primer.
+- Excel desktop with the official ChatGPT add-in signed in at least once.
 
-Windows setup through the dashboard:
+The Windows reader automatically reads the add-in's cached `bps_auth_tokens`
+session from Office's WebView2 Local Storage database. It works while Excel is
+closed; it never monitors network traffic, needs no DevTools port, and has no
+dashboard toggle. If the session is missing, malformed, incomplete, or
+expired, the dashboard reports that condition; open the signed-in add-in once
+to refresh its cache, then retry the GPT Excel request.
 
-1. Open **Integrations**.
-2. Under **GPT Excel**, click **Capture Excel session**.
-3. Send one message in the ChatGPT Excel add-in.
-4. Wait for the dashboard to report **Ready · encrypted with Windows DPAPI**.
-
-The command-line primer remains available:
-
-```powershell
-.\prime-excel-session.ps1
-```
-
-When prompted, send one message in the ChatGPT Excel add-in. The primer copies
-only the bearer/account/client header bundle and the add-in's non-secret tools
-version ID to the loopback proxy endpoint; it does not print the token. GHCP
-Proxy encrypts the allowlisted bundle with DPAPI.
 Check non-secret status with:
 
 ```powershell
 Invoke-RestMethod http://127.0.0.1:8000/api/config/excel-session
 ```
 
-### Capturing from Excel for Mac
+### Reading from Excel for Mac
 
 Excel for macOS stores the signed-in ChatGPT add-in session in WebKit
 LocalStorage. GHCP Proxy reads that SQLite database directly; it does not
-install a certificate, change macOS proxy settings, or require mitmproxy.
+install a certificate or change macOS proxy settings.
 
 Mac prerequisites:
 

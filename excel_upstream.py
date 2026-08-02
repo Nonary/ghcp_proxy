@@ -1028,7 +1028,7 @@ class ExcelSessionStore:
                     "ChatGPT Excel sign-in was not found. Open the ChatGPT task pane in Excel and sign in."
                 )
             raise RuntimeError(
-                "GPT Excel is not primed. Run the Excel session primer and send one prompt in the Excel add-in."
+                "GPT Excel is not configured. Read the cached session from the signed-in Excel add-in, then retry."
             )
         if expires_at is not None and expires_at <= time.time():
             if sys.platform == "darwin":
@@ -1036,7 +1036,7 @@ class ExcelSessionStore:
                     "The ChatGPT Excel token has expired. Refresh the ChatGPT Excel task pane, then retry."
                 )
             raise RuntimeError(
-                "The GPT Excel session has expired. Run the Excel session primer again."
+                "The GPT Excel session has expired. Refresh the signed-in Excel add-in session, then read it again."
             )
         headers.update(
             {

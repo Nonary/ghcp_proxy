@@ -1,9 +1,4 @@
-"""Background capture process for the ChatGPT Excel WebView session.
-
-Windows Excel exposes WebView2 over Chrome DevTools Protocol. Excel for macOS
-stores the signed-in add-in session in WebKit LocalStorage, so macOS reads that
-SQLite database directly without installing a certificate or changing proxies.
-"""
+"""Read the cached ChatGPT Excel WebView session without observing traffic."""
 
 from __future__ import annotations
 
@@ -11,17 +6,13 @@ import base64
 import json
 import os
 from pathlib import Path
-import shutil
 import sqlite3
-import subprocess
 import sys
 import threading
-import time
 import urllib.parse
-from collections.abc import Callable
 
 
-_MACOS_STORAGE_KEY = "bps_auth_tokens"
+_STORAGE_KEY = "bps_auth_tokens"
 _MACOS_WEBSITE_DATA = Path(
     os.environ.get(
         "GHCP_EXCEL_WEBKIT_WEBSITE_DATA_DIR",
@@ -31,20 +22,15 @@ _MACOS_WEBSITE_DATA = Path(
         ),
     )
 ).expanduser()
+_WINDOWS_WEBVIEW_ROOT = Path(
+    os.environ.get(
+        "GHCP_EXCEL_WEBVIEW2_DATA_DIR",
+        str(Path(os.environ.get("LOCALAPPDATA", "")) / "Microsoft/Office"),
+    )
+).expanduser()
 _MACOS_REFRESH_LOCK = threading.Lock()
-
-
-def _decode_macos_storage_value(value: object) -> dict[str, object]:
-    if isinstance(value, bytes):
-        text = value.decode("utf-16-le")
-    elif isinstance(value, str):
-        text = value
-    else:
-        raise ValueError("the WebKit LocalStorage value has an unsupported type")
-    payload = json.loads(text)
-    if not isinstance(payload, dict):
-        raise ValueError("the WebKit LocalStorage token payload is not an object")
-    return payload
+_WINDOWS_REFRESH_LOCK = threading.Lock()
+_LEVELDB_TABLE_MAGIC = 0xDB4775248B80FB57
 
 
 def _jwt_payload(token: str) -> dict[str, object]:
@@ -57,7 +43,7 @@ def _jwt_payload(token: str) -> dict[str, object]:
     return payload if isinstance(payload, dict) else {}
 
 
-def _macos_session_headers(payload: dict[str, object]) -> tuple[dict[str, str], float]:
+def _cached_session_headers(payload: dict[str, object]) -> tuple[dict[str, str], float]:
     session_info = payload.get("sessionInfo")
     user_info = payload.get("userInfo")
     if not isinstance(session_info, dict) or not isinstance(user_info, dict):
@@ -111,16 +97,17 @@ def load_macos_excel_session(website_data: Path | None = None) -> dict[str, str]
             connection = sqlite3.connect(uri, uri=True, timeout=1)
             try:
                 row = connection.execute(
-                    "SELECT value FROM ItemTable WHERE key = ?",
-                    (_MACOS_STORAGE_KEY,),
+                    "SELECT value FROM ItemTable WHERE key = ?", (_STORAGE_KEY,)
                 ).fetchone()
             finally:
                 connection.close()
             if row is None:
                 continue
-            headers, expires_at = _macos_session_headers(
-                _decode_macos_storage_value(row[0])
-            )
+            value = row[0]
+            text = value.decode("utf-16-le") if isinstance(value, bytes) else value
+            if not isinstance(text, str):
+                raise ValueError("the WebKit LocalStorage value has an unsupported type")
+            headers, expires_at = _cached_session_headers(json.loads(text))
             candidates.append((expires_at, headers))
         except (OSError, sqlite3.Error, UnicodeError, ValueError, json.JSONDecodeError) as exc:
             errors.append(f"{database}: {exc}")
@@ -134,12 +121,159 @@ def load_macos_excel_session(website_data: Path | None = None) -> dict[str, str]
     )
 
 
-def refresh_macos_excel_session(
-    session_store,
-    *,
-    force: bool = False,
-    website_data: Path | None = None,
-) -> dict[str, object]:
+def _decode_leveldb_varint(data: bytes, offset: int) -> tuple[int, int]:
+    value = 0
+    shift = 0
+    while offset < len(data) and shift <= 63:
+        byte = data[offset]
+        offset += 1
+        value |= (byte & 0x7F) << shift
+        if not byte & 0x80:
+            return value, offset
+        shift += 7
+    raise ValueError("invalid LevelDB varint")
+
+
+def _decompress_snappy(data: bytes) -> bytes:
+    expected_size, offset = _decode_leveldb_varint(data, 0)
+    output = bytearray()
+    while offset < len(data):
+        tag = data[offset]
+        offset += 1
+        kind = tag & 0x03
+        if kind == 0:
+            length = tag >> 2
+            if length < 60:
+                length += 1
+            else:
+                width = length - 59
+                if offset + width > len(data):
+                    raise ValueError("truncated Snappy literal length")
+                length = int.from_bytes(data[offset : offset + width], "little") + 1
+                offset += width
+            if offset + length > len(data):
+                raise ValueError("truncated Snappy literal")
+            output.extend(data[offset : offset + length])
+            offset += length
+            continue
+        length = 4 + ((tag >> 2) & 0x07) if kind == 1 else 1 + (tag >> 2)
+        if kind == 1:
+            if offset >= len(data):
+                raise ValueError("truncated Snappy copy")
+            distance = ((tag & 0xE0) << 3) | data[offset]
+            offset += 1
+        else:
+            width = 2 if kind == 2 else 4
+            if offset + width > len(data):
+                raise ValueError("truncated Snappy copy distance")
+            distance = int.from_bytes(data[offset : offset + width], "little")
+            offset += width
+        if distance <= 0 or distance > len(output):
+            raise ValueError("invalid Snappy copy distance")
+        for _ in range(length):
+            output.append(output[-distance])
+    if len(output) != expected_size:
+        raise ValueError("invalid Snappy output length")
+    return bytes(output)
+
+
+def _leveldb_block_entries(data: bytes):
+    if len(data) < 4:
+        raise ValueError("truncated LevelDB block")
+    restart_count = int.from_bytes(data[-4:], "little")
+    entries_end = len(data) - 4 - restart_count * 4
+    if entries_end < 0:
+        raise ValueError("invalid LevelDB restart array")
+    offset = 0
+    prior_key = b""
+    while offset < entries_end:
+        shared, offset = _decode_leveldb_varint(data, offset)
+        unshared, offset = _decode_leveldb_varint(data, offset)
+        value_length, offset = _decode_leveldb_varint(data, offset)
+        if shared > len(prior_key) or offset + unshared + value_length > entries_end:
+            raise ValueError("invalid LevelDB entry")
+        key = prior_key[:shared] + data[offset : offset + unshared]
+        offset += unshared
+        value = data[offset : offset + value_length]
+        offset += value_length
+        prior_key = key
+        yield key, value
+
+
+def _leveldb_table_entries(path: Path):
+    data = path.read_bytes()
+    if len(data) < 48 or int.from_bytes(data[-8:], "little") != _LEVELDB_TABLE_MAGIC:
+        raise ValueError("not a LevelDB table")
+    footer = data[-48:-8]
+    _, offset = _decode_leveldb_varint(footer, 0)
+    _, offset = _decode_leveldb_varint(footer, offset)
+    index_offset, offset = _decode_leveldb_varint(footer, offset)
+    index_size, _ = _decode_leveldb_varint(footer, offset)
+
+    def read_block(block_offset: int, block_size: int) -> bytes:
+        trailer_offset = block_offset + block_size
+        if block_offset < 0 or trailer_offset >= len(data):
+            raise ValueError("invalid LevelDB block handle")
+        compressed = data[block_offset:trailer_offset]
+        compression_type = data[trailer_offset]
+        if compression_type == 0:
+            return compressed
+        if compression_type == 1:
+            return _decompress_snappy(compressed)
+        raise ValueError("unsupported LevelDB compression")
+
+    for _, encoded_handle in _leveldb_block_entries(read_block(index_offset, index_size)):
+        block_offset, handle_offset = _decode_leveldb_varint(encoded_handle, 0)
+        block_size, _ = _decode_leveldb_varint(encoded_handle, handle_offset)
+        yield from _leveldb_block_entries(read_block(block_offset, block_size))
+
+
+def _windows_leveldb_paths(webview_root: Path) -> list[Path]:
+    return sorted(
+        webview_root.glob("**/EBWebView/Default/Local Storage/leveldb"),
+        key=lambda path: path.stat().st_mtime if path.exists() else 0,
+        reverse=True,
+    )
+
+
+def _decode_windows_storage_value(value: bytes) -> dict[str, object]:
+    text = value.decode("utf-8")
+    start = text.find("{")
+    if start < 0:
+        raise ValueError("the WebView2 LocalStorage value is not JSON")
+    payload, _ = json.JSONDecoder().raw_decode(text[start:])
+    if not isinstance(payload, dict):
+        raise ValueError("the WebView2 LocalStorage token payload is not an object")
+    return payload
+
+
+def load_windows_excel_session(webview_root: Path | None = None) -> dict[str, str]:
+    root = webview_root or _WINDOWS_WEBVIEW_ROOT
+    candidates: list[tuple[float, float, dict[str, str]]] = []
+    errors: list[str] = []
+    for database in _windows_leveldb_paths(root):
+        for table in sorted(database.glob("*.ldb"), reverse=True):
+            try:
+                for key, value in _leveldb_table_entries(table):
+                    if _STORAGE_KEY.encode("utf-8") not in key:
+                        continue
+                    headers, expires_at = _cached_session_headers(
+                        _decode_windows_storage_value(value)
+                    )
+                    candidates.append((table.stat().st_mtime, expires_at, headers))
+            except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
+                errors.append(f"{table}: {exc}")
+    if candidates:
+        return max(candidates, key=lambda item: (item[0], item[1]))[2]
+    if errors:
+        raise RuntimeError(errors[0])
+    raise RuntimeError(
+        "No signed-in ChatGPT Excel session was found in the Windows WebView2 cache. "
+        "Open the ChatGPT task pane in Excel and sign in."
+    )
+
+
+def refresh_macos_excel_session(session_store, *, force: bool = False, website_data: Path | None = None) -> dict[str, object]:
     if sys.platform != "darwin":
         return session_store.status()
     status = session_store.status()
@@ -151,260 +285,55 @@ def refresh_macos_excel_session(
             return status
         try:
             headers = load_macos_excel_session(website_data)
-            return session_store.configure(
-                headers,
-                persist=False,
-                allow_expired=True,
-            )
+            return session_store.configure(headers, persist=False, allow_expired=True)
         except (OSError, RuntimeError, ValueError, UnicodeError, json.JSONDecodeError):
             return session_store.status()
 
 
-class ExcelSessionCaptureManager:
-    def __init__(
-        self,
-        *,
-        script_path: str,
-        macos_script_path: str | None = None,
-        macos_conf_dir: str | None = None,
-        session_status_provider: Callable[[], dict[str, object]],
-        proxy_url: str = "http://127.0.0.1:8000/api/config/excel-session",
-    ):
-        self._script_path = script_path
-        self._macos_script_path = macos_script_path or os.path.join(
-            os.path.dirname(script_path),
-            "prime-excel-session-macos.py",
-        )
-        # Retained for caller compatibility with older versions.
-        self._macos_conf_dir = macos_conf_dir
-        self._session_status_provider = session_status_provider
-        self._proxy_url = proxy_url
-        self._lock = threading.RLock()
-        self._process: subprocess.Popen[str] | None = None
-        self._started_at: float | None = None
-        self._finished_at: float | None = None
-        self._timeout_seconds: int | None = None
-        self._baseline_configured_at: object = None
-        self._captured = False
-        self._stopping = False
-        self._error = ""
-        self._message = ""
+def refresh_windows_excel_session(session_store, *, force: bool = False, webview_root: Path | None = None) -> dict[str, object]:
+    if sys.platform != "win32":
+        return session_store.status()
+    status = session_store.status()
+    if not force and status.get("configured") and not status.get("expired"):
+        return status
+    with _WINDOWS_REFRESH_LOCK:
+        status = session_store.status()
+        if not force and status.get("configured") and not status.get("expired"):
+            return status
+        try:
+            headers = load_windows_excel_session(webview_root)
+            return session_store.configure(headers, persist=True, allow_expired=True)
+        except (OSError, RuntimeError, ValueError, UnicodeError, json.JSONDecodeError):
+            return session_store.status()
 
-    def _node_path(self) -> str:
-        return shutil.which("node") or ""
 
-    def _capture_method(self) -> str:
-        if sys.platform == "win32":
-            return "webview2-devtools"
-        if sys.platform == "darwin":
-            return "webkit-localstorage-sqlite"
-        return "unavailable"
-
-    def _macos_command(self, *, timeout_seconds: int) -> list[str]:
-        del timeout_seconds
-        return [
-            sys.executable,
-            self._macos_script_path,
-            "--session-url",
-            self._proxy_url,
-        ]
-
-    def available(self) -> bool:
-        if sys.platform == "win32":
-            return bool(self._node_path() and os.path.isfile(self._script_path))
-        if sys.platform == "darwin":
-            return os.path.isfile(self._macos_script_path)
-        return False
-
-    def _unavailable_message(self) -> str:
-        if sys.platform == "darwin":
-            return "The macOS WebKit LocalStorage session reader is missing."
-        if sys.platform == "win32":
-            return (
-                "Excel session capture requires Windows, Node.js, and "
-                "tools/prime-excel-session.js"
-            )
-        return "Excel session capture is supported on Windows and macOS."
-
-    def start(self, *, devtools_port: int = 9222, timeout_seconds: int = 300) -> dict[str, object]:
-        if not self.available():
-            raise RuntimeError(self._unavailable_message())
-        if not isinstance(devtools_port, int) or not 1 <= devtools_port <= 65_535:
-            raise ValueError("DevTools port must be between 1 and 65535")
-        if not isinstance(timeout_seconds, int) or not 10 <= timeout_seconds <= 900:
-            raise ValueError("capture timeout must be between 10 and 900 seconds")
-
-        with self._lock:
-            if self._process is not None and self._process.poll() is None:
-                return self.status()
-            command = (
-                self._macos_command(timeout_seconds=timeout_seconds)
-                if sys.platform == "darwin"
-                else [
-                    self._node_path(),
-                    self._script_path,
-                    "--devtools-port",
-                    str(devtools_port),
-                    "--proxy-url",
-                    self._proxy_url,
-                    "--timeout-ms",
-                    str(timeout_seconds * 1000),
-                ]
-            )
-            creation_flags = (
-                getattr(subprocess, "CREATE_NO_WINDOW", 0)
-                if sys.platform == "win32"
-                else 0
-            )
-            self._baseline_configured_at = self._session_status_provider().get(
-                "configured_at"
-            )
-            try:
-                self._process = subprocess.Popen(
-                    command,
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    creationflags=creation_flags,
-                )
-            except OSError as exc:
-                raise RuntimeError(
-                    f"Could not start the Excel session capture helper: {exc}"
-                ) from exc
-            self._started_at = time.time()
-            self._finished_at = None
-            self._timeout_seconds = timeout_seconds
-            self._captured = False
-            self._stopping = False
-            self._error = ""
-            self._message = self._waiting_message()
-            process = self._process
-        threading.Thread(
-            target=self._watch_capture_progress,
-            args=(process,),
-            name="ghcp-excel-session-capture-progress",
-            daemon=True,
-        ).start()
-        threading.Thread(
-            target=self._watch_process,
-            args=(process,),
-            name="ghcp-excel-session-capture",
-            daemon=True,
-        ).start()
-        return self.status()
-
-    def _waiting_message(self) -> str:
-        if sys.platform == "darwin":
-            return "Reading the signed-in ChatGPT Excel session from WebKit LocalStorage."
-        return (
-            "Waiting for the next ChatGPT Excel prompt. Send one message in the "
-            "Excel add-in."
-        )
-
-    def _capture_success_message(self) -> str:
-        session_status = self._session_status_provider()
-        if session_status.get("persisted"):
-            return "GPT Excel session captured and saved securely."
-        if sys.platform == "darwin":
-            return "GPT Excel session loaded from WebKit LocalStorage."
-        return "GPT Excel session captured."
-
-    def _new_session_was_captured(self) -> bool:
-        status = self._session_status_provider()
-        return bool(
-            status.get("configured")
-            and status.get("configured_at") != self._baseline_configured_at
-        )
-
-    def _watch_capture_progress(self, process: subprocess.Popen[str]) -> None:
-        while process.poll() is None:
-            if self._new_session_was_captured():
-                with self._lock:
-                    if process is self._process:
-                        self._captured = True
-                        self._error = ""
-                        self._message = self._capture_success_message()
-                return
-            time.sleep(0.05)
-
-    def _watch_process(self, process: subprocess.Popen[str]) -> None:
-        stdout, stderr = process.communicate()
-        with self._lock:
-            if process is not self._process:
-                return
-            self._finished_at = time.time()
-            captured = self._captured or self._new_session_was_captured()
-            if captured:
-                self._captured = True
-                self._error = ""
-                self._message = self._capture_success_message()
-            elif self._stopping:
-                self._error = ""
-                self._message = ""
-            else:
-                detail = (stderr or stdout or "Excel session capture failed").strip()
-                self._error = detail[-600:]
-                self._message = ""
-
-    def stop(self) -> None:
-        with self._lock:
-            process = self._process
-            self._stopping = True
-        if process is not None and process.poll() is None:
-            process.terminate()
-
-    def status(self) -> dict[str, object]:
-        with self._lock:
-            process = self._process
-            process_running = process is not None and process.poll() is None
-            capturing = process_running and not self._captured and not self._stopping
-            phase = ""
-            if capturing:
-                phase = "reading_local_storage" if sys.platform == "darwin" else "waiting_for_excel"
-            elif process_running and self._captured:
-                phase = "finishing"
-            elif not process_running and self._captured:
-                phase = "complete"
-            result: dict[str, object] = {
-                "available": self.available(),
-                "capturing": capturing,
-                "process_running": process_running,
-                "method": self._capture_method(),
-                "platform": sys.platform,
-                "started_at": self._started_at,
-                "finished_at": self._finished_at,
-                "timeout_seconds": self._timeout_seconds,
-                "deadline_at": (
-                    self._started_at + self._timeout_seconds
-                    if self._started_at is not None and self._timeout_seconds is not None
-                    else None
-                ),
-                "phase": phase,
-                "proxy_active": False,
-                "workflow_version": 3 if sys.platform == "darwin" else 1,
-                "cancel_supported": True,
-                "proxy_port": None,
-                "excel_helper_restarted": False,
-                "error": self._error,
-                "message": self._message if not capturing else self._waiting_message(),
-                "prerequisite_error": "" if self.available() else self._unavailable_message(),
-                "devtools_default_port": 9222,
-            }
-            if sys.platform == "darwin":
-                result.update(
-                    {
-                        "ca_certificate_path": "",
-                        "ca_certificate_exists": False,
-                        "ca_trusted": False,
-                        "setup_required": False,
-                        "network_service": "",
-                        "ca_install_command": "",
-                        "install_command": "",
-                        "install_url": "",
-                        "intercepted_host": "",
-                    }
-                )
-            return result
+def cached_session_reader_status() -> dict[str, object]:
+    if sys.platform == "win32":
+        return {
+            "available": bool(_windows_leveldb_paths(_WINDOWS_WEBVIEW_ROOT)),
+            "method": "webview2-localstorage-leveldb",
+            "platform": sys.platform,
+            "process_running": False,
+            "capturing": False,
+            "error": "",
+            "message": "",
+        }
+    if sys.platform == "darwin":
+        return {
+            "available": bool(_macos_database_paths(_MACOS_WEBSITE_DATA)),
+            "method": "webkit-localstorage-sqlite",
+            "platform": sys.platform,
+            "process_running": False,
+            "capturing": False,
+            "error": "",
+            "message": "",
+        }
+    return {
+        "available": False,
+        "method": "unavailable",
+        "platform": sys.platform,
+        "process_running": False,
+        "capturing": False,
+        "error": "",
+        "message": "",
+    }

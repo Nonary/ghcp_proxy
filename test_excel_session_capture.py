@@ -12,14 +12,11 @@ from unittest import mock
 
 import excel_upstream
 from excel_session_capture import (
-    ExcelSessionCaptureManager,
+    _decompress_snappy,
     load_macos_excel_session,
+    load_windows_excel_session,
     refresh_macos_excel_session,
 )
-
-
-ROOT = Path(__file__).resolve().parent
-MACOS_SCRIPT_PATH = ROOT / "tools" / "prime-excel-session-macos.py"
 
 
 def _jwt_with_exp(expiration: float) -> str:
@@ -155,28 +152,45 @@ class MacLocalStorageCaptureTests(unittest.TestCase):
         )
 
 
-class ExcelSessionCaptureManagerTests(unittest.TestCase):
-    def _manager(self) -> ExcelSessionCaptureManager:
-        return ExcelSessionCaptureManager(
-            script_path=str(ROOT / "tools" / "prime-excel-session.js"),
-            macos_script_path=str(MACOS_SCRIPT_PATH),
-            session_status_provider=lambda: {
-                "configured": False,
-                "configured_at": None,
-            },
-        )
+class WindowsLocalStorageCacheTests(unittest.TestCase):
+    def test_snappy_literal_decompression(self):
+        self.assertEqual(_decompress_snappy(b"\x03\x08abc"), b"abc")
 
-    def test_macos_status_requires_no_proxy_or_certificate(self):
-        manager = self._manager()
-        with mock.patch("excel_session_capture.sys.platform", "darwin"):
-            status = manager.status()
-        self.assertEqual(status["method"], "webkit-localstorage-sqlite")
-        self.assertTrue(status["available"])
-        self.assertFalse(status["proxy_active"])
-        self.assertFalse(status["setup_required"])
-        self.assertEqual(status["workflow_version"], 3)
-        self.assertEqual(status["ca_install_command"], "")
-        self.assertEqual(status["install_command"], "")
+    def test_cache_reader_loads_webview2_localstorage_entry(self):
+        payload = {
+            "authMode": "chatgpt",
+            "sessionInfo": {"access_token": _jwt_with_exp(time.time() + 600)},
+            "userInfo": {
+                "chatgpt_account_id": "account-id",
+                "chatgpt_account_user_id": "account-user-id",
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            table = (
+                root
+                / "profile"
+                / "EBWebView"
+                / "Default"
+                / "Local Storage"
+                / "leveldb"
+                / "000001.ldb"
+            )
+            table.parent.mkdir(parents=True)
+            table.touch()
+            with mock.patch(
+                "excel_session_capture._leveldb_table_entries",
+                return_value=[
+                    (
+                        b"https://bps.openai.com\x00bps_auth_tokens",
+                        json.dumps(payload).encode("utf-8"),
+                    )
+                ],
+            ):
+                headers = load_windows_excel_session(root)
+        self.assertTrue(headers["authorization"].startswith("Bearer "))
+        self.assertEqual(headers["chatgpt-account-id"], "account-id")
+        self.assertEqual(headers["x-openai-account-user-id"], "account-user-id")
 
 
 if __name__ == "__main__":

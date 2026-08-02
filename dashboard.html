@@ -2672,17 +2672,17 @@
           <article class="mini-card" style="margin-top: 12px;">
             <div class="eyebrow">GPT Excel</div>
             <div :class="['status', excelSessionStatusClass()]">{{ excelSessionStatusLabel() }}</div>
-            <div class="subtle" style="margin-top: 8px;" v-if="excelSessionStatus.capture?.method === 'webview2-devtools'">
-              Capture credentials from the official ChatGPT Excel add-in and store them encrypted for this Windows user with DPAPI.
+            <div class="subtle" style="margin-top: 8px;" v-if="isWindowsExcelCacheRead()">
+              Automatically reads the cached session from the official ChatGPT Excel add-in and stores it encrypted for this Windows user with DPAPI. Missing or expired cached sessions are reported without monitoring Excel traffic.
             </div>
             <div class="subtle" style="margin-top: 8px;" v-else-if="isMacExcelCapture()">
               Uses the current ChatGPT Excel sign-in automatically from macOS WebKit LocalStorage.
             </div>
             <div class="subtle" style="margin-top: 8px;" v-else>
-              Capture credentials from the official ChatGPT Excel add-in.
+              Read the cached session from the official ChatGPT Excel add-in.
             </div>
             <div class="subtle" style="margin-top: 4px;" v-if="excelSessionStatus.persistence_supported">
-              {{ excelSessionStatus.persisted ? 'Encrypted session will reload after proxy restarts.' : 'No encrypted session has been saved yet.' }}
+              {{ excelSessionStatus.persisted ? 'The cache is refreshed automatically at proxy startup and before GPT Excel requests.' : 'Open the signed-in Excel add-in; GHCP Proxy will read its cache automatically.' }}
             </div>
             <div class="subtle" style="margin-top: 4px;" v-else-if="isMacExcelCapture()">
               The session is loaded automatically at startup and refreshed when needed.
@@ -2692,30 +2692,6 @@
             </div>
             <div class="subtle" style="margin-top: 8px;" v-if="!isMacExcelCapture() && excelSessionStatus.capture?.process_running && excelSessionStatus.capture?.message">
               {{ excelSessionStatus.capture.message }}
-            </div>
-            <div v-if="!isMacExcelCapture()" class="toolbar" style="margin-top: 10px;">
-              <button v-if="!excelSessionStatus.capture?.process_running"
-                      class="primary"
-                      @click="startExcelSessionCapture"
-                      :disabled="savingExcelSession || !excelSessionStatus.capture?.available">
-                <span v-if="savingExcelSession" class="spinner"></span>
-                {{ excelCaptureButtonLabel() }}
-              </button>
-              <button v-else-if="excelSessionStatus.capture?.cancel_supported"
-                      @click="cancelExcelSessionCapture"
-                      :disabled="savingExcelSession">
-                <span v-if="savingExcelSession" class="spinner"></span>
-                Cancel capture
-              </button>
-              <button v-else disabled>
-                <span class="spinner"></span>
-                Capture running…
-              </button>
-              <button @click="clearExcelSession"
-                      :disabled="savingExcelSession || excelSessionStatus.capture?.process_running || (!excelSessionStatus.configured && !excelSessionStatus.persisted)">
-                Clear session
-              </button>
-              <button @click="loadExcelSessionStatus" :disabled="savingExcelSession">Refresh</button>
             </div>
             <div v-if="excelSessionStatus.error" class="status error" style="margin-top: 10px;">{{ excelSessionStatus.error }}</div>
             <div v-else-if="!isMacExcelCapture() && excelSessionStatus.capture?.error" class="status error" style="margin-top: 10px;">{{ excelSessionStatus.capture.error }}</div>
@@ -5464,29 +5440,33 @@
               ? 'Ready'
               : 'Open ChatGPT Excel and sign in';
           }
-          if (this.excelSessionStatus.capture?.capturing) return 'Waiting for ChatGPT Excel';
-          if (this.excelSessionStatus.expired) return 'Saved session expired; capture a fresh session';
+          if (this.excelSessionStatus.capture?.capturing) {
+            if (this.isWindowsExcelCacheRead()) {
+              return 'Reading cached ChatGPT Excel session';
+            }
+            return 'Reading ChatGPT Excel session';
+          }
+          if (this.excelSessionStatus.expired) {
+            return this.isWindowsExcelCacheRead()
+              ? 'Saved session expired; refresh the cached session'
+              : 'Saved session expired; refresh the Excel session';
+          }
           if (this.excelSessionStatus.configured) {
             return this.excelSessionStatus.persisted
               ? 'Ready - encrypted with Windows DPAPI'
               : 'Ready - memory only';
           }
-          if (!this.excelSessionStatus.capture?.available) return 'Capture unavailable on this machine';
+          if (!this.excelSessionStatus.capture?.available) return 'Session reader unavailable on this machine';
           return 'Not configured';
-        },
-        excelCaptureButtonLabel() {
-          if (this.excelSessionStatus.capture?.capturing) {
-            return this.excelSessionStatus.capture?.method === 'webkit-localstorage-sqlite'
-              ? 'Reading Excel session...'
-              : 'Waiting for Excel...';
-          }
-          if (this.excelSessionStatus.capture?.process_running) return 'Finishing capture...';
-          return this.excelSessionStatus.configured
-            ? 'Refresh Excel session'
-            : 'Capture Excel session';
         },
         isMacExcelCapture() {
           return this.excelSessionStatus.capture?.method === 'webkit-localstorage-sqlite';
+        },
+        isWindowsExcelCacheRead() {
+          return (
+            this.excelSessionStatus.capture?.method === 'webview2-localstorage-leveldb'
+            || Boolean(this.excelSessionStatus.persistence_supported)
+          );
         },
         isOneClickMacExcelCapture() {
           return (
@@ -5496,22 +5476,28 @@
         },
         excelCaptureFlowMessage() {
           const capture = this.excelSessionStatus.capture || {};
-          if (capture.error) return 'Capture stopped. Review the error below, then try again.';
+          if (capture.error) return 'Session read stopped. Review the error below, then try again.';
           if (capture.process_running) {
             if (capture.method === 'webkit-localstorage-sqlite') {
               return 'Reading the signed-in ChatGPT Excel session directly from macOS WebKit LocalStorage...';
             }
-            return 'Waiting for the next ChatGPT Excel request...';
+            if (this.isWindowsExcelCacheRead()) {
+              return 'Reading the cached ChatGPT Excel session from the add-in...';
+            }
+            return 'Reading the ChatGPT Excel session...';
           }
           if (this.excelSessionStatus.configured && !this.excelSessionStatus.expired) {
             return capture.method === 'webkit-localstorage-sqlite'
               ? 'Done. The Excel session was loaded directly from macOS WebKit LocalStorage.'
-              : 'Done. The Excel session is ready.';
+              : 'Done. The cached Excel session is ready.';
           }
-          if (!capture.available) return 'The Excel session capture helper is unavailable.';
+          if (!capture.available) return 'The Excel session reader is unavailable.';
+          if (this.isWindowsExcelCacheRead()) {
+            return 'Click once to read the cached ChatGPT Excel session from the add-in.';
+          }
           return capture.method === 'webkit-localstorage-sqlite'
-            ? 'Click once to load the current ChatGPT Excel sign-in from macOS WebKit LocalStorage.'
-            : 'Click once, send any message in ChatGPT Excel, and the session is captured automatically.';
+              ? 'Click once to load the current ChatGPT Excel sign-in from macOS WebKit LocalStorage.'
+              : 'Click once to read the current ChatGPT Excel session.';
         },
         excelCaptureStepClass(step) {
           const capture = this.excelSessionStatus.capture || {};
@@ -5528,7 +5514,7 @@
         excelCaptureTimeRemainingLabel() {
           const deadline = Number(this.excelSessionStatus.capture?.deadline_at || 0) * 1000;
           const remainingSeconds = Math.max(0, Math.ceil((deadline - Date.now()) / 1000));
-          if (!deadline || remainingSeconds <= 0) return 'while capture finishes';
+          if (!deadline || remainingSeconds <= 0) return 'while the session read finishes';
           const minutes = Math.floor(remainingSeconds / 60);
           const seconds = remainingSeconds % 60;
           if (!minutes) return `for ${seconds}s`;
@@ -5575,79 +5561,18 @@
               && this.excelSessionStatus.configured_at !== previousConfiguredAt
             );
             if (capturedNow || (previousCapturing && this.excelSessionStatus.configured)) {
+              const readCachedWindowsSession = this.isWindowsExcelCacheRead();
               this.excelSessionStatus.statusMessage = this.excelSessionStatus.capture?.message
-                || (this.excelSessionStatus.persisted
-                  ? 'Excel session captured and saved securely.'
-                  : 'Excel session captured in memory.');
+                || (readCachedWindowsSession
+                  ? (this.excelSessionStatus.persisted
+                    ? 'Cached Excel session read and saved securely.'
+                    : 'Cached Excel session read.')
+                  : (this.excelSessionStatus.persisted
+                    ? 'Excel session read and saved securely.'
+                    : 'Excel session read in memory.'));
             }
           } catch (error) {
             this.excelSessionStatus.error = error.message;
-          }
-        },
-        async startExcelSessionCapture() {
-          if (this.savingExcelSession || this.excelSessionStatus.capture?.process_running) return;
-          this.savingExcelSession = true;
-          this.excelSessionStatus.statusMessage = '';
-          this.excelSessionStatus.error = '';
-          try {
-            const response = await fetch('/api/config/excel-session', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                action: 'capture',
-                devtools_port: 9222,
-                timeout_seconds: 600,
-              }),
-            });
-            const payload = await response.json().catch(() => ({}));
-            if (!response.ok) {
-              throw new Error(payload.detail || `Excel session capture request failed: ${response.status}`);
-            }
-            this.excelSessionStatus = {
-              ...this.excelSessionStatus,
-              ...payload,
-              capture: {
-                ...this.excelSessionStatus.capture,
-                ...(payload.capture || {}),
-              },
-              error: '',
-            };
-            this._scheduleExcelSessionStatusPoll();
-          } catch (error) {
-            this.excelSessionStatus.error = error.message;
-          } finally {
-            this.savingExcelSession = false;
-          }
-        },
-        async cancelExcelSessionCapture() {
-          if (this.savingExcelSession || !this.excelSessionStatus.capture?.process_running) return;
-          this.savingExcelSession = true;
-          this.excelSessionStatus.error = '';
-          this.excelSessionStatus.statusMessage = 'Stopping capture and restoring proxy settings…';
-          try {
-            const response = await fetch('/api/config/excel-session', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ action: 'cancel_capture' }),
-            });
-            const payload = await response.json().catch(() => ({}));
-            if (!response.ok) {
-              throw new Error(payload.detail || `Excel capture cancellation failed: ${response.status}`);
-            }
-            this.excelSessionStatus = {
-              ...this.excelSessionStatus,
-              ...payload,
-              capture: {
-                ...this.excelSessionStatus.capture,
-                ...(payload.capture || {}),
-              },
-              error: '',
-            };
-            this._scheduleExcelSessionStatusPoll();
-          } catch (error) {
-            this.excelSessionStatus.error = error.message;
-          } finally {
-            this.savingExcelSession = false;
           }
         },
         async clearExcelSession() {

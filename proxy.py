@@ -485,21 +485,6 @@ bridge_planner = ProtocolBridgePlanner(
     model_routing_config_service,
     capability_resolver=lambda model: model_supports_native_messages(model) if model else False,
 )
-excel_session_capture_manager = excel_session_capture.ExcelSessionCaptureManager(
-    script_path=os.path.join(
-        os.path.dirname(__file__),
-        "tools",
-        "prime-excel-session.js",
-    ),
-    macos_script_path=os.path.join(
-        os.path.dirname(__file__),
-        "tools",
-        "prime-excel-session-macos.py",
-    ),
-    session_status_provider=excel_upstream.excel_session_store.status,
-)
-
-
 def _debug_prompt_logging_settings() -> dict[str, object]:
     try:
         settings = client_proxy_config_service.load_client_proxy_settings()
@@ -788,13 +773,16 @@ async def _app_startup_restore_client_proxy_configs():
         excel_upstream.excel_session_store,
         force=True,
     )
+    excel_session_capture.refresh_windows_excel_session(
+        excel_upstream.excel_session_store,
+        force=True,
+    )
     restore_client_proxy_configs_on_startup()
     auto_update_runtime_controller.start_periodic_checks()
 
 
 @app.on_event("shutdown")
 async def _app_shutdown_revert_client_proxy_configs():
-    excel_session_capture_manager.stop()
     await auto_update_runtime_controller.stop_periodic_checks()
     revert_client_proxy_configs_on_shutdown()
 
@@ -5362,10 +5350,13 @@ async def excel_session_status_api():
     excel_session_capture.refresh_macos_excel_session(
         excel_upstream.excel_session_store,
     )
+    excel_session_capture.refresh_windows_excel_session(
+        excel_upstream.excel_session_store,
+    )
     return JSONResponse(
         content={
             **excel_upstream.excel_session_store.status(),
-            "capture": excel_session_capture_manager.status(),
+            "capture": excel_session_capture.cached_session_reader_status(),
         }
     )
 
@@ -5374,26 +5365,26 @@ async def excel_session_status_api():
 async def excel_session_config_api(request: Request):
     payload = await parse_json_request(request)
     action = str(payload.get("action") or "").strip().lower()
-    if action == "cancel_capture":
-        excel_session_capture_manager.stop()
+    if action in {"cancel_capture", "cancel_read"}:
         return JSONResponse(
             content={
                 **excel_upstream.excel_session_store.status(),
-                "capture": excel_session_capture_manager.status(),
+                "capture": excel_session_capture.cached_session_reader_status(),
             }
         )
-    if action == "capture":
-        try:
-            capture = excel_session_capture_manager.start(
-                devtools_port=int(payload.get("devtools_port") or 9222),
-                timeout_seconds=int(payload.get("timeout_seconds") or 300),
-            )
-        except (RuntimeError, TypeError, ValueError) as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if action in {"capture", "read_cached"}:
+        excel_session_capture.refresh_macos_excel_session(
+            excel_upstream.excel_session_store,
+            force=True,
+        )
+        excel_session_capture.refresh_windows_excel_session(
+            excel_upstream.excel_session_store,
+            force=True,
+        )
         return JSONResponse(
             content={
                 **excel_upstream.excel_session_store.status(),
-                "capture": capture,
+                "capture": excel_session_capture.cached_session_reader_status(),
             }
         )
     try:
@@ -5406,7 +5397,7 @@ async def excel_session_config_api(request: Request):
     return JSONResponse(
         content={
             **status,
-            "capture": excel_session_capture_manager.status(),
+            "capture": excel_session_capture.cached_session_reader_status(),
         }
     )
 
@@ -5416,7 +5407,7 @@ async def excel_session_clear_api():
     return JSONResponse(
         content={
             **excel_upstream.excel_session_store.clear(),
-            "capture": excel_session_capture_manager.status(),
+            "capture": excel_session_capture.cached_session_reader_status(),
         }
     )
 
@@ -5792,6 +5783,10 @@ async def _handle_excel_responses(
     source_body: dict | None = None,
 ) -> Response:
     excel_session_capture.refresh_macos_excel_session(
+        excel_upstream.excel_session_store,
+        force=True,
+    )
+    excel_session_capture.refresh_windows_excel_session(
         excel_upstream.excel_session_store,
         force=True,
     )
