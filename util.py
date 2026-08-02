@@ -631,6 +631,9 @@ def _usage_event_cost_breakdown(model_name: str | None, usage: dict | None) -> d
             "cached_input_per_million": entry.get(
                 "long_context_cached_input_per_million", entry.get("cached_input_per_million")
             ),
+            "cache_write_per_million": entry.get(
+                "long_context_cache_write_per_million", entry.get("cache_write_per_million")
+            ),
             "output_per_million": entry.get("long_context_output_per_million", entry.get("output_per_million")),
         }
 
@@ -641,9 +644,12 @@ def _usage_event_cost_breakdown(model_name: str | None, usage: dict | None) -> d
         cached_rate = round(input_rate * 0.1, 6)
     cached_rate = _coerce_float(cached_rate, default=input_rate)
 
-    cache_creation_rate = input_rate
-    if str(entry.get("provider") or "").lower() == "anthropic":
-        cache_creation_rate = _anthropic_cache_creation_rate_per_million(entry)
+    cache_creation_rate = _coerce_float(entry.get("cache_write_per_million"), default=None)
+    if cache_creation_rate is None:
+        if str(entry.get("provider") or "").lower() == "anthropic":
+            cache_creation_rate = _anthropic_cache_creation_rate_per_million(entry)
+        else:
+            cache_creation_rate = input_rate
 
     breakdown["input_fresh"] = (input_tokens * input_rate) / 1_000_000.0
     breakdown["cached_input"] = (cached_input_tokens * cached_rate) / 1_000_000.0

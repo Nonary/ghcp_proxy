@@ -57,18 +57,26 @@ def _model_token_pricing_description(model_name: str) -> str:
         f"{_format_token_rate(pricing.get('input_per_million'))} input",
         f"{_format_token_rate(pricing.get('cached_input_per_million'))} cached",
     ]
-    if pricing.get("cache_write_5m_per_million") is not None:
-        parts.append(f"{_format_token_rate(pricing.get('cache_write_5m_per_million'))} cache write")
+    cache_write_rate = pricing.get("cache_write_per_million")
+    if cache_write_rate is None:
+        cache_write_rate = pricing.get("cache_write_5m_per_million")
+    if cache_write_rate is not None:
+        parts.append(f"{_format_token_rate(cache_write_rate)} cache write")
     parts.append(f"{_format_token_rate(pricing.get('output_per_million'))} output")
     description = " / ".join(parts) + " per 1M tokens"
     threshold = pricing.get("long_context_threshold")
     if isinstance(threshold, int) and threshold > 0:
-        description += (
-            f"; over {threshold // 1000}K input: "
-            f"{_format_token_rate(pricing.get('long_context_input_per_million'))} input / "
-            f"{_format_token_rate(pricing.get('long_context_cached_input_per_million'))} cached / "
-            f"{_format_token_rate(pricing.get('long_context_output_per_million'))} output"
-        )
+        long_context_parts = [
+            f"{_format_token_rate(pricing.get('long_context_input_per_million'))} input",
+            f"{_format_token_rate(pricing.get('long_context_cached_input_per_million'))} cached",
+        ]
+        long_cache_write_rate = pricing.get("long_context_cache_write_per_million")
+        if long_cache_write_rate is None:
+            long_cache_write_rate = pricing.get("cache_write_per_million")
+        if long_cache_write_rate is not None:
+            long_context_parts.append(f"{_format_token_rate(long_cache_write_rate)} cache write")
+        long_context_parts.append(f"{_format_token_rate(pricing.get('long_context_output_per_million'))} output")
+        description += f"; over {threshold // 1000}K input: " + " / ".join(long_context_parts)
     return description
 
 
