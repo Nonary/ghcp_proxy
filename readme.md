@@ -373,6 +373,32 @@ python .\proxy.py
 `GHCP_UPSTREAM_TIMEOUT_SECONDS` applies to upstream non-streaming requests,
 including `/v1/responses/compact`. The default is `300` seconds.
 
+### Upstream Proxy Environment Variables
+
+GHCP Proxy uses standard proxy variables (`HTTPS_PROXY`, `HTTP_PROXY`,
+`NO_PROXY`) via `httpx` environment handling. It also accepts GHCP-specific
+aliases and maps them to standard names at startup when needed:
+
+- `GHCP_UPSTREAM_PROXY` (applies to both HTTP and HTTPS unless overridden)
+- `GHCP_HTTPS_PROXY`
+- `GHCP_HTTP_PROXY`
+- `GHCP_NO_PROXY`
+
+When a proxy is configured, GHCP Proxy now defaults to:
+
+- `GHCP_UPSTREAM_TLS_VERIFY=0` (to tolerate enterprise TLS interception certs
+  that are not in certifi by default)
+- `GHCP_UPSTREAM_HTTP2=0` (to avoid proxy-specific HTTP/2 stream resets)
+
+You can override either default explicitly:
+
+- `GHCP_UPSTREAM_TLS_VERIFY=1` to require certificate validation
+- `GHCP_UPSTREAM_HTTP2=1` to force HTTP/2 upstream requests
+
+When background startup is enabled on macOS, the launch agent now records these
+proxy-related environment variables so the background process can use the same
+proxy route as interactive shell launches.
+
 ### Background Startup Gets Confusing
 
 The first setup is easiest with a visible terminal running `proxy.py`. Install

@@ -17,6 +17,18 @@ START_MARKER = "# >>> ghcp_proxy commands >>>"
 END_MARKER = "# <<< ghcp_proxy commands <<<"
 WINDOWS_POWERSHELL_PROFILE_DIRS = ("WindowsPowerShell", "PowerShell")
 POWERSHELL_PROFILE_FILENAME = "Microsoft.PowerShell_profile.ps1"
+PROXY_ENV_KEYS = (
+    "HTTPS_PROXY",
+    "HTTP_PROXY",
+    "NO_PROXY",
+    "https_proxy",
+    "http_proxy",
+    "no_proxy",
+    "GHCP_UPSTREAM_PROXY",
+    "GHCP_HTTPS_PROXY",
+    "GHCP_HTTP_PROXY",
+    "GHCP_NO_PROXY",
+)
 
 
 def _quote_ps(value: str) -> str:
@@ -47,6 +59,18 @@ def _expand_user_path(path: str) -> str:
         if home:
             return os.path.join(home, path[2:])
     return os.path.expanduser(path)
+
+
+def _proxy_environment_variables_from_process() -> dict[str, str]:
+    env: dict[str, str] = {}
+    for key in PROXY_ENV_KEYS:
+        raw = os.environ.get(key)
+        if not isinstance(raw, str):
+            continue
+        value = raw.strip()
+        if value:
+            env[key] = value
+    return env
 
 
 def _windows_documents_path() -> str:
@@ -229,6 +253,20 @@ class BackgroundProxyManager:
 
     def _macos_launch_agent(self) -> str:
         os.makedirs(TOKEN_DIR, exist_ok=True)
+        proxy_env = _proxy_environment_variables_from_process()
+        env_xml = ""
+        if proxy_env:
+            env_lines: list[str] = []
+            for key in sorted(proxy_env):
+                env_lines.append(f"    <key>{_quote_xml(key)}</key>")
+                env_lines.append(f"    <string>{_quote_xml(proxy_env[key])}</string>")
+            env_xml = (
+                "  <key>EnvironmentVariables</key>\n"
+                "  <dict>\n"
+                + "\n".join(env_lines)
+                + "\n"
+                "  </dict>\n"
+            )
         return f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -242,7 +280,7 @@ class BackgroundProxyManager:
   </array>
   <key>WorkingDirectory</key>
   <string>{_quote_xml(self.repo_dir)}</string>
-  <key>RunAtLoad</key>
+{env_xml}  <key>RunAtLoad</key>
   <true/>
   <key>StandardOutPath</key>
   <string>{_quote_xml(PROXY_STDOUT_LOG_FILE)}</string>
