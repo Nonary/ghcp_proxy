@@ -1323,6 +1323,20 @@ def _agent_turn_state(raw_input: object) -> tuple[str, str]:
     return fingerprint, str(iteration_outputs + 1)
 
 
+def _append_before_terminal_compaction_trigger(
+    input_items: list,
+    injected_items: list,
+) -> list:
+    """Insert proxy-authored items without displacing a compact trigger."""
+    if (
+        input_items
+        and isinstance(input_items[-1], dict)
+        and input_items[-1].get("type") == "compaction_trigger"
+    ):
+        return input_items[:-1] + injected_items + [input_items[-1]]
+    return input_items + injected_items
+
+
 def prepare_responses_body(
     source: dict,
     *,
@@ -1358,13 +1372,19 @@ def prepare_responses_body(
         prologue.append(_message_item("developer", instructions))
     catalog = _message_item("developer", _client_tool_protocol_instructions(source))
     if CATALOG_AT_PROMPT_END:
-        input_items = prologue + input_items + [catalog]
+        input_items = _append_before_terminal_compaction_trigger(
+            prologue + input_items,
+            [catalog],
+        )
     else:
         prologue.append(catalog)
         reminder = _client_tool_protocol_reminder(source)
         input_items = prologue + input_items
         if reminder:
-            input_items.append(_message_item("developer", reminder))
+            input_items = _append_before_terminal_compaction_trigger(
+                input_items,
+                [_message_item("developer", reminder)],
+            )
     output["input"] = input_items
 
     cache_key = _cache_key(source)

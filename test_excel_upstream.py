@@ -743,6 +743,29 @@ class ExcelUpstreamTests(unittest.TestCase):
         # relative to the catalog it replaces.
         self.assertLess(len(reminder), len(catalog) / 2)
 
+    def test_compaction_trigger_stays_final_after_tool_reminder(self):
+        body = excel_upstream.prepare_responses_body(
+            {
+                "model": "gpt-excel",
+                "input": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "Hello"}],
+                    },
+                    {"type": "compaction_trigger"},
+                ],
+                "tools": [{"type": "function", "name": "demo"}],
+            }
+        )
+
+        self.assertEqual(body["input"][-1], {"type": "compaction_trigger"})
+        self.assertEqual(body["input"][-2]["role"], "developer")
+        self.assertIn(
+            "run_officejs",
+            body["input"][-2]["content"][0]["text"],
+        )
+
     def test_catalog_is_the_only_message_without_tools(self):
         without_tools = excel_upstream.prepare_responses_body(
             {"model": "gpt-excel", "input": "Hello"}
@@ -882,6 +905,32 @@ class ExcelUpstreamTests(unittest.TestCase):
         self.assertIn(
             '"name":"demo"',
             body["input"][-1]["content"][0]["text"],
+        )
+
+    def test_suffix_catalog_precedes_terminal_compaction_trigger(self):
+        source = {
+            "model": "gpt-excel",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Hello"}],
+                },
+                {"type": "compaction_trigger"},
+            ],
+            "tools": [{"type": "function", "name": "demo"}],
+        }
+        original = excel_upstream.CATALOG_AT_PROMPT_END
+        excel_upstream.CATALOG_AT_PROMPT_END = True
+        try:
+            body = excel_upstream.prepare_responses_body(source)
+        finally:
+            excel_upstream.CATALOG_AT_PROMPT_END = original
+
+        self.assertEqual(body["input"][-1], {"type": "compaction_trigger"})
+        self.assertIn(
+            '"name":"demo"',
+            body["input"][-2]["content"][0]["text"],
         )
 
     def test_empty_tool_output_is_rendered_as_explicit_success(self):
