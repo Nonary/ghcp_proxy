@@ -7,6 +7,8 @@ from unittest.mock import patch
 
 from copilot.session_events import (
     AssistantMessageDeltaData,
+    AssistantReasoningData,
+    AssistantReasoningDeltaData,
     AssistantUsageData,
     ExternalToolRequestedData,
     SessionIdleData,
@@ -231,6 +233,97 @@ class CopilotSdkEventTests(unittest.IsolatedAsyncioTestCase):
         positions = [wire.index(f"event: {name}") for name in expected]
         self.assertEqual(positions, sorted(positions))
         self.assertTrue(session.disconnected)
+
+    async def test_wait_for_outcome_collects_reasoning_without_duplication(self):
+        session = _FakeSession()
+
+        async def dispatch():
+            session.emit(
+                "assistant.reasoning_delta",
+                AssistantReasoningDeltaData(delta_content="thinking step", reasoning_id="r-1"),
+            )
+            session.emit(
+                "assistant.reasoning",
+                AssistantReasoningData(content="thinking step", reasoning_id="r-1"),
+            )
+            session.emit(
+                "assistant.message_delta",
+                AssistantMessageDeltaData(delta_content="answer", message_id="m-1"),
+            )
+            session.emit("session.idle", SessionIdleData())
+
+        outcome = await sdk._wait_for_outcome(session, dispatch, sdk.ToolRegistration())
+        self.assertEqual(outcome.reasoning, "thinking step")
+        self.assertEqual(outcome.text, "answer")
+
+    async def test_stream_emits_reasoning_and_message_with_stable_ids_and_indices(self):
+        session = _FakeSession()
+
+        async def dispatch():
+            session.emit(
+                "assistant.reasoning_delta",
+                AssistantReasoningDeltaData(delta_content="thought", reasoning_id="r-1"),
+            )
+            session.emit(
+                "assistant.reasoning",
+                AssistantReasoningData(content="thought", reasoning_id="r-1"),
+            )
+            session.emit(
+                "assistant.message_delta",
+                AssistantMessageDeltaData(delta_content="reply", message_id="m-1"),
+            )
+            session.emit("session.idle", SessionIdleData())
+
+        events: list[tuple[str, dict]] = []
+        async for chunk in sdk._stream_turn(
+            _ConnectedRequest(),
+            {"model": "gpt-test"},
+            session,
+            dispatch,
+            sdk.ToolRegistration(),
+        ):
+            text = chunk.decode()
+            for block in text.strip().split("\n\n"):
+                if not block.strip():
+                    continue
+                lines = block.splitlines()
+                ev_name = lines[0].replace("event: ", "").strip()
+                data = json.loads(lines[1].replace("data: ", ""))
+                events.append((ev_name, data))
+
+        event_names = [name for name, _ in events]
+        expected_names = [
+            "response.created",
+            "response.in_progress",
+            "response.output_item.added",
+            "response.reasoning_summary_part.added",
+            "response.reasoning_summary_text.delta",
+            "response.reasoning_summary_text.done",
+            "response.reasoning_summary_part.done",
+            "response.output_item.done",
+            "response.output_item.added",
+            "response.content_part.added",
+            "response.output_text.delta",
+            "response.output_text.done",
+            "response.content_part.done",
+            "response.output_item.done",
+            "response.completed",
+        ]
+        self.assertEqual(event_names, expected_names)
+
+        # Verify reasoning item has output_index 0 and message has output_index 1
+        reasoning_added = next(d for name, d in events if name == "response.output_item.added" and d["item"]["type"] == "reasoning")
+        message_added = next(d for name, d in events if name == "response.output_item.added" and d["item"]["type"] == "message")
+        self.assertEqual(reasoning_added["output_index"], 0)
+        self.assertEqual(message_added["output_index"], 1)
+
+        # Verify response.completed matches item IDs and ordering
+        completed = events[-1][1]["response"]
+        self.assertEqual(len(completed["output"]), 2)
+        self.assertEqual(completed["output"][0]["id"], reasoning_added["item"]["id"])
+        self.assertEqual(completed["output"][0]["type"], "reasoning")
+        self.assertEqual(completed["output"][1]["id"], message_added["item"]["id"])
+        self.assertEqual(completed["output"][1]["type"], "message")
 
 
 if __name__ == "__main__":

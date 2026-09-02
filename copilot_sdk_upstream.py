@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
 import json
 import os
 import re
@@ -34,8 +35,11 @@ try:
     from copilot.rpc import HandlePendingToolCallRequest
     from copilot.session import PermissionHandler
     from copilot.session_events import (
+        AssistantIntentData,
         AssistantMessageData,
         AssistantMessageDeltaData,
+        AssistantReasoningData,
+        AssistantReasoningDeltaData,
         AssistantUsageData,
         ExternalToolRequestedData,
         SessionErrorData,
@@ -45,6 +49,8 @@ except ImportError as exc:  # pragma: no cover - exercised only on broken instal
     CopilotClient = None  # type: ignore[assignment,misc]
     Tool = None  # type: ignore[assignment,misc]
     _SDK_IMPORT_ERROR: Exception | None = exc
+    AssistantIntentData = AssistantMessageData = None  # type: ignore[assignment,misc]
+    AssistantReasoningData = AssistantReasoningDeltaData = None  # type: ignore[assignment,misc]
 else:
     _SDK_IMPORT_ERROR = None
 
@@ -181,7 +187,10 @@ def _decode_call_id(call_id: Any) -> dict[str, str] | None:
     try:
         padded = encoded + "=" * (-len(encoded) % 4)
         value = json.loads(base64.urlsafe_b64decode(padded).decode("utf-8"))
-    except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+    # urlsafe_b64decode raises binascii.Error (not ValueError) for malformed
+    # client-supplied call IDs.  A bad continuation is a 400, not an internal
+    # error from the proxy.
+    except (binascii.Error, ValueError, UnicodeDecodeError, json.JSONDecodeError):
         return None
     if not isinstance(value, dict):
         return None
@@ -391,11 +400,24 @@ def _reasoning_effort(body: dict) -> str | None:
     return effort if effort in {"low", "medium", "high", "xhigh"} else None
 
 
+def _reasoning_summary(body: dict) -> str:
+    """Map Responses reasoning settings to the SDK's summary modes."""
+    reasoning = body.get("reasoning")
+    summary = reasoning.get("summary") if isinstance(reasoning, dict) else None
+    if summary in {"none", "concise", "detailed"}:
+        return summary
+    return "detailed"
+
+
 def _session_options(body: dict, registration: ToolRegistration) -> dict[str, Any]:
     instructions = body.get("instructions")
     options: dict[str, Any] = {
         "model": body.get("model") if isinstance(body.get("model"), str) else None,
         "reasoning_effort": _reasoning_effort(body),
+        # The SDK does not emit Copilot's reasoning/intent timeline events
+        # unless a reasoning summary mode is selected.  Without this, Codex
+        # receives only the final answer and tool calls.
+        "reasoning_summary": _reasoning_summary(body),
         "streaming": bool(body.get("stream")),
         "tools": registration.tools,
         "available_tools": ["custom:*"],
@@ -457,11 +479,15 @@ class ToolCall:
     name: str
     tool_type: str
     arguments: Any
+    item_id: str = field(default_factory=lambda: _new_id("fc"))
 
 
 @dataclass
 class TurnOutcome:
     text: str = ""
+    reasoning: str = ""
+    reasoning_id: str = field(default_factory=lambda: _new_id("rs"))
+    message_id: str = field(default_factory=lambda: _new_id("msg"))
     calls: list[ToolCall] = field(default_factory=list)
     usage: dict[str, int] = field(default_factory=dict)
 
@@ -488,11 +514,13 @@ def _usage_from_event(data: Any) -> dict[str, int]:
 def _tool_call(data: Any, registration: ToolRegistration) -> ToolCall:
     safe_name = str(getattr(data, "tool_name", "tool"))
     metadata = registration.names.get(safe_name, ToolMetadata(safe_name, "function"))
+    prefix = "ctc" if metadata.tool_type == "custom" else "fc"
     return ToolCall(
         request_id=str(getattr(data, "request_id")),
         name=metadata.original_name,
         tool_type=metadata.tool_type,
         arguments=getattr(data, "arguments", {}) or {},
+        item_id=_new_id(prefix),
     )
 
 
@@ -514,8 +542,18 @@ async def _wait_for_outcome(
     queue, unsubscribe = _event_queue(session)
     outcome = TurnOutcome()
     saw_delta = False
+    saw_reasoning_delta = False
     dispatch_task = asyncio.create_task(dispatch())
     try:
+        # ``send`` is asynchronous and may fail before the SDK emits any
+        # event.  Give it one scheduling turn so invalid input/auth failures
+        # are surfaced immediately instead of waiting for the full turn
+        # timeout.
+        await asyncio.sleep(0)
+        if dispatch_task.done():
+            error = dispatch_task.exception()
+            if error is not None:
+                raise error
         while True:
             timeout = _PARALLEL_TOOL_SETTLE_SECONDS if outcome.calls else _TURN_TIMEOUT_SECONDS
             try:
@@ -528,6 +566,15 @@ async def _wait_for_outcome(
             if isinstance(data, AssistantMessageDeltaData):
                 outcome.text += data.delta_content
                 saw_delta = True
+            elif isinstance(data, AssistantReasoningDeltaData):
+                outcome.reasoning += data.delta_content
+                saw_reasoning_delta = True
+            elif isinstance(data, AssistantReasoningData):
+                if not saw_reasoning_delta and data.content:
+                    outcome.reasoning = data.content
+            elif isinstance(data, AssistantIntentData):
+                if not saw_reasoning_delta and not outcome.reasoning and data.intent:
+                    outcome.reasoning = data.intent
             elif isinstance(data, AssistantMessageData):
                 if not saw_delta:
                     outcome.text = data.content or outcome.text
@@ -574,7 +621,7 @@ def _tool_item(session_id: str, call: ToolCall, *, completed: bool = True) -> di
     )
     item = {
         "type": "custom_tool_call" if call.tool_type == "custom" else "function_call",
-        "id": _new_id("ctc" if call.tool_type == "custom" else "fc"),
+        "id": call.item_id,
         "call_id": call_id,
         "name": call.name,
         "status": "completed" if completed else "in_progress",
@@ -593,11 +640,24 @@ def _message_item(text: str, *, item_id: str | None = None, completed: bool = Tr
     }
 
 
+def _reasoning_item(text: str, *, item_id: str | None = None, completed: bool = True) -> dict:
+    return {
+        "type": "reasoning",
+        "id": item_id or _new_id("rs"),
+        "status": "completed" if completed else "in_progress",
+        "summary": ([{"type": "summary_text", "text": text}] if (completed and text) else []),
+        "content": [],
+        "encrypted_content": None,
+    }
+
+
 def _response_payload(body: dict, session_id: str, outcome: TurnOutcome, response_id: str) -> dict:
     output: list[dict] = []
+    if outcome.reasoning:
+        output.append(_reasoning_item(outcome.reasoning, item_id=outcome.reasoning_id, completed=True))
     if outcome.text:
-        output.append(_message_item(outcome.text))
-    output.extend(_tool_item(session_id, call) for call in outcome.calls)
+        output.append(_message_item(outcome.text, item_id=outcome.message_id, completed=True))
+    output.extend(_tool_item(session_id, call, completed=True) for call in outcome.calls)
     return {
         "id": response_id,
         "object": "response",
@@ -642,32 +702,126 @@ async def _stream_turn(
     queue, unsubscribe = _event_queue(session)
     dispatch_task = asyncio.create_task(dispatch())
     outcome = TurnOutcome()
-    message_id: str | None = None
     output_index = 0
-    saw_delta = False
     preserve_session = False
 
-    async def emit_text_start() -> list[bytes]:
-        nonlocal message_id
-        if message_id is not None:
+    reasoning_started = False
+    reasoning_closed = False
+    reasoning_output_index = 0
+    saw_reasoning_delta = False
+
+    message_started = False
+    message_closed = False
+    message_output_index = 0
+    saw_delta = False
+
+    def emit_reasoning_start() -> list[bytes]:
+        nonlocal reasoning_started, reasoning_output_index, output_index
+        if reasoning_started:
             return []
-        message_id = _new_id("msg")
+        reasoning_started = True
+        reasoning_output_index = output_index
+        output_index += 1
         return [
             _sse(
                 "response.output_item.added",
-                output_index=output_index,
-                item=_message_item("", item_id=message_id, completed=False),
+                output_index=reasoning_output_index,
+                item=_reasoning_item("", item_id=outcome.reasoning_id, completed=False),
+            ),
+            _sse(
+                "response.reasoning_summary_part.added",
+                item_id=outcome.reasoning_id,
+                output_index=reasoning_output_index,
+                summary_index=0,
+                part={"type": "summary_text", "text": ""},
+            ),
+        ]
+
+    def emit_reasoning_done() -> list[bytes]:
+        nonlocal reasoning_closed
+        if not reasoning_started or reasoning_closed:
+            return []
+        reasoning_closed = True
+        return [
+            _sse(
+                "response.reasoning_summary_text.done",
+                item_id=outcome.reasoning_id,
+                output_index=reasoning_output_index,
+                summary_index=0,
+                text=outcome.reasoning,
+            ),
+            _sse(
+                "response.reasoning_summary_part.done",
+                item_id=outcome.reasoning_id,
+                output_index=reasoning_output_index,
+                summary_index=0,
+                part={"type": "summary_text", "text": outcome.reasoning},
+            ),
+            _sse(
+                "response.output_item.done",
+                output_index=reasoning_output_index,
+                item=_reasoning_item(outcome.reasoning, item_id=outcome.reasoning_id, completed=True),
+            ),
+        ]
+
+    def emit_text_start() -> list[bytes]:
+        nonlocal message_started, message_output_index, output_index
+        if message_started:
+            return []
+        chunks = list(emit_reasoning_done())
+        message_started = True
+        message_output_index = output_index
+        output_index += 1
+        chunks.extend([
+            _sse(
+                "response.output_item.added",
+                output_index=message_output_index,
+                item=_message_item("", item_id=outcome.message_id, completed=False),
             ),
             _sse(
                 "response.content_part.added",
-                item_id=message_id,
-                output_index=output_index,
+                item_id=outcome.message_id,
+                output_index=message_output_index,
                 content_index=0,
                 part={"type": "output_text", "text": "", "annotations": []},
+            ),
+        ])
+        return chunks
+
+    def emit_text_done() -> list[bytes]:
+        nonlocal message_closed
+        if not message_started or message_closed:
+            return []
+        message_closed = True
+        completed_message = _message_item(outcome.text, item_id=outcome.message_id, completed=True)
+        return [
+            _sse(
+                "response.output_text.done",
+                item_id=outcome.message_id,
+                output_index=message_output_index,
+                content_index=0,
+                text=outcome.text,
+            ),
+            _sse(
+                "response.content_part.done",
+                item_id=outcome.message_id,
+                output_index=message_output_index,
+                content_index=0,
+                part=completed_message["content"][0],
+            ),
+            _sse(
+                "response.output_item.done",
+                output_index=message_output_index,
+                item=completed_message,
             ),
         ]
 
     try:
+        await asyncio.sleep(0)
+        if dispatch_task.done():
+            error = dispatch_task.exception()
+            if error is not None:
+                raise error
         while True:
             if await request.is_disconnected():
                 await session.abort()
@@ -680,27 +834,63 @@ async def _stream_turn(
                     break
                 raise TimeoutError("Timed out waiting for the Copilot SDK turn")
             data = getattr(event, "data", None)
-            if isinstance(data, AssistantMessageDeltaData):
-                for chunk in await emit_text_start():
+            if isinstance(data, AssistantReasoningDeltaData):
+                for chunk in emit_reasoning_start():
+                    yield chunk
+                outcome.reasoning += data.delta_content
+                saw_reasoning_delta = True
+                yield _sse(
+                    "response.reasoning_summary_text.delta",
+                    item_id=outcome.reasoning_id,
+                    output_index=reasoning_output_index,
+                    summary_index=0,
+                    delta=data.delta_content,
+                )
+            elif isinstance(data, AssistantReasoningData):
+                if not saw_reasoning_delta and data.content:
+                    for chunk in emit_reasoning_start():
+                        yield chunk
+                    outcome.reasoning = data.content
+                    yield _sse(
+                        "response.reasoning_summary_text.delta",
+                        item_id=outcome.reasoning_id,
+                        output_index=reasoning_output_index,
+                        summary_index=0,
+                        delta=data.content,
+                    )
+            elif isinstance(data, AssistantIntentData):
+                if not saw_reasoning_delta and not outcome.reasoning and data.intent:
+                    for chunk in emit_reasoning_start():
+                        yield chunk
+                    outcome.reasoning = data.intent
+                    yield _sse(
+                        "response.reasoning_summary_text.delta",
+                        item_id=outcome.reasoning_id,
+                        output_index=reasoning_output_index,
+                        summary_index=0,
+                        delta=data.intent,
+                    )
+            elif isinstance(data, AssistantMessageDeltaData):
+                for chunk in emit_text_start():
                     yield chunk
                 outcome.text += data.delta_content
                 saw_delta = True
                 yield _sse(
                     "response.output_text.delta",
-                    item_id=message_id,
-                    output_index=output_index,
+                    item_id=outcome.message_id,
+                    output_index=message_output_index,
                     content_index=0,
                     delta=data.delta_content,
                 )
             elif isinstance(data, AssistantMessageData):
                 if not saw_delta and data.content:
-                    for chunk in await emit_text_start():
+                    for chunk in emit_text_start():
                         yield chunk
                     outcome.text = data.content
                     yield _sse(
                         "response.output_text.delta",
-                        item_id=message_id,
-                        output_index=output_index,
+                        item_id=outcome.message_id,
+                        output_index=message_output_index,
                         content_index=0,
                         delta=data.content,
                     )
@@ -717,30 +907,15 @@ async def _stream_turn(
                 if error is not None:
                     raise error
 
-        if message_id is not None:
-            completed_message = _message_item(outcome.text, item_id=message_id)
-            yield _sse(
-                "response.output_text.done",
-                item_id=message_id,
-                output_index=output_index,
-                content_index=0,
-                text=outcome.text,
-            )
-            yield _sse(
-                "response.content_part.done",
-                item_id=message_id,
-                output_index=output_index,
-                content_index=0,
-                part=completed_message["content"][0],
-            )
-            yield _sse(
-                "response.output_item.done",
-                output_index=output_index,
-                item=completed_message,
-            )
-            output_index += 1
+        for chunk in emit_reasoning_done():
+            yield chunk
+        for chunk in emit_text_done():
+            yield chunk
+
         for call in outcome.calls:
-            completed_item = _tool_item(session.session_id, call)
+            call_output_index = output_index
+            output_index += 1
+            completed_item = _tool_item(session.session_id, call, completed=True)
             started_item = dict(completed_item)
             started_item["status"] = "in_progress"
             field = "input" if call.tool_type == "custom" else "arguments"
@@ -756,11 +931,11 @@ async def _stream_turn(
                 if call.tool_type == "custom"
                 else "response.function_call_arguments.done"
             )
-            yield _sse("response.output_item.added", output_index=output_index, item=started_item)
-            yield _sse(delta_event, item_id=completed_item["id"], output_index=output_index, delta=value)
-            yield _sse(done_event, item_id=completed_item["id"], output_index=output_index, **{field: value})
-            yield _sse("response.output_item.done", output_index=output_index, item=completed_item)
-            output_index += 1
+            yield _sse("response.output_item.added", output_index=call_output_index, item=started_item)
+            yield _sse(delta_event, item_id=completed_item["id"], output_index=call_output_index, delta=value)
+            yield _sse(done_event, item_id=completed_item["id"], output_index=call_output_index, **{field: value})
+            yield _sse("response.output_item.done", output_index=call_output_index, item=completed_item)
+
         preserve_session = bool(outcome.calls)
         yield _sse(
             "response.completed",
