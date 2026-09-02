@@ -57,6 +57,7 @@ import auto_update
 import background_proxy
 import codex_agent_compat
 import codex_native_ingest
+import copilot_sdk_upstream
 import dashboard as dashboard_module
 import excel_session_capture
 import excel_upstream
@@ -914,6 +915,7 @@ async def _app_startup_restore_client_proxy_configs():
 @app.on_event("shutdown")
 async def _app_shutdown_revert_client_proxy_configs():
     await auto_update_runtime_controller.stop_periodic_checks()
+    await copilot_sdk_upstream.shutdown()
     revert_client_proxy_configs_on_shutdown()
 
 
@@ -5988,6 +5990,13 @@ async def responses(request: Request):
     )
     if excel_upstream.is_excel_model(body.get("model")):
         return await _handle_excel_responses(request, body)
+    if copilot_sdk_upstream.enabled():
+        sdk_body = dict(body)
+        sdk_body["model"] = (
+            model_routing_config_service.resolve_target_model(body.get("model"))
+            or body.get("model")
+        )
+        return await copilot_sdk_upstream.handle_responses(request, sdk_body)
 
     effective_subagent = _responses_effective_subagent(request, body)
 
@@ -6095,6 +6104,10 @@ async def responses_compact(request: Request):
             summary_request,
             source_body=body,
         )
+    if copilot_sdk_upstream.enabled():
+        sdk_summary_request = dict(summary_request)
+        sdk_summary_request["model"] = resolved_target or summary_request.get("model")
+        return await copilot_sdk_upstream.handle_responses(request, sdk_summary_request)
 
     try:
         api_key = auth.get_api_key()
@@ -6196,6 +6209,8 @@ async def chat_completions(request: Request):
 @app.get("/models")
 @app.get("/v1/models")
 async def models():
+    if copilot_sdk_upstream.enabled():
+        return await copilot_sdk_upstream.models_response()
     return await _proxy_models_request()
 
 
@@ -6289,6 +6304,7 @@ if __name__ == "__main__":
     # browser dashboard instead of blocking on a terminal prompt.
     print("Starting GHCP proxy on http://127.0.0.1:8000 (loopback only)", flush=True)
     print("  Responses API : POST /v1/responses", flush=True)
+    print(f"  Codex upstream: {copilot_sdk_upstream.responses_upstream()}", flush=True)
     print("  Compaction    : POST /v1/responses/compact", flush=True)
     print("  Chat API      : POST /v1/chat/completions", flush=True)
     print("  Dashboard     : GET  /ui", flush=True)
