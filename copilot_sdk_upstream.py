@@ -47,6 +47,7 @@ try:
         SessionCompactionStartData,
         SessionErrorData,
         SessionIdleData,
+        SessionShutdownData,
         SubagentCompletedData,
         SubagentFailedData,
         SubagentSelectedData,
@@ -60,7 +61,7 @@ except ImportError as exc:  # pragma: no cover - exercised only on broken instal
     AssistantReasoningData = AssistantReasoningDeltaData = None  # type: ignore[assignment,misc]
     AssistantUsageData = ExternalToolRequestedData = None  # type: ignore[assignment,misc]
     SessionCompactionCompleteData = SessionCompactionStartData = None  # type: ignore[assignment,misc]
-    SessionErrorData = SessionIdleData = None  # type: ignore[assignment,misc]
+    SessionErrorData = SessionIdleData = SessionShutdownData = None  # type: ignore[assignment,misc]
     SubagentCompletedData = SubagentFailedData = None  # type: ignore[assignment,misc]
     SubagentSelectedData = SubagentStartedData = None  # type: ignore[assignment,misc]
 else:
@@ -72,7 +73,8 @@ SDK_UPSTREAM = "sdk"
 REST_UPSTREAM = "rest"
 _CALL_ID_PREFIX = "ghcpsdk_"
 _VALID_TOOL_NAME = re.compile(r"^[A-Za-z0-9_-]+$")
-_TURN_TIMEOUT_SECONDS = 300.0
+_TURN_TIMEOUT_SECONDS = float(os.environ.get("GHCP_UPSTREAM_TIMEOUT_SECONDS", "1800") or 1800)
+_KEEPALIVE_INTERVAL_SECONDS = 15.0
 _PARALLEL_TOOL_SETTLE_SECONDS = 0.05
 _SDK_STATE_DIR = os.path.join(TOKEN_DIR, "copilot-sdk")
 _SESSION_LEDGER_FILE = os.path.join(_SDK_STATE_DIR, "proxy-sessions.json")
@@ -538,6 +540,64 @@ def _usage_from_event(data: Any) -> dict[str, int]:
     }
 
 
+def _extract_shutdown_usage(data: Any) -> dict[str, int]:
+    """Extract cumulative token counts from SessionShutdownData or equivalent dict."""
+    if hasattr(data, "token_details") and data.token_details:
+        td = data.token_details
+        inp = getattr(td.get("input"), "token_count", 0) or 0
+        out = getattr(td.get("output"), "token_count", 0) or 0
+        cread = getattr(td.get("cache_read"), "token_count", 0) or 0
+        cwrite = getattr(td.get("cache_write"), "token_count", 0) or 0
+    elif isinstance(data, dict) and data.get("tokenDetails"):
+        td = data["tokenDetails"]
+        inp = td.get("input", {}).get("tokenCount", 0) or 0
+        out = td.get("output", {}).get("tokenCount", 0) or 0
+        cread = td.get("cache_read", {}).get("tokenCount", 0) or 0
+        cwrite = td.get("cache_write", {}).get("tokenCount", 0) or 0
+    else:
+        inp = out = cread = cwrite = 0
+
+    reas = 0
+    mm = getattr(data, "model_metrics", None) or (data.get("modelMetrics") if isinstance(data, dict) else None)
+    if isinstance(mm, dict):
+        for m_val in mm.values():
+            u = getattr(m_val, "usage", None) or (m_val.get("usage") if isinstance(m_val, dict) else None)
+            if u is not None:
+                r = getattr(u, "reasoning_tokens", None) if hasattr(u, "reasoning_tokens") else (u.get("reasoningTokens") if isinstance(u, dict) else 0)
+                reas += int(r or 0)
+
+    return {
+        "input_tokens": int(inp),
+        "output_tokens": int(out),
+        "cached_input_tokens": int(cread),
+        "cache_creation_input_tokens": int(cwrite),
+        "reasoning_output_tokens": int(reas),
+        "total_tokens": int(inp) + int(out),
+    }
+
+
+def _usage_delta(current: dict[str, int], previous: dict[str, int] | None) -> dict[str, int]:
+    """Compute per-turn token usage delta from cumulative session totals."""
+    if previous is None:
+        return dict(current)
+    inp = max(0, current["input_tokens"] - previous.get("input_tokens", 0))
+    out = max(0, current["output_tokens"] - previous.get("output_tokens", 0))
+    cread = max(0, current["cached_input_tokens"] - previous.get("cached_input_tokens", 0))
+    cwrite = max(0, current["cache_creation_input_tokens"] - previous.get("cache_creation_input_tokens", 0))
+    reas = max(0, current["reasoning_output_tokens"] - previous.get("reasoning_output_tokens", 0))
+    return {
+        "input_tokens": inp,
+        "output_tokens": out,
+        "cached_input_tokens": cread,
+        "cache_creation_input_tokens": cwrite,
+        "reasoning_output_tokens": reas,
+        "total_tokens": inp + out,
+    }
+
+
+_session_last_shutdown_usage: dict[str, dict[str, int]] = {}
+
+
 def _tool_call(data: Any, registration: ToolRegistration) -> ToolCall:
     safe_name = str(getattr(data, "tool_name", "tool"))
     metadata = registration.names.get(safe_name, ToolMetadata(safe_name, "function"))
@@ -581,14 +641,18 @@ async def _wait_for_outcome(
             error = dispatch_task.exception()
             if error is not None:
                 raise error
+        start_wait_time = time.time()
         while True:
-            timeout = _PARALLEL_TOOL_SETTLE_SECONDS if outcome.calls else _TURN_TIMEOUT_SECONDS
+            timeout = _PARALLEL_TOOL_SETTLE_SECONDS if outcome.calls else min(15.0, _TURN_TIMEOUT_SECONDS)
             try:
                 event = await asyncio.wait_for(queue.get(), timeout=timeout)
+                start_wait_time = time.time()
             except TimeoutError:
                 if outcome.calls:
                     return outcome
-                raise TimeoutError("Timed out waiting for the Copilot SDK turn")
+                if (time.time() - start_wait_time) >= _TURN_TIMEOUT_SECONDS:
+                    raise TimeoutError(f"Timed out waiting for the Copilot SDK turn after {_TURN_TIMEOUT_SECONDS}s")
+                continue
             data = getattr(event, "data", None)
             if isinstance(data, AssistantMessageDeltaData):
                 if getattr(data, "parent_tool_call_id", None):
@@ -613,6 +677,14 @@ async def _wait_for_outcome(
                 else:
                     if not saw_delta:
                         outcome.text = data.content or outcome.text
+            elif (
+                (SessionShutdownData is not None and isinstance(data, SessionShutdownData))
+                or _event_name(event) == "session.shutdown"
+            ):
+                current_shutdown = _extract_shutdown_usage(data)
+                prev_shutdown = _session_last_shutdown_usage.get(session.session_id)
+                outcome.usage = _usage_delta(current_shutdown, prev_shutdown)
+                _session_last_shutdown_usage[session.session_id] = current_shutdown
             elif isinstance(data, AssistantUsageData):
                 outcome.usage = _usage_from_event(data)
             elif isinstance(data, ExternalToolRequestedData):
@@ -773,6 +845,11 @@ async def _stream_turn(
     session: Any,
     dispatch: Callable[[], Awaitable[None]],
     registration: ToolRegistration,
+    *,
+    plan: Any = None,
+    is_compact: bool = False,
+    finish_usage_callback: Any = None,
+    mark_first_output_callback: Any = None,
 ) -> AsyncIterator[bytes]:
     response_id = _new_id("resp")
     base = {
@@ -789,7 +866,7 @@ async def _stream_turn(
     dispatch_task = asyncio.create_task(dispatch())
     outcome = TurnOutcome()
     output_index = 0
-    preserve_session = False
+    final_payload: dict | None = None
 
     reasoning_started = False
     reasoning_closed = False
@@ -801,10 +878,23 @@ async def _stream_turn(
     message_output_index = 0
     saw_delta = False
 
+    first_output_marked = False
+
+    def mark_first() -> None:
+        nonlocal first_output_marked
+        if not first_output_marked:
+            first_output_marked = True
+            if mark_first_output_callback is not None:
+                try:
+                    mark_first_output_callback()
+                except Exception:
+                    pass
+
     def emit_reasoning_start() -> list[bytes]:
         nonlocal reasoning_started, reasoning_output_index, output_index
         if reasoning_started:
             return []
+        mark_first()
         reasoning_started = True
         reasoning_output_index = output_index
         output_index += 1
@@ -854,6 +944,7 @@ async def _stream_turn(
         nonlocal message_started, message_output_index, output_index
         if message_started:
             return []
+        mark_first()
         chunks = list(emit_reasoning_done())
         message_started = True
         message_output_index = output_index
@@ -908,17 +999,22 @@ async def _stream_turn(
             error = dispatch_task.exception()
             if error is not None:
                 raise error
+        start_wait_time = time.time()
         while True:
             if await request.is_disconnected():
                 await session.abort()
                 return
-            timeout = _PARALLEL_TOOL_SETTLE_SECONDS if outcome.calls else _TURN_TIMEOUT_SECONDS
+            timeout = _PARALLEL_TOOL_SETTLE_SECONDS if outcome.calls else _KEEPALIVE_INTERVAL_SECONDS
             try:
                 event = await asyncio.wait_for(queue.get(), timeout=timeout)
+                start_wait_time = time.time()
             except TimeoutError:
                 if outcome.calls:
                     break
-                raise TimeoutError("Timed out waiting for the Copilot SDK turn")
+                if (time.time() - start_wait_time) >= _TURN_TIMEOUT_SECONDS:
+                    raise TimeoutError(f"Timed out waiting for the Copilot SDK turn after {_TURN_TIMEOUT_SECONDS}s")
+                yield b": keep-alive\n\n"
+                continue
             data = getattr(event, "data", None)
             if isinstance(data, AssistantReasoningDeltaData):
                 for chunk in emit_reasoning_start():
@@ -956,30 +1052,111 @@ async def _stream_turn(
                         summary_index=0,
                         delta=data.intent,
                     )
-            elif isinstance(data, AssistantMessageDeltaData):
-                for chunk in emit_text_start():
+            elif (SubagentStartedData is not None and isinstance(data, SubagentStartedData)) or _event_name(event) == "subagent.started":
+                agent_name = getattr(data, "agent_display_name", None) or getattr(data, "agent_name", "subagent")
+                notice = f"[Subagent '{agent_name}' started]\n"
+                for chunk in emit_reasoning_start():
                     yield chunk
-                outcome.text += data.delta_content
-                saw_delta = True
+                outcome.reasoning += notice
+                saw_reasoning_delta = True
                 yield _sse(
-                    "response.output_text.delta",
-                    item_id=outcome.message_id,
-                    output_index=message_output_index,
-                    content_index=0,
-                    delta=data.delta_content,
+                    "response.reasoning_summary_text.delta",
+                    item_id=outcome.reasoning_id,
+                    output_index=reasoning_output_index,
+                    summary_index=0,
+                    delta=notice,
                 )
-            elif isinstance(data, AssistantMessageData):
-                if not saw_delta and data.content:
+            elif (SubagentCompletedData is not None and isinstance(data, SubagentCompletedData)) or _event_name(event) == "subagent.completed":
+                agent_name = getattr(data, "agent_display_name", None) or getattr(data, "agent_name", "subagent")
+                notice = f"[Subagent '{agent_name}' completed]\n"
+                for chunk in emit_reasoning_start():
+                    yield chunk
+                outcome.reasoning += notice
+                saw_reasoning_delta = True
+                yield _sse(
+                    "response.reasoning_summary_text.delta",
+                    item_id=outcome.reasoning_id,
+                    output_index=reasoning_output_index,
+                    summary_index=0,
+                    delta=notice,
+                )
+            elif (SubagentFailedData is not None and isinstance(data, SubagentFailedData)) or _event_name(event) == "subagent.failed":
+                agent_name = getattr(data, "agent_display_name", None) or getattr(data, "agent_name", "subagent")
+                err_msg = getattr(data, "error", "error")
+                notice = f"[Subagent '{agent_name}' failed: {err_msg}]\n"
+                for chunk in emit_reasoning_start():
+                    yield chunk
+                outcome.reasoning += notice
+                saw_reasoning_delta = True
+                yield _sse(
+                    "response.reasoning_summary_text.delta",
+                    item_id=outcome.reasoning_id,
+                    output_index=reasoning_output_index,
+                    summary_index=0,
+                    delta=notice,
+                )
+            elif (SessionCompactionCompleteData is not None and isinstance(data, SessionCompactionCompleteData)) or _event_name(event) == "session.compaction_complete":
+                summary = getattr(data, "summary_content", None)
+                if summary and not outcome.text:
+                    outcome.text = summary
+            elif isinstance(data, AssistantMessageDeltaData):
+                if getattr(data, "parent_tool_call_id", None):
+                    for chunk in emit_reasoning_start():
+                        yield chunk
+                    outcome.reasoning += data.delta_content
+                    saw_reasoning_delta = True
+                    yield _sse(
+                        "response.reasoning_summary_text.delta",
+                        item_id=outcome.reasoning_id,
+                        output_index=reasoning_output_index,
+                        summary_index=0,
+                        delta=data.delta_content,
+                    )
+                else:
                     for chunk in emit_text_start():
                         yield chunk
-                    outcome.text = data.content
+                    outcome.text += data.delta_content
+                    saw_delta = True
                     yield _sse(
                         "response.output_text.delta",
                         item_id=outcome.message_id,
                         output_index=message_output_index,
                         content_index=0,
-                        delta=data.content,
+                        delta=data.delta_content,
                     )
+            elif isinstance(data, AssistantMessageData):
+                if getattr(data, "parent_tool_call_id", None):
+                    if not saw_reasoning_delta and data.content:
+                        for chunk in emit_reasoning_start():
+                            yield chunk
+                        outcome.reasoning += data.content
+                        yield _sse(
+                            "response.reasoning_summary_text.delta",
+                            item_id=outcome.reasoning_id,
+                            output_index=reasoning_output_index,
+                            summary_index=0,
+                            delta=data.content,
+                        )
+                else:
+                    if not saw_delta and data.content:
+                        for chunk in emit_text_start():
+                            yield chunk
+                        outcome.text = data.content
+                        yield _sse(
+                            "response.output_text.delta",
+                            item_id=outcome.message_id,
+                            output_index=message_output_index,
+                            content_index=0,
+                            delta=data.content,
+                        )
+            elif (
+                (SessionShutdownData is not None and isinstance(data, SessionShutdownData))
+                or _event_name(event) == "session.shutdown"
+            ):
+                current_shutdown = _extract_shutdown_usage(data)
+                prev_shutdown = _session_last_shutdown_usage.get(session.session_id)
+                outcome.usage = _usage_delta(current_shutdown, prev_shutdown)
+                _session_last_shutdown_usage[session.session_id] = current_shutdown
             elif isinstance(data, AssistantUsageData):
                 outcome.usage = _usage_from_event(data)
             elif isinstance(data, ExternalToolRequestedData):
@@ -1022,10 +1199,13 @@ async def _stream_turn(
             yield _sse(done_event, item_id=completed_item["id"], output_index=call_output_index, **{field: value})
             yield _sse("response.output_item.done", output_index=call_output_index, item=completed_item)
 
-        preserve_session = bool(outcome.calls)
+        if is_compact:
+            final_payload = to_compaction_payload(body, session.session_id, outcome, response_id)
+        else:
+            final_payload = _response_payload(body, session.session_id, outcome, response_id)
         yield _sse(
             "response.completed",
-            response=_response_payload(body, session.session_id, outcome, response_id),
+            response=final_payload,
         )
     except asyncio.CancelledError:
         await session.abort()
@@ -1044,40 +1224,102 @@ async def _stream_turn(
         if not dispatch_task.done():
             dispatch_task.cancel()
         await session.disconnect()
-        if not preserve_session:
-            await _delete_owned_session(session.session_id)
+        _remember_session(session.session_id)
+        if finish_usage_callback is not None and plan is not None:
+            status_code = 200 if final_payload is not None else 500
+            try:
+                finish_usage_callback(
+                    plan,
+                    status_code,
+                    response_payload=final_payload,
+                    response_text=outcome.text,
+                    reasoning_text=outcome.reasoning,
+                    usage=outcome.usage,
+                )
+            except Exception:
+                pass
 
 
-async def handle_responses(request: Request, body: dict) -> Response:
+async def handle_responses(
+    request: Request,
+    body: dict,
+    *,
+    plan: Any = None,
+    is_compact: bool = False,
+    finish_usage_callback: Any = None,
+    mark_first_output_callback: Any = None,
+) -> Response:
     if body.get("input") is None:
         return format_translation.openai_error_response(400, "input is required")
     registration = build_tool_registration(body)
     try:
         session, dispatch = await _open_session(body, registration)
     except Exception as exc:
+        if finish_usage_callback is not None and plan is not None:
+            try:
+                finish_usage_callback(plan, 502, response_text=str(exc))
+            except Exception:
+                pass
         return format_translation.openai_error_response(502, f"Copilot SDK: {exc}")
+
+    if plan is not None and getattr(plan, "usage_event", None) is not None:
+        if not plan.usage_event.get("session_id"):
+            plan.usage_event["session_id"] = session.session_id
 
     if bool(body.get("stream")):
         return StreamingResponse(
-            _stream_turn(request, body, session, dispatch, registration),
+            _stream_turn(
+                request,
+                body,
+                session,
+                dispatch,
+                registration,
+                plan=plan,
+                is_compact=is_compact,
+                finish_usage_callback=finish_usage_callback,
+                mark_first_output_callback=mark_first_output_callback,
+            ),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
     response_id = _new_id("resp")
-    preserve_session = False
     try:
         outcome = await _wait_for_outcome(session, dispatch, registration)
-        preserve_session = bool(outcome.calls)
-        return JSONResponse(_response_payload(body, session.session_id, outcome, response_id))
+        if is_compact:
+            payload = to_compaction_payload(body, session.session_id, outcome, response_id)
+        else:
+            payload = _response_payload(body, session.session_id, outcome, response_id)
+        if finish_usage_callback is not None and plan is not None:
+            try:
+                finish_usage_callback(
+                    plan,
+                    200,
+                    response_payload=payload,
+                    response_text=outcome.text,
+                    reasoning_text=outcome.reasoning,
+                    usage=outcome.usage,
+                )
+            except Exception:
+                pass
+        return JSONResponse(payload)
     except ValueError as exc:
+        if finish_usage_callback is not None and plan is not None:
+            try:
+                finish_usage_callback(plan, 400, response_text=str(exc))
+            except Exception:
+                pass
         return format_translation.openai_error_response(400, str(exc))
     except Exception as exc:
+        if finish_usage_callback is not None and plan is not None:
+            try:
+                finish_usage_callback(plan, 502, response_text=str(exc))
+            except Exception:
+                pass
         return format_translation.openai_error_response(502, f"Copilot SDK: {exc}")
     finally:
         await session.disconnect()
-        if not preserve_session:
-            await _delete_owned_session(session.session_id)
+        _remember_session(session.session_id)
 
 
 async def models_response() -> Response:
@@ -1111,6 +1353,272 @@ async def shutdown() -> None:
         await client.stop()
 
 
+# ---------------------------------------------------------------------------
+# Session Ingestion & Discovery
+# ---------------------------------------------------------------------------
+
+_INGEST_CURSOR_FILE = os.path.join(_SDK_STATE_DIR, "session-cursor.json")
+_SESSION_STATE_DIR = os.path.join(_SDK_STATE_DIR, "session-state")
+
+
+def _read_cursor() -> dict:
+    if os.path.isfile(_INGEST_CURSOR_FILE):
+        try:
+            with open(_INGEST_CURSOR_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    return data
+        except Exception:
+            pass
+    return {}
+
+
+def _write_cursor(cursor: dict) -> None:
+    os.makedirs(_SDK_STATE_DIR, exist_ok=True)
+    tmp = _INGEST_CURSOR_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(cursor, f, indent=2)
+    os.replace(tmp, _INGEST_CURSOR_FILE)
+
+
+def _parse_session_state_file(session_id: str, events_path: str) -> list[dict]:
+    """Parse session-state events.jsonl into individual per-turn usage events."""
+    events: list[dict] = []
+    try:
+        with open(events_path, "r", encoding="utf-8", errors="replace") as f:
+            lines = [l for l in f if l.strip()]
+    except OSError:
+        return []
+
+    model = "copilot-sdk"
+    cwd = None
+    current_turn = None
+    prev_shutdown_usage = None
+    prev_api_dur = 0
+    turn_index = 0
+
+    for line in lines:
+        try:
+            ev = json.loads(line)
+        except Exception:
+            continue
+        t = ev.get("type")
+        d = ev.get("data") if isinstance(ev.get("data"), dict) else {}
+        ts = ev.get("timestamp")
+
+        if t == "session.start":
+            model = d.get("selectedModel") or model
+            cwd = d.get("context", {}).get("cwd") or cwd
+        elif t == "assistant.turn_start":
+            current_turn = {
+                "turn_index": turn_index,
+                "turn_id": d.get("turnId"),
+                "interaction_id": d.get("interactionId"),
+                "started_at": ts,
+                "model": model,
+                "last_seen_ts": ts,
+            }
+            turn_index += 1
+        elif t == "assistant.message":
+            if d.get("model"):
+                model = d.get("model")
+            if current_turn is None:
+                current_turn = {
+                    "turn_index": turn_index,
+                    "turn_id": d.get("turnId") or "0",
+                    "interaction_id": d.get("interactionId"),
+                    "started_at": ts,
+                    "model": model,
+                    "last_seen_ts": ts,
+                }
+                turn_index += 1
+            else:
+                current_turn["model"] = model
+                if ts:
+                    current_turn["last_seen_ts"] = ts
+            if d.get("outputTokens") and "fallback_output_tokens" not in current_turn:
+                current_turn["fallback_output_tokens"] = int(d["outputTokens"])
+        elif t in {"tool.execution_start", "external_tool.requested"}:
+            if current_turn is not None and ts:
+                current_turn["last_seen_ts"] = ts
+        elif t == "session.shutdown":
+            if current_turn is None:
+                current_turn = {
+                    "turn_index": turn_index,
+                    "turn_id": "0",
+                    "interaction_id": None,
+                    "started_at": ts,
+                    "model": model,
+                    "last_seen_ts": ts,
+                }
+                turn_index += 1
+            if current_turn is not None:
+                finish_ts = ts or current_turn["last_seen_ts"]
+                api_dur = int(d.get("totalApiDurationMs", 0) or 0)
+                dur = max(0, api_dur - prev_api_dur)
+                prev_api_dur = api_dur
+                shutdown_usage = _extract_shutdown_usage(d)
+                usage_delta = _usage_delta(shutdown_usage, prev_shutdown_usage)
+                prev_shutdown_usage = shutdown_usage
+
+                interaction_id = current_turn.get("interaction_id") or f"turn_{current_turn['turn_index']}"
+                req_id = f"copilot-sdk:{session_id}:{interaction_id}"
+                turn_model = current_turn.get("model") or model
+                turn_event = {
+                    "request_id": req_id,
+                    "started_at": current_turn["started_at"] or finish_ts,
+                    "finished_at": finish_ts,
+                    "path": "/v1/responses",
+                    "method": "POST",
+                    "requested_model": turn_model,
+                    "resolved_model": turn_model,
+                    "response_model": turn_model,
+                    "initiator": "user",
+                    "session_id": session_id,
+                    "session_id_origin": "copilot_sdk",
+                    "project_path": cwd,
+                    "client_request_id": None,
+                    "subagent": None,
+                    "server_request_id": session_id,
+                    "status_code": 200,
+                    "success": True,
+                    "duration_ms": dur,
+                    "time_to_first_token_ms": None,
+                    "usage": usage_delta,
+                    "native_source": "copilot_sdk",
+                    "native_source_event_key": req_id,
+                }
+                turn_event["cost_usd"] = util._usage_event_estimated_cost(turn_event, model_name=turn_model, usage=usage_delta)
+                events.append(turn_event)
+                current_turn = None
+
+    if current_turn is not None and current_turn.get("started_at"):
+        finish_ts = current_turn["last_seen_ts"] or current_turn["started_at"]
+        dur = 0
+        out_tokens = current_turn.get("fallback_output_tokens", 0)
+        usage = {
+            "input_tokens": 0,
+            "output_tokens": out_tokens,
+            "total_tokens": out_tokens,
+            "cached_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "reasoning_output_tokens": 0,
+        }
+        interaction_id = current_turn.get("interaction_id") or f"turn_{current_turn['turn_index']}"
+        req_id = f"copilot-sdk:{session_id}:{interaction_id}"
+        turn_model = current_turn.get("model") or model
+        turn_event = {
+            "request_id": req_id,
+            "started_at": current_turn["started_at"],
+            "finished_at": finish_ts,
+            "path": "/v1/responses",
+            "method": "POST",
+            "requested_model": turn_model,
+            "resolved_model": turn_model,
+            "response_model": turn_model,
+            "initiator": "user",
+            "session_id": session_id,
+            "session_id_origin": "copilot_sdk",
+            "project_path": cwd,
+            "client_request_id": None,
+            "subagent": None,
+            "server_request_id": session_id,
+            "status_code": 200,
+            "success": True,
+            "duration_ms": dur,
+            "time_to_first_token_ms": None,
+            "usage": usage,
+            "native_source": "copilot_sdk",
+            "native_source_event_key": req_id,
+        }
+        turn_event["cost_usd"] = util._usage_event_estimated_cost(turn_event, model_name=turn_model, usage=usage)
+        events.append(turn_event)
+
+    return events
+
+
+def scan_session_state(record_callback: Callable[[dict], None]) -> int:
+    """Scan session-state directory and emit usage events for completed SDK session turns."""
+    if not os.path.isdir(_SESSION_STATE_DIR):
+        return 0
+    cursor = _read_cursor()
+    ingested_count = 0
+    dirty = False
+
+    try:
+        entries = sorted(os.listdir(_SESSION_STATE_DIR))
+    except OSError:
+        return 0
+
+    for session_id in entries:
+        session_dir = os.path.join(_SESSION_STATE_DIR, session_id)
+        if not os.path.isdir(session_dir):
+            continue
+        events_path = os.path.join(session_dir, "events.jsonl")
+        if not os.path.isfile(events_path):
+            continue
+
+        try:
+            mtime = os.path.getmtime(events_path)
+            size = os.path.getsize(events_path)
+        except OSError:
+            continue
+
+        prior = cursor.get(session_id)
+        prior_turns = 0
+        if isinstance(prior, dict):
+            if prior.get("size") == size and prior.get("mtime") == mtime:
+                continue
+            prior_turns = int(prior.get("ingested_turns", 0) or 0)
+
+        turn_events = _parse_session_state_file(session_id, events_path)
+        if not turn_events:
+            continue
+
+        new_turns = turn_events[prior_turns:]
+        for event in new_turns:
+            try:
+                record_callback(event)
+                ingested_count += 1
+            except Exception as exc:
+                print(f"copilot_sdk_upstream: failed to record turn {event.get('request_id')}: {exc}", flush=True)
+
+        cursor[session_id] = {
+            "size": size,
+            "mtime": mtime,
+            "ingested_turns": len(turn_events),
+            "updated_at": time.time(),
+        }
+        dirty = True
+
+    if dirty:
+        try:
+            _write_cursor(cursor)
+        except OSError:
+            pass
+
+    return ingested_count
+
+
+def start_background_scanner(
+    record_callback: Callable[[dict], None],
+    *,
+    interval_seconds: float = 10.0,
+) -> threading.Thread:
+    """Start background thread scanning Copilot SDK session state."""
+    def _run():
+        while True:
+            try:
+                scan_session_state(record_callback)
+            except Exception as exc:
+                print(f"copilot_sdk_upstream: background scanner error: {exc}", flush=True)
+            time.sleep(interval_seconds)
+
+    thread = threading.Thread(target=_run, name="CopilotSdkSessionScanner", daemon=True)
+    thread.start()
+    return thread
+
+
 __all__ = [
     "REST_UPSTREAM",
     "SDK_UPSTREAM",
@@ -1121,5 +1629,8 @@ __all__ = [
     "models_response",
     "resolve_tool_continuation",
     "responses_upstream",
+    "scan_session_state",
     "shutdown",
+    "start_background_scanner",
+    "to_compaction_payload",
 ]

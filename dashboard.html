@@ -3969,6 +3969,7 @@
           if (normalized === 'claude') return 'Claude';
           if (normalized === 'codex') return 'Codex (proxied)';
           if (normalized === 'codex_native') return 'Codex (native)';
+          if (normalized === 'copilot_sdk') return 'Copilot SDK';
           if (!normalized) return 'Unknown';
           return normalized.charAt(0).toUpperCase() + normalized.slice(1);
         },
@@ -3977,6 +3978,7 @@
           if (normalized === 'claude') return 'tone-claude';
           if (normalized === 'codex') return 'tone-codex';
           if (normalized === 'codex_native') return 'tone-codex-native';
+          if (normalized === 'copilot_sdk') return 'tone-codex';
           return 'tone-other';
         },
         shareValue(row) {
@@ -6373,6 +6375,7 @@
           if (normalized === 'claude') return 'Claude';
           if (normalized === 'codex') return 'Codex (proxied)';
           if (normalized === 'codex_native') return 'Codex (native)';
+          if (normalized === 'copilot_sdk') return 'Copilot SDK';
           if (!normalized || normalized === 'unknown') return 'Unknown';
           return normalized.charAt(0).toUpperCase() + normalized.slice(1);
         },

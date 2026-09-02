@@ -263,6 +263,7 @@ class ExcelUpstreamTests(unittest.TestCase):
             },
             {
                 "type": "function_call_output",
+                "id": "fc_call_ghcp_excel_marker_1",
                 "call_id": "call_ghcp_excel_marker_1",
                 "output": "file.txt",
             },

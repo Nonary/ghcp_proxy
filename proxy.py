@@ -896,6 +896,16 @@ try:
 except Exception as _codex_ingest_exc:  # pragma: no cover - best effort
     print(f"codex_native_ingest: disabled ({_codex_ingest_exc})", flush=True)
 
+try:
+    _copilot_sdk_interval = float(os.environ.get("GHCP_COPILOT_SDK_INGEST_INTERVAL", "5") or 5)
+    if _copilot_sdk_interval > 0:
+        copilot_sdk_upstream.start_background_scanner(
+            usage_tracker.record_usage_event,
+            interval_seconds=_copilot_sdk_interval,
+        )
+except Exception as _sdk_ingest_exc:  # pragma: no cover - best effort
+    print(f"copilot_sdk_ingest: disabled ({_sdk_ingest_exc})", flush=True)
+
 
 @app.on_event("startup")
 async def _app_startup_restore_client_proxy_configs():
@@ -3778,6 +3788,11 @@ def _translate_bridge_success_payload(bridge_plan: BridgeExecutionPlan, payload:
             payload, fallback_model=bridge_plan.resolved_model,
         )
     if bridge_plan.caller_protocol == "responses" and bridge_plan.upstream_protocol == "responses":
+        if bridge_plan.is_compact:
+            return format_translation.responses_to_compaction_response(
+                payload,
+                fallback_model=bridge_plan.resolved_model,
+            )
         return format_translation.normalize_response_reasoning_for_client(payload)
     return payload
 
@@ -6164,6 +6179,75 @@ async def _handle_excel_responses(
     return await _post_excel_non_streaming_request(plan, client_body=body)
 
 
+async def _handle_copilot_sdk_responses(
+    request: Request,
+    body: dict,
+    *,
+    source_body: dict | None = None,
+    is_compact: bool = False,
+) -> Response:
+    effective_subagent = _responses_effective_subagent(request, body)
+    approval_agent = is_approval_agent_request(
+        subagent=effective_subagent,
+        inbound_protocol="responses",
+        body=body if isinstance(body, dict) else None,
+    )
+    requested_model = body.get("model")
+    mapped_model = None
+    if approval_agent:
+        mapped_model = model_routing_config_service.resolve_approval_target_model(requested_model)
+    if mapped_model is None:
+        mapped_model = model_routing_config_service.resolve_target_model(requested_model)
+    resolved_model = normalize_routing_model_name(mapped_model or requested_model)
+
+    sdk_body = dict(body)
+    sdk_body["model"] = resolved_model
+
+    raw_input = sdk_body.get("input")
+    has_compaction_input = format_translation.input_contains_compaction(raw_input)
+    if raw_input is not None:
+        sdk_body["input"] = format_translation.sanitize_input(
+            raw_input,
+            native_responses_passthrough=False,
+        )
+
+    upstream_path = "/v1/responses/compact" if is_compact else "/v1/responses"
+    upstream_url = f"copilot-sdk://responses{'/compact' if is_compact else ''}"
+    plan, error_response = _prepare_upstream_request(
+        request,
+        body=sdk_body,
+        requested_model=requested_model,
+        resolved_model=resolved_model,
+        upstream_path=upstream_path,
+        upstream_url=upstream_url,
+        header_builder=lambda _api_key, _request_id: dict(request.headers),
+        error_response=format_translation.openai_error_response,
+        api_key="copilot-sdk",
+        source_body=source_body if isinstance(source_body, dict) else body,
+        force_initiator="agent" if (has_compaction_input or is_compact) else None,
+        trace_metadata={
+            "sdk": True,
+            "strategy_name": "copilot_sdk_compact" if is_compact else "copilot_sdk_responses",
+            "caller_protocol": "responses",
+            "upstream_protocol": "sdk",
+            "subagent": effective_subagent,
+            "approval_agent": approval_agent,
+            "is_compact": is_compact,
+        },
+    )
+    if error_response is not None:
+        return error_response
+
+    return await copilot_sdk_upstream.handle_responses(
+        request,
+        sdk_body,
+        plan=plan,
+        is_compact=is_compact,
+        finish_usage_callback=_finish_usage_and_trace,
+        mark_first_output_callback=(lambda: usage_tracker.mark_first_output(plan.usage_event)) if plan else None,
+    )
+
+
 @app.post("/responses")
 @app.post("/v1/responses")
 async def responses(request: Request):
@@ -6183,12 +6267,7 @@ async def responses(request: Request):
     if excel_upstream.is_excel_model(body.get("model")):
         return await _handle_excel_responses(request, body)
     if copilot_sdk_upstream.enabled():
-        sdk_body = dict(body)
-        sdk_body["model"] = (
-            model_routing_config_service.resolve_target_model(body.get("model"))
-            or body.get("model")
-        )
-        return await copilot_sdk_upstream.handle_responses(request, sdk_body)
+        return await _handle_copilot_sdk_responses(request, body)
 
     effective_subagent = _responses_effective_subagent(request, body)
 
@@ -6297,9 +6376,12 @@ async def responses_compact(request: Request):
             source_body=body,
         )
     if copilot_sdk_upstream.enabled():
-        sdk_summary_request = dict(summary_request)
-        sdk_summary_request["model"] = resolved_target or summary_request.get("model")
-        return await copilot_sdk_upstream.handle_responses(request, sdk_summary_request)
+        return await _handle_copilot_sdk_responses(
+            request,
+            summary_request,
+            source_body=body,
+            is_compact=True,
+        )
 
     try:
         api_key = auth.get_api_key()
