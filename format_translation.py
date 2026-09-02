@@ -1425,6 +1425,17 @@ def chat_completion_to_response(payload: dict, fallback_model=None) -> dict:
     message = first_choice.get("message") if isinstance(first_choice, dict) else {}
 
     output = []
+    reasoning_text = extract_reasoning_from_chat_message(message if isinstance(message, dict) else {})
+    if reasoning_text:
+        formatted_reasoning = ensure_codex_reasoning_header(reasoning_text)
+        output.append(
+            {
+                "type": "reasoning",
+                "id": f"rs_{uuid4().hex}",
+                "summary": [{"type": "summary_text", "text": formatted_reasoning}],
+                "content": [{"type": "reasoning_text", "text": formatted_reasoning}],
+            }
+        )
     text = _extract_chat_message_text(message if isinstance(message, dict) else {})
     if text:
         output.append(
@@ -1751,6 +1762,103 @@ def extract_reasoning_from_chat_delta(delta) -> str:
                 if isinstance(text, str):
                     parts.append(text)
     return "".join(parts)
+
+
+_CODEX_THINKING_SUMMARY_HEADER = "**Thinking**\n\n"
+
+
+def ensure_codex_reasoning_header(text: str) -> str:
+    """Ensure reasoning summary text begins with a bold header for Codex/ChatGPT desktop."""
+    if not isinstance(text, str) or not text.strip():
+        return text
+    stripped = text.lstrip()
+    if stripped.startswith("**") or stripped.startswith("#"):
+        return text
+    return f"{_CODEX_THINKING_SUMMARY_HEADER}{text}"
+
+
+def extract_reasoning_from_chat_message(message: dict) -> str:
+    """Extract reasoning/thinking text from a non-streaming chat completion message."""
+    if not isinstance(message, dict):
+        return ""
+    parts: list[str] = []
+    for key in ("thinking", "reasoning_content", "reasoning_text", "reasoning"):
+        value = message.get(key)
+        if isinstance(value, str) and value:
+            parts.append(value)
+        elif isinstance(value, dict):
+            text = value.get("text")
+            if isinstance(text, str) and text:
+                parts.append(text)
+            summary = value.get("summary")
+            if isinstance(summary, list):
+                for item in summary:
+                    if isinstance(item, dict) and isinstance(item.get("text"), str):
+                        parts.append(item["text"])
+        elif isinstance(value, list):
+            for item in value:
+                if isinstance(item, str):
+                    parts.append(item)
+                elif isinstance(item, dict) and isinstance(item.get("text"), str):
+                    parts.append(item["text"])
+    return "".join(parts)
+
+
+def normalize_reasoning_item_for_client(item: dict, fallback_text: str = "") -> dict:
+    """Normalize a Responses reasoning item so the ChatGPT/Codex Electron app displays it.
+
+    Codex and the ChatGPT desktop app only render reasoning items from the
+    ``summary`` array (ignoring ``content``). Items with empty ``summary`` are
+    discarded. This helper guarantees:
+    1. ``summary`` is populated with summary_text.
+    2. ``content`` is populated with reasoning_text.
+    3. Text begins with a bold header if none was present.
+    """
+    if not isinstance(item, dict) or item.get("type") != "reasoning":
+        return item
+
+    summary_parts = []
+    raw_summary = item.get("summary")
+    if isinstance(raw_summary, list):
+        for p in raw_summary:
+            if isinstance(p, dict) and isinstance(p.get("text"), str):
+                summary_parts.append(p["text"])
+            elif isinstance(p, str):
+                summary_parts.append(p)
+    summary_text = "".join(summary_parts)
+
+    content_parts = []
+    raw_content = item.get("content")
+    if isinstance(raw_content, list):
+        for p in raw_content:
+            if isinstance(p, dict) and isinstance(p.get("text"), str):
+                content_parts.append(p["text"])
+            elif isinstance(p, str):
+                content_parts.append(p)
+    content_text = "".join(content_parts)
+
+    text = summary_text or content_text or fallback_text
+    if not text and item.get("encrypted_content"):
+        text = "*Thinking process completed.*"
+
+    if text:
+        formatted = ensure_codex_reasoning_header(text)
+        item["summary"] = [{"type": "summary_text", "text": formatted}]
+        item["content"] = [{"type": "reasoning_text", "text": formatted}]
+
+    return item
+
+
+def normalize_response_reasoning_for_client(payload: dict) -> dict:
+    """Normalize all reasoning items in a completed Responses payload."""
+    if not isinstance(payload, dict):
+        return payload
+    output = payload.get("output")
+    if isinstance(output, list):
+        for item in output:
+            if isinstance(item, dict) and item.get("type") == "reasoning":
+                normalize_reasoning_item_for_client(item)
+    return payload
 
 
 def extract_tool_call_deltas(delta) -> list[dict]:
@@ -2486,6 +2594,41 @@ def extract_response_output_text(payload: dict) -> str | None:
         return None
     return "\n\n".join(parts)
 
+
+def responses_to_compaction_response(payload: dict, fallback_model=None) -> dict:
+    """Wrap a Responses summary as a Responses compact payload.
+
+    If the payload already contains a native compaction item in ``output``, it is
+    passed through. Otherwise, the assistant text is extracted and encoded in the
+    proxy's local fake compaction format for downstream expansion.
+    """
+    if not isinstance(payload, dict):
+        return {}
+    output = payload.get("output")
+    if isinstance(output, list) and any(
+        isinstance(item, dict) and item.get("type") == "compaction" for item in output
+    ):
+        return payload
+    summary_text = (extract_response_output_text(payload) or "").strip()
+    if not summary_text:
+        summary_text = "(no summary available)"
+
+    return {
+        "id": (payload.get("id") if isinstance(payload, dict) else None) or f"resp_{uuid4().hex}",
+        "object": "response",
+        "created_at": payload.get("created_at") if isinstance(payload, dict) else int(time.time()),
+        "status": "completed",
+        "model": fallback_model or (payload.get("model") if isinstance(payload, dict) else None),
+        "output": [
+            {
+                "type": "compaction",
+                "encrypted_content": encode_fake_compaction(summary_text),
+            }
+        ],
+        "output_text": summary_text,
+        "usage": payload.get("usage") if isinstance(payload.get("usage"), dict) else {},
+    }
+
 # ─── Anthropic Messages response → Responses response translation ────────────
 
 def _anthropic_usage_to_responses_usage(usage) -> dict:
@@ -2590,9 +2733,11 @@ def _anthropic_content_blocks_to_responses_output(content) -> list[dict]:
             thinking_text = block.get("thinking")
             if not isinstance(thinking_text, str):
                 thinking_text = ""
+            formatted_thinking = ensure_codex_reasoning_header(thinking_text)
             reasoning_item: dict = {
                 "type": "reasoning",
-                "summary": [{"type": "summary_text", "text": thinking_text}],
+                "summary": [{"type": "summary_text", "text": formatted_thinking}] if formatted_thinking else [],
+                "content": [{"type": "reasoning_text", "text": formatted_thinking}] if formatted_thinking else [],
             }
             raw_signature = block.get("signature")
             if isinstance(raw_signature, str):
@@ -2607,9 +2752,11 @@ def _anthropic_content_blocks_to_responses_output(content) -> list[dict]:
         if block_type == "redacted_thinking":
             # Preserve the opaque payload via encrypted_content if present.
             redacted = block.get("data") or block.get("signature")
+            placeholder = ensure_codex_reasoning_header("*Thinking process completed.*")
             reasoning_item = {
                 "type": "reasoning",
-                "summary": [],
+                "summary": [{"type": "summary_text", "text": placeholder}],
+                "content": [{"type": "reasoning_text", "text": placeholder}],
             }
             if isinstance(redacted, str) and redacted:
                 reasoning_item["encrypted_content"] = redacted

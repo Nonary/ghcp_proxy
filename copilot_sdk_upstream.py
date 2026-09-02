@@ -28,6 +28,7 @@ import certifi
 import auth
 import excel_upstream
 import format_translation
+import util
 from constants import TOKEN_DIR
 
 try:
@@ -42,8 +43,14 @@ try:
         AssistantReasoningDeltaData,
         AssistantUsageData,
         ExternalToolRequestedData,
+        SessionCompactionCompleteData,
+        SessionCompactionStartData,
         SessionErrorData,
         SessionIdleData,
+        SubagentCompletedData,
+        SubagentFailedData,
+        SubagentSelectedData,
+        SubagentStartedData,
     )
 except ImportError as exc:  # pragma: no cover - exercised only on broken installs
     CopilotClient = None  # type: ignore[assignment,misc]
@@ -51,6 +58,11 @@ except ImportError as exc:  # pragma: no cover - exercised only on broken instal
     _SDK_IMPORT_ERROR: Exception | None = exc
     AssistantIntentData = AssistantMessageData = None  # type: ignore[assignment,misc]
     AssistantReasoningData = AssistantReasoningDeltaData = None  # type: ignore[assignment,misc]
+    AssistantUsageData = ExternalToolRequestedData = None  # type: ignore[assignment,misc]
+    SessionCompactionCompleteData = SessionCompactionStartData = None  # type: ignore[assignment,misc]
+    SessionErrorData = SessionIdleData = None  # type: ignore[assignment,misc]
+    SubagentCompletedData = SubagentFailedData = None  # type: ignore[assignment,misc]
+    SubagentSelectedData = SubagentStartedData = None  # type: ignore[assignment,misc]
 else:
     _SDK_IMPORT_ERROR = None
 
@@ -297,14 +309,28 @@ def input_to_prompt(value: Any) -> str:
     if not isinstance(value, list):
         return _text_from_content(value)
     rendered: list[str] = []
-    for item in value:
+    # Truncate to the latest compaction window so pre-compaction history is not replayed.
+    window_items = format_translation._latest_compaction_window(value)
+    for item in window_items:
         if isinstance(item, str):
             rendered.append(f"User: {item}")
             continue
         if not isinstance(item, dict):
             continue
+        if format_translation._is_subagent_notification_message(item):
+            continue
         item_type = item.get("type")
         if item_type == "reasoning":
+            continue
+        if item_type == "compaction":
+            encrypted_content = item.get("encrypted_content")
+            summary_text = None
+            if isinstance(encrypted_content, str):
+                summary_text = format_translation.decode_fake_compaction(encrypted_content)
+            if not summary_text:
+                summary_text = item.get("output_text") or item.get("summary") or item.get("text")
+            if summary_text:
+                rendered.append(f"User: {format_translation.FAKE_COMPACTION_SUMMARY_LABEL}\n{summary_text}")
             continue
         if item_type in {"function_call", "custom_tool_call"}:
             payload = item.get("arguments") if item_type == "function_call" else item.get("input")
@@ -421,6 +447,7 @@ def _session_options(body: dict, registration: ToolRegistration) -> dict[str, An
         "streaming": bool(body.get("stream")),
         "tools": registration.tools,
         "available_tools": ["custom:*"],
+        "include_sub_agent_streaming_events": True,
         "on_permission_request": PermissionHandler.approve_all,
         "infinite_sessions": {"enabled": False},
         "enable_managed_settings": False,
@@ -564,8 +591,12 @@ async def _wait_for_outcome(
                 raise TimeoutError("Timed out waiting for the Copilot SDK turn")
             data = getattr(event, "data", None)
             if isinstance(data, AssistantMessageDeltaData):
-                outcome.text += data.delta_content
-                saw_delta = True
+                if getattr(data, "parent_tool_call_id", None):
+                    outcome.reasoning += data.delta_content
+                    saw_reasoning_delta = True
+                else:
+                    outcome.text += data.delta_content
+                    saw_delta = True
             elif isinstance(data, AssistantReasoningDeltaData):
                 outcome.reasoning += data.delta_content
                 saw_reasoning_delta = True
@@ -576,12 +607,33 @@ async def _wait_for_outcome(
                 if not saw_reasoning_delta and not outcome.reasoning and data.intent:
                     outcome.reasoning = data.intent
             elif isinstance(data, AssistantMessageData):
-                if not saw_delta:
-                    outcome.text = data.content or outcome.text
+                if getattr(data, "parent_tool_call_id", None):
+                    if not saw_reasoning_delta and data.content:
+                        outcome.reasoning = data.content
+                else:
+                    if not saw_delta:
+                        outcome.text = data.content or outcome.text
             elif isinstance(data, AssistantUsageData):
                 outcome.usage = _usage_from_event(data)
             elif isinstance(data, ExternalToolRequestedData):
                 outcome.calls.append(_tool_call(data, registration))
+            elif (SubagentStartedData is not None and isinstance(data, SubagentStartedData)) or _event_name(event) == "subagent.started":
+                agent_name = getattr(data, "agent_display_name", None) or getattr(data, "agent_name", "subagent")
+                outcome.reasoning += f"[Subagent '{agent_name}' started]\n"
+                saw_reasoning_delta = True
+            elif (SubagentCompletedData is not None and isinstance(data, SubagentCompletedData)) or _event_name(event) == "subagent.completed":
+                agent_name = getattr(data, "agent_display_name", None) or getattr(data, "agent_name", "subagent")
+                outcome.reasoning += f"[Subagent '{agent_name}' completed]\n"
+                saw_reasoning_delta = True
+            elif (SubagentFailedData is not None and isinstance(data, SubagentFailedData)) or _event_name(event) == "subagent.failed":
+                agent_name = getattr(data, "agent_display_name", None) or getattr(data, "agent_name", "subagent")
+                err_msg = getattr(data, "error", "error")
+                outcome.reasoning += f"[Subagent '{agent_name}' failed: {err_msg}]\n"
+                saw_reasoning_delta = True
+            elif (SessionCompactionCompleteData is not None and isinstance(data, SessionCompactionCompleteData)) or _event_name(event) == "session.compaction_complete":
+                summary = getattr(data, "summary_content", None)
+                if summary and not outcome.text:
+                    outcome.text = summary
             elif isinstance(data, SessionErrorData):
                 raise RuntimeError(data.message)
             elif isinstance(data, SessionIdleData):
@@ -641,12 +693,13 @@ def _message_item(text: str, *, item_id: str | None = None, completed: bool = Tr
 
 
 def _reasoning_item(text: str, *, item_id: str | None = None, completed: bool = True) -> dict:
+    formatted_text = format_translation.ensure_codex_reasoning_header(text) if (completed and text) else text
     return {
         "type": "reasoning",
         "id": item_id or _new_id("rs"),
         "status": "completed" if completed else "in_progress",
-        "summary": ([{"type": "summary_text", "text": text}] if (completed and text) else []),
-        "content": [],
+        "summary": ([{"type": "summary_text", "text": formatted_text}] if (completed and formatted_text) else []),
+        "content": ([{"type": "reasoning_text", "text": formatted_text}] if (completed and formatted_text) else []),
         "encrypted_content": None,
     }
 
@@ -666,6 +719,39 @@ def _response_payload(body: dict, session_id: str, outcome: TurnOutcome, respons
         "model": body.get("model"),
         "output": output,
         "parallel_tool_calls": len(outcome.calls) > 1,
+        "usage": outcome.usage or {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+            "input_tokens_details": {"cached_tokens": 0},
+            "output_tokens_details": {"reasoning_tokens": 0},
+        },
+    }
+
+
+def to_compaction_payload(
+    body: dict,
+    session_id: str,
+    outcome: TurnOutcome,
+    response_id: str,
+    *,
+    fallback_model: str | None = None,
+) -> dict:
+    summary_text = outcome.text.strip() or "(no summary available)"
+    return {
+        "id": response_id,
+        "object": "response",
+        "created_at": int(time.time()),
+        "status": "completed",
+        "model": fallback_model or body.get("model"),
+        "output": [
+            {
+                "type": "compaction",
+                "encrypted_content": format_translation.encode_fake_compaction(summary_text),
+            }
+        ],
+        "output_text": summary_text,
+        "parallel_tool_calls": False,
         "usage": outcome.usage or {
             "input_tokens": 0,
             "output_tokens": 0,

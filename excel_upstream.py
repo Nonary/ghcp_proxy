@@ -1249,7 +1249,13 @@ def translate_input_items(
         if item_type == "reasoning":
             encrypted = item.get("encrypted_content")
             if isinstance(encrypted, str) and encrypted:
-                result.append(item)
+                result.append(
+                    {
+                        "type": "reasoning",
+                        "summary": [],
+                        "encrypted_content": encrypted,
+                    }
+                )
             continue
         if item_type == "item_reference":
             continue

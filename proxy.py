@@ -3777,6 +3777,8 @@ def _translate_bridge_success_payload(bridge_plan: BridgeExecutionPlan, payload:
         return format_translation.anthropic_response_to_responses(
             payload, fallback_model=bridge_plan.resolved_model,
         )
+    if bridge_plan.caller_protocol == "responses" and bridge_plan.upstream_protocol == "responses":
+        return format_translation.normalize_response_reasoning_for_client(payload)
     return payload
 
 
@@ -4799,6 +4801,187 @@ async def proxy_responses_from_anthropic_streaming_response(
     )
 
 
+def _responses_reasoning_stream_transform():
+    """Stream transform adapting upstream Responses SSE reasoning events for Codex/Electron."""
+    async def transform(byte_iter):
+        reasoning_states: dict[str, dict] = {}
+
+        async for event_name, data in format_translation.iter_sse_messages(byte_iter):
+            if data == "[DONE]":
+                yield b"data: [DONE]\n\n"
+                continue
+            try:
+                payload = json.loads(data)
+            except (json.JSONDecodeError, TypeError):
+                yield format_translation.sse_encode(event_name or "message", data)
+                continue
+            if not isinstance(payload, dict):
+                yield format_translation.sse_encode(event_name or "message", payload)
+                continue
+
+            event_type = str(event_name or payload.get("type") or "").strip().lower()
+
+            if event_type == "response.output_item.added":
+                item = payload.get("item")
+                if isinstance(item, dict) and item.get("type") == "reasoning":
+                    item_id = item.get("id") or "rs"
+                    out_idx = payload.get("output_index", 0)
+                    reasoning_states[item_id] = {
+                        "output_index": out_idx,
+                        "summary_started": False,
+                        "header_sent": False,
+                        "text_parts": [],
+                    }
+                    item.setdefault("summary", [])
+                    item.setdefault("content", [])
+                yield format_translation.sse_encode(event_type, payload)
+                continue
+
+            if event_type == "response.reasoning_summary_part.added":
+                item_id = payload.get("item_id")
+                if item_id in reasoning_states:
+                    reasoning_states[item_id]["summary_started"] = True
+                yield format_translation.sse_encode(event_type, payload)
+                continue
+
+            if event_type == "response.reasoning_text.delta":
+                item_id = payload.get("item_id")
+                delta = payload.get("delta")
+                out_idx = payload.get("output_index", 0)
+                state = reasoning_states.setdefault(
+                    item_id,
+                    {
+                        "output_index": out_idx,
+                        "summary_started": False,
+                        "header_sent": False,
+                        "text_parts": [],
+                    },
+                )
+                if not state["summary_started"]:
+                    state["summary_started"] = True
+                    yield format_translation.sse_encode(
+                        "response.reasoning_summary_part.added",
+                        {
+                            "type": "response.reasoning_summary_part.added",
+                            "item_id": item_id,
+                            "output_index": out_idx,
+                            "summary_index": 0,
+                            "part": {"type": "summary_text", "text": ""},
+                        },
+                    )
+                if isinstance(delta, str) and delta:
+                    if not state["header_sent"]:
+                        state["header_sent"] = True
+                        if not delta.lstrip().startswith("**") and not delta.lstrip().startswith("#"):
+                            header = format_translation._CODEX_THINKING_SUMMARY_HEADER
+                            state["text_parts"].append(header)
+                            yield format_translation.sse_encode(
+                                "response.reasoning_summary_text.delta",
+                                {
+                                    "type": "response.reasoning_summary_text.delta",
+                                    "item_id": item_id,
+                                    "output_index": out_idx,
+                                    "summary_index": 0,
+                                    "delta": header,
+                                },
+                            )
+                    state["text_parts"].append(delta)
+                    yield format_translation.sse_encode(
+                        "response.reasoning_summary_text.delta",
+                        {
+                            "type": "response.reasoning_summary_text.delta",
+                            "item_id": item_id,
+                            "output_index": out_idx,
+                            "summary_index": 0,
+                            "delta": delta,
+                        },
+                    )
+                yield format_translation.sse_encode(event_type, payload)
+                continue
+
+            if event_type == "response.reasoning_summary_text.delta":
+                item_id = payload.get("item_id")
+                delta = payload.get("delta")
+                out_idx = payload.get("output_index", 0)
+                state = reasoning_states.setdefault(
+                    item_id,
+                    {
+                        "output_index": out_idx,
+                        "summary_started": True,
+                        "header_sent": False,
+                        "text_parts": [],
+                    },
+                )
+                if isinstance(delta, str) and delta:
+                    if not state["header_sent"]:
+                        state["header_sent"] = True
+                        if not delta.lstrip().startswith("**") and not delta.lstrip().startswith("#"):
+                            header = format_translation._CODEX_THINKING_SUMMARY_HEADER
+                            state["text_parts"].append(header)
+                            yield format_translation.sse_encode(
+                                "response.reasoning_summary_text.delta",
+                                {
+                                    "type": "response.reasoning_summary_text.delta",
+                                    "item_id": item_id,
+                                    "output_index": out_idx,
+                                    "summary_index": 0,
+                                    "delta": header,
+                                },
+                            )
+                    state["text_parts"].append(delta)
+                yield format_translation.sse_encode(event_type, payload)
+                continue
+
+            if event_type == "response.reasoning_text.done":
+                item_id = payload.get("item_id")
+                out_idx = payload.get("output_index", 0)
+                state = reasoning_states.get(item_id)
+                full_text = "".join(state["text_parts"]) if state else (payload.get("text") or "")
+                yield format_translation.sse_encode(
+                    "response.reasoning_summary_text.done",
+                    {
+                        "type": "response.reasoning_summary_text.done",
+                        "item_id": item_id,
+                        "output_index": out_idx,
+                        "summary_index": 0,
+                        "text": full_text,
+                    },
+                )
+                yield format_translation.sse_encode(
+                    "response.reasoning_summary_part.done",
+                    {
+                        "type": "response.reasoning_summary_part.done",
+                        "item_id": item_id,
+                        "output_index": out_idx,
+                        "summary_index": 0,
+                        "part": {"type": "summary_text", "text": full_text},
+                    },
+                )
+                yield format_translation.sse_encode(event_type, payload)
+                continue
+
+            if event_type == "response.output_item.done":
+                item = payload.get("item")
+                if isinstance(item, dict) and item.get("type") == "reasoning":
+                    item_id = item.get("id")
+                    state = reasoning_states.get(item_id)
+                    text = "".join(state["text_parts"]) if (state and state["text_parts"]) else ""
+                    format_translation.normalize_reasoning_item_for_client(item, fallback_text=text)
+                yield format_translation.sse_encode(event_type, payload)
+                continue
+
+            if event_type in {"response.completed", "response.failed", "response.incomplete"}:
+                resp = payload.get("response")
+                if isinstance(resp, dict):
+                    format_translation.normalize_response_reasoning_for_client(resp)
+                yield format_translation.sse_encode(event_type, payload)
+                continue
+
+            yield format_translation.sse_encode(event_type or "message", payload)
+
+    return transform
+
+
 async def _proxy_bridge_streaming_response(
     plan: UpstreamRequestPlan,
     bridge_plan: BridgeExecutionPlan,
@@ -4815,6 +4998,7 @@ async def _proxy_bridge_streaming_response(
             stream_type="responses",
             trace_plan=plan,
             downstream_request=downstream_request,
+            stream_transform=_responses_reasoning_stream_transform(),
         )
     if bridge_plan.caller_protocol == "responses" and bridge_plan.upstream_protocol == "chat":
         return await proxy_responses_from_chat_streaming_response(
@@ -5782,12 +5966,18 @@ def _excel_tool_stream_transform(source_body: dict):
                 ):
                     held_events.append(encoded)
                     continue
+                if item_type == "reasoning":
+                    format_translation.normalize_reasoning_item_for_client(item)
+                    yield format_translation.sse_encode(event_type, payload)
+                    continue
                 yield encoded
                 continue
 
             if event_type in {"response.completed", "response.failed", "response.incomplete"}:
                 response = payload.get("response")
                 response = response if isinstance(response, dict) else None
+                if response:
+                    format_translation.normalize_response_reasoning_for_client(response)
                 tool_call = None
                 if event_type == "response.completed":
                     completed_text = full_text or (
@@ -5887,6 +6077,8 @@ async def _post_excel_non_streaming_request(
                 response_payload,
                 tool_call,
             )
+        if isinstance(translated_payload, dict):
+            format_translation.normalize_response_reasoning_for_client(translated_payload)
     _finish_usage_and_trace(
         plan,
         upstream.status_code,
