@@ -542,37 +542,63 @@ def _usage_from_event(data: Any) -> dict[str, int]:
 
 def _extract_shutdown_usage(data: Any) -> dict[str, int]:
     """Extract cumulative token counts from SessionShutdownData or equivalent dict."""
-    if hasattr(data, "token_details") and data.token_details:
-        td = data.token_details
-        inp = getattr(td.get("input"), "token_count", 0) or 0
-        out = getattr(td.get("output"), "token_count", 0) or 0
-        cread = getattr(td.get("cache_read"), "token_count", 0) or 0
-        cwrite = getattr(td.get("cache_write"), "token_count", 0) or 0
-    elif isinstance(data, dict) and data.get("tokenDetails"):
-        td = data["tokenDetails"]
-        inp = td.get("input", {}).get("tokenCount", 0) or 0
-        out = td.get("output", {}).get("tokenCount", 0) or 0
-        cread = td.get("cache_read", {}).get("tokenCount", 0) or 0
-        cwrite = td.get("cache_write", {}).get("tokenCount", 0) or 0
-    else:
-        inp = out = cread = cwrite = 0
-
+    total_inp = 0
+    cread = 0
+    cwrite = 0
+    out = 0
     reas = 0
+    found_mm = False
+
     mm = getattr(data, "model_metrics", None) or (data.get("modelMetrics") if isinstance(data, dict) else None)
     if isinstance(mm, dict):
         for m_val in mm.values():
             u = getattr(m_val, "usage", None) or (m_val.get("usage") if isinstance(m_val, dict) else None)
             if u is not None:
-                r = getattr(u, "reasoning_tokens", None) if hasattr(u, "reasoning_tokens") else (u.get("reasoningTokens") if isinstance(u, dict) else 0)
-                reas += int(r or 0)
+                found_mm = True
+                inp_val = getattr(u, "input_tokens", None) if hasattr(u, "input_tokens") else (u.get("inputTokens") if isinstance(u, dict) else 0)
+                read_val = getattr(u, "cache_read_tokens", None) if hasattr(u, "cache_read_tokens") else (u.get("cacheReadTokens") if isinstance(u, dict) else 0)
+                write_val = getattr(u, "cache_write_tokens", None) if hasattr(u, "cache_write_tokens") else (u.get("cacheWriteTokens") if isinstance(u, dict) else 0)
+                out_val = getattr(u, "output_tokens", None) if hasattr(u, "output_tokens") else (u.get("outputTokens") if isinstance(u, dict) else 0)
+                reas_val = getattr(u, "reasoning_tokens", None) if hasattr(u, "reasoning_tokens") else (u.get("reasoningTokens") if isinstance(u, dict) else 0)
+                total_inp += int(inp_val or 0)
+                cread += int(read_val or 0)
+                cwrite += int(write_val or 0)
+                out += int(out_val or 0)
+                reas += int(reas_val or 0)
+
+    td = getattr(data, "token_details", None) or (data.get("tokenDetails") if isinstance(data, dict) else None)
+    if isinstance(td, dict):
+        inp_tok = getattr(td.get("input"), "token_count", None) if hasattr(td.get("input"), "token_count") else (td.get("input", {}).get("tokenCount") if isinstance(td.get("input"), dict) else 0)
+        read_tok = getattr(td.get("cache_read"), "token_count", None) if hasattr(td.get("cache_read"), "token_count") else (td.get("cache_read", {}).get("tokenCount") if isinstance(td.get("cache_read"), dict) else 0)
+        write_tok = getattr(td.get("cache_write"), "token_count", None) if hasattr(td.get("cache_write"), "token_count") else (td.get("cache_write", {}).get("tokenCount") if isinstance(td.get("cache_write"), dict) else 0)
+        out_tok = getattr(td.get("output"), "token_count", None) if hasattr(td.get("output"), "token_count") else (td.get("output", {}).get("tokenCount") if isinstance(td.get("output"), dict) else 0)
+
+        i = int(inp_tok or 0)
+        r = int(read_tok or 0)
+        w = int(write_tok or 0)
+        o = int(out_tok or 0)
+        if total_inp == 0:
+            total_inp = i + r + w
+        if cread == 0:
+            cread = r
+        if cwrite == 0:
+            cwrite = w
+        if out == 0:
+            out = o
+
+    fresh = max(0, total_inp - cread - cwrite)
 
     return {
-        "input_tokens": int(inp),
-        "output_tokens": int(out),
-        "cached_input_tokens": int(cread),
-        "cache_creation_input_tokens": int(cwrite),
-        "reasoning_output_tokens": int(reas),
-        "total_tokens": int(inp) + int(out),
+        "input_tokens": total_inp,
+        "cached_input_tokens": cread,
+        "cache_creation_input_tokens": cwrite,
+        "fresh_input_tokens": fresh,
+        "pricing_fresh_input_tokens": fresh,
+        "pricing_cached_input_tokens": cread,
+        "pricing_cache_creation_input_tokens": cwrite,
+        "output_tokens": out,
+        "reasoning_output_tokens": reas,
+        "total_tokens": total_inp + out,
     }
 
 
@@ -585,11 +611,16 @@ def _usage_delta(current: dict[str, int], previous: dict[str, int] | None) -> di
     cread = max(0, current["cached_input_tokens"] - previous.get("cached_input_tokens", 0))
     cwrite = max(0, current["cache_creation_input_tokens"] - previous.get("cache_creation_input_tokens", 0))
     reas = max(0, current["reasoning_output_tokens"] - previous.get("reasoning_output_tokens", 0))
+    fresh = max(0, inp - cread - cwrite)
     return {
         "input_tokens": inp,
         "output_tokens": out,
         "cached_input_tokens": cread,
         "cache_creation_input_tokens": cwrite,
+        "fresh_input_tokens": fresh,
+        "pricing_fresh_input_tokens": fresh,
+        "pricing_cached_input_tokens": cread,
+        "pricing_cache_creation_input_tokens": cwrite,
         "reasoning_output_tokens": reas,
         "total_tokens": inp + out,
     }

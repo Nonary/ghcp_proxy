@@ -524,8 +524,9 @@ class CopilotSdkEventTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(ev["session_id"], "test-sess-1")
                 self.assertEqual(ev["requested_model"], "gpt-5.6-luna")
                 self.assertEqual(ev["duration_ms"], 5000)
-                self.assertEqual(ev["usage"]["input_tokens"], 50)
+                self.assertEqual(ev["usage"]["input_tokens"], 250)
                 self.assertEqual(ev["usage"]["cached_input_tokens"], 200)
+                self.assertEqual(ev["usage"]["fresh_input_tokens"], 50)
                 self.assertEqual(ev["usage"]["output_tokens"], 100)
                 self.assertEqual(ev["usage"]["reasoning_output_tokens"], 20)
 
@@ -579,15 +580,19 @@ class CopilotSdkEventTests(unittest.IsolatedAsyncioTestCase):
                 t1 = recorded[0]
                 self.assertEqual(t1["request_id"], "copilot-sdk:test-multi-turn:turn-1")
                 self.assertEqual(t1["duration_ms"], 5000)
+                self.assertEqual(t1["usage"]["input_tokens"], 250)
                 self.assertEqual(t1["usage"]["output_tokens"], 100)
                 self.assertEqual(t1["usage"]["cached_input_tokens"], 200)
+                self.assertEqual(t1["usage"]["fresh_input_tokens"], 50)
 
                 # Check Turn 2 (deltas!)
                 t2 = recorded[1]
                 self.assertEqual(t2["request_id"], "copilot-sdk:test-multi-turn:turn-2")
                 self.assertEqual(t2["duration_ms"], 3000)  # 8000 - 5000
+                self.assertEqual(t2["usage"]["input_tokens"], 310)  # 560 - 250
                 self.assertEqual(t2["usage"]["output_tokens"], 50)  # 150 - 100
                 self.assertEqual(t2["usage"]["cached_input_tokens"], 300)  # 500 - 200
+                self.assertEqual(t2["usage"]["fresh_input_tokens"], 10)  # 60 - 50
                 self.assertEqual(t2["usage"]["reasoning_output_tokens"], 10)  # 30 - 20
 
     async def test_stream_turn_emits_keepalive_comments_on_timeout(self):
@@ -665,9 +670,10 @@ class CopilotSdkEventTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(recorded_usage), 1)
         u = recorded_usage[0]
-        self.assertEqual(u["input_tokens"], 25)
+        self.assertEqual(u["input_tokens"], 125)
         self.assertEqual(u["output_tokens"], 15)
         self.assertEqual(u["cached_input_tokens"], 100)
+        self.assertEqual(u["fresh_input_tokens"], 25)
         self.assertEqual(u["reasoning_output_tokens"], 5)
 
 

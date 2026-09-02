@@ -2458,10 +2458,10 @@
               <article class="detail-block" v-if="selectedRequest.usage">
                 <div class="detail-label">Request Usage</div>
                 <div class="detail-grid">
-                  <div><div class="detail-label">Input Tokens</div><div class="detail-value">{{ compact(displayInputTokens(selectedRequest.usage)) }}</div></div>
+                  <div><div class="detail-label">Input Tokens</div><div class="detail-value">{{ compact(requestInputTokens(selectedRequest)) }}</div></div>
                   <div><div class="detail-label">Output Tokens</div><div class="detail-value">{{ compact(displayOutputTokens(selectedRequest.usage)) }}</div></div>
                   <div><div class="detail-label">Cached Input Tokens</div><div class="detail-value">{{ compact(cachedInputTokens(selectedRequest)) }}</div></div>
-                  <div><div class="detail-label">Total Tokens</div><div class="detail-value">{{ compact(displayTotalTokens(selectedRequest.usage)) }}</div></div>
+                  <div><div class="detail-label">Total Tokens</div><div class="detail-value">{{ compact(requestTotalTokens(selectedRequest)) }}</div></div>
                 </div>
               </article>
               <article class="detail-block" v-if="selectedRequest.request_prompt_available || selectedRequestPrompt">
@@ -5341,6 +5341,23 @@
         displayTotalTokens(usage) {
           return displayTotalTokensFromUsage(usage);
         },
+        requestInputTokens(row) {
+          const usage = row?.usage || (row && typeof row === 'object' && row.input_tokens != null ? row : {});
+          let i = Number(usage.input_tokens ?? row?.input_tokens ?? 0);
+          const cached = Number(this.cachedInputTokens(row));
+          if (i < cached) {
+            i = i + cached;
+          }
+          return i;
+        },
+        requestTotalTokens(row) {
+          const usage = row?.usage || (row && typeof row === 'object' && row.total_tokens != null ? row : {});
+          const total = Number(usage.total_tokens);
+          const inp = this.requestInputTokens(row);
+          const out = Number(this.displayOutputTokens(usage)) || Number(row?.output_tokens || 0);
+          if (Number.isFinite(total) && total >= inp + out) return total;
+          return inp + out;
+        },
         displayOutputTokens(usage) {
           // reasoning_output_tokens is a subset retained for diagnostics.
           if (!usage || typeof usage !== 'object') return 0;
@@ -6427,11 +6444,9 @@
         },
         shortTokens(row) {
           const usage = row?.usage || {};
-          const i = Number(
-            typeof this.displayInputTokens === 'function'
-              ? this.displayInputTokens(usage, row?.input_tokens)
-              : displayInputTokensFromUsage(usage, row?.input_tokens)
-          );
+          const i = typeof this.requestInputTokens === 'function'
+            ? this.requestInputTokens(row)
+            : Number(usage.input_tokens ?? row?.input_tokens ?? 0);
           const o = Number((typeof this.displayOutputTokens === 'function' ? this.displayOutputTokens(usage) : (usage.output_tokens || 0))) ||
                     Number(row?.output_tokens || 0);
           if (!i && !o) return '—';
