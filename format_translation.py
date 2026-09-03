@@ -1991,7 +1991,71 @@ def _latest_compaction_window(input_items):
 
     if latest_compaction_index is None:
         return input_items
-    return input_items[latest_compaction_index:]
+
+    pre_items = input_items[:latest_compaction_index]
+    post_items = input_items[latest_compaction_index:]
+
+    # Check if pre_items has any intermediate assistant turns or tool interactions
+    has_intermediate_turns = any(
+        isinstance(item, dict)
+        and (
+            item.get("type") in {
+                "function_call",
+                "custom_tool_call",
+                "function_call_output",
+                "custom_tool_call_output",
+                "reasoning",
+            }
+            or (item.get("type") == "message" and str(item.get("role", "")).lower() == "assistant")
+        )
+        for item in pre_items
+    )
+
+    if not has_intermediate_turns:
+        # Pre-compaction items contain no intermediate conversation turns (e.g. Codex
+        # already pruned them, keeping only developer/system instructions, environment
+        # context, and the active user task). Keep all pre_items so context and user
+        # instructions are not lost.
+        return input_items
+
+    # If there were intermediate turns, preserve preamble items (developer/system
+    # messages, environment/skills context), plus the active user task if post_items
+    # doesn't contain any user prompt.
+    has_post_user_message = any(
+        isinstance(item, dict)
+        and item.get("type") == "message"
+        and str(item.get("role", "")).lower() == "user"
+        for item in post_items[1:]  # skip the compaction item itself
+    )
+
+    preserved_pre = []
+    latest_user_task = None
+    for item in pre_items:
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role", "")).lower()
+        item_type = str(item.get("type", "")).lower()
+        if role in {"developer", "system"} or item_type in {"developer", "system"}:
+            preserved_pre.append(item)
+            continue
+        text = _message_text(item) if item_type in {"", "message"} else ""
+        if any(marker in text for marker in (
+            "<environment_context>",
+            "<permissions instructions>",
+            "<skills_instructions>",
+            "<instructions>",
+            "# AGENTS.md",
+        )):
+            preserved_pre.append(item)
+            continue
+        if role == "user" or (item_type in {"", "message"} and not role):
+            latest_user_task = item
+
+    if not has_post_user_message and latest_user_task is not None and latest_user_task not in preserved_pre:
+        preserved_pre.append(latest_user_task)
+
+    return [*preserved_pre, *post_items]
+
 
 
 def _summarize_inline_data_image(image_url: str, *, detail=None) -> str | None:

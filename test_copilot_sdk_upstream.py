@@ -170,6 +170,47 @@ class CopilotSdkTranslationTests(unittest.TestCase):
         self.assertEqual(item["input"], "*** patch")
         self.assertEqual(sdk._decode_call_id(item["call_id"])["s"], "session-1")
 
+    def test_response_payload_unwraps_luna_apply_patch_arguments(self):
+        patch_text = "*** Begin Patch\n*** Update File: example.txt\n@@\n-old\n+new\n*** End Patch"
+        observed_arguments = [
+            patch_text,
+            {"input": patch_text},
+            json.dumps({"input": patch_text}),
+            {"patch": patch_text},
+            json.dumps({"patch": patch_text}),
+        ]
+
+        for arguments in observed_arguments:
+            with self.subTest(arguments=arguments):
+                call = sdk.ToolCall("request-1", "apply_patch", "custom", arguments)
+                self.assertEqual(sdk._arguments_json(call), patch_text)
+
+    def test_custom_tool_does_not_unwrap_unknown_structured_arguments(self):
+        call = sdk.ToolCall("request-1", "other_custom_tool", "custom", {"patch": "value"})
+        self.assertEqual(json.loads(sdk._arguments_json(call)), {"patch": "value"})
+
+    def test_response_payload_includes_input_and_output_tokens_details(self):
+        outcome = sdk.TurnOutcome(
+            usage={
+                "input_tokens": 1000,
+                "output_tokens": 150,
+                "cached_input_tokens": 800,
+                "cache_creation_input_tokens": 50,
+                "fresh_input_tokens": 200,
+                "reasoning_output_tokens": 40,
+                "total_tokens": 1150,
+            },
+        )
+        payload = sdk._response_payload({"model": "gpt-5.6-luna"}, "session-1", outcome, "resp_1")
+        usage = payload["usage"]
+        self.assertEqual(usage["input_tokens"], 1000)
+        self.assertEqual(usage["output_tokens"], 150)
+        self.assertEqual(usage["cached_input_tokens"], 800)
+        self.assertEqual(usage["input_tokens_details"]["cached_tokens"], 800)
+        self.assertEqual(usage["input_tokens_details"]["cache_creation_input_tokens"], 50)
+        self.assertEqual(usage["output_tokens_details"]["reasoning_tokens"], 40)
+
+
 
 class _IsolatedSdkState:
     """Redirect SDK state files at a temp dir for the duration of a test."""
@@ -425,6 +466,90 @@ class CopilotSdkEventTests(unittest.IsolatedAsyncioTestCase):
         sdk._commit_alias_watermark("sdk-session-9", success=False)
         self.assertIsNone(sdk._session_for_alias("thread-B"))
 
+    async def test_tool_continuation_falls_back_to_session_send_when_pending_tool_call_rejected(self):
+        sent = []
+        handled = []
+
+        class _RpcTools:
+            async def handle_pending_tool_call(self, req):
+                handled.append(req)
+                return SimpleNamespace(success=False)
+
+        class _Rpc:
+            tools = _RpcTools()
+
+        class _Session(_FakeSession):
+            def __init__(self, session_id):
+                super().__init__()
+                self.session_id = session_id
+                self.rpc = _Rpc()
+
+            async def send(self, prompt):
+                sent.append(prompt)
+
+        class _Client:
+            async def resume_session(self, session_id, **options):
+                return _Session(session_id)
+
+        call_id = sdk._encode_call_id("sdk-sess-1", "req-1", tool_name="bash", tool_type="function")
+        body = {
+            "input": [
+                {"role": "user", "content": "run ls"},
+                {"type": "function_call", "call_id": call_id, "name": "bash", "arguments": '{"cmd":"ls"}'},
+                {"type": "function_call_output", "call_id": call_id, "output": "file1.txt"},
+            ],
+            "session_id": "thread-C",
+        }
+        sdk._remember_session("sdk-sess-1")
+        with patch.object(sdk, "_get_client", return_value=_Client()):
+            session, dispatch = await sdk._open_session(body, sdk.ToolRegistration())
+            await dispatch()
+
+        self.assertEqual(len(handled), 1)
+        self.assertEqual(handled[0].request_id, "req-1")
+        self.assertEqual(len(sent), 1)
+        self.assertIn("Tool result for bash: file1.txt", sent[0])
+
+    async def test_tool_continuation_falls_back_to_create_session_when_resume_fails(self):
+        created = []
+        sent = []
+
+        class _Session(_FakeSession):
+            def __init__(self, session_id):
+                super().__init__()
+                self.session_id = session_id
+
+            async def send(self, prompt):
+                sent.append(prompt)
+
+        class _Client:
+            async def resume_session(self, session_id, **options):
+                raise RuntimeError("Session state missing on disk")
+
+            async def create_session(self, **options):
+                created.append(options)
+                return _Session("new-sdk-sess")
+
+        call_id = sdk._encode_call_id("lost-sess-1", "req-1", tool_name="bash", tool_type="function")
+        body = {
+            "input": [
+                {"role": "user", "content": "run ls"},
+                {"type": "function_call", "call_id": call_id, "name": "bash", "arguments": '{"cmd":"ls"}'},
+                {"type": "function_call_output", "call_id": call_id, "output": "file1.txt"},
+            ],
+            "session_id": "thread-D",
+        }
+        sdk._remember_session("lost-sess-1")
+        with patch.object(sdk, "_get_client", return_value=_Client()):
+            session, dispatch = await sdk._open_session(body, sdk.ToolRegistration())
+            await dispatch()
+
+        self.assertEqual(len(created), 1)
+        self.assertEqual(session.session_id, "new-sdk-sess")
+        self.assertEqual(len(sent), 1)
+        self.assertIn("Tool result: file1.txt", sent[0])
+
+
     async def test_external_tool_request_suspends_and_returns_to_caller(self):
         session = _FakeSession()
         registration = sdk.build_tool_registration(
@@ -456,6 +581,116 @@ class CopilotSdkEventTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(outcome.calls), 1)
         self.assertEqual(outcome.calls[0].name, "lookup")
         self.assertEqual(json.loads(sdk._arguments_json(outcome.calls[0])), {"key": "value"})
+
+    async def test_tool_call_captures_session_shutdown_usage(self):
+        session = _FakeSession()
+        registration = sdk.build_tool_registration(
+            {
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "lookup",
+                        "parameters": {"type": "object", "properties": {}},
+                    }
+                ]
+            }
+        )
+
+        async def dispatch():
+            session.emit(
+                "external_tool.requested",
+                ExternalToolRequestedData(
+                    request_id="request-1",
+                    session_id="session-1",
+                    tool_call_id="runtime-call-1",
+                    tool_name="lookup",
+                    arguments={"key": "value"},
+                ),
+            )
+            session.emit(
+                "session.shutdown",
+                SimpleNamespace(
+                    token_details=None,
+                    model_metrics={
+                        "gpt-test": SimpleNamespace(
+                            usage=SimpleNamespace(
+                                input_tokens=400,
+                                cache_read_tokens=300,
+                                cache_write_tokens=0,
+                                output_tokens=50,
+                                reasoning_tokens=0,
+                            )
+                        )
+                    },
+                ),
+            )
+
+        outcome = await sdk._wait_for_outcome(session, dispatch, registration)
+        self.assertEqual(len(outcome.calls), 1)
+        self.assertEqual(outcome.usage["input_tokens"], 400)
+        self.assertEqual(outcome.usage["cached_input_tokens"], 300)
+        self.assertEqual(outcome.usage["output_tokens"], 50)
+
+    async def test_stream_turn_tool_call_captures_session_shutdown_usage(self):
+        session = _FakeSession()
+        registration = sdk.build_tool_registration(
+            {
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "lookup",
+                        "parameters": {"type": "object", "properties": {}},
+                    }
+                ]
+            }
+        )
+
+        async def dispatch():
+            session.emit(
+                "external_tool.requested",
+                ExternalToolRequestedData(
+                    request_id="request-1",
+                    session_id="session-1",
+                    tool_call_id="runtime-call-1",
+                    tool_name="lookup",
+                    arguments={"key": "value"},
+                ),
+            )
+            session.emit(
+                "session.shutdown",
+                SimpleNamespace(
+                    token_details=None,
+                    model_metrics={
+                        "gpt-test": SimpleNamespace(
+                            usage=SimpleNamespace(
+                                input_tokens=600,
+                                cache_read_tokens=450,
+                                cache_write_tokens=0,
+                                output_tokens=35,
+                                reasoning_tokens=0,
+                            )
+                        )
+                    },
+                ),
+            )
+
+        chunks = [
+            chunk.decode()
+            async for chunk in sdk._stream_turn(
+                _ConnectedRequest(),
+                {"model": "gpt-test"},
+                session,
+                dispatch,
+                registration,
+            )
+        ]
+        completed = [c for c in chunks if "response.completed" in c]
+        self.assertEqual(len(completed), 1)
+        data = json.loads(completed[0].replace("event: response.completed\ndata: ", "").strip())
+        usage = data["response"]["usage"]
+        self.assertEqual(usage["input_tokens"], 600)
+        self.assertEqual(usage["input_tokens_details"]["cached_tokens"], 450)
+        self.assertEqual(usage["output_tokens"], 35)
 
     async def test_stream_emits_responses_event_sequence(self):
         session = _FakeSession()
@@ -721,6 +956,55 @@ class CopilotSdkEventTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("[Compacted conversation summary]\nPrevious conversation summary", prompt)
         self.assertIn("User: Current question", prompt)
 
+    def test_input_to_prompt_preserves_preamble_and_task_for_codex_compaction(self):
+        fake_enc = format_translation.encode_fake_compaction("Investigation focused on RTSS limiter.")
+        items = [
+            {"type": "message", "role": "developer", "content": "<skills_instructions>\n## Skills\nAvailable skills...</skills_instructions>"},
+            {"type": "message", "role": "user", "content": "<environment_context>\n  <cwd>/Users/chasepayne/sources/vibeshine</cwd>\n</environment_context>"},
+            {"type": "message", "role": "user", "content": "Getting reports that the windows version frame limiter is broken"},
+            {"type": "compaction", "encrypted_content": fake_enc},
+        ]
+        prompt = sdk.input_to_prompt(items)
+        self.assertIn("Developer: <skills_instructions>", prompt)
+        self.assertIn("User: <environment_context>", prompt)
+        self.assertIn("User: Getting reports that the windows version frame limiter is broken", prompt)
+        self.assertIn("Assistant: [Compacted conversation summary]\nInvestigation focused on RTSS limiter.", prompt)
+        self.assertIn("User: Please continue and complete your response", prompt)
+
+    def test_input_to_prompt_preserves_preamble_when_intermediate_turns_compacted(self):
+        fake_enc = format_translation.encode_fake_compaction("Summary of earlier work")
+        items = [
+            {"type": "message", "role": "developer", "content": "<skills_instructions>skills</skills_instructions>"},
+            {"type": "message", "role": "user", "content": "<environment_context><cwd>/repo</cwd></environment_context>"},
+            {"type": "message", "role": "user", "content": "Old user turn"},
+            {"type": "message", "role": "assistant", "content": "Old assistant turn"},
+            {"type": "compaction", "encrypted_content": fake_enc},
+            {"type": "message", "role": "user", "content": "New user follow-up"},
+        ]
+        prompt = sdk.input_to_prompt(items)
+        self.assertIn("Developer: <skills_instructions>skills</skills_instructions>", prompt)
+        self.assertIn("User: <environment_context><cwd>/repo</cwd></environment_context>", prompt)
+        self.assertNotIn("Old user turn", prompt)
+        self.assertNotIn("Old assistant turn", prompt)
+        self.assertIn("Assistant: [Compacted conversation summary]\nSummary of earlier work", prompt)
+        self.assertIn("User: New user follow-up", prompt)
+        self.assertNotIn("Please continue and complete your response", prompt)
+
+    def test_input_to_prompt_preserves_task_without_post_compaction_user_message(self):
+        fake_enc = format_translation.encode_fake_compaction("Summary of ongoing work")
+        items = [
+            {"type": "message", "role": "developer", "content": "Developer instructions"},
+            {"type": "message", "role": "user", "content": "Active task to solve"},
+            {"type": "message", "role": "assistant", "content": "Initial assistant thought"},
+            {"type": "compaction", "encrypted_content": fake_enc},
+        ]
+        prompt = sdk.input_to_prompt(items)
+        self.assertIn("Developer: Developer instructions", prompt)
+        self.assertIn("User: Active task to solve", prompt)
+        self.assertNotIn("Initial assistant thought", prompt)
+        self.assertIn("Assistant: [Compacted conversation summary]\nSummary of ongoing work", prompt)
+        self.assertIn("User: Please continue and complete your response", prompt)
+
     def test_input_to_prompt_skips_subagent_notification_messages(self):
         items = [
             {"type": "message", "role": "user", "content": "<subagent_notification>\n{\"status\": \"completed\"}\n</subagent_notification>"},
@@ -731,7 +1015,16 @@ class CopilotSdkEventTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Real user instruction", prompt)
 
     def test_to_compaction_payload(self):
-        outcome = sdk.TurnOutcome(text="Summary of earlier code work.")
+        outcome = sdk.TurnOutcome(
+            text="Summary of earlier code work.",
+            usage={
+                "input_tokens": 500,
+                "output_tokens": 100,
+                "cached_input_tokens": 400,
+                "cache_creation_input_tokens": 20,
+                "reasoning_output_tokens": 15,
+            },
+        )
         payload = sdk.to_compaction_payload({"model": "gpt-5.6-luna"}, "sess-1", outcome, "resp-1")
         self.assertEqual(payload["id"], "resp-1")
         self.assertEqual(payload["status"], "completed")
@@ -740,6 +1033,11 @@ class CopilotSdkEventTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["output"][0]["type"], "compaction")
         enc = payload["output"][0]["encrypted_content"]
         self.assertEqual(format_translation.decode_fake_compaction(enc), "Summary of earlier code work.")
+        self.assertEqual(payload["usage"]["input_tokens"], 500)
+        self.assertEqual(payload["usage"]["input_tokens_details"]["cached_tokens"], 400)
+        self.assertEqual(payload["usage"]["input_tokens_details"]["cache_creation_input_tokens"], 20)
+        self.assertEqual(payload["usage"]["output_tokens_details"]["reasoning_tokens"], 15)
+
 
     def test_responses_to_compaction_response(self):
         responses_payload = {
@@ -1109,6 +1407,9 @@ class CopilotSdkEventTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(u["cached_input_tokens"], 100)
         self.assertEqual(u["fresh_input_tokens"], 25)
         self.assertEqual(u["reasoning_output_tokens"], 5)
+        self.assertEqual(u["input_tokens_details"]["cached_tokens"], 100)
+        self.assertEqual(u["output_tokens_details"]["reasoning_tokens"], 5)
+
 
 
 if __name__ == "__main__":

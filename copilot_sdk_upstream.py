@@ -76,7 +76,7 @@ _CALL_ID_PREFIX = "ghcpsdk_"
 _VALID_TOOL_NAME = re.compile(r"^[A-Za-z0-9_-]+$")
 _TURN_TIMEOUT_SECONDS = float(os.environ.get("GHCP_UPSTREAM_TIMEOUT_SECONDS", "1800") or 1800)
 _KEEPALIVE_INTERVAL_SECONDS = 15.0
-_PARALLEL_TOOL_SETTLE_SECONDS = 0.05
+_PARALLEL_TOOL_SETTLE_SECONDS = 0.5
 _SDK_STATE_DIR = os.path.join(TOKEN_DIR, "copilot-sdk")
 _SESSION_LEDGER_NAME = "proxy-sessions.json"
 _SESSION_ALIASES_NAME = "proxy-session-aliases.json"
@@ -471,9 +471,13 @@ def _render_input_segments(value: Any) -> list[tuple[str, str]]:
     rendered: list[tuple[str, str]] = []
     # Truncate to the latest compaction window so pre-compaction history is not replayed.
     window_items = format_translation._latest_compaction_window(value)
+    saw_compaction = False
+    saw_user_after_compaction = False
     for item in window_items:
         if isinstance(item, str):
             rendered.append((_SEGMENT_USER, f"User: {item}"))
+            if saw_compaction:
+                saw_user_after_compaction = True
             continue
         if not isinstance(item, dict):
             continue
@@ -483,6 +487,8 @@ def _render_input_segments(value: Any) -> list[tuple[str, str]]:
         if item_type == "reasoning":
             continue
         if item_type == "compaction":
+            saw_compaction = True
+            saw_user_after_compaction = False
             encrypted_content = item.get("encrypted_content")
             summary_text = None
             if isinstance(encrypted_content, str):
@@ -491,8 +497,8 @@ def _render_input_segments(value: Any) -> list[tuple[str, str]]:
                 summary_text = item.get("output_text") or item.get("summary") or item.get("text")
             if summary_text:
                 rendered.append((
-                    _SEGMENT_USER,
-                    f"User: {format_translation.FAKE_COMPACTION_SUMMARY_LABEL}\n{summary_text}",
+                    _SEGMENT_ECHO,
+                    f"Assistant: {format_translation.FAKE_COMPACTION_SUMMARY_LABEL}\n{summary_text}",
                 ))
             continue
         if item_type in {"function_call", "custom_tool_call"}:
@@ -508,8 +514,33 @@ def _render_input_segments(value: Any) -> list[tuple[str, str]]:
         role = item.get("role") or ("assistant" if item_type == "message" else "user")
         text = _text_from_content(item.get("content"))
         if text:
-            kind = _SEGMENT_ECHO if str(role).lower() == "assistant" else _SEGMENT_USER
-            rendered.append((kind, f"{str(role).capitalize()}: {text}"))
+            if text.startswith(format_translation.FAKE_COMPACTION_SUMMARY_LABEL):
+                saw_compaction = True
+                saw_user_after_compaction = False
+                rendered.append((
+                    _SEGMENT_ECHO,
+                    f"Assistant: {text}",
+                ))
+            else:
+                is_assistant = str(role).lower() == "assistant"
+                kind = _SEGMENT_ECHO if is_assistant else _SEGMENT_USER
+                if not is_assistant and saw_compaction:
+                    if not any(marker in text for marker in (
+                        "<environment_context>",
+                        "<permissions instructions>",
+                        "<skills_instructions>",
+                        "<instructions>",
+                        "# AGENTS.md",
+                    )):
+                        saw_user_after_compaction = True
+                rendered.append((kind, f"{str(role).capitalize()}: {text}"))
+
+    if saw_compaction and not saw_user_after_compaction:
+        rendered.append((
+            _SEGMENT_USER,
+            "User: Please continue and complete your response to the user's request based on the work already completed in the summary above. Do not repeat investigations or tool calls already documented in the summary.",
+        ))
+
     return rendered
 
 
@@ -549,6 +580,7 @@ class PendingToolResult:
     session_id: str
     request_id: str
     output: str
+    tool_name: str = ""
 
 
 def resolve_tool_continuation(value: Any) -> tuple[str, list[PendingToolResult]] | None:
@@ -572,6 +604,7 @@ def resolve_tool_continuation(value: Any) -> tuple[str, list[PendingToolResult]]
                 session_id=decoded["s"],
                 request_id=decoded["r"],
                 output=_text_from_content(item.get("output")),
+                tool_name=decoded.get("n", ""),
             )
         )
     if not trailing:
@@ -713,15 +746,47 @@ async def _open_session(body: dict, registration: ToolRegistration):
         return session, dispatch
 
     session_id, results = continuation
-    if not _owns_session(session_id):
-        raise ValueError("Tool continuation does not belong to this proxy")
-    _remember_session(session_id)
-    session = await client.resume_session(
-        session_id,
-        continue_pending_work=True,
-        **options,
-    )
+    session = None
+    if _owns_session(session_id):
+        try:
+            session = await client.resume_session(
+                session_id,
+                continue_pending_work=True,
+                **options,
+            )
+        except Exception:
+            try:
+                session = await client.resume_session(
+                    session_id,
+                    continue_pending_work=False,
+                    **options,
+                )
+            except Exception:
+                session = None
 
+    if session is None:
+        # If the SDK session could not be resumed (e.g. proxy was reset and session
+        # was pruned or state file lost), fall back to creating a fresh session
+        # carrying the transcript up to and including the tool output.
+        segments = _render_input_segments(body.get("input"))
+        session = await client.create_session(**options)
+        prompt = "\n\n".join(text for _, text in segments)
+        _remember_session(session.session_id)
+        alias = _session_alias(body)
+        if alias:
+            _pending_alias_watermark[session.session_id] = (
+                alias,
+                _segment_fingerprints(segments),
+            )
+
+        async def dispatch_fresh() -> None:
+            if not prompt:
+                raise ValueError("input must contain at least one text message")
+            await session.send(prompt)
+
+        return session, dispatch_fresh
+
+    _remember_session(session.session_id)
     alias = _session_alias(body)
     if alias:
         _pending_alias_watermark[session.session_id] = (
@@ -730,13 +795,35 @@ async def _open_session(body: dict, registration: ToolRegistration):
         )
 
     async def dispatch() -> None:
+        failed = False
         for result in results:
-            await session.rpc.tools.handle_pending_tool_call(
-                HandlePendingToolCallRequest(
-                    request_id=result.request_id,
-                    result=result.output,
+            try:
+                res = await session.rpc.tools.handle_pending_tool_call(
+                    HandlePendingToolCallRequest(
+                        request_id=result.request_id,
+                        result=result.output,
+                    )
                 )
-            )
+                if res is not None and getattr(res, "success", None) is False:
+                    failed = True
+                    break
+            except Exception:
+                failed = True
+                break
+
+        if failed:
+            # The pending tool call was lost (e.g. proxy or Copilot SDK daemon was reset
+            # while the tool was running). The CLI discarded the in-memory pending
+            # work and will never emit turn events on its own. Deliver the tool
+            # results as a prompt so the model continues rather than leaving Codex
+            # stuck on "reconnecting".
+            tool_texts = []
+            for result in results:
+                name = getattr(result, "tool_name", "")
+                prefix = f"Tool result for {name}: " if name else "Tool result: "
+                tool_texts.append(f"{prefix}{result.output}")
+            fallback_prompt = "\n\n".join(tool_texts) or "Tool execution completed."
+            await session.send(fallback_prompt)
 
     return session, dispatch
 
@@ -970,6 +1057,69 @@ def _record_shutdown_usage(outcome: "TurnOutcome", session_id: str, data: Any) -
     _store_shutdown_baseline(session_id, current)
 
 
+def _format_client_usage(usage: dict[str, int] | None) -> dict[str, Any]:
+    """Format token usage for OpenAI Responses API clients such as Codex.
+
+    Responses API requires nested ``input_tokens_details.cached_tokens`` and
+    ``output_tokens_details.reasoning_tokens`` so clients correctly recognize
+    cached input and reasoning token breakdowns.
+    """
+    if not isinstance(usage, dict) or not usage:
+        return {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+            "input_tokens_details": {"cached_tokens": 0},
+            "output_tokens_details": {"reasoning_tokens": 0},
+        }
+    input_tokens = int(usage.get("input_tokens") or 0)
+    output_tokens = int(usage.get("output_tokens") or 0)
+    cached_tokens = int(
+        usage.get("cached_input_tokens")
+        or (
+            usage.get("input_tokens_details", {}).get("cached_tokens")
+            if isinstance(usage.get("input_tokens_details"), dict)
+            else 0
+        )
+        or 0
+    )
+    cache_creation_tokens = int(
+        usage.get("cache_creation_input_tokens")
+        or (
+            usage.get("input_tokens_details", {}).get("cache_creation_input_tokens")
+            if isinstance(usage.get("input_tokens_details"), dict)
+            else 0
+        )
+        or 0
+    )
+    reasoning_tokens = int(
+        usage.get("reasoning_output_tokens")
+        or (
+            usage.get("output_tokens_details", {}).get("reasoning_tokens")
+            if isinstance(usage.get("output_tokens_details"), dict)
+            else 0
+        )
+        or 0
+    )
+    total_tokens = int(usage.get("total_tokens") or (input_tokens + output_tokens))
+
+    input_details: dict[str, int] = {"cached_tokens": cached_tokens}
+    if cache_creation_tokens:
+        input_details["cache_creation_input_tokens"] = cache_creation_tokens
+
+    output_details: dict[str, int] = {"reasoning_tokens": reasoning_tokens}
+
+    result = dict(usage)
+    result.update({
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens,
+        "input_tokens_details": input_details,
+        "output_tokens_details": output_details,
+    })
+    return result
+
+
 def _finalize_usage(outcome: "TurnOutcome") -> None:
     """Pick the authoritative usage record for the turn.
 
@@ -979,7 +1129,9 @@ def _finalize_usage(outcome: "TurnOutcome") -> None:
     to be sibling ``elif`` branches assigning the same field, and whichever
     arrived last silently erased the other.
     """
-    outcome.usage = outcome.shutdown_usage or outcome.event_usage
+    raw = outcome.shutdown_usage or outcome.event_usage
+    outcome.usage = _format_client_usage(raw) if raw else {}
+
 
 
 def _tool_call(data: Any, registration: ToolRegistration) -> ToolCall:
@@ -1067,6 +1219,9 @@ async def _wait_for_outcome(
                 or _event_name(event) == "session.shutdown"
             ):
                 _record_shutdown_usage(outcome, session.session_id, data)
+                if outcome.calls:
+                    _finalize_usage(outcome)
+                    return outcome
             elif isinstance(data, AssistantUsageData):
                 _add_usage(outcome.event_usage, _usage_from_event(data))
             elif isinstance(data, ExternalToolRequestedData):
@@ -1111,9 +1266,32 @@ async def _wait_for_outcome(
 
 def _arguments_json(call: ToolCall) -> str:
     if call.tool_type == "custom":
-        if isinstance(call.arguments, dict) and isinstance(call.arguments.get("input"), str):
-            return call.arguments["input"]
-        return _text_from_content(call.arguments)
+        arguments = call.arguments
+        # The SDK only exposes JSON-schema tools, so free-form Responses tools
+        # are registered behind an {"input": "..."} shim.  Some models return
+        # that shim as a JSON string rather than a decoded object.  Luna also
+        # uses the semantically natural {"patch": "..."} spelling for
+        # apply_patch.  Passing either wrapper through as the custom tool's raw
+        # input makes Codex reject a valid patch, after which the model retries
+        # the identical call indefinitely.
+        if isinstance(arguments, str):
+            try:
+                decoded = json.loads(arguments)
+            except json.JSONDecodeError:
+                return arguments
+            if isinstance(decoded, dict):
+                arguments = decoded
+            else:
+                return arguments
+        if isinstance(arguments, dict):
+            wrapped_input = arguments.get("input")
+            if isinstance(wrapped_input, str):
+                return wrapped_input
+            if call.name == "apply_patch":
+                wrapped_patch = arguments.get("patch")
+                if isinstance(wrapped_patch, str):
+                    return wrapped_patch
+        return _text_from_content(arguments)
     if isinstance(call.arguments, str):
         try:
             json.loads(call.arguments)
@@ -1178,13 +1356,7 @@ def _response_payload(body: dict, session_id: str, outcome: TurnOutcome, respons
         "model": body.get("model"),
         "output": output,
         "parallel_tool_calls": len(outcome.calls) > 1,
-        "usage": outcome.usage or {
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "total_tokens": 0,
-            "input_tokens_details": {"cached_tokens": 0},
-            "output_tokens_details": {"reasoning_tokens": 0},
-        },
+        "usage": _format_client_usage(outcome.usage),
     }
 
 
@@ -1211,13 +1383,7 @@ def to_compaction_payload(
         ],
         "output_text": summary_text,
         "parallel_tool_calls": False,
-        "usage": outcome.usage or {
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "total_tokens": 0,
-            "input_tokens_details": {"cached_tokens": 0},
-            "output_tokens_details": {"reasoning_tokens": 0},
-        },
+        "usage": _format_client_usage(outcome.usage),
     }
 
 
@@ -1584,6 +1750,8 @@ async def _stream_turn(
                 or _event_name(event) == "session.shutdown"
             ):
                 _record_shutdown_usage(outcome, session.session_id, data)
+                if outcome.calls:
+                    break
             elif isinstance(data, AssistantUsageData):
                 _add_usage(outcome.event_usage, _usage_from_event(data))
             elif isinstance(data, ExternalToolRequestedData):

@@ -910,14 +910,16 @@ except Exception as _sdk_ingest_exc:  # pragma: no cover - best effort
 @app.on_event("startup")
 async def _app_startup_restore_client_proxy_configs():
     excel_upstream.excel_session_store.load()
-    excel_session_capture.refresh_macos_excel_session(
+    asyncio.create_task(asyncio.to_thread(
+        excel_session_capture.refresh_macos_excel_session,
         excel_upstream.excel_session_store,
         force=True,
-    )
-    excel_session_capture.refresh_windows_excel_session(
+    ))
+    asyncio.create_task(asyncio.to_thread(
+        excel_session_capture.refresh_windows_excel_session,
         excel_upstream.excel_session_store,
         force=True,
-    )
+    ))
     restore_client_proxy_configs_on_startup()
     auto_update_runtime_controller.start_periodic_checks()
 
