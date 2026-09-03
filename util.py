@@ -460,7 +460,12 @@ def _usage_event_source(event: dict | None) -> str:
     # through this proxy but should still be counted toward expense.
     native_source = event.get("native_source")
     if isinstance(native_source, str) and native_source.strip():
-        return native_source.strip()
+        native_source = native_source.strip()
+        # Copilot SDK turns still flow through this proxy, so they belong to
+        # the "codex" (proxied) bucket rather than a separate client label.
+        if native_source == "copilot_sdk":
+            return "codex"
+        return native_source
 
     # The request path identifies the calling CLI/client for the native
     # protocol routes: Claude Code calls /v1/messages; Codex calls

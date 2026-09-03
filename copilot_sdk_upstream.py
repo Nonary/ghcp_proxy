@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import hashlib
 import json
 import os
 import re
@@ -77,7 +78,9 @@ _TURN_TIMEOUT_SECONDS = float(os.environ.get("GHCP_UPSTREAM_TIMEOUT_SECONDS", "1
 _KEEPALIVE_INTERVAL_SECONDS = 15.0
 _PARALLEL_TOOL_SETTLE_SECONDS = 0.05
 _SDK_STATE_DIR = os.path.join(TOKEN_DIR, "copilot-sdk")
-_SESSION_LEDGER_FILE = os.path.join(_SDK_STATE_DIR, "proxy-sessions.json")
+_SESSION_LEDGER_NAME = "proxy-sessions.json"
+_SESSION_ALIASES_NAME = "proxy-session-aliases.json"
+_SESSION_USAGE_NAME = "proxy-session-usage.json"
 _SESSION_LEDGER_LOCK = threading.Lock()
 _ABANDONED_SESSION_SECONDS = 24 * 60 * 60
 
@@ -89,7 +92,7 @@ _client_pruned = False
 
 def _read_session_ledger_unlocked() -> dict[str, float]:
     try:
-        with open(_SESSION_LEDGER_FILE, encoding="utf-8") as handle:
+        with open(_state_path(_SESSION_LEDGER_NAME), encoding="utf-8") as handle:
             payload = json.load(handle)
     except (OSError, ValueError, json.JSONDecodeError):
         return {}
@@ -103,22 +106,7 @@ def _read_session_ledger_unlocked() -> dict[str, float]:
 
 
 def _write_session_ledger_unlocked(ledger: dict[str, float]) -> None:
-    os.makedirs(_SDK_STATE_DIR, exist_ok=True)
-    descriptor, temporary_path = tempfile.mkstemp(
-        prefix="proxy-sessions-",
-        suffix=".tmp",
-        dir=_SDK_STATE_DIR,
-    )
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            json.dump(ledger, handle, separators=(",", ":"), sort_keys=True)
-        os.replace(temporary_path, _SESSION_LEDGER_FILE)
-    except Exception:
-        try:
-            os.unlink(temporary_path)
-        except OSError:
-            pass
-        raise
+    _write_json_state(_state_path(_SESSION_LEDGER_NAME), ledger, "proxy-sessions-")
 
 
 def _remember_session(session_id: str) -> None:
@@ -140,10 +128,149 @@ def _owns_session(session_id: str) -> bool:
         return session_id in _read_session_ledger_unlocked()
 
 
+def _state_path(name: str) -> str:
+    """Resolve a state file under the current state dir.
+
+    Deliberately computed per call rather than at import: tests redirect
+    _SDK_STATE_DIR, and a module-level constant would keep writing to the
+    real one.
+    """
+    return os.path.join(_SDK_STATE_DIR, name)
+
+
+def _read_json_state(path: str) -> Any:
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def _write_json_state(path: str, payload: Any, prefix: str) -> None:
+    os.makedirs(_SDK_STATE_DIR, exist_ok=True)
+    descriptor, temporary_path = tempfile.mkstemp(prefix=prefix, suffix=".tmp", dir=_SDK_STATE_DIR)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, separators=(",", ":"), sort_keys=True)
+        os.replace(temporary_path, path)
+    except Exception:
+        try:
+            os.unlink(temporary_path)
+        except OSError:
+            pass
+        raise
+
+
+def _read_session_aliases_unlocked() -> dict[str, dict]:
+    """Map each caller conversation id to its SDK session and consumed prefix.
+
+    Older files stored a bare session id string; those load with an empty
+    watermark, which simply forces one full replay before resuming kicks in.
+    """
+    payload = _read_json_state(_state_path(_SESSION_ALIASES_NAME))
+    if not isinstance(payload, dict):
+        return {}
+    aliases: dict[str, dict] = {}
+    for key, value in payload.items():
+        if not isinstance(key, str) or not key:
+            continue
+        if isinstance(value, str) and value:
+            aliases[key] = {"session_id": value, "segments": []}
+            continue
+        if not isinstance(value, dict):
+            continue
+        session_id = value.get("session_id")
+        if not isinstance(session_id, str) or not session_id:
+            continue
+        segments = value.get("segments")
+        aliases[key] = {
+            "session_id": session_id,
+            "segments": [s for s in segments if isinstance(s, str)] if isinstance(segments, list) else [],
+        }
+    return aliases
+
+
+def _write_session_aliases_unlocked(aliases: dict[str, dict]) -> None:
+    _write_json_state(_state_path(_SESSION_ALIASES_NAME), aliases, "proxy-session-aliases-")
+
+
+def _session_alias(body: dict) -> str | None:
+    """Return the caller's stable conversation id, if one was supplied.
+
+    This keys the SDK session a follow-up turn resumes, so it has to be
+    per-thread rather than per-conversation: Codex hands the same
+    ``session_id`` to a root thread and to every subagent it spawns, and
+    resuming a subagent into its parent's session would splice the two
+    histories together.  ``thread_id`` distinguishes them.
+    """
+    value = body.get("session_id") or body.get("sessionId")
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    # Codex keeps this in client metadata.  Importing lazily avoids making the
+    # SDK adapter depend on the rest of the request routing path at import time.
+    try:
+        import codex_agent_compat
+        value = codex_agent_compat.codex_thread_id(body) or codex_agent_compat.codex_session_id(body)
+    except Exception:
+        value = None
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def _remember_session_alias(alias: str, session_id: str, fingerprints: list[str]) -> None:
+    with _SESSION_LEDGER_LOCK:
+        aliases = _read_session_aliases_unlocked()
+        aliases[alias] = {"session_id": session_id, "segments": list(fingerprints)}
+        _write_session_aliases_unlocked(aliases)
+
+
+def _session_for_alias(alias: str) -> tuple[str, list[str]] | None:
+    """Return the live SDK session for a caller conversation and its watermark."""
+    with _SESSION_LEDGER_LOCK:
+        entry = _read_session_aliases_unlocked().get(alias)
+        if not entry:
+            return None
+        session_id = entry["session_id"]
+        if session_id not in _read_session_ledger_unlocked():
+            return None
+        return session_id, entry["segments"]
+
+
+def _forget_session_aliases(session_ids: set[str]) -> None:
+    """Drop alias entries pointing at sessions that no longer exist."""
+    if not session_ids:
+        return
+    with _SESSION_LEDGER_LOCK:
+        aliases = _read_session_aliases_unlocked()
+        remaining = {
+            alias: entry
+            for alias, entry in aliases.items()
+            if entry["session_id"] not in session_ids
+        }
+        if len(remaining) != len(aliases):
+            _write_session_aliases_unlocked(remaining)
+
+
+# Alias watermarks are only durable once the turn they describe succeeded;
+# until then they sit here keyed by SDK session id.
+_pending_alias_watermark: dict[str, tuple[str, list[str]]] = {}
+
+
+def _commit_alias_watermark(session_id: str, *, success: bool) -> None:
+    pending = _pending_alias_watermark.pop(session_id, None)
+    if pending is None or not success:
+        return
+    alias, fingerprints = pending
+    try:
+        _remember_session_alias(alias, session_id, fingerprints)
+    except OSError:
+        pass
+
+
 async def _prune_abandoned_sessions(client: Any) -> None:
     cutoff = time.time() - _ABANDONED_SESSION_SECONDS
     with _SESSION_LEDGER_LOCK:
         ledger = _read_session_ledger_unlocked()
+    pruned: set[str] = set()
     for session_id, updated_at in ledger.items():
         if updated_at >= cutoff:
             continue
@@ -152,6 +279,9 @@ async def _prune_abandoned_sessions(client: Any) -> None:
         except Exception:
             pass
         _forget_session(session_id)
+        pruned.add(session_id)
+    _forget_session_aliases(pruned)
+    _forget_shutdown_baselines(pruned)
 
 
 async def _delete_owned_session(session_id: str) -> None:
@@ -163,6 +293,8 @@ async def _delete_owned_session(session_id: str) -> None:
     except Exception:
         return
     _forget_session(session_id)
+    _forget_session_aliases({session_id})
+    _forget_shutdown_baselines({session_id})
 
 
 def responses_upstream() -> str:
@@ -304,18 +436,27 @@ def _text_from_content(content: Any) -> str:
     return "\n".join(part for part in parts if part)
 
 
-def input_to_prompt(value: Any) -> str:
-    """Render a full Responses transcript into one SDK user message."""
+# Segment kinds.  ``_SEGMENT_USER`` marks content that originates with the
+# caller; ``_SEGMENT_ECHO`` marks a transcript echo of work the SDK session
+# performed itself, which a resumed session already holds and must not be
+# re-sent.
+_SEGMENT_USER = "user"
+_SEGMENT_ECHO = "echo"
+
+
+def _render_input_segments(value: Any) -> list[tuple[str, str]]:
+    """Render a Responses transcript into ordered ``(kind, text)`` segments."""
     if isinstance(value, str):
-        return value
+        return [(_SEGMENT_USER, value)] if value else []
     if not isinstance(value, list):
-        return _text_from_content(value)
-    rendered: list[str] = []
+        text = _text_from_content(value)
+        return [(_SEGMENT_USER, text)] if text else []
+    rendered: list[tuple[str, str]] = []
     # Truncate to the latest compaction window so pre-compaction history is not replayed.
     window_items = format_translation._latest_compaction_window(value)
     for item in window_items:
         if isinstance(item, str):
-            rendered.append(f"User: {item}")
+            rendered.append((_SEGMENT_USER, f"User: {item}"))
             continue
         if not isinstance(item, dict):
             continue
@@ -332,20 +473,58 @@ def input_to_prompt(value: Any) -> str:
             if not summary_text:
                 summary_text = item.get("output_text") or item.get("summary") or item.get("text")
             if summary_text:
-                rendered.append(f"User: {format_translation.FAKE_COMPACTION_SUMMARY_LABEL}\n{summary_text}")
+                rendered.append((
+                    _SEGMENT_USER,
+                    f"User: {format_translation.FAKE_COMPACTION_SUMMARY_LABEL}\n{summary_text}",
+                ))
             continue
         if item_type in {"function_call", "custom_tool_call"}:
             payload = item.get("arguments") if item_type == "function_call" else item.get("input")
-            rendered.append(f"Assistant tool call {item.get('name', '')}: {_text_from_content(payload)}")
+            rendered.append((
+                _SEGMENT_ECHO,
+                f"Assistant tool call {item.get('name', '')}: {_text_from_content(payload)}",
+            ))
             continue
         if item_type in {"function_call_output", "custom_tool_call_output"}:
-            rendered.append(f"Tool result: {_text_from_content(item.get('output'))}")
+            rendered.append((_SEGMENT_ECHO, f"Tool result: {_text_from_content(item.get('output'))}"))
             continue
         role = item.get("role") or ("assistant" if item_type == "message" else "user")
         text = _text_from_content(item.get("content"))
         if text:
-            rendered.append(f"{str(role).capitalize()}: {text}")
-    return "\n\n".join(rendered)
+            kind = _SEGMENT_ECHO if str(role).lower() == "assistant" else _SEGMENT_USER
+            rendered.append((kind, f"{str(role).capitalize()}: {text}"))
+    return rendered
+
+
+def input_to_prompt(value: Any) -> str:
+    """Render a full Responses transcript into one SDK user message."""
+    return "\n\n".join(text for _, text in _render_input_segments(value))
+
+
+def _segment_fingerprints(segments: list[tuple[str, str]]) -> list[str]:
+    return [
+        hashlib.sha1(f"{kind}\x00{text}".encode("utf-8")).hexdigest()
+        for kind, text in segments
+    ]
+
+
+def _resume_delta(
+    segments: list[tuple[str, str]],
+    fingerprints: list[str],
+    seen: list[str],
+) -> list[str]:
+    """Return the caller-authored text a resumed session has not consumed yet.
+
+    An empty result means the session cannot be resumed against this
+    transcript -- either nothing new arrived, or the history diverged from
+    what the session consumed (a client-side compaction, say) -- and the
+    caller should fall back to a fresh session carrying the full transcript.
+    """
+    if not seen or len(seen) >= len(fingerprints):
+        return []
+    if fingerprints[: len(seen)] != seen:
+        return []
+    return [text for kind, text in segments[len(seen):] if kind == _SEGMENT_USER]
 
 
 @dataclass(frozen=True)
@@ -469,11 +648,43 @@ async def _open_session(body: dict, registration: ToolRegistration):
     continuation = resolve_tool_continuation(body.get("input"))
     options = _session_options(body, registration)
     if continuation is None:
-        session = await client.create_session(**options)
+        alias = _session_alias(body)
+        segments = _render_input_segments(body.get("input"))
+        fingerprints = _segment_fingerprints(segments)
+
+        # Resuming lets the SDK keep owning the history.  Replaying the whole
+        # transcript into a fresh session instead costs the caller its entire
+        # context window before the agent does any work, which is why long
+        # conversations used to stall out early.
+        session = None
+        prompt = None
+        if alias:
+            known = _session_for_alias(alias)
+            if known is not None:
+                known_session_id, seen = known
+                new_text = _resume_delta(segments, fingerprints, seen)
+                if new_text:
+                    try:
+                        session = await client.resume_session(
+                            known_session_id,
+                            continue_pending_work=False,
+                            **options,
+                        )
+                        prompt = "\n\n".join(new_text)
+                    except Exception:
+                        # The SDK discarded the session; fall through to a
+                        # fresh one carrying the full transcript.
+                        session = None
+                        prompt = None
+        if session is None:
+            session = await client.create_session(**options)
+            prompt = "\n\n".join(text for _, text in segments)
+
         _remember_session(session.session_id)
+        if alias:
+            _pending_alias_watermark[session.session_id] = (alias, fingerprints)
 
         async def dispatch() -> None:
-            prompt = input_to_prompt(body.get("input"))
             if not prompt:
                 raise ValueError("input must contain at least one text message")
             await session.send(prompt)
@@ -489,6 +700,13 @@ async def _open_session(body: dict, registration: ToolRegistration):
         continue_pending_work=True,
         **options,
     )
+
+    alias = _session_alias(body)
+    if alias:
+        _pending_alias_watermark[session.session_id] = (
+            alias,
+            _segment_fingerprints(_render_input_segments(body.get("input"))),
+        )
 
     async def dispatch() -> None:
         for result in results:
@@ -519,6 +737,9 @@ class TurnOutcome:
     message_id: str = field(default_factory=lambda: _new_id("msg"))
     calls: list[ToolCall] = field(default_factory=list)
     usage: dict[str, int] = field(default_factory=dict)
+    # Two independent usage sources; ``_finalize_usage`` picks between them.
+    shutdown_usage: dict[str, int] = field(default_factory=dict)
+    event_usage: dict[str, int] = field(default_factory=dict)
 
 
 def _event_name(event: Any) -> str:
@@ -534,20 +755,30 @@ def _usage_from_event(data: Any) -> dict[str, int]:
     input_tokens = int(getattr(data, "input_tokens", 0) or 0)
     output_tokens = int(getattr(data, "output_tokens", 0) or 0)
     cached_tokens = int(getattr(data, "cache_read_tokens", 0) or 0)
+    cache_write_tokens = int(getattr(data, "cache_write_tokens", 0) or 0)
     reasoning_tokens = int(getattr(data, "reasoning_tokens", 0) or 0)
-    fresh = max(0, input_tokens - cached_tokens)
+    fresh = max(0, input_tokens - cached_tokens - cache_write_tokens)
     return {
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "total_tokens": input_tokens + output_tokens,
         "cached_input_tokens": cached_tokens,
-        "cache_creation_input_tokens": 0,
+        "cache_creation_input_tokens": cache_write_tokens,
         "fresh_input_tokens": fresh,
         "pricing_fresh_input_tokens": fresh,
         "pricing_cached_input_tokens": cached_tokens,
-        "pricing_cache_creation_input_tokens": 0,
+        "pricing_cache_creation_input_tokens": cache_write_tokens,
         "reasoning_output_tokens": reasoning_tokens,
     }
+
+
+def _token_count(entry: Any) -> int:
+    if entry is None:
+        return 0
+    value = getattr(entry, "token_count", None)
+    if value is None and isinstance(entry, dict):
+        value = entry.get("tokenCount")
+    return int(value or 0)
 
 
 def _extract_shutdown_usage(data: Any) -> dict[str, int]:
@@ -557,44 +788,42 @@ def _extract_shutdown_usage(data: Any) -> dict[str, int]:
     cwrite = 0
     out = 0
     reas = 0
-    found_mm = False
 
     mm = getattr(data, "model_metrics", None) or (data.get("modelMetrics") if isinstance(data, dict) else None)
     if isinstance(mm, dict):
         for m_val in mm.values():
             u = getattr(m_val, "usage", None) or (m_val.get("usage") if isinstance(m_val, dict) else None)
-            if u is not None:
-                found_mm = True
-                inp_val = getattr(u, "input_tokens", None) if hasattr(u, "input_tokens") else (u.get("inputTokens") if isinstance(u, dict) else 0)
-                read_val = getattr(u, "cache_read_tokens", None) if hasattr(u, "cache_read_tokens") else (u.get("cacheReadTokens") if isinstance(u, dict) else 0)
-                write_val = getattr(u, "cache_write_tokens", None) if hasattr(u, "cache_write_tokens") else (u.get("cacheWriteTokens") if isinstance(u, dict) else 0)
-                out_val = getattr(u, "output_tokens", None) if hasattr(u, "output_tokens") else (u.get("outputTokens") if isinstance(u, dict) else 0)
-                reas_val = getattr(u, "reasoning_tokens", None) if hasattr(u, "reasoning_tokens") else (u.get("reasoningTokens") if isinstance(u, dict) else 0)
-                total_inp += int(inp_val or 0)
-                cread += int(read_val or 0)
-                cwrite += int(write_val or 0)
-                out += int(out_val or 0)
-                reas += int(reas_val or 0)
+            if u is None:
+                continue
+            inp_val = getattr(u, "input_tokens", None) if hasattr(u, "input_tokens") else (u.get("inputTokens") if isinstance(u, dict) else 0)
+            read_val = getattr(u, "cache_read_tokens", None) if hasattr(u, "cache_read_tokens") else (u.get("cacheReadTokens") if isinstance(u, dict) else 0)
+            write_val = getattr(u, "cache_write_tokens", None) if hasattr(u, "cache_write_tokens") else (u.get("cacheWriteTokens") if isinstance(u, dict) else 0)
+            out_val = getattr(u, "output_tokens", None) if hasattr(u, "output_tokens") else (u.get("outputTokens") if isinstance(u, dict) else 0)
+            reas_val = getattr(u, "reasoning_tokens", None) if hasattr(u, "reasoning_tokens") else (u.get("reasoningTokens") if isinstance(u, dict) else 0)
+            total_inp += int(inp_val or 0)
+            cread += int(read_val or 0)
+            cwrite += int(write_val or 0)
+            out += int(out_val or 0)
+            reas += int(reas_val or 0)
 
+    # ``tokenDetails`` is the session-wide superset: it also covers API calls
+    # that never land in ``modelMetrics`` (observed ~11% higher on long
+    # sessions), so it wins whenever it reports anything.  Reasoning tokens
+    # only ever appear under ``modelMetrics``.
     td = getattr(data, "token_details", None) or (data.get("tokenDetails") if isinstance(data, dict) else None)
     if isinstance(td, dict):
-        inp_tok = getattr(td.get("input"), "token_count", None) if hasattr(td.get("input"), "token_count") else (td.get("input", {}).get("tokenCount") if isinstance(td.get("input"), dict) else 0)
-        read_tok = getattr(td.get("cache_read"), "token_count", None) if hasattr(td.get("cache_read"), "token_count") else (td.get("cache_read", {}).get("tokenCount") if isinstance(td.get("cache_read"), dict) else 0)
-        write_tok = getattr(td.get("cache_write"), "token_count", None) if hasattr(td.get("cache_write"), "token_count") else (td.get("cache_write", {}).get("tokenCount") if isinstance(td.get("cache_write"), dict) else 0)
-        out_tok = getattr(td.get("output"), "token_count", None) if hasattr(td.get("output"), "token_count") else (td.get("output", {}).get("tokenCount") if isinstance(td.get("output"), dict) else 0)
-
-        i = int(inp_tok or 0)
-        r = int(read_tok or 0)
-        w = int(write_tok or 0)
-        o = int(out_tok or 0)
-        if total_inp == 0:
-            total_inp = i + r + w
-        if cread == 0:
-            cread = r
-        if cwrite == 0:
-            cwrite = w
-        if out == 0:
-            out = o
+        fresh_tok = _token_count(td.get("input"))
+        read_tok = _token_count(td.get("cache_read"))
+        write_tok = _token_count(td.get("cache_write"))
+        out_tok = _token_count(td.get("output"))
+        if fresh_tok or read_tok or write_tok or out_tok:
+            # ``tokenDetails.input`` is the uncached remainder, so the total
+            # input is the sum of all three buckets.  This matches
+            # ``modelMetrics.inputTokens`` on the same event.
+            total_inp = fresh_tok + read_tok + write_tok
+            cread = read_tok
+            cwrite = write_tok
+            out = out_tok
 
     fresh = max(0, total_inp - cread - cwrite)
 
@@ -636,7 +865,96 @@ def _usage_delta(current: dict[str, int], previous: dict[str, int] | None) -> di
     }
 
 
-_session_last_shutdown_usage: dict[str, dict[str, int]] = {}
+def _add_usage(total: dict[str, int], usage: dict[str, int]) -> None:
+    """Accumulate usage from one SDK API call into the current turn.
+
+    A Copilot turn can contain several model calls (for example, a tool call
+    followed by the final answer).  ``assistant.usage`` is emitted per call,
+    so replacing the previous record loses all but the last call.
+    """
+    for key in _USAGE_KEYS:
+        total[key] = total.get(key, 0) + max(0, int(usage.get(key, 0) or 0))
+    total["total_tokens"] = total.get("input_tokens", 0) + total.get("output_tokens", 0)
+
+
+_USAGE_KEYS = (
+    "input_tokens",
+    "output_tokens",
+    "cached_input_tokens",
+    "cache_creation_input_tokens",
+    "fresh_input_tokens",
+    "pricing_fresh_input_tokens",
+    "pricing_cached_input_tokens",
+    "pricing_cache_creation_input_tokens",
+    "reasoning_output_tokens",
+)
+
+
+def _read_shutdown_baselines_unlocked() -> dict[str, dict[str, int]]:
+    payload = _read_json_state(_state_path(_SESSION_USAGE_NAME))
+    if not isinstance(payload, dict):
+        return {}
+    baselines: dict[str, dict[str, int]] = {}
+    for session_id, usage in payload.items():
+        if not isinstance(session_id, str) or not isinstance(usage, dict):
+            continue
+        baselines[session_id] = {
+            key: int(usage.get(key) or 0) for key in _USAGE_KEYS + ("total_tokens",)
+        }
+    return baselines
+
+
+def _shutdown_baseline(session_id: str) -> dict[str, int] | None:
+    """Cumulative session usage as of the previous turn, or None if unseen.
+
+    This has to survive a proxy restart: SDK sessions outlive the process
+    now, and ``session.shutdown`` reports session-cumulative totals.  Losing
+    the baseline would bill an entire multi-million-token session against
+    whichever single request happened to come first after the restart.
+    """
+    with _SESSION_LEDGER_LOCK:
+        return _read_shutdown_baselines_unlocked().get(session_id)
+
+
+def _store_shutdown_baseline(session_id: str, usage: dict[str, int]) -> None:
+    with _SESSION_LEDGER_LOCK:
+        baselines = _read_shutdown_baselines_unlocked()
+        baselines[session_id] = dict(usage)
+        try:
+            _write_json_state(_state_path(_SESSION_USAGE_NAME), baselines, "proxy-session-usage-")
+        except OSError:
+            pass
+
+
+def _forget_shutdown_baselines(session_ids: set[str]) -> None:
+    if not session_ids:
+        return
+    with _SESSION_LEDGER_LOCK:
+        baselines = _read_shutdown_baselines_unlocked()
+        remaining = {k: v for k, v in baselines.items() if k not in session_ids}
+        if len(remaining) != len(baselines):
+            try:
+                _write_json_state(_state_path(_SESSION_USAGE_NAME), remaining, "proxy-session-usage-")
+            except OSError:
+                pass
+
+
+def _record_shutdown_usage(outcome: "TurnOutcome", session_id: str, data: Any) -> None:
+    current = _extract_shutdown_usage(data)
+    outcome.shutdown_usage = _usage_delta(current, _shutdown_baseline(session_id))
+    _store_shutdown_baseline(session_id, current)
+
+
+def _finalize_usage(outcome: "TurnOutcome") -> None:
+    """Pick the authoritative usage record for the turn.
+
+    ``session.shutdown`` carries session-cumulative totals and lands at the
+    end of a turn, while ``assistant.usage`` fires per model API call during
+    it.  They describe the same tokens, so exactly one must win -- these used
+    to be sibling ``elif`` branches assigning the same field, and whichever
+    arrived last silently erased the other.
+    """
+    outcome.usage = outcome.shutdown_usage or outcome.event_usage
 
 
 def _tool_call(data: Any, registration: ToolRegistration) -> ToolCall:
@@ -690,6 +1008,7 @@ async def _wait_for_outcome(
                 start_wait_time = time.time()
             except TimeoutError:
                 if outcome.calls:
+                    _finalize_usage(outcome)
                     return outcome
                 if (time.time() - start_wait_time) >= _TURN_TIMEOUT_SECONDS:
                     raise TimeoutError(f"Timed out waiting for the Copilot SDK turn after {_TURN_TIMEOUT_SECONDS}s")
@@ -722,12 +1041,9 @@ async def _wait_for_outcome(
                 (SessionShutdownData is not None and isinstance(data, SessionShutdownData))
                 or _event_name(event) == "session.shutdown"
             ):
-                current_shutdown = _extract_shutdown_usage(data)
-                prev_shutdown = _session_last_shutdown_usage.get(session.session_id)
-                outcome.usage = _usage_delta(current_shutdown, prev_shutdown)
-                _session_last_shutdown_usage[session.session_id] = current_shutdown
+                _record_shutdown_usage(outcome, session.session_id, data)
             elif isinstance(data, AssistantUsageData):
-                outcome.usage = _usage_from_event(data)
+                _add_usage(outcome.event_usage, _usage_from_event(data))
             elif isinstance(data, ExternalToolRequestedData):
                 outcome.calls.append(_tool_call(data, registration))
             elif (SubagentStartedData is not None and isinstance(data, SubagentStartedData)) or _event_name(event) == "subagent.started":
@@ -750,6 +1066,7 @@ async def _wait_for_outcome(
             elif isinstance(data, SessionErrorData):
                 raise RuntimeError(data.message)
             elif isinstance(data, SessionIdleData):
+                _finalize_usage(outcome)
                 return outcome
             elif _event_name(event) == "session.error":
                 raise RuntimeError(str(getattr(data, "message", "Copilot session error")))
@@ -1194,12 +1511,9 @@ async def _stream_turn(
                 (SessionShutdownData is not None and isinstance(data, SessionShutdownData))
                 or _event_name(event) == "session.shutdown"
             ):
-                current_shutdown = _extract_shutdown_usage(data)
-                prev_shutdown = _session_last_shutdown_usage.get(session.session_id)
-                outcome.usage = _usage_delta(current_shutdown, prev_shutdown)
-                _session_last_shutdown_usage[session.session_id] = current_shutdown
+                _record_shutdown_usage(outcome, session.session_id, data)
             elif isinstance(data, AssistantUsageData):
-                outcome.usage = _usage_from_event(data)
+                _add_usage(outcome.event_usage, _usage_from_event(data))
             elif isinstance(data, ExternalToolRequestedData):
                 outcome.calls.append(_tool_call(data, registration))
             elif isinstance(data, SessionErrorData):
@@ -1240,6 +1554,7 @@ async def _stream_turn(
             yield _sse(done_event, item_id=completed_item["id"], output_index=call_output_index, **{field: value})
             yield _sse("response.output_item.done", output_index=call_output_index, item=completed_item)
 
+        _finalize_usage(outcome)
         if is_compact:
             final_payload = to_compaction_payload(body, session.session_id, outcome, response_id)
         else:
@@ -1266,6 +1581,7 @@ async def _stream_turn(
             dispatch_task.cancel()
         await session.disconnect()
         _remember_session(session.session_id)
+        _commit_alias_watermark(session.session_id, success=final_payload is not None)
         if finish_usage_callback is not None and plan is not None:
             status_code = 200 if final_payload is not None else 500
             try:
@@ -1325,8 +1641,10 @@ async def handle_responses(
         )
 
     response_id = _new_id("resp")
+    succeeded = False
     try:
         outcome = await _wait_for_outcome(session, dispatch, registration)
+        succeeded = True
         if is_compact:
             payload = to_compaction_payload(body, session.session_id, outcome, response_id)
         else:
@@ -1361,6 +1679,7 @@ async def handle_responses(
     finally:
         await session.disconnect()
         _remember_session(session.session_id)
+        _commit_alias_watermark(session.session_id, success=succeeded)
 
 
 async def models_response() -> Response:
@@ -1594,6 +1913,15 @@ def scan_session_state(record_callback: Callable[[dict], None]) -> int:
     for session_id in entries:
         session_dir = os.path.join(_SESSION_STATE_DIR, session_id)
         if not os.path.isdir(session_dir):
+            continue
+        # Requests handled by this proxy already report their usage through
+        # ``finish_usage_callback``.  The SDK also persists the same
+        # session.shutdown record, so ingesting an owned session here would
+        # count every turn twice (once under the HTTP request id and once
+        # under copilot-sdk:<session>:<interaction>).  The scanner is for SDK
+        # sessions created outside the request lifecycle, such as sessions
+        # left behind by a crashed/older proxy process.
+        if _owns_session(session_id):
             continue
         events_path = os.path.join(session_dir, "events.jsonl")
         if not os.path.isfile(events_path):

@@ -99,7 +99,7 @@ from bridge_streams import (
 )
 from initiator_policy import InitiatorPolicy, is_approval_agent_request
 from event_bus import EventBus
-from model_routing_config import ModelRoutingConfig, ModelRoutingConfigService, model_provider_family
+from model_routing_config import ModelRoutingConfig, ModelRoutingConfigService, model_provider_family, normalize_routing_model_name
 from protocol_bridge import BridgeExecutionPlan, ProtocolBridgePlanner
 from proxy_client_config import (
     ProxyClientConfig,
@@ -3387,6 +3387,7 @@ def _prepare_upstream_request(
     source_body: dict | None = None,
     trace_metadata: dict | None = None,
     replay_subagent: str | None = None,
+    force_initiator: str | None = None,
 ) -> tuple[UpstreamRequestPlan | None, Response | None]:
     request_id = uuid4().hex
 
@@ -3411,6 +3412,10 @@ def _prepare_upstream_request(
 
     headers = header_builder(effective_api_key, request_id)
     initiator_header = header_value("X-Initiator")
+    # Callers that already know the initiator (e.g. compaction turns, which
+    # carry no X-Initiator header) can override what the client sent.
+    if isinstance(force_initiator, str) and force_initiator.strip():
+        initiator_header = force_initiator.strip()
     initiator = str(initiator_header or "").strip().lower()
     initiator_verdict = None
     if isinstance(trace_metadata, dict):

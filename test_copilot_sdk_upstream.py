@@ -150,7 +150,28 @@ class CopilotSdkTranslationTests(unittest.TestCase):
         self.assertEqual(sdk._decode_call_id(item["call_id"])["s"], "session-1")
 
 
+class _IsolatedSdkState:
+    """Redirect SDK state files at a temp dir for the duration of a test."""
+
+    def __enter__(self):
+        import tempfile
+        self._dir = tempfile.TemporaryDirectory()
+        self._patch = patch.object(sdk, "_SDK_STATE_DIR", self._dir.name)
+        self._patch.start()
+        return self._dir.name
+
+    def __exit__(self, *exc):
+        self._patch.stop()
+        self._dir.cleanup()
+        return False
+
+
 class CopilotSdkEventTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self._sdk_state = _IsolatedSdkState()
+        self._sdk_state.__enter__()
+        self.addCleanup(self._sdk_state.__exit__, None, None, None)
+
     async def test_non_streaming_event_translation_collects_text_and_usage(self):
         session = _FakeSession()
 
@@ -219,6 +240,169 @@ class CopilotSdkEventTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(u["cached_input_tokens"], 0)
         self.assertEqual(u["fresh_input_tokens"], 80)
         self.assertEqual(u["output_tokens"], 20)
+
+    async def test_usage_events_are_accumulated_across_model_calls_in_one_turn(self):
+        session = _FakeSession()
+
+        async def dispatch():
+            session.emit(
+                "assistant.usage",
+                AssistantUsageData(model="gpt-test", input_tokens=100, output_tokens=10),
+            )
+            session.emit(
+                "assistant.usage",
+                AssistantUsageData(
+                    model="gpt-test",
+                    input_tokens=40,
+                    output_tokens=20,
+                    cache_read_tokens=30,
+                    cache_write_tokens=2,
+                    reasoning_tokens=5,
+                ),
+            )
+            session.emit("session.idle", SessionIdleData())
+
+        outcome = await sdk._wait_for_outcome(session, dispatch, sdk.ToolRegistration())
+
+        self.assertEqual(outcome.usage["input_tokens"], 140)
+        self.assertEqual(outcome.usage["output_tokens"], 30)
+        self.assertEqual(outcome.usage["cached_input_tokens"], 30)
+        self.assertEqual(outcome.usage["fresh_input_tokens"], 108)
+        self.assertEqual(outcome.usage["cache_creation_input_tokens"], 2)
+        self.assertEqual(outcome.usage["reasoning_output_tokens"], 5)
+        self.assertEqual(outcome.usage["total_tokens"], 170)
+
+    async def test_shutdown_usage_wins_over_per_call_usage_events(self):
+        """The two sources describe the same tokens; exactly one must win."""
+        session = _FakeSession()
+
+        async def dispatch():
+            session.emit(
+                "assistant.usage",
+                AssistantUsageData(model="gpt-test", input_tokens=100, output_tokens=10),
+            )
+            session.emit(
+                "session.shutdown",
+                SimpleNamespace(
+                    token_details=None,
+                    model_metrics={
+                        "gpt-test": SimpleNamespace(
+                            usage=SimpleNamespace(
+                                input_tokens=500,
+                                cache_read_tokens=100,
+                                cache_write_tokens=50,
+                                output_tokens=40,
+                                reasoning_tokens=7,
+                            )
+                        )
+                    },
+                ),
+            )
+            session.emit("session.idle", SessionIdleData())
+
+        outcome = await sdk._wait_for_outcome(session, dispatch, sdk.ToolRegistration())
+
+        # Shutdown totals, not the 100/10 from the per-call event, and not a sum.
+        self.assertEqual(outcome.usage["input_tokens"], 500)
+        self.assertEqual(outcome.usage["output_tokens"], 40)
+        self.assertEqual(outcome.usage["fresh_input_tokens"], 350)
+        self.assertEqual(outcome.event_usage["input_tokens"], 100)
+
+    async def test_shutdown_baseline_survives_a_proxy_restart(self):
+        """A resumed session must not bill its whole history to one request."""
+        def shutdown(total_input, output):
+            return SimpleNamespace(
+                token_details=None,
+                model_metrics={
+                    "gpt-test": SimpleNamespace(
+                        usage=SimpleNamespace(
+                            input_tokens=total_input,
+                            cache_read_tokens=0,
+                            cache_write_tokens=0,
+                            output_tokens=output,
+                            reasoning_tokens=0,
+                        )
+                    )
+                },
+            )
+
+        async def run_turn(total_input, output):
+            session = _FakeSession()
+
+            async def dispatch():
+                session.emit("session.shutdown", shutdown(total_input, output))
+                session.emit("session.idle", SessionIdleData())
+
+            return await sdk._wait_for_outcome(session, dispatch, sdk.ToolRegistration())
+
+        first = await run_turn(1000, 50)
+        self.assertEqual(first.usage["input_tokens"], 1000)
+
+        # Session-cumulative totals keep climbing; the second turn is the delta.
+        second = await run_turn(3000, 120)
+        self.assertEqual(second.usage["input_tokens"], 2000)
+        self.assertEqual(second.usage["output_tokens"], 70)
+
+        # Simulate a proxy restart: only the on-disk baseline is left.
+        self.assertIsNotNone(sdk._shutdown_baseline("session-1"))
+        third = await run_turn(3500, 130)
+        self.assertEqual(third.usage["input_tokens"], 500)
+        self.assertEqual(third.usage["output_tokens"], 10)
+
+    async def test_open_session_resumes_alias_and_sends_only_new_input(self):
+        """The fix for replaying a whole transcript into a fresh session."""
+        created = []
+        resumed = []
+        sent = []
+
+        class _Session(_FakeSession):
+            def __init__(self, session_id):
+                super().__init__()
+                self.session_id = session_id
+
+            async def send(self, prompt):
+                sent.append(prompt)
+
+        class _Client:
+            async def create_session(self, **options):
+                created.append(options)
+                return _Session("sdk-session-1")
+
+            async def resume_session(self, session_id, **options):
+                resumed.append(session_id)
+                return _Session(session_id)
+
+        first_body = {"input": [{"role": "user", "content": "hello"}], "session_id": "thread-A"}
+        with patch.object(sdk, "_get_client", return_value=_Client()):
+            session, dispatch = await sdk._open_session(first_body, sdk.ToolRegistration())
+            await dispatch()
+        self.assertEqual(len(created), 1)
+        self.assertEqual(sent, ["User: hello"])
+
+        # The turn succeeded, so the watermark becomes durable.
+        sdk._commit_alias_watermark(session.session_id, success=True)
+
+        second_body = {
+            "input": [
+                {"role": "user", "content": "hello"},
+                {"type": "message", "role": "assistant", "content": "hi"},
+                {"role": "user", "content": "next question"},
+            ],
+            "session_id": "thread-A",
+        }
+        with patch.object(sdk, "_get_client", return_value=_Client()):
+            _, dispatch = await sdk._open_session(second_body, sdk.ToolRegistration())
+            await dispatch()
+
+        # Resumed rather than recreated, and only the new user turn was sent.
+        self.assertEqual(resumed, ["sdk-session-1"])
+        self.assertEqual(len(created), 1)
+        self.assertEqual(sent[1], "User: next question")
+
+    async def test_open_session_does_not_commit_watermark_for_a_failed_turn(self):
+        sdk._pending_alias_watermark["sdk-session-9"] = ("thread-B", ["abc"])
+        sdk._commit_alias_watermark("sdk-session-9", success=False)
+        self.assertIsNone(sdk._session_for_alias("thread-B"))
 
     async def test_external_tool_request_suspends_and_returns_to_caller(self):
         session = _FakeSession()
@@ -379,6 +563,66 @@ class CopilotSdkEventTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(completed["output"][0]["type"], "reasoning")
         self.assertEqual(completed["output"][1]["id"], message_added["item"]["id"])
         self.assertEqual(completed["output"][1]["type"], "message")
+
+    def test_extract_shutdown_usage_prefers_token_details_over_model_metrics(self):
+        """tokenDetails is the session-wide superset; modelMetrics undercounts."""
+        usage = sdk._extract_shutdown_usage({
+            "tokenDetails": {
+                "input": {"tokenCount": 282},
+                "cache_read": {"tokenCount": 3076421},
+                "cache_write": {"tokenCount": 255349},
+                "output": {"tokenCount": 38342},
+            },
+            "modelMetrics": {
+                "gpt-5.6-luna": {
+                    "usage": {
+                        "inputTokens": 3006170,
+                        "outputTokens": 33717,
+                        "cacheReadTokens": 2752601,
+                        "cacheWriteTokens": 253437,
+                        "reasoningTokens": 26418,
+                    }
+                }
+            },
+        })
+        self.assertEqual(usage["input_tokens"], 282 + 3076421 + 255349)
+        self.assertEqual(usage["cached_input_tokens"], 3076421)
+        self.assertEqual(usage["cache_creation_input_tokens"], 255349)
+        self.assertEqual(usage["fresh_input_tokens"], 282)
+        self.assertEqual(usage["output_tokens"], 38342)
+        # Reasoning only ever appears under modelMetrics.
+        self.assertEqual(usage["reasoning_output_tokens"], 26418)
+
+    def test_resume_delta_returns_only_new_user_segments(self):
+        first = [{"role": "user", "content": "hello"}]
+        segments = sdk._render_input_segments(first)
+        seen = sdk._segment_fingerprints(segments)
+
+        follow_up = first + [
+            {"type": "message", "role": "assistant", "content": "hi there"},
+            {"type": "function_call", "name": "ls", "arguments": "{}"},
+            {"type": "function_call_output", "output": "a.py"},
+            {"role": "user", "content": "now what?"},
+        ]
+        segments2 = sdk._render_input_segments(follow_up)
+        delta = sdk._resume_delta(segments2, sdk._segment_fingerprints(segments2), seen)
+
+        # Only the new user turn: the session already holds its own reply and
+        # the tool call/result it executed.
+        self.assertEqual(delta, ["User: now what?"])
+
+    def test_resume_delta_bails_out_when_history_diverges(self):
+        segments = sdk._render_input_segments([{"role": "user", "content": "hello"}])
+        stale = sdk._segment_fingerprints(
+            sdk._render_input_segments([{"role": "user", "content": "different"}])
+        )
+        self.assertEqual(sdk._resume_delta(segments, sdk._segment_fingerprints(segments), stale), [])
+
+        # Nothing new to send is also a bail-out.
+        fresh = sdk._segment_fingerprints(segments)
+        self.assertEqual(sdk._resume_delta(segments, fresh, fresh), [])
+        # No watermark at all means a full replay.
+        self.assertEqual(sdk._resume_delta(segments, fresh, []), [])
 
     def test_input_to_prompt_compaction_window_and_decoding(self):
         fake_enc = format_translation.encode_fake_compaction("Previous conversation summary")
@@ -644,6 +888,31 @@ class CopilotSdkEventTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(t2["usage"]["cached_input_tokens"], 300)  # 500 - 200
                 self.assertEqual(t2["usage"]["fresh_input_tokens"], 10)  # 60 - 50
                 self.assertEqual(t2["usage"]["reasoning_output_tokens"], 10)  # 30 - 20
+
+    def test_scan_session_state_skips_sessions_owned_by_request_path(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as temp_dir:
+            sess_dir = os.path.join(temp_dir, "session-state", "owned-session")
+            os.makedirs(sess_dir, exist_ok=True)
+            with open(os.path.join(sess_dir, "events.jsonl"), "w") as f:
+                f.write(json.dumps({
+                    "type": "assistant.turn_start",
+                    "timestamp": "2026-09-02T12:00:01Z",
+                    "data": {"interactionId": "turn-1"},
+                }) + "\n")
+                f.write(json.dumps({
+                    "type": "session.shutdown",
+                    "timestamp": "2026-09-02T12:00:02Z",
+                    "data": {"modelMetrics": {"model": {"usage": {"inputTokens": 100}}}},
+                }) + "\n")
+
+            recorded = []
+            with patch.object(sdk, "_SDK_STATE_DIR", temp_dir), \
+                 patch.object(sdk, "_SESSION_STATE_DIR", os.path.join(temp_dir, "session-state")), \
+                 patch.object(sdk, "_INGEST_CURSOR_FILE", os.path.join(temp_dir, "session-cursor.json")), \
+                 patch.object(sdk, "_owns_session", return_value=True):
+                self.assertEqual(sdk.scan_session_state(recorded.append), 0)
+            self.assertEqual(recorded, [])
 
     async def test_stream_turn_emits_keepalive_comments_on_timeout(self):
         session = _FakeSession()
