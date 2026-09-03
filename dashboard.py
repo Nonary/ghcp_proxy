@@ -629,10 +629,24 @@ def _usage_display_input_tokens(usage: dict) -> int:
 
 
 def _usage_display_total_tokens(usage: dict, *, input_tokens: int, output_tokens: int) -> int:
-    """Return the total-token count shown in dashboard rollups."""
-    if usage.get("fresh_input_tokens") is not None or usage.get("billable_input_tokens") is not None:
-        return max(0, input_tokens) + max(0, output_tokens)
-    return _coerce_int(usage.get("total_tokens"))
+    """Return the total token volume shown in dashboard rollups.
+
+    ``fresh_input_tokens`` is intentionally the small uncached portion of an
+    input.  It is useful for the Input (fresh) cost breakdown, but it is not a
+    request's total token volume.  In particular, Copilot SDK reports cache
+    reads and cache writes separately; showing fresh input plus output here
+    made normal cached turns appear to consume only a few tokens.
+    """
+    total_tokens = _coerce_int(usage.get("total_tokens"), default=None)
+    if total_tokens is not None:
+        return max(0, total_tokens)
+
+    gross_input_tokens = _coerce_int(usage.get("input_tokens"), default=None)
+    if gross_input_tokens is None:
+        gross_input_tokens = max(0, input_tokens)
+        gross_input_tokens += max(0, _coerce_int(usage.get("cached_input_tokens")))
+        gross_input_tokens += max(0, _coerce_int(usage.get("cache_creation_input_tokens")))
+    return max(0, gross_input_tokens) + max(0, output_tokens)
 
 
 def _prepare_usage_event(event: dict) -> dict | None:

@@ -615,7 +615,11 @@ def _usage_event_cost_breakdown(model_name: str | None, usage: dict | None) -> d
         fresh_input_tokens = usage.get("fresh_input_tokens")
     if fresh_input_tokens is None:
         fresh_input_tokens = usage.get("billable_input_tokens")
-    input_tokens = _coerce_int(
+    # ``fresh_input_tokens`` is gross input minus cache reads.  A cache write
+    # is therefore a subset of fresh input, not an additional input token.
+    # Charge its tokens at the cache-creation rate instead of charging them a
+    # second time at the normal fresh-input rate below.
+    fresh_input_tokens = _coerce_int(
         fresh_input_tokens if fresh_input_tokens is not None else usage.get("input_tokens")
     )
     output_tokens = _coerce_int(usage.get("output_tokens"))
@@ -627,7 +631,7 @@ def _usage_event_cost_breakdown(model_name: str | None, usage: dict | None) -> d
     cache_creation_input_tokens = _coerce_int(usage.get("pricing_cache_creation_input_tokens"), default=None)
     if cache_creation_input_tokens is None:
         cache_creation_input_tokens = _coerce_int(usage.get("cache_creation_input_tokens"))
-    billed_input_tokens = input_tokens + cached_input_tokens + cache_creation_input_tokens
+    billed_input_tokens = fresh_input_tokens + cached_input_tokens
     long_context_threshold = _coerce_int(entry.get("long_context_threshold"), default=None)
     if long_context_threshold is not None and billed_input_tokens > long_context_threshold:
         entry = {
@@ -656,7 +660,8 @@ def _usage_event_cost_breakdown(model_name: str | None, usage: dict | None) -> d
         else:
             cache_creation_rate = input_rate
 
-    breakdown["input_fresh"] = (input_tokens * input_rate) / 1_000_000.0
+    non_cache_creation_input_tokens = max(0, fresh_input_tokens - cache_creation_input_tokens)
+    breakdown["input_fresh"] = (non_cache_creation_input_tokens * input_rate) / 1_000_000.0
     breakdown["cached_input"] = (cached_input_tokens * cached_rate) / 1_000_000.0
     breakdown["cache_creation"] = (cache_creation_input_tokens * cache_creation_rate) / 1_000_000.0
     # OpenAI/Responses and Anthropic both include reasoning/thinking in their

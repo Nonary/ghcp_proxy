@@ -3481,15 +3481,18 @@
 
     function displayTotalTokensFromUsage(usage) {
       if (!usage || typeof usage !== 'object') return 0;
-      const input = displayInputTokensFromUsage(usage);
       const output = Math.max(0, Number(usage.output_tokens || 0));
-      const hasNetInput = usage.fresh_input_tokens != null
-        || usage.billable_input_tokens != null
-        || Boolean((usage.input_tokens_details || usage.prompt_tokens_details)?.cached_tokens != null);
-      if (hasNetInput) return input + output;
       const total = Number(usage.total_tokens);
       if (Number.isFinite(total) && total > 0) return total;
-      return input + output;
+      // fresh_input_tokens is only the non-cache portion of the prompt.  It
+      // must not replace gross input in token-volume totals: Copilot SDK turns
+      // commonly have a few fresh tokens plus substantial cache reads/writes.
+      const grossInput = Number(usage.input_tokens);
+      if (Number.isFinite(grossInput) && grossInput >= 0) return grossInput + output;
+      const freshInput = displayInputTokensFromUsage(usage);
+      const cachedInput = Math.max(0, Number(usage.cached_input_tokens ?? usage.cache_read_input_tokens ?? 0) || 0);
+      const cacheCreation = Math.max(0, Number(usage.cache_creation_input_tokens || 0) || 0);
+      return freshInput + cachedInput + cacheCreation + output;
     }
 
     function mergeUsageRows(rows) {
@@ -3800,7 +3803,7 @@
           const rows = [
             { label: 'Input (fresh)',    tokens: freshInput,                                     field: 'input_fresh',             color: '#ff8752' },
             { label: 'Input (cached)',   tokens: Number(u.cached_input_tokens || 0),             field: 'cached_input',            color: '#6ee7c8' },
-            { label: 'Cache Creation',   tokens: Number(u.cache_creation_tokens || 0),           field: 'cache_creation',          color: '#f6b16d' },
+            { label: 'Cache Creation (of fresh)', tokens: Number(u.cache_creation_tokens || 0),  field: 'cache_creation',          color: '#f6b16d' },
             { label: 'Output',           tokens: outputTokens,                                   field: 'output_tokens',           color: '#7eaaff' },
           ].filter(r => r.tokens > 0);
           const exactCosts = {
@@ -5343,20 +5346,11 @@
         },
         requestInputTokens(row) {
           const usage = row?.usage || (row && typeof row === 'object' && row.input_tokens != null ? row : {});
-          let i = Number(usage.input_tokens ?? row?.input_tokens ?? 0);
-          const cached = Number(this.cachedInputTokens(row));
-          if (i < cached) {
-            i = i + cached;
-          }
-          return i;
+          return Math.max(0, Number(usage.input_tokens ?? row?.input_tokens ?? 0) || 0);
         },
         requestTotalTokens(row) {
           const usage = row?.usage || (row && typeof row === 'object' && row.total_tokens != null ? row : {});
-          const total = Number(usage.total_tokens);
-          const inp = this.requestInputTokens(row);
-          const out = Number(this.displayOutputTokens(usage)) || Number(row?.output_tokens || 0);
-          if (Number.isFinite(total) && total >= inp + out) return total;
-          return inp + out;
+          return this.displayTotalTokens(usage);
         },
         displayOutputTokens(usage) {
           // reasoning_output_tokens is a subset retained for diagnostics.

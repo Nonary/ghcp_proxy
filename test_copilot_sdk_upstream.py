@@ -61,6 +61,27 @@ class CopilotSdkTranslationTests(unittest.TestCase):
         with patch.dict(os.environ, {sdk.RESPONSES_UPSTREAM_ENV: "rest"}):
             self.assertEqual(sdk.responses_upstream(), "rest")
 
+    def test_sdk_sessions_enable_automatic_context_compaction(self):
+        options = sdk._session_options({"model": "gpt-test"}, sdk.ToolRegistration())
+        self.assertEqual(options["infinite_sessions"], {"enabled": True})
+
+    def test_recognizes_terminal_in_band_compaction_trigger(self):
+        self.assertTrue(
+            sdk.is_compaction_request(
+                {
+                    "input": [
+                        {"type": "message", "role": "user", "content": "history"},
+                        {"type": "compaction_trigger"},
+                    ]
+                }
+            )
+        )
+        self.assertFalse(
+            sdk.is_compaction_request(
+                {"input": [{"type": "message", "role": "user", "content": "normal"}]}
+            )
+        )
+
     def test_function_and_custom_tools_are_declaration_only(self):
         registration = sdk.build_tool_registration(
             {
@@ -267,7 +288,7 @@ class CopilotSdkEventTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outcome.usage["input_tokens"], 140)
         self.assertEqual(outcome.usage["output_tokens"], 30)
         self.assertEqual(outcome.usage["cached_input_tokens"], 30)
-        self.assertEqual(outcome.usage["fresh_input_tokens"], 108)
+        self.assertEqual(outcome.usage["fresh_input_tokens"], 110)
         self.assertEqual(outcome.usage["cache_creation_input_tokens"], 2)
         self.assertEqual(outcome.usage["reasoning_output_tokens"], 5)
         self.assertEqual(outcome.usage["total_tokens"], 170)
@@ -305,7 +326,7 @@ class CopilotSdkEventTests(unittest.IsolatedAsyncioTestCase):
         # Shutdown totals, not the 100/10 from the per-call event, and not a sum.
         self.assertEqual(outcome.usage["input_tokens"], 500)
         self.assertEqual(outcome.usage["output_tokens"], 40)
-        self.assertEqual(outcome.usage["fresh_input_tokens"], 350)
+        self.assertEqual(outcome.usage["fresh_input_tokens"], 400)
         self.assertEqual(outcome.event_usage["input_tokens"], 100)
 
     async def test_shutdown_baseline_survives_a_proxy_restart(self):
@@ -495,6 +516,23 @@ class CopilotSdkEventTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outcome.reasoning, "thinking step")
         self.assertEqual(outcome.text, "answer")
 
+    async def test_wait_for_outcome_does_not_expose_internal_compaction_summary(self):
+        session = _FakeSession()
+
+        async def dispatch():
+            session.emit(
+                "session.compaction_complete",
+                SimpleNamespace(summary_content="internal SDK summary"),
+            )
+            session.emit(
+                "assistant.message",
+                AssistantMessageData(content="visible answer", message_id="m-1"),
+            )
+            session.emit("session.idle", SessionIdleData())
+
+        outcome = await sdk._wait_for_outcome(session, dispatch, sdk.ToolRegistration())
+        self.assertEqual(outcome.text, "visible answer")
+
     async def test_stream_emits_reasoning_and_message_with_stable_ids_and_indices(self):
         session = _FakeSession()
 
@@ -588,10 +626,55 @@ class CopilotSdkEventTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(usage["input_tokens"], 282 + 3076421 + 255349)
         self.assertEqual(usage["cached_input_tokens"], 3076421)
         self.assertEqual(usage["cache_creation_input_tokens"], 255349)
-        self.assertEqual(usage["fresh_input_tokens"], 282)
+        self.assertEqual(usage["fresh_input_tokens"], 282 + 255349)
         self.assertEqual(usage["output_tokens"], 38342)
+        # Cache creation is fresh input; only cache reads are excluded.
+        self.assertEqual(usage["pricing_fresh_input_tokens"], 282 + 255349)
         # Reasoning only ever appears under modelMetrics.
         self.assertEqual(usage["reasoning_output_tokens"], 26418)
+
+    def test_dashboard_keeps_cached_sdk_tokens_in_total_volume(self):
+        """Fresh input is a cost bucket, not the request's token total."""
+        import dashboard
+
+        event = {
+            "requested_model": "gpt-5.6-luna",
+            "finished_at": "2026-09-03T19:31:00+00:00",
+            "usage": {
+                "input_tokens": 65_087,
+                "cached_input_tokens": 54_898,
+                "cache_creation_input_tokens": 10_186,
+                "fresh_input_tokens": 10_189,
+                "output_tokens": 936,
+                "total_tokens": 66_023,
+            },
+        }
+
+        prepared = dashboard._prepare_usage_event(event)
+        self.assertEqual(prepared["input_tokens"], 10_189)
+        self.assertEqual(prepared["total_tokens"], 66_023)
+
+    def test_cache_creation_is_part_of_fresh_input_but_not_double_billed(self):
+        import util
+
+        usage = sdk._extract_shutdown_usage({
+            "tokenDetails": {
+                "input": {"tokenCount": 10},
+                "cache_read": {"tokenCount": 70},
+                "cache_write": {"tokenCount": 20},
+                "output": {"tokenCount": 0},
+            },
+        })
+        # Total input contains direct input, cache reads, and cache writes.
+        # Fresh input is total input less only cache reads.
+        self.assertEqual(usage["input_tokens"], 100)
+        self.assertEqual(usage["fresh_input_tokens"], 30)
+        self.assertEqual(usage["cached_input_tokens"], 70)
+
+        breakdown = util._usage_event_cost_breakdown("gpt-5.6-luna", usage)
+        # 10 direct fresh tokens at $0.20/M, plus 20 cache writes at $0.25/M.
+        self.assertAlmostEqual(breakdown["input_fresh"], 10 * 0.20 / 1_000_000)
+        self.assertAlmostEqual(breakdown["cache_creation"], 20 * 0.25 / 1_000_000)
 
     def test_resume_delta_returns_only_new_user_segments(self):
         first = [{"role": "user", "content": "hello"}]
@@ -775,10 +858,42 @@ class CopilotSdkEventTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(resp.status_code, 200)
             self.assertEqual(plan.usage_event.get("session_id"), "custom-sdk-session-id")
+            self.assertEqual(plan.usage_event.get("session_id_origin"), "copilot_sdk")
             self.assertEqual(len(finished_events), 1)
             self.assertEqual(finished_events[0][1], 200)
             # Verify session was NOT deleted
             mock_delete.assert_not_called()
+
+    async def test_stream_records_finished_turn_before_cancelled_disconnect(self):
+        class _CancelledDisconnectSession(_FakeSession):
+            async def disconnect(self):
+                raise asyncio.CancelledError
+
+        session = _CancelledDisconnectSession()
+
+        async def dispatch():
+            session.emit(
+                "assistant.message_delta",
+                AssistantMessageDeltaData(delta_content="done", message_id="msg-1"),
+            )
+            session.emit("session.idle", SessionIdleData())
+
+        finished_events = []
+        async for _chunk in sdk._stream_turn(
+            _ConnectedRequest(),
+            {"model": "gpt-test"},
+            session,
+            dispatch,
+            sdk.ToolRegistration(),
+            plan=SimpleNamespace(),
+            finish_usage_callback=lambda plan, status, **kwargs: finished_events.append(
+                (status, kwargs)
+            ),
+        ):
+            pass
+
+        self.assertEqual(len(finished_events), 1)
+        self.assertEqual(finished_events[0][0], 200)
 
     def test_scan_session_state(self):
         import tempfile

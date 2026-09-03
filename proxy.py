@@ -6207,6 +6207,11 @@ async def _handle_copilot_sdk_responses(
 
     sdk_body = dict(body)
     sdk_body["model"] = resolved_model
+    if is_compact:
+        # Compaction is a pure summarization turn.  The generic fake compact
+        # request intentionally retains tool declarations for cache affinity,
+        # but the SDK executes declared tools unless explicitly disabled.
+        sdk_body["tool_choice"] = "none"
 
     raw_input = sdk_body.get("input")
     has_compaction_input = format_translation.input_contains_compaction(raw_input)
@@ -6272,6 +6277,13 @@ async def responses(request: Request):
     if excel_upstream.is_excel_model(body.get("model")):
         return await _handle_excel_responses(request, body)
     if copilot_sdk_upstream.enabled():
+        if copilot_sdk_upstream.is_compaction_request(body):
+            return await _handle_copilot_sdk_responses(
+                request,
+                format_translation.build_fake_compaction_request(body),
+                source_body=body,
+                is_compact=True,
+            )
         return await _handle_copilot_sdk_responses(request, body)
 
     effective_subagent = _responses_effective_subagent(request, body)

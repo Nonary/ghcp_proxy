@@ -307,6 +307,23 @@ def enabled() -> bool:
     return responses_upstream() == SDK_UPSTREAM
 
 
+def is_compaction_request(body: dict | None) -> bool:
+    """Recognize Codex's in-band manual compaction turn.
+
+    Recent Codex clients post this to /responses rather than
+    /responses/compact and terminate the input with a compaction_trigger item.
+    """
+    if not isinstance(body, dict):
+        return False
+    input_items = body.get("input")
+    return bool(
+        isinstance(input_items, list)
+        and input_items
+        and isinstance(input_items[-1], dict)
+        and input_items[-1].get("type") == "compaction_trigger"
+    )
+
+
 def _new_id(prefix: str) -> str:
     return f"{prefix}_{uuid4().hex}"
 
@@ -630,7 +647,11 @@ def _session_options(body: dict, registration: ToolRegistration) -> dict[str, An
         "available_tools": ["custom:*"],
         "include_sub_agent_streaming_events": True,
         "on_permission_request": PermissionHandler.approve_all,
-        "infinite_sessions": {"enabled": False},
+        # Resumed SDK sessions own their conversation history, so they also
+        # need the SDK's context-window management.  Disabling this makes a
+        # long-lived Codex thread fail before the caller gets a chance to
+        # consume the proxy's /responses/compact handoff.
+        "infinite_sessions": {"enabled": True},
         "enable_managed_settings": False,
         "enable_config_discovery": False,
         "skip_custom_instructions": True,
@@ -757,7 +778,9 @@ def _usage_from_event(data: Any) -> dict[str, int]:
     cached_tokens = int(getattr(data, "cache_read_tokens", 0) or 0)
     cache_write_tokens = int(getattr(data, "cache_write_tokens", 0) or 0)
     reasoning_tokens = int(getattr(data, "reasoning_tokens", 0) or 0)
-    fresh = max(0, input_tokens - cached_tokens - cache_write_tokens)
+    # Cache creation is still fresh input.  Only a cache *read* was supplied
+    # from prior context, so fresh input is total input minus cache reads.
+    fresh = max(0, input_tokens - cached_tokens)
     return {
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
@@ -825,7 +848,9 @@ def _extract_shutdown_usage(data: Any) -> dict[str, int]:
             cwrite = write_tok
             out = out_tok
 
-    fresh = max(0, total_inp - cread - cwrite)
+    # ``cache_write`` is an independently billed subset of fresh input, not
+    # previously cached context.  Do not subtract it from fresh input.
+    fresh = max(0, total_inp - cread)
 
     return {
         "input_tokens": total_inp,
@@ -850,7 +875,7 @@ def _usage_delta(current: dict[str, int], previous: dict[str, int] | None) -> di
     cread = max(0, current["cached_input_tokens"] - previous.get("cached_input_tokens", 0))
     cwrite = max(0, current["cache_creation_input_tokens"] - previous.get("cache_creation_input_tokens", 0))
     reas = max(0, current["reasoning_output_tokens"] - previous.get("reasoning_output_tokens", 0))
-    fresh = max(0, inp - cread - cwrite)
+    fresh = max(0, inp - cread)
     return {
         "input_tokens": inp,
         "output_tokens": out,
@@ -1059,10 +1084,14 @@ async def _wait_for_outcome(
                 err_msg = getattr(data, "error", "error")
                 outcome.reasoning += f"[Subagent '{agent_name}' failed: {err_msg}]\n"
                 saw_reasoning_delta = True
-            elif (SessionCompactionCompleteData is not None and isinstance(data, SessionCompactionCompleteData)) or _event_name(event) == "session.compaction_complete":
-                summary = getattr(data, "summary_content", None)
-                if summary and not outcome.text:
-                    outcome.text = summary
+            elif (
+                (SessionCompactionCompleteData is not None and isinstance(data, SessionCompactionCompleteData))
+                or _event_name(event) in {"session.compaction_start", "session.compaction_complete"}
+            ):
+                # Internal session maintenance, not assistant output.  The
+                # model response to our compact prompt arrives through the
+                # ordinary assistant message events.
+                pass
             elif isinstance(data, SessionErrorData):
                 raise RuntimeError(data.message)
             elif isinstance(data, SessionIdleData):
@@ -1225,6 +1254,7 @@ async def _stream_turn(
     outcome = TurnOutcome()
     output_index = 0
     final_payload: dict | None = None
+    usage_finished = False
 
     reasoning_started = False
     reasoning_closed = False
@@ -1237,6 +1267,24 @@ async def _stream_turn(
     saw_delta = False
 
     first_output_marked = False
+
+    def finish_usage() -> None:
+        nonlocal usage_finished
+        if usage_finished or finish_usage_callback is None or plan is None:
+            return
+        usage_finished = True
+        status_code = 200 if final_payload is not None else 500
+        try:
+            finish_usage_callback(
+                plan,
+                status_code,
+                response_payload=final_payload,
+                response_text=outcome.text,
+                reasoning_text=outcome.reasoning,
+                usage=outcome.usage,
+            )
+        except Exception:
+            pass
 
     def mark_first() -> None:
         nonlocal first_output_marked
@@ -1374,6 +1422,28 @@ async def _stream_turn(
                 yield b": keep-alive\n\n"
                 continue
             data = getattr(event, "data", None)
+            # A compact response is a different Responses item type.  Do not
+            # leak the SDK's ordinary assistant/tool items into that stream:
+            # remote compaction v2 validates the streamed output and requires
+            # exactly one compaction item.  Still collect assistant text so it
+            # can be placed in the encrypted compaction payload below.
+            if is_compact and isinstance(data, AssistantReasoningDeltaData):
+                outcome.reasoning += data.delta_content
+                saw_reasoning_delta = True
+                continue
+            if is_compact and isinstance(data, AssistantReasoningData):
+                if not saw_reasoning_delta and data.content:
+                    outcome.reasoning = data.content
+                continue
+            if is_compact and isinstance(data, AssistantMessageDeltaData):
+                if not getattr(data, "parent_tool_call_id", None):
+                    outcome.text += data.delta_content
+                    saw_delta = True
+                continue
+            if is_compact and isinstance(data, AssistantMessageData):
+                if not getattr(data, "parent_tool_call_id", None) and not saw_delta:
+                    outcome.text = data.content or outcome.text
+                continue
             if isinstance(data, AssistantReasoningDeltaData):
                 for chunk in emit_reasoning_start():
                     yield chunk
@@ -1453,10 +1523,12 @@ async def _stream_turn(
                     summary_index=0,
                     delta=notice,
                 )
-            elif (SessionCompactionCompleteData is not None and isinstance(data, SessionCompactionCompleteData)) or _event_name(event) == "session.compaction_complete":
-                summary = getattr(data, "summary_content", None)
-                if summary and not outcome.text:
-                    outcome.text = summary
+            elif (
+                (SessionCompactionCompleteData is not None and isinstance(data, SessionCompactionCompleteData))
+                or _event_name(event) in {"session.compaction_start", "session.compaction_complete"}
+            ):
+                # Internal bookkeeping, not downstream response text.
+                pass
             elif isinstance(data, AssistantMessageDeltaData):
                 if getattr(data, "parent_tool_call_id", None):
                     for chunk in emit_reasoning_start():
@@ -1525,12 +1597,13 @@ async def _stream_turn(
                 if error is not None:
                     raise error
 
-        for chunk in emit_reasoning_done():
-            yield chunk
-        for chunk in emit_text_done():
-            yield chunk
+        if not is_compact:
+            for chunk in emit_reasoning_done():
+                yield chunk
+            for chunk in emit_text_done():
+                yield chunk
 
-        for call in outcome.calls:
+        for call in outcome.calls if not is_compact else []:
             call_output_index = output_index
             output_index += 1
             completed_item = _tool_item(session.session_id, call, completed=True)
@@ -1559,12 +1632,34 @@ async def _stream_turn(
             final_payload = to_compaction_payload(body, session.session_id, outcome, response_id)
         else:
             final_payload = _response_payload(body, session.session_id, outcome, response_id)
+        # Persist before yielding the terminal event.  A downstream can close
+        # the connection as soon as it consumes response.completed, without
+        # asking the async generator for another item.
+        finish_usage()
+        if is_compact:
+            compact_item = final_payload["output"][0]
+            compact_index = output_index
+            yield _sse(
+                "response.output_item.added",
+                output_index=compact_index,
+                item={"type": "compaction", "encrypted_content": None},
+            )
+            yield _sse(
+                "response.output_item.done",
+                output_index=compact_index,
+                item=compact_item,
+            )
         yield _sse(
             "response.completed",
             response=final_payload,
         )
     except asyncio.CancelledError:
-        await session.abort()
+        try:
+            await asyncio.shield(session.abort())
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
         raise
     except Exception as exc:
         yield _sse(
@@ -1579,22 +1674,22 @@ async def _stream_turn(
         unsubscribe()
         if not dispatch_task.done():
             dispatch_task.cancel()
-        await session.disconnect()
+        # Record the HTTP turn before any awaited cleanup.  Starlette cancels
+        # streaming generators when the caller closes the response (normally
+        # after receiving a tool call); cancellation used to interrupt
+        # ``disconnect`` and skip this entire lifecycle update.  Those turns
+        # consequently appeared in neither Requests nor Sessions.
         _remember_session(session.session_id)
         _commit_alias_watermark(session.session_id, success=final_payload is not None)
-        if finish_usage_callback is not None and plan is not None:
-            status_code = 200 if final_payload is not None else 500
-            try:
-                finish_usage_callback(
-                    plan,
-                    status_code,
-                    response_payload=final_payload,
-                    response_text=outcome.text,
-                    reasoning_text=outcome.reasoning,
-                    usage=outcome.usage,
-                )
-            except Exception:
-                pass
+        finish_usage()
+        try:
+            await asyncio.shield(session.disconnect())
+        except asyncio.CancelledError:
+            # The shielded disconnect continues independently; lifecycle
+            # reporting above has already completed.
+            pass
+        except Exception:
+            pass
 
 
 async def handle_responses(
@@ -1622,6 +1717,7 @@ async def handle_responses(
     if plan is not None and getattr(plan, "usage_event", None) is not None:
         if not plan.usage_event.get("session_id"):
             plan.usage_event["session_id"] = session.session_id
+            plan.usage_event["session_id_origin"] = "copilot_sdk"
 
     if bool(body.get("stream")):
         return StreamingResponse(
@@ -1995,6 +2091,7 @@ __all__ = [
     "enabled",
     "handle_responses",
     "input_to_prompt",
+    "is_compaction_request",
     "models_response",
     "resolve_tool_continuation",
     "responses_upstream",
