@@ -170,6 +170,56 @@ class CopilotSdkEventTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outcome.text, "SDK")
         self.assertEqual(outcome.usage["total_tokens"], 6)
 
+    async def test_usage_event_subtracts_cached_tokens_from_fresh(self):
+        """AssistantUsageData.input_tokens is the *total* (fresh + cached).
+        _usage_from_event must subtract cache_read_tokens so that
+        fresh_input_tokens and cached_input_tokens are reported correctly."""
+        session = _FakeSession()
+
+        async def dispatch():
+            session.emit(
+                "assistant.usage",
+                AssistantUsageData(
+                    model="gpt-test",
+                    input_tokens=300,   # total = 100 fresh + 200 cached
+                    output_tokens=50,
+                    cache_read_tokens=200,
+                    reasoning_tokens=10,
+                ),
+            )
+            session.emit("session.idle", SessionIdleData())
+
+        outcome = await sdk._wait_for_outcome(session, dispatch, sdk.ToolRegistration())
+
+        u = outcome.usage
+        self.assertEqual(u["input_tokens"], 300)
+        self.assertEqual(u["cached_input_tokens"], 200)
+        self.assertEqual(u["fresh_input_tokens"], 100)
+        self.assertEqual(u["pricing_fresh_input_tokens"], 100)
+        self.assertEqual(u["pricing_cached_input_tokens"], 200)
+        self.assertEqual(u["output_tokens"], 50)
+        self.assertEqual(u["reasoning_output_tokens"], 10)
+        self.assertEqual(u["total_tokens"], 350)
+
+    async def test_usage_event_no_cached_tokens_fresh_equals_total(self):
+        """When cache_read_tokens is zero, fresh_input_tokens == input_tokens."""
+        session = _FakeSession()
+
+        async def dispatch():
+            session.emit(
+                "assistant.usage",
+                AssistantUsageData(model="gpt-test", input_tokens=80, output_tokens=20),
+            )
+            session.emit("session.idle", SessionIdleData())
+
+        outcome = await sdk._wait_for_outcome(session, dispatch, sdk.ToolRegistration())
+
+        u = outcome.usage
+        self.assertEqual(u["input_tokens"], 80)
+        self.assertEqual(u["cached_input_tokens"], 0)
+        self.assertEqual(u["fresh_input_tokens"], 80)
+        self.assertEqual(u["output_tokens"], 20)
+
     async def test_external_tool_request_suspends_and_returns_to_caller(self):
         session = _FakeSession()
         registration = sdk.build_tool_registration(

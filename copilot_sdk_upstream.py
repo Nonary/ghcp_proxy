@@ -527,16 +527,26 @@ def _event_name(event: Any) -> str:
 
 
 def _usage_from_event(data: Any) -> dict[str, int]:
+    # ``input_tokens`` from AssistantUsageData is the *total* input (fresh +
+    # cached).  Subtract ``cache_read_tokens`` so that the flat dict we return
+    # is consistent with the shape produced by ``_usage_delta``, where
+    # ``input_tokens`` == total and ``fresh_input_tokens`` == uncached portion.
     input_tokens = int(getattr(data, "input_tokens", 0) or 0)
     output_tokens = int(getattr(data, "output_tokens", 0) or 0)
     cached_tokens = int(getattr(data, "cache_read_tokens", 0) or 0)
     reasoning_tokens = int(getattr(data, "reasoning_tokens", 0) or 0)
+    fresh = max(0, input_tokens - cached_tokens)
     return {
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "total_tokens": input_tokens + output_tokens,
-        "input_tokens_details": {"cached_tokens": cached_tokens},
-        "output_tokens_details": {"reasoning_tokens": reasoning_tokens},
+        "cached_input_tokens": cached_tokens,
+        "cache_creation_input_tokens": 0,
+        "fresh_input_tokens": fresh,
+        "pricing_fresh_input_tokens": fresh,
+        "pricing_cached_input_tokens": cached_tokens,
+        "pricing_cache_creation_input_tokens": 0,
+        "reasoning_output_tokens": reasoning_tokens,
     }
 
 
