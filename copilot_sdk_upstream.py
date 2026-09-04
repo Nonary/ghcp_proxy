@@ -34,7 +34,7 @@ from constants import TOKEN_DIR
 
 try:
     from copilot import CopilotClient, Tool
-    from copilot.rpc import HandlePendingToolCallRequest
+    from copilot.rpc import ExternalToolTextResultForLlm, HandlePendingToolCallRequest
     from copilot.session import PermissionHandler
     from copilot.session_events import (
         AssistantIntentData,
@@ -57,6 +57,7 @@ try:
 except ImportError as exc:  # pragma: no cover - exercised only on broken installs
     CopilotClient = None  # type: ignore[assignment,misc]
     Tool = None  # type: ignore[assignment,misc]
+    ExternalToolTextResultForLlm = None  # type: ignore[assignment,misc]
     _SDK_IMPORT_ERROR: Exception | None = exc
     AssistantIntentData = AssistantMessageData = None  # type: ignore[assignment,misc]
     AssistantReasoningData = AssistantReasoningDeltaData = None  # type: ignore[assignment,misc]
@@ -403,6 +404,16 @@ def build_tool_registration(body: dict) -> ToolRegistration:
         if not isinstance(name, str) or not name:
             continue
         safe_name = _sanitize_tool_name(name, used)
+        if tool_type == "custom":
+            # ``apply_patch`` (and potentially other names from the CLI's
+            # built-in catalog) is a free-form runtime tool.  Registering a
+            # client-owned custom tool under that name makes the SDK resume
+            # it as a built-in custom call.  Gemini then rejects the pending
+            # result because the SDK's continuation RPC has no tool-name
+            # field.  A private runtime name keeps the call on the ordinary
+            # external-function path; ``registration.names`` still maps it
+            # back to the OpenAI custom-tool name for the caller.
+            safe_name = _sanitize_tool_name(f"ghcp_custom_{safe_name}", used)
         description = spec.get("description")
         if not isinstance(description, str):
             description = ""
@@ -427,7 +438,7 @@ def build_tool_registration(body: dict) -> ToolRegistration:
                 name=safe_name,
                 description=description,
                 parameters=parameters,
-                overrides_built_in_tool=True,
+                overrides_built_in_tool=tool_type == "function",
                 skip_permission=True,
                 defer="never",
             )
@@ -1121,7 +1132,14 @@ async def _open_session(body: dict, registration: ToolRegistration):
                 res = await session.rpc.tools.handle_pending_tool_call(
                     HandlePendingToolCallRequest(
                         request_id=result.request_id,
-                        result=result.output,
+                        result=(
+                            ExternalToolTextResultForLlm(
+                                text_result_for_llm=result.output,
+                                result_type="success",
+                            )
+                            if ExternalToolTextResultForLlm is not None
+                            else result.output
+                        ),
                     )
                 )
                 if res is not None and getattr(res, "success", None) is False:

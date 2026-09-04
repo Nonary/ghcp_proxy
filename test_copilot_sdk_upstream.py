@@ -142,7 +142,10 @@ class CopilotSdkTranslationTests(unittest.TestCase):
             }
         )
 
-        self.assertEqual([tool.name for tool in registration.tools], ["mcp_server_read", "apply_patch"])
+        self.assertEqual(
+            [tool.name for tool in registration.tools],
+            ["mcp_server_read", "ghcp_custom_apply_patch"],
+        )
         self.assertTrue(all(tool.handler is None for tool in registration.tools))
         self.assertTrue(all(tool.skip_permission for tool in registration.tools))
         self.assertTrue(all(tool.defer == "never" for tool in registration.tools))
@@ -150,6 +153,21 @@ class CopilotSdkTranslationTests(unittest.TestCase):
             registration.tools[1].parameters["properties"]["input"]["type"],
             "string",
         )
+
+    def test_custom_runtime_alias_maps_back_to_the_original_tool_name(self):
+        registration = sdk.build_tool_registration(
+            {"tools": [{"type": "custom", "name": "apply_patch"}]}
+        )
+        call = sdk._tool_call(
+            SimpleNamespace(
+                request_id="request-1",
+                tool_name="ghcp_custom_apply_patch",
+                arguments={"input": "*** Begin Patch"},
+            ),
+            registration,
+        )
+        self.assertEqual(call.name, "apply_patch")
+        self.assertEqual(call.tool_type, "custom")
 
     def test_call_id_round_trip_carries_resume_and_original_tool_metadata(self):
         call_id = sdk._encode_call_id(
@@ -544,6 +562,8 @@ class CopilotSdkEventTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(handled), 1)
         self.assertEqual(handled[0].request_id, "req-1")
+        self.assertEqual(handled[0].result.text_result_for_llm, "file1.txt")
+        self.assertEqual(handled[0].result.result_type, "success")
         self.assertEqual(len(sent), 1)
         self.assertIn("Tool result for bash: file1.txt", sent[0])
 
