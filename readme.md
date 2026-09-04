@@ -72,6 +72,14 @@ encodes the SDK session and request IDs in `call_id`. Codex executes the tool,
 then its next Responses request resumes that exact SDK turn. Parallel calls are
 batched and the encoded continuation survives proxy restarts.
 
+The SDK session stays connected across that tool round-trip instead of being
+destroyed after every response, so the runtime's own background compaction
+(infinite sessions) can finish and take effect. A session parked on a tool
+result is dropped after `GHCP_SDK_SESSION_IDLE_SECONDS` (default 300) if the
+result never arrives. When Codex compacts its own transcript, the proxy keeps
+the same SDK session -- the one that wrote the summary -- and only sends what
+follows the summary, rather than replaying the summary into a fresh session.
+
 To temporarily restore the old direct REST implementation while diagnosing a
 regression, start the proxy with:
 

@@ -65,6 +65,43 @@ class CopilotSdkTranslationTests(unittest.TestCase):
         options = sdk._session_options({"model": "gpt-test"}, sdk.ToolRegistration())
         self.assertEqual(options["infinite_sessions"], {"enabled": True})
 
+    def test_reasoning_effort_is_not_sent_to_models_that_do_not_support_it(self):
+        class _Supports:
+            reasoning_effort = False
+
+        class _Capabilities:
+            supports = _Supports()
+
+        class _Model:
+            id = "gemini-3.8-flash"
+            capabilities = _Capabilities()
+            supported_reasoning_efforts = None
+
+        class _Client:
+            async def list_models(self):
+                return [_Model()]
+
+        body = {"model": "gemini-3.8-flash", "reasoning": {"effort": "high"}}
+        effort = asyncio.run(sdk._reasoning_effort_for_client(body, _Client()))
+        self.assertIsNone(effort)
+        self.assertNotIn(
+            "reasoning_effort",
+            sdk._session_options(body, sdk.ToolRegistration(), reasoning_effort=effort),
+        )
+
+    def test_reasoning_effort_is_sent_when_model_advertises_the_requested_level(self):
+        class _Model:
+            id = "gpt-5.6"
+            supported_reasoning_efforts = ["low", "high"]
+            capabilities = None
+
+        class _Client:
+            async def list_models(self):
+                return [_Model()]
+
+        body = {"model": "gpt-5.6", "reasoning": {"effort": "high"}}
+        self.assertEqual(asyncio.run(sdk._reasoning_effort_for_client(body, _Client())), "high")
+
     def test_recognizes_terminal_in_band_compaction_trigger(self):
         self.assertTrue(
             sdk.is_compaction_request(
@@ -1410,6 +1447,258 @@ class CopilotSdkEventTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(u["input_tokens_details"]["cached_tokens"], 100)
         self.assertEqual(u["output_tokens_details"]["reasoning_tokens"], 5)
 
+
+
+class CopilotSdkCompactionContinuityTests(unittest.IsolatedAsyncioTestCase):
+    """A client-side compaction must not cost the thread its SDK session."""
+
+    def setUp(self):
+        self._sdk_state = _IsolatedSdkState()
+        self._sdk_state.__enter__()
+        self.addCleanup(self._sdk_state.__exit__, None, None, None)
+        sdk._live_sessions.clear()
+        self.addCleanup(sdk._live_sessions.clear)
+
+    @staticmethod
+    def _compaction_item(summary="Summary of the earlier work"):
+        return {
+            "type": "compaction",
+            "encrypted_content": format_translation.encode_fake_compaction(summary),
+        }
+
+    @staticmethod
+    def _tool_pair(call_id):
+        return [
+            {"type": "function_call", "call_id": call_id, "name": "bash", "arguments": '{"cmd":"ls"}'},
+            {"type": "function_call_output", "call_id": call_id, "output": "file1.txt"},
+        ]
+
+    def test_post_compaction_nudge_is_not_part_of_the_resume_watermark(self):
+        call_id = sdk._encode_call_id("sdk-sess-1", "req-1", tool_name="bash", tool_type="function")
+        tool_turn = [{"role": "user", "content": "hi"}, self._compaction_item(), *self._tool_pair(call_id)]
+        segments = sdk._render_input_segments(tool_turn)
+        self.assertEqual(segments[-1][0], sdk._SEGMENT_SYNTHETIC)
+        self.assertEqual(sdk.input_to_prompt(tool_turn).split("\n\n")[-1], sdk._CONTINUE_AFTER_COMPACTION_PROMPT)
+        seen = sdk._segment_fingerprints(segments)
+        self.assertEqual(len(seen), len(segments) - 1)
+
+        # The first real user message after the compaction used to diverge
+        # from the watermark (the nudge sat where the tool echo now is) and
+        # replay the whole post-compaction window into a fresh session.
+        next_turn = [
+            *tool_turn,
+            {"type": "message", "role": "assistant", "content": "done"},
+            {"role": "user", "content": "next"},
+        ]
+        next_segments = sdk._render_input_segments(next_turn)
+        delta = sdk._resume_delta(next_segments, sdk._segment_fingerprints(next_segments), seen)
+        self.assertEqual(delta, ["User: next"])
+
+    def test_compaction_resume_delta_reuses_the_session_that_wrote_the_summary(self):
+        compact_turn = [
+            {"role": "user", "content": "hi"},
+            {"type": "message", "role": "assistant", "content": "working"},
+            {"role": "user", "content": format_translation.COMPACTION_SUMMARY_PROMPT},
+        ]
+        seen = sdk._segment_fingerprints(sdk._render_input_segments(compact_turn))
+        self.assertEqual(seen[-1], sdk._SUMMARY_REQUEST_FINGERPRINT)
+
+        after = [{"role": "user", "content": "hi"}, self._compaction_item()]
+        segments = sdk._render_input_segments(after)
+        fingerprints = sdk._segment_fingerprints(segments)
+        self.assertEqual(sdk._resume_delta(segments, fingerprints, seen), [])
+        self.assertEqual(
+            sdk._compaction_resume_delta(segments, fingerprints, seen),
+            [sdk._CONTINUE_AFTER_COMPACTION_PROMPT],
+        )
+
+        with_message = [*after, {"role": "user", "content": "what now?"}]
+        segments = sdk._render_input_segments(with_message)
+        self.assertEqual(
+            sdk._compaction_resume_delta(segments, sdk._segment_fingerprints(segments), seen),
+            ["User: what now?"],
+        )
+
+        # A changed preamble or a session that did not write a summary falls back.
+        diverged = [{"role": "user", "content": "different"}, self._compaction_item()]
+        segments = sdk._render_input_segments(diverged)
+        self.assertEqual(sdk._compaction_resume_delta(segments, sdk._segment_fingerprints(segments), seen), [])
+        segments = sdk._render_input_segments(after)
+        self.assertEqual(sdk._compaction_resume_delta(segments, sdk._segment_fingerprints(segments), seen[:-1]), [])
+
+    async def test_open_session_resumes_across_a_client_compaction(self):
+        created, resumed, sent = [], [], []
+
+        class _Session(_FakeSession):
+            def __init__(self, session_id):
+                super().__init__()
+                self.session_id = session_id
+
+            async def send(self, prompt):
+                sent.append(prompt)
+
+        class _Client:
+            async def create_session(self, **options):
+                created.append(options)
+                return _Session("sdk-session-1")
+
+            async def resume_session(self, session_id, **options):
+                resumed.append(session_id)
+                return _Session(session_id)
+
+        async def turn(body):
+            with patch.object(sdk, "_get_client", return_value=_Client()):
+                session, dispatch = await sdk._open_session(body, sdk.ToolRegistration())
+                await dispatch()
+            sdk._commit_alias_watermark(session.session_id, success=True)
+            await sdk._release_session(session, sdk.TurnOutcome(), completed=True)
+            return session
+
+        history = [
+            {"role": "user", "content": "hello"},
+            {"type": "message", "role": "assistant", "content": "hi"},
+        ]
+        await turn({"input": history[:1], "session_id": "thread-A"})
+        compact_body = format_translation.build_fake_compaction_request(
+            {"input": history, "session_id": "thread-A"}
+        )
+        compact_body["session_id"] = "thread-A"
+        await turn(compact_body)
+        self.assertEqual(resumed, ["sdk-session-1"])
+        self.assertTrue(sent[-1].startswith("User: Please create a detailed summary"))
+
+        after = {"input": [history[0], self._compaction_item()], "session_id": "thread-A"}
+        session = await turn(after)
+        self.assertEqual(session.session_id, "sdk-session-1")
+        self.assertEqual(resumed, ["sdk-session-1", "sdk-session-1"])
+        self.assertEqual(len(created), 1)
+        self.assertEqual(sent[-1], sdk._CONTINUE_AFTER_COMPACTION_PROMPT)
+
+    async def test_tool_call_turn_keeps_the_session_connected_for_its_continuation(self):
+        handled, resumed = [], []
+
+        class _RpcTools:
+            async def handle_pending_tool_call(self, req):
+                handled.append(req)
+                return SimpleNamespace(success=True)
+
+        class _Rpc:
+            tools = _RpcTools()
+
+        class _Session(_FakeSession):
+            def __init__(self, session_id):
+                super().__init__()
+                self.session_id = session_id
+                self.rpc = _Rpc()
+                self.sent = []
+
+            async def send(self, prompt):
+                self.sent.append(prompt)
+
+        class _Client:
+            async def create_session(self, **options):
+                return _Session("sdk-sess-live")
+
+            async def resume_session(self, session_id, **options):
+                resumed.append(session_id)
+                return _Session(session_id)
+
+        with patch.object(sdk, "_get_client", return_value=_Client()):
+            session, dispatch = await sdk._open_session(
+                {"input": [{"role": "user", "content": "run ls"}], "session_id": "thread-L"},
+                sdk.ToolRegistration(),
+            )
+            await dispatch()
+            outcome = sdk.TurnOutcome()
+            outcome.calls.append(sdk.ToolCall("req-1", "bash", "function", {"cmd": "ls"}))
+            await sdk._release_session(session, outcome, completed=True)
+            self.assertFalse(session.disconnected)
+            self.assertIn("sdk-sess-live", sdk._live_sessions)
+
+            call_id = sdk._encode_call_id("sdk-sess-live", "req-1", tool_name="bash", tool_type="function")
+            continued, dispatch = await sdk._open_session(
+                {
+                    "input": [{"role": "user", "content": "run ls"}, *self._tool_pair(call_id)],
+                    "session_id": "thread-L",
+                },
+                sdk.ToolRegistration(),
+            )
+            await dispatch()
+        self.assertIs(continued, session)
+        self.assertEqual(resumed, [])
+        self.assertEqual([req.request_id for req in handled], ["req-1"])
+
+        # The turn finished without further calls: now the session goes away.
+        await sdk._release_session(session, sdk.TurnOutcome(), completed=True)
+        self.assertTrue(session.disconnected)
+        self.assertNotIn("sdk-sess-live", sdk._live_sessions)
+
+    async def test_new_user_message_discards_a_session_parked_on_a_tool_call(self):
+        resumed = []
+
+        class _Session(_FakeSession):
+            def __init__(self, session_id):
+                super().__init__()
+                self.session_id = session_id
+
+            async def send(self, prompt):
+                pass
+
+        class _Client:
+            async def create_session(self, **options):
+                return _Session("sdk-sess-parked")
+
+            async def resume_session(self, session_id, **options):
+                resumed.append(options.get("continue_pending_work"))
+                return _Session(session_id)
+
+        first = {"input": [{"role": "user", "content": "run ls"}], "session_id": "thread-P"}
+        with patch.object(sdk, "_get_client", return_value=_Client()):
+            session, dispatch = await sdk._open_session(first, sdk.ToolRegistration())
+            await dispatch()
+            sdk._commit_alias_watermark(session.session_id, success=True)
+            outcome = sdk.TurnOutcome()
+            outcome.calls.append(sdk.ToolCall("req-1", "bash", "function", {}))
+            await sdk._release_session(session, outcome, completed=True)
+
+            follow_up = {
+                "input": [
+                    {"role": "user", "content": "run ls"},
+                    {"type": "message", "role": "assistant", "content": "ok"},
+                    {"role": "user", "content": "never mind"},
+                ],
+                "session_id": "thread-P",
+            }
+            replacement, _ = await sdk._open_session(follow_up, sdk.ToolRegistration())
+        self.assertTrue(session.disconnected)
+        self.assertIsNot(replacement, session)
+        self.assertEqual(resumed, [False])
+
+    async def test_release_waits_for_a_background_compaction_before_disconnecting(self):
+        session = _FakeSession()
+        entry = await sdk._track_live_session(session)
+        session.emit("session.compaction_start", SimpleNamespace())
+        await asyncio.sleep(0)
+        self.assertTrue(entry.compaction_in_flight)
+
+        await sdk._release_session(session, sdk.TurnOutcome(), completed=True)
+        await asyncio.sleep(0)
+        self.assertFalse(session.disconnected)
+        self.assertIsNotNone(entry.reaper)
+
+        session.emit("session.compaction_complete", SimpleNamespace())
+        await asyncio.wait_for(entry.reaper, 1)
+        self.assertTrue(session.disconnected)
+        self.assertNotIn(session.session_id, sdk._live_sessions)
+
+    async def test_failed_or_aborted_turns_disconnect_immediately(self):
+        session = _FakeSession()
+        await sdk._track_live_session(session)
+        outcome = sdk.TurnOutcome()
+        outcome.calls.append(sdk.ToolCall("req-1", "bash", "function", {}))
+        await sdk._release_session(session, outcome, completed=False)
+        self.assertTrue(session.disconnected)
+        self.assertEqual(sdk._live_sessions, {})
 
 
 if __name__ == "__main__":

@@ -456,9 +456,22 @@ def _text_from_content(content: Any) -> str:
 # Segment kinds.  ``_SEGMENT_USER`` marks content that originates with the
 # caller; ``_SEGMENT_ECHO`` marks a transcript echo of work the SDK session
 # performed itself, which a resumed session already holds and must not be
-# re-sent.
+# re-sent; ``_SEGMENT_SUMMARY`` is the client-side compaction summary, which
+# the session wrote itself; ``_SEGMENT_SYNTHETIC`` is text the proxy adds to
+# a single turn (the post-compaction nudge).  The caller's next transcript
+# never contains synthetic text, so it stays out of the resume watermark --
+# fingerprinting it used to force a fresh session, and a replay of the whole
+# post-compaction window, on the first real user message after a compaction.
 _SEGMENT_USER = "user"
 _SEGMENT_ECHO = "echo"
+_SEGMENT_SUMMARY = "summary"
+_SEGMENT_SYNTHETIC = "synthetic"
+
+_CONTINUE_AFTER_COMPACTION_PROMPT = (
+    "User: Please continue and complete your response to the user's request based on "
+    "the work already completed in the summary above. Do not repeat investigations or "
+    "tool calls already documented in the summary."
+)
 
 
 def _render_input_segments(value: Any) -> list[tuple[str, str]]:
@@ -497,7 +510,7 @@ def _render_input_segments(value: Any) -> list[tuple[str, str]]:
                 summary_text = item.get("output_text") or item.get("summary") or item.get("text")
             if summary_text:
                 rendered.append((
-                    _SEGMENT_ECHO,
+                    _SEGMENT_SUMMARY,
                     f"Assistant: {format_translation.FAKE_COMPACTION_SUMMARY_LABEL}\n{summary_text}",
                 ))
             continue
@@ -518,7 +531,7 @@ def _render_input_segments(value: Any) -> list[tuple[str, str]]:
                 saw_compaction = True
                 saw_user_after_compaction = False
                 rendered.append((
-                    _SEGMENT_ECHO,
+                    _SEGMENT_SUMMARY,
                     f"Assistant: {text}",
                 ))
             else:
@@ -536,10 +549,7 @@ def _render_input_segments(value: Any) -> list[tuple[str, str]]:
                 rendered.append((kind, f"{str(role).capitalize()}: {text}"))
 
     if saw_compaction and not saw_user_after_compaction:
-        rendered.append((
-            _SEGMENT_USER,
-            "User: Please continue and complete your response to the user's request based on the work already completed in the summary above. Do not repeat investigations or tool calls already documented in the summary.",
-        ))
+        rendered.append((_SEGMENT_SYNTHETIC, _CONTINUE_AFTER_COMPACTION_PROMPT))
 
     return rendered
 
@@ -549,11 +559,25 @@ def input_to_prompt(value: Any) -> str:
     return "\n\n".join(text for _, text in _render_input_segments(value))
 
 
+def _durable_segments(segments: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """The segments the caller's later transcripts will replay verbatim."""
+    return [segment for segment in segments if segment[0] != _SEGMENT_SYNTHETIC]
+
+
+def _segment_fingerprint(kind: str, text: str) -> str:
+    return hashlib.sha1(f"{kind}\x00{text}".encode("utf-8")).hexdigest()
+
+
 def _segment_fingerprints(segments: list[tuple[str, str]]) -> list[str]:
-    return [
-        hashlib.sha1(f"{kind}\x00{text}".encode("utf-8")).hexdigest()
-        for kind, text in segments
-    ]
+    return [_segment_fingerprint(kind, text) for kind, text in _durable_segments(segments)]
+
+
+# The last thing a session consumes before the caller compacts is the proxy's
+# summary request, so this fingerprint at the end of a watermark identifies a
+# session that wrote the compaction summary now sitting in the transcript.
+_SUMMARY_REQUEST_FINGERPRINT = _segment_fingerprint(
+    _SEGMENT_USER, f"User: {format_translation.COMPACTION_SUMMARY_PROMPT}"
+)
 
 
 def _resume_delta(
@@ -565,14 +589,53 @@ def _resume_delta(
 
     An empty result means the session cannot be resumed against this
     transcript -- either nothing new arrived, or the history diverged from
-    what the session consumed (a client-side compaction, say) -- and the
-    caller should fall back to a fresh session carrying the full transcript.
+    what the session consumed -- and the caller should try
+    ``_compaction_resume_delta`` before falling back to a fresh session
+    carrying the full transcript.
     """
     if not seen or len(seen) >= len(fingerprints):
         return []
     if fingerprints[: len(seen)] != seen:
         return []
-    return [text for kind, text in segments[len(seen):] if kind == _SEGMENT_USER]
+    durable = _durable_segments(segments)
+    new_text = [text for kind, text in durable[len(seen):] if kind == _SEGMENT_USER]
+    if not new_text:
+        return []
+    new_text.extend(text for kind, text in segments if kind == _SEGMENT_SYNTHETIC)
+    return new_text
+
+
+def _compaction_resume_delta(
+    segments: list[tuple[str, str]],
+    fingerprints: list[str],
+    seen: list[str],
+) -> list[str]:
+    """Return what to send a session whose caller just compacted its transcript.
+
+    A client-side compaction rewrites the transcript to preamble + summary, so
+    the prefix check in ``_resume_delta`` fails even though the SDK session
+    that wrote that summary is the right home for the thread: it still holds
+    the working context (the SDK manages its own window), and the summary is
+    its own last turn.  Replaying the summary into a fresh session instead
+    hands the model a second-hand account of its own work, which it then
+    re-verifies from scratch.  Recognize the handoff -- the session's last
+    consumed segment was the proxy's summary request and the caller's
+    preamble is unchanged -- and send only what follows the summary.
+    """
+    if not seen or seen[-1] != _SUMMARY_REQUEST_FINGERPRINT:
+        return []
+    durable = _durable_segments(segments)
+    summary_index = next(
+        (index for index, (kind, _) in enumerate(durable) if kind == _SEGMENT_SUMMARY),
+        None,
+    )
+    if summary_index is None:
+        return []
+    if fingerprints[:summary_index] != seen[:summary_index]:
+        return []
+    new_text = [text for kind, text in durable[summary_index + 1:] if kind == _SEGMENT_USER]
+    new_text.extend(text for kind, text in segments if kind == _SEGMENT_SYNTHETIC)
+    return new_text
 
 
 @dataclass(frozen=True)
@@ -657,6 +720,79 @@ def _reasoning_effort(body: dict) -> str | None:
     return effort if effort in {"low", "medium", "high", "xhigh"} else None
 
 
+def _model_id_for_lookup(model: Any) -> str | None:
+    if not isinstance(model, str) or not model.strip():
+        return None
+    value = model.strip().lower()
+    # The Responses API may use provider-qualified ids while the SDK's model
+    # registry stores the Copilot id without the provider prefix.
+    if "/" in value:
+        value = value.rsplit("/", 1)[1]
+    return value
+
+
+def _model_supports_reasoning_effort(
+    model: Any,
+    requested_effort: str,
+    models: Any,
+) -> bool | None:
+    """Return the SDK registry's reasoning-effort capability for ``model``.
+
+    ``None`` means that the registry could not answer (for example, an older
+    SDK does not expose model metadata).  It is important to distinguish that
+    from ``False``: the Copilot RPC rejects *any* reasoning-effort field for
+    models such as Gemini Flash, rather than simply ignoring it.
+    """
+    requested_id = _model_id_for_lookup(model)
+    if requested_id is None or not isinstance(models, (list, tuple)):
+        return None
+
+    for info in models:
+        info_id = _model_id_for_lookup(getattr(info, "id", None))
+        if info_id != requested_id:
+            continue
+
+        supported_efforts = getattr(info, "supported_reasoning_efforts", None)
+        if isinstance(supported_efforts, (list, tuple)):
+            return any(
+                isinstance(effort, str) and effort.lower() == requested_effort.lower()
+                for effort in supported_efforts
+            )
+
+        capabilities = getattr(info, "capabilities", None)
+        supports = getattr(capabilities, "supports", None)
+        supported = getattr(supports, "reasoning_effort", None)
+        if isinstance(supported, bool):
+            return supported
+        return None
+    return None
+
+
+async def _reasoning_effort_for_client(body: dict, client: Any) -> str | None:
+    """Filter the requested effort using the SDK's cached ``models.list``."""
+    requested = _reasoning_effort(body)
+    if requested is None:
+        return None
+
+    try:
+        models = await client.list_models()
+    except Exception:
+        models = None
+
+    # Keep the legacy behavior for model registries unavailable to this SDK,
+    # except for Gemini/Grok where sending the field is known to be invalid.
+    requested_model = body.get("model")
+    supported = _model_supports_reasoning_effort(requested_model, requested, models)
+    if supported is False:
+        return None
+    if supported is True:
+        return requested
+    model_id = _model_id_for_lookup(requested_model) or ""
+    if model_id.startswith(("gemini-", "grok-")):
+        return None
+    return requested
+
+
 def _reasoning_summary(body: dict) -> str:
     """Map Responses reasoning settings to the SDK's summary modes."""
     reasoning = body.get("reasoning")
@@ -666,11 +802,18 @@ def _reasoning_summary(body: dict) -> str:
     return "detailed"
 
 
-def _session_options(body: dict, registration: ToolRegistration) -> dict[str, Any]:
+def _session_options(
+    body: dict,
+    registration: ToolRegistration,
+    *,
+    reasoning_effort: str | None | object = ...,
+) -> dict[str, Any]:
     instructions = body.get("instructions")
+    if reasoning_effort is ...:
+        reasoning_effort = _reasoning_effort(body)
     options: dict[str, Any] = {
         "model": body.get("model") if isinstance(body.get("model"), str) else None,
-        "reasoning_effort": _reasoning_effort(body),
+        "reasoning_effort": reasoning_effort,
         # The SDK does not emit Copilot's reasoning/intent timeline events
         # unless a reasoning summary mode is selected.  Without this, Codex
         # receives only the final answer and tool calls.
@@ -697,10 +840,180 @@ def _session_options(body: dict, registration: ToolRegistration) -> dict[str, An
     return {key: value for key, value in options.items() if value is not None}
 
 
+# ---------------------------------------------------------------------------
+# Live session pool
+# ---------------------------------------------------------------------------
+#
+# Each Codex tool call used to end with ``session.disconnect`` (a
+# ``session.destroy`` RPC) and the tool result arrived a moment later on a
+# fresh ``resume_session``.  The SDK's own context management could not
+# survive that cycle: its background compaction starts at the turn's first
+# model call and takes ~25s, so every destroy killed it mid-flight, the
+# resumed session rebuilt the full context from disk, and the next turn
+# started the same compaction again -- 24 wasted summary calls in twelve
+# minutes on one session, with the context never shrinking.  Keeping the
+# session connected across the tool round-trip lets the turn run the way the
+# SDK expects (result -> model -> ... -> turn end), so a compaction that
+# starts during a turn can finish and take effect.
+
+_LIVE_SESSION_IDLE_SECONDS = float(os.environ.get("GHCP_SDK_SESSION_IDLE_SECONDS", "300") or 300)
+_LIVE_COMPACTION_WAIT_SECONDS = 600.0
+
+
+@dataclass
+class _LiveSession:
+    session: Any
+    in_use: bool = True
+    pending_calls: bool = False
+    compaction_in_flight: bool = False
+    compaction_settled: asyncio.Event = field(default_factory=asyncio.Event)
+    unsubscribe: Callable[[], None] | None = None
+    reaper: asyncio.Task | None = None
+
+
+_live_sessions: dict[str, _LiveSession] = {}
+
+
+def _set_compaction_state(entry: _LiveSession, in_flight: bool) -> None:
+    entry.compaction_in_flight = in_flight
+    if in_flight:
+        entry.compaction_settled.clear()
+    else:
+        entry.compaction_settled.set()
+
+
+def _is_compaction_event(event: Any, *, started: bool) -> bool:
+    data = getattr(event, "data", None)
+    if started:
+        return (
+            (SessionCompactionStartData is not None and isinstance(data, SessionCompactionStartData))
+            or _event_name(event) == "session.compaction_start"
+        )
+    return (
+        (SessionCompactionCompleteData is not None and isinstance(data, SessionCompactionCompleteData))
+        or _event_name(event) == "session.compaction_complete"
+    )
+
+
+async def _track_live_session(session: Any) -> _LiveSession:
+    """Register a session object the current request is about to drive."""
+    entry = _live_sessions.get(session.session_id)
+    if entry is not None:
+        if entry.session is session:
+            entry.in_use = True
+            if entry.reaper is not None:
+                entry.reaper.cancel()
+                entry.reaper = None
+            return entry
+        # A different object for the same id: the old one was superseded by
+        # a resume, so it no longer represents the runtime session.
+        await _evict_live_session(session.session_id)
+
+    entry = _LiveSession(session=session)
+    loop = asyncio.get_running_loop()
+
+    def handler(event: Any) -> None:
+        if _is_compaction_event(event, started=True):
+            loop.call_soon_threadsafe(_set_compaction_state, entry, True)
+        elif _is_compaction_event(event, started=False):
+            loop.call_soon_threadsafe(_set_compaction_state, entry, False)
+
+    try:
+        entry.unsubscribe = session.on(handler)
+    except Exception:
+        entry.unsubscribe = None
+    _live_sessions[session.session_id] = entry
+    return entry
+
+
+async def _reuse_live_session(session_id: str, *, allow_pending: bool) -> Any | None:
+    """Hand back a connected session for ``session_id`` if one is idle.
+
+    A session parked on a pending tool call is only reusable by the request
+    that delivers the result.  Any other request (a new user message while
+    a tool was still running) needs ``continue_pending_work=False``, which
+    is a resume-time option, so the live object is discarded first.
+    """
+    entry = _live_sessions.get(session_id)
+    if entry is None or entry.in_use:
+        return None
+    if entry.pending_calls and not allow_pending:
+        await _evict_live_session(session_id)
+        return None
+    entry.in_use = True
+    if entry.reaper is not None:
+        entry.reaper.cancel()
+        entry.reaper = None
+    return entry.session
+
+
+async def _evict_live_session(session_id: str) -> None:
+    entry = _live_sessions.pop(session_id, None)
+    if entry is None:
+        return
+    if entry.unsubscribe is not None:
+        try:
+            entry.unsubscribe()
+        except Exception:
+            pass
+    if entry.reaper is not None and entry.reaper is not asyncio.current_task():
+        entry.reaper.cancel()
+    try:
+        await entry.session.disconnect()
+    except Exception:
+        pass
+
+
+async def _reap_live_session(session_id: str, entry: _LiveSession) -> None:
+    try:
+        if entry.compaction_in_flight:
+            try:
+                await asyncio.wait_for(entry.compaction_settled.wait(), _LIVE_COMPACTION_WAIT_SECONDS)
+            except TimeoutError:
+                pass
+        if entry.pending_calls:
+            await asyncio.sleep(_LIVE_SESSION_IDLE_SECONDS)
+    except asyncio.CancelledError:
+        return
+    if entry.in_use or _live_sessions.get(session_id) is not entry:
+        return
+    await _evict_live_session(session_id)
+
+
+async def _release_session(session: Any, outcome: "TurnOutcome | None", *, completed: bool) -> None:
+    """Finish a request's use of ``session``.
+
+    The session stays connected when the caller owes it a tool result or the
+    SDK is compacting it in the background; a reaper disconnects it if
+    neither resolves.  Everything else disconnects immediately, which is
+    also what closes out per-session usage on the SDK side.
+    """
+    entry = _live_sessions.get(session.session_id)
+    if entry is None or entry.session is not session:
+        try:
+            await session.disconnect()
+        except Exception:
+            pass
+        return
+    pending = bool(completed and outcome is not None and outcome.calls)
+    if not completed or not (pending or entry.compaction_in_flight):
+        await _evict_live_session(session.session_id)
+        return
+    entry.in_use = False
+    entry.pending_calls = pending
+    entry.reaper = asyncio.create_task(_reap_live_session(session.session_id, entry))
+
+
+async def _evict_all_live_sessions() -> None:
+    for session_id in list(_live_sessions):
+        await _evict_live_session(session_id)
+
+
 async def _open_session(body: dict, registration: ToolRegistration):
     client = await _get_client()
     continuation = resolve_tool_continuation(body.get("input"))
-    options = _session_options(body, registration)
+    reasoning_effort = await _reasoning_effort_for_client(body, client)
+    options = _session_options(body, registration, reasoning_effort=reasoning_effort)
     if continuation is None:
         alias = _session_alias(body)
         segments = _render_input_segments(body.get("input"))
@@ -717,23 +1030,28 @@ async def _open_session(body: dict, registration: ToolRegistration):
             if known is not None:
                 known_session_id, seen = known
                 new_text = _resume_delta(segments, fingerprints, seen)
+                if not new_text:
+                    new_text = _compaction_resume_delta(segments, fingerprints, seen)
                 if new_text:
-                    try:
-                        session = await client.resume_session(
-                            known_session_id,
-                            continue_pending_work=False,
-                            **options,
-                        )
+                    session = await _reuse_live_session(known_session_id, allow_pending=False)
+                    if session is None:
+                        try:
+                            session = await client.resume_session(
+                                known_session_id,
+                                continue_pending_work=False,
+                                **options,
+                            )
+                        except Exception:
+                            # The SDK discarded the session; fall through to a
+                            # fresh one carrying the full transcript.
+                            session = None
+                    if session is not None:
                         prompt = "\n\n".join(new_text)
-                    except Exception:
-                        # The SDK discarded the session; fall through to a
-                        # fresh one carrying the full transcript.
-                        session = None
-                        prompt = None
         if session is None:
             session = await client.create_session(**options)
             prompt = "\n\n".join(text for _, text in segments)
 
+        await _track_live_session(session)
         _remember_session(session.session_id)
         if alias:
             _pending_alias_watermark[session.session_id] = (alias, fingerprints)
@@ -746,8 +1064,8 @@ async def _open_session(body: dict, registration: ToolRegistration):
         return session, dispatch
 
     session_id, results = continuation
-    session = None
-    if _owns_session(session_id):
+    session = await _reuse_live_session(session_id, allow_pending=True)
+    if session is None and _owns_session(session_id):
         try:
             session = await client.resume_session(
                 session_id,
@@ -771,6 +1089,7 @@ async def _open_session(body: dict, registration: ToolRegistration):
         segments = _render_input_segments(body.get("input"))
         session = await client.create_session(**options)
         prompt = "\n\n".join(text for _, text in segments)
+        await _track_live_session(session)
         _remember_session(session.session_id)
         alias = _session_alias(body)
         if alias:
@@ -786,6 +1105,7 @@ async def _open_session(body: dict, registration: ToolRegistration):
 
         return session, dispatch_fresh
 
+    await _track_live_session(session)
     _remember_session(session.session_id)
     alias = _session_alias(body)
     if alias:
@@ -1851,9 +2171,11 @@ async def _stream_turn(
         _commit_alias_watermark(session.session_id, success=final_payload is not None)
         finish_usage()
         try:
-            await asyncio.shield(session.disconnect())
+            await asyncio.shield(
+                _release_session(session, outcome, completed=final_payload is not None)
+            )
         except asyncio.CancelledError:
-            # The shielded disconnect continues independently; lifecycle
+            # The shielded release continues independently; lifecycle
             # reporting above has already completed.
             pass
         except Exception:
@@ -1906,6 +2228,7 @@ async def handle_responses(
 
     response_id = _new_id("resp")
     succeeded = False
+    outcome = None
     try:
         outcome = await _wait_for_outcome(session, dispatch, registration)
         succeeded = True
@@ -1941,7 +2264,7 @@ async def handle_responses(
                 pass
         return format_translation.openai_error_response(502, f"Copilot SDK: {exc}")
     finally:
-        await session.disconnect()
+        await _release_session(session, outcome, completed=succeeded)
         _remember_session(session.session_id)
         _commit_alias_watermark(session.session_id, success=succeeded)
 
@@ -1973,6 +2296,7 @@ async def shutdown() -> None:
     _client = None
     _client_token = None
     _client_pruned = False
+    await _evict_all_live_sessions()
     if client is not None:
         await client.stop()
 
