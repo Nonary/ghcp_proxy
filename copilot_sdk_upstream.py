@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import copy
 import hashlib
 import json
 import os
@@ -657,18 +658,26 @@ class PendingToolResult:
     tool_name: str = ""
 
 
+def _is_caller_message(item: Any) -> bool:
+    return isinstance(item, str) or (
+        isinstance(item, dict)
+        and item.get("type") in {None, "message"}
+        and item.get("role") in {"user", "developer", "system"}
+    )
+
+
 def resolve_tool_continuation(value: Any) -> tuple[str, list[PendingToolResult]] | None:
-    """Resolve only the trailing tool-result block, excluding older history."""
+    """Resolve the trailing tool results, allowing accompanying caller messages."""
     if not isinstance(value, list):
         return None
     trailing: list[PendingToolResult] = []
-    for index, item in enumerate(reversed(value)):
+    for item in reversed(value):
+        if _is_caller_message(item):
+            continue
         if not isinstance(item, dict) or item.get("type") not in {
             "function_call_output",
             "custom_tool_call_output",
         }:
-            if index == 0:
-                return None
             break
         decoded = _decode_call_id(item.get("call_id"))
         if decoded is None:
@@ -728,7 +737,7 @@ async def _get_client():
 def _reasoning_effort(body: dict) -> str | None:
     reasoning = body.get("reasoning")
     effort = reasoning.get("effort") if isinstance(reasoning, dict) else None
-    return effort if effort in {"low", "medium", "high", "xhigh"} else None
+    return effort if effort in {"low", "medium", "high", "xhigh", "max"} else None
 
 
 def _model_id_for_lookup(model: Any) -> str | None:
@@ -831,7 +840,9 @@ def _session_options(
         "reasoning_summary": _reasoning_summary(body),
         "streaming": bool(body.get("stream")),
         "tools": registration.tools,
-        "available_tools": ["custom:*"],
+        # Resume may retain previously registered tools when the new list is
+        # empty. An explicit allowlist also enforces removals/tool_choice=none.
+        "available_tools": [f"custom:{tool.name}" for tool in registration.tools],
         "include_sub_agent_streaming_events": True,
         "on_permission_request": PermissionHandler.approve_all,
         # Resumed SDK sessions own their conversation history, so they also
@@ -874,6 +885,8 @@ _LIVE_COMPACTION_WAIT_SECONDS = 600.0
 @dataclass
 class _LiveSession:
     session: Any
+    options: dict[str, Any] | None = None
+    input_fingerprints: list[str] = field(default_factory=list)
     in_use: bool = True
     pending_calls: bool = False
     compaction_in_flight: bool = False
@@ -906,11 +919,20 @@ def _is_compaction_event(event: Any, *, started: bool) -> bool:
     )
 
 
-async def _track_live_session(session: Any) -> _LiveSession:
+async def _track_live_session(
+    session: Any,
+    *,
+    options: dict[str, Any] | None = None,
+    fingerprints: list[str] | None = None,
+) -> _LiveSession:
     """Register a session object the current request is about to drive."""
     entry = _live_sessions.get(session.session_id)
     if entry is not None:
         if entry.session is session:
+            if options is not None:
+                entry.options = copy.deepcopy(options)
+            if fingerprints is not None:
+                entry.input_fingerprints = list(fingerprints)
             entry.in_use = True
             if entry.reaper is not None:
                 entry.reaper.cancel()
@@ -920,7 +942,11 @@ async def _track_live_session(session: Any) -> _LiveSession:
         # a resume, so it no longer represents the runtime session.
         await _evict_live_session(session.session_id)
 
-    entry = _LiveSession(session=session)
+    entry = _LiveSession(
+        session=session,
+        options=copy.deepcopy(options),
+        input_fingerprints=list(fingerprints or []),
+    )
     loop = asyncio.get_running_loop()
 
     def handler(event: Any) -> None:
@@ -937,18 +963,23 @@ async def _track_live_session(session: Any) -> _LiveSession:
     return entry
 
 
-async def _reuse_live_session(session_id: str, *, allow_pending: bool) -> Any | None:
+async def _reuse_live_session(
+    session_id: str, *, allow_pending: bool, options: dict[str, Any]
+) -> Any | None:
     """Hand back a connected session for ``session_id`` if one is idle.
 
     A session parked on a pending tool call is only reusable by the request
     that delivers the result.  Any other request (a new user message while
     a tool was still running) needs ``continue_pending_work=False``, which
-    is a resume-time option, so the live object is discarded first.
+    is a resume-time option, so the live object is discarded first. Changed
+    configuration also needs a resume: the SDK's live options API cannot
+    replace tool declarations or the system message. Unchanged configurations
+    stay connected so ordinary tool round-trips preserve background compaction.
     """
     entry = _live_sessions.get(session_id)
     if entry is None or entry.in_use:
         return None
-    if entry.pending_calls and not allow_pending:
+    if (entry.pending_calls and not allow_pending) or entry.options != options:
         await _evict_live_session(session_id)
         return None
     entry.in_use = True
@@ -956,6 +987,44 @@ async def _reuse_live_session(session_id: str, *, allow_pending: bool) -> Any | 
         entry.reaper.cancel()
         entry.reaper = None
     return entry.session
+
+
+def _continuation_prompt(
+    body: dict,
+    session_id: str,
+    segments: list[tuple[str, str]],
+    fingerprints: list[str],
+) -> str:
+    """Find new caller instructions without replaying the session's history."""
+    entry = _live_sessions.get(session_id)
+    seen = entry.input_fingerprints if entry is not None else []
+    if not seen:
+        alias = _session_alias(body)
+        known = _session_for_alias(alias) if alias else None
+        if known is not None and known[0] == session_id:
+            seen = known[1]
+    if seen and fingerprints[:len(seen)] == seen:
+        return "\n\n".join(
+            text for kind, text in _durable_segments(segments)[len(seen):]
+            if kind == _SEGMENT_USER
+        )
+
+    # After a restart or with a partial transcript, the current tool-call /
+    # assistant item bounds the new messages. Never resend earlier user turns.
+    tail = []
+    for item in reversed(body.get("input") or []):
+        if _is_caller_message(item):
+            tail.append(item)
+        elif isinstance(item, dict) and item.get("type") in {
+            "function_call_output", "custom_tool_call_output",
+        }:
+            continue
+        else:
+            break
+    return "\n\n".join(
+        text for kind, text in _render_input_segments(list(reversed(tail)))
+        if kind == _SEGMENT_USER
+    )
 
 
 async def _evict_live_session(session_id: str) -> None:
@@ -1025,10 +1094,10 @@ async def _open_session(body: dict, registration: ToolRegistration):
     continuation = resolve_tool_continuation(body.get("input"))
     reasoning_effort = await _reasoning_effort_for_client(body, client)
     options = _session_options(body, registration, reasoning_effort=reasoning_effort)
+    segments = _render_input_segments(body.get("input"))
+    fingerprints = _segment_fingerprints(segments)
     if continuation is None:
         alias = _session_alias(body)
-        segments = _render_input_segments(body.get("input"))
-        fingerprints = _segment_fingerprints(segments)
 
         # Resuming lets the SDK keep owning the history.  Replaying the whole
         # transcript into a fresh session instead costs the caller its entire
@@ -1044,7 +1113,9 @@ async def _open_session(body: dict, registration: ToolRegistration):
                 if not new_text:
                     new_text = _compaction_resume_delta(segments, fingerprints, seen)
                 if new_text:
-                    session = await _reuse_live_session(known_session_id, allow_pending=False)
+                    session = await _reuse_live_session(
+                        known_session_id, allow_pending=False, options=options,
+                    )
                     if session is None:
                         try:
                             session = await client.resume_session(
@@ -1062,7 +1133,7 @@ async def _open_session(body: dict, registration: ToolRegistration):
             session = await client.create_session(**options)
             prompt = "\n\n".join(text for _, text in segments)
 
-        await _track_live_session(session)
+        await _track_live_session(session, options=options, fingerprints=fingerprints)
         _remember_session(session.session_id)
         if alias:
             _pending_alias_watermark[session.session_id] = (alias, fingerprints)
@@ -1075,7 +1146,10 @@ async def _open_session(body: dict, registration: ToolRegistration):
         return session, dispatch
 
     session_id, results = continuation
-    session = await _reuse_live_session(session_id, allow_pending=True)
+    # Read the old watermark before reconfiguration can evict the live entry.
+    steering_prompt = _continuation_prompt(body, session_id, segments, fingerprints)
+    pending_work = True
+    session = await _reuse_live_session(session_id, allow_pending=True, options=options)
     if session is None and _owns_session(session_id):
         try:
             session = await client.resume_session(
@@ -1084,6 +1158,7 @@ async def _open_session(body: dict, registration: ToolRegistration):
                 **options,
             )
         except Exception:
+            pending_work = False
             try:
                 session = await client.resume_session(
                     session_id,
@@ -1097,16 +1172,15 @@ async def _open_session(body: dict, registration: ToolRegistration):
         # If the SDK session could not be resumed (e.g. proxy was reset and session
         # was pruned or state file lost), fall back to creating a fresh session
         # carrying the transcript up to and including the tool output.
-        segments = _render_input_segments(body.get("input"))
         session = await client.create_session(**options)
         prompt = "\n\n".join(text for _, text in segments)
-        await _track_live_session(session)
+        await _track_live_session(session, options=options, fingerprints=fingerprints)
         _remember_session(session.session_id)
         alias = _session_alias(body)
         if alias:
             _pending_alias_watermark[session.session_id] = (
                 alias,
-                _segment_fingerprints(segments),
+                fingerprints,
             )
 
         async def dispatch_fresh() -> None:
@@ -1116,18 +1190,22 @@ async def _open_session(body: dict, registration: ToolRegistration):
 
         return session, dispatch_fresh
 
-    await _track_live_session(session)
+    await _track_live_session(session, options=options, fingerprints=fingerprints)
     _remember_session(session.session_id)
     alias = _session_alias(body)
     if alias:
         _pending_alias_watermark[session.session_id] = (
             alias,
-            _segment_fingerprints(_render_input_segments(body.get("input"))),
+            fingerprints,
         )
 
     async def dispatch() -> None:
-        failed = False
-        for result in results:
+        if steering_prompt and pending_work:
+            # Enqueue would wait for the agent to finish. Immediate steering
+            # must precede the result that releases its next model call.
+            await session.send(steering_prompt, mode="immediate")
+        failed = not pending_work
+        for result in results if pending_work else []:
             try:
                 res = await session.rpc.tools.handle_pending_tool_call(
                     HandlePendingToolCallRequest(
@@ -1161,6 +1239,8 @@ async def _open_session(body: dict, registration: ToolRegistration):
                 prefix = f"Tool result for {name}: " if name else "Tool result: "
                 tool_texts.append(f"{prefix}{result.output}")
             fallback_prompt = "\n\n".join(tool_texts) or "Tool execution completed."
+            if steering_prompt and not pending_work:
+                fallback_prompt = f"{steering_prompt}\n\n{fallback_prompt}"
             await session.send(fallback_prompt)
 
     return session, dispatch

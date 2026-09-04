@@ -3,7 +3,7 @@ import json
 import os
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from copilot.session_events import (
     AssistantMessageData,
@@ -91,16 +91,23 @@ class CopilotSdkTranslationTests(unittest.TestCase):
 
     def test_reasoning_effort_is_sent_when_model_advertises_the_requested_level(self):
         class _Model:
-            id = "gpt-5.6"
-            supported_reasoning_efforts = ["low", "high"]
+            id = "gpt-5.6-luna"
+            supported_reasoning_efforts = ["low", "high", "xhigh", "max"]
             capabilities = None
 
         class _Client:
             async def list_models(self):
                 return [_Model()]
 
-        body = {"model": "gpt-5.6", "reasoning": {"effort": "high"}}
-        self.assertEqual(asyncio.run(sdk._reasoning_effort_for_client(body, _Client())), "high")
+        for requested in ("high", "xhigh", "max"):
+            with self.subTest(effort=requested):
+                body = {"model": "gpt-5.6-luna", "reasoning": {"effort": requested}}
+                effort = asyncio.run(sdk._reasoning_effort_for_client(body, _Client()))
+                self.assertEqual(effort, requested)
+                self.assertEqual(
+                    sdk._session_options(body, sdk.ToolRegistration(), reasoning_effort=effort)["reasoning_effort"],
+                    requested,
+                )
 
     def test_recognizes_terminal_in_band_compaction_trigger(self):
         self.assertTrue(
@@ -196,8 +203,15 @@ class CopilotSdkTranslationTests(unittest.TestCase):
         session_id, results = sdk.resolve_tool_continuation(value)
         self.assertEqual(session_id, "session-1")
         self.assertEqual([(item.request_id, item.output) for item in results], [("new", "new result")])
+        self.assertEqual(
+            sdk.resolve_tool_continuation(value + [{"role": "user", "content": "keep going"}]),
+            (session_id, results),
+        )
         self.assertIsNone(
-            sdk.resolve_tool_continuation(value + [{"role": "user", "content": "new turn"}])
+            sdk.resolve_tool_continuation(value + [
+                {"role": "assistant", "content": "done"},
+                {"role": "user", "content": "new turn"},
+            ])
         )
 
     def test_prompt_preserves_roles_and_omits_opaque_reasoning(self):
@@ -1719,6 +1733,236 @@ class CopilotSdkCompactionContinuityTests(unittest.IsolatedAsyncioTestCase):
         await sdk._release_session(session, outcome, completed=False)
         self.assertTrue(session.disconnected)
         self.assertEqual(sdk._live_sessions, {})
+
+
+class CopilotSdkRequestContinuityTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.state = _IsolatedSdkState()
+        self.state.__enter__()
+        self.addCleanup(self.state.__exit__, None, None, None)
+        for name in ("_live_sessions", "_pending_alias_watermark"):
+            patcher = patch.object(sdk, name, {})
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.addAsyncCleanup(sdk._evict_all_live_sessions)
+        self.actions = []
+        self.accept_pending = True
+        self.client = SimpleNamespace(
+            create_session=AsyncMock(side_effect=lambda **options: self.new_session()),
+            resume_session=AsyncMock(side_effect=lambda session_id, **options: self.new_session()),
+            list_models=AsyncMock(return_value=[SimpleNamespace(
+                id="gpt-5.6-luna", supported_reasoning_efforts=["low", "high", "xhigh", "max"],
+            )]),
+        )
+        patcher = patch.object(sdk, "_get_client", AsyncMock(return_value=self.client))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.call_id = sdk._encode_call_id(
+            "sdk-review", "pending-1", tool_name="inspect", tool_type="function",
+        )
+        self.body = {
+            "model": "gpt-5.6-luna",
+            "reasoning": {"effort": "high"},
+            "instructions": "Implement the task.",
+            "session_id": "review-thread",
+            "tools": [{"type": "function", "name": "inspect", "parameters": {
+                "type": "object", "properties": {},
+            }}],
+            "input": [{"role": "user", "content": "Original task"}],
+        }
+
+    def new_session(self):
+        session = _FakeSession()
+        session.session_id = "sdk-review"
+
+        async def send(prompt, **options):
+            self.actions.append(("send", prompt, options))
+
+        async def handle(result):
+            self.actions.append(("result", result.request_id, result.result.text_result_for_llm))
+            return SimpleNamespace(success=self.accept_pending)
+
+        session.send = AsyncMock(side_effect=send)
+        session.rpc = SimpleNamespace(tools=SimpleNamespace(
+            handle_pending_tool_call=AsyncMock(side_effect=handle),
+        ))
+        return session
+
+    async def open(self, body):
+        return await sdk._open_session(body, sdk.build_tool_registration(body))
+
+    async def begin(self):
+        session, dispatch = await self.open(self.body)
+        await dispatch()
+        sdk._commit_alias_watermark(session.session_id, success=True)
+        outcome = sdk.TurnOutcome(calls=[sdk.ToolCall("pending-1", "inspect", "function", {})])
+        await sdk._release_session(session, outcome, completed=True)
+        self.actions.clear()
+        return session
+
+    def continuation(self, *, messages=(), after_result=False):
+        call = {"type": "function_call", "call_id": self.call_id, "name": "inspect", "arguments": "{}"}
+        result = {"type": "function_call_output", "call_id": self.call_id, "output": "Inspection done"}
+        tail = [call, result, *messages] if after_result else [call, *messages, result]
+        return {**self.body, "input": [*self.body["input"], *tail]}
+
+    async def test_unchanged_options_keep_the_live_session_and_do_not_replay_input(self):
+        original = await self.begin()
+        session, dispatch = await self.open(self.continuation())
+        await dispatch()
+        self.assertIs(session, original)
+        self.client.resume_session.assert_not_awaited()
+        self.assertEqual(self.actions, [("result", "pending-1", "Inspection done")])
+
+    async def test_changed_model_effort_instructions_and_tools_reconfigure_pending_session(self):
+        changes = [
+            {"model": "gpt-other"},
+            {"reasoning": {"effort": "max"}},
+            {"instructions": "Continue until verification is complete."},
+            {"tools": [{"type": "function", "name": "verify", "description": "Run checks"}]},
+            {"tool_choice": "none"},
+            {"stream": True},
+        ]
+        for change in changes:
+            with self.subTest(change=change):
+                original = await self.begin()
+                self.client.resume_session.reset_mock()
+                body = {**self.continuation(), **change}
+                session, dispatch = await self.open(body)
+                await dispatch()
+                self.assertTrue(original.disconnected)
+                self.assertIsNot(session, original)
+                self.client.resume_session.assert_awaited_once()
+                options = self.client.resume_session.call_args.kwargs
+                self.assertTrue(options["continue_pending_work"])
+                self.assertEqual(options["model"], body["model"])
+                self.assertEqual(options["reasoning_effort"], body["reasoning"]["effort"])
+                self.assertEqual(options["system_message"]["content"], body["instructions"])
+                self.assertEqual(options["tools"], sdk.build_tool_registration(body).tools)
+                self.assertEqual(options["available_tools"], [f"custom:{t.name}" for t in options["tools"]])
+                self.assertEqual(self.actions, [("result", "pending-1", "Inspection done")])
+                await sdk._evict_all_live_sessions()
+
+    async def test_mutating_a_tool_schema_does_not_mutate_the_stored_configuration(self):
+        original = await self.begin()
+        self.body["tools"][0]["parameters"]["properties"]["path"] = {"type": "string"}
+        session, _ = await self.open(self.continuation())
+        self.assertIsNot(session, original)
+        self.client.resume_session.assert_awaited_once()
+
+    async def test_new_user_turn_applies_changed_options_to_a_connected_session(self):
+        original, dispatch = await self.open(self.body)
+        await dispatch()
+        sdk._commit_alias_watermark(original.session_id, success=True)
+        sdk._set_compaction_state(sdk._live_sessions[original.session_id], True)
+        await sdk._release_session(original, sdk.TurnOutcome(), completed=True)
+        body = {**self.body, "reasoning": {"effort": "max"}, "input": [
+            *self.body["input"],
+            {"role": "assistant", "content": "First answer"},
+            {"role": "user", "content": "Next task"},
+        ]}
+        self.actions.clear()
+        session, dispatch = await self.open(body)
+        await dispatch()
+        self.assertIsNot(session, original)
+        self.assertTrue(original.disconnected)
+        options = self.client.resume_session.call_args.kwargs
+        self.assertFalse(options["continue_pending_work"])
+        self.assertEqual(options["reasoning_effort"], "max")
+        self.assertEqual(self.actions, [("send", "User: Next task", {})])
+
+    async def test_unsupported_max_is_omitted_from_session_creation(self):
+        self.client.list_models.return_value[0].supported_reasoning_efforts = ["low", "high"]
+        self.body["reasoning"] = {"effort": "max"}
+        await self.begin()
+        self.assertNotIn("reasoning_effort", self.client.create_session.call_args.kwargs)
+
+    async def test_new_instructions_are_steered_before_the_tool_result(self):
+        await self.begin()
+        body = self.continuation(messages=[{"role": "user", "content": "Finish verification too"}])
+        _, dispatch = await self.open(body)
+        await dispatch()
+        self.assertEqual(self.actions, [
+            ("send", "User: Finish verification too", {"mode": "immediate"}),
+            ("result", "pending-1", "Inspection done"),
+        ])
+
+    async def test_messages_after_and_between_parallel_results_are_delivered_once(self):
+        await self.begin()
+        body = self.continuation(messages=[{"role": "developer", "content": "Verify first"}], after_result=True)
+        second_id = sdk._encode_call_id("sdk-review", "pending-2", tool_name="inspect", tool_type="function")
+        body["input"].extend([
+            {"type": "function_call_output", "call_id": second_id, "output": "Second result"},
+            {"role": "user", "content": "Keep going"},
+        ])
+        session, dispatch = await self.open(body)
+        await dispatch()
+        self.assertEqual(self.actions, [
+            ("send", "Developer: Verify first\n\nUser: Keep going", {"mode": "immediate"}),
+            ("result", "pending-1", "Inspection done"),
+            ("result", "pending-2", "Second result"),
+        ])
+        sdk._commit_alias_watermark(session.session_id, success=True)
+        await sdk._release_session(session, sdk.TurnOutcome(calls=[sdk.ToolCall("pending-3", "inspect", "function", {})]), completed=True)
+        third_id = sdk._encode_call_id("sdk-review", "pending-3", tool_name="inspect", tool_type="function")
+        body["input"].extend([
+            {"type": "function_call", "call_id": third_id, "name": "inspect", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": third_id, "output": "Third result"},
+        ])
+        self.actions.clear()
+        _, dispatch = await self.open(body)
+        await dispatch()
+        self.assertEqual(self.actions, [("result", "pending-3", "Third result")])
+
+    async def test_live_watermark_works_without_a_caller_session_alias(self):
+        self.body.pop("session_id")
+        await self.begin()
+        body = self.continuation()
+        body["input"].insert(1, {"role": "developer", "content": "Continue working"})
+        _, dispatch = await self.open(body)
+        await dispatch()
+        self.assertEqual(self.actions[0], ("send", "Developer: Continue working", {"mode": "immediate"}))
+
+    async def test_restart_preserves_the_watermark_and_new_instructions(self):
+        await self.begin()
+        await sdk._evict_all_live_sessions()
+        body = self.continuation()
+        body["input"].insert(1, {"role": "user", "content": "Finish the task"})
+        _, dispatch = await self.open(body)
+        await dispatch()
+        self.assertEqual(self.actions[0], ("send", "User: Finish the task", {"mode": "immediate"}))
+        self.assertTrue(self.client.resume_session.call_args.kwargs["continue_pending_work"])
+
+    async def test_partial_transcript_steers_only_messages_after_the_pending_call(self):
+        await self.begin()
+        await sdk._evict_all_live_sessions()
+        body = self.continuation(messages=[{"role": "user", "content": "Continue"}])
+        body.pop("session_id")
+        _, dispatch = await self.open(body)
+        await dispatch()
+        self.assertEqual(self.actions[0], ("send", "User: Continue", {"mode": "immediate"}))
+
+    async def test_lost_pending_work_sends_one_prompt_with_instructions_and_results(self):
+        await self.begin()
+        await sdk._evict_all_live_sessions()
+        self.client.resume_session.side_effect = [RuntimeError("Cannot restore pending work"), self.new_session()]
+        body = self.continuation(messages=[{"role": "user", "content": "Finish verification"}])
+        _, dispatch = await self.open(body)
+        await dispatch()
+        self.assertEqual(self.actions, [
+            ("send", "User: Finish verification\n\nTool result for inspect: Inspection done", {}),
+        ])
+
+    async def test_new_session_fallback_keeps_instructions_and_tool_results(self):
+        await self.begin()
+        await sdk._evict_all_live_sessions()
+        self.client.resume_session.side_effect = RuntimeError("Missing session")
+        body = self.continuation(messages=[{"role": "user", "content": "Finish verification"}])
+        _, dispatch = await self.open(body)
+        await dispatch()
+        self.assertEqual(len(self.actions), 1)
+        self.assertIn("User: Finish verification", self.actions[0][1])
+        self.assertIn("Tool result: Inspection done", self.actions[0][1])
 
 
 if __name__ == "__main__":
