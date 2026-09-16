@@ -34,6 +34,7 @@ class ExcelUpstreamTests(unittest.TestCase):
         self.assertNotIn("cookie", headers)
         self.assertEqual(headers["x-openai-account-id"], "account-1")
         self.assertEqual(headers["accept"], "text/event-stream")
+        self.assertEqual(headers["accept-encoding"], "identity")
 
     def test_session_store_keeps_captured_tools_version(self):
         store = excel_upstream.ExcelSessionStore()
@@ -86,7 +87,7 @@ class ExcelUpstreamTests(unittest.TestCase):
         }
         body = excel_upstream.prepare_responses_body(source)
 
-        self.assertEqual(body["model"], "gpt-5.5")
+        self.assertEqual(body["model"], "gpt-5.6-sol")
         self.assertFalse(body["store"])
         self.assertEqual(body["reasoning_effort"], "xhigh")
         self.assertEqual(body["prompt_cache_key"], "conversation-1")
@@ -105,6 +106,30 @@ class ExcelUpstreamTests(unittest.TestCase):
         self.assertNotIn("text", body)
         self.assertNotIn("max_output_tokens", body)
         self.assertNotIn("reasoning", body)
+
+    def test_supported_reasoning_efforts_and_x_high_alias_are_forwarded(self):
+        expected = {
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
+            "xhigh": "xhigh",
+            "x-high": "xhigh",
+        }
+        for requested, forwarded in expected.items():
+            with self.subTest(requested=requested):
+                body = excel_upstream.prepare_responses_body(
+                    {
+                        "model": "gpt-excel",
+                        "input": "Hello",
+                        "reasoning": {"effort": requested},
+                    }
+                )
+                self.assertEqual(body["reasoning_effort"], forwarded)
+
+        self.assertEqual(
+            excel_upstream.LOCAL_MODEL_CAPABILITIES["gpt-excel"]["reasoning_efforts"],
+            ["low", "medium", "high", "xhigh"],
+        )
 
     def test_task_identity_is_stable_for_a_conversation(self):
         source = {
@@ -742,6 +767,73 @@ class ExcelUpstreamTests(unittest.TestCase):
         # The trailing message re-bills on every turn, so it must stay small
         # relative to the catalog it replaces.
         self.assertLess(len(reminder), len(catalog) / 2)
+
+    def test_nested_plugin_tools_are_forwarded_in_catalog(self):
+        source = {
+            "model": "gpt-excel",
+            "input": "Open Calendar.",
+            "tools": [
+                {
+                    "type": "namespace",
+                    "name": "computer_use",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "js",
+                            "description": "Control desktop applications.",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {"code": {"type": "string"}},
+                                "required": ["code"],
+                            },
+                        }
+                    ],
+                }
+            ],
+        }
+
+        self.assertEqual(
+            excel_upstream.client_tool_types(source),
+            {"computer_use.js": "function"},
+        )
+        body = excel_upstream.prepare_responses_body(source)
+        catalog = body["input"][0]["content"][0]["text"]
+        self.assertIn('"name":"computer_use.js"', catalog)
+        self.assertIn('"namespace":"computer_use"', catalog)
+        self.assertIn('"tool":"js"', catalog)
+        self.assertIn('"required":["code"]', catalog)
+        self.assertIn("Control desktop applications.", catalog)
+        self.assertIn("computer_use.js", body["input"][-1]["content"][0]["text"])
+
+        tool_call = excel_upstream.extract_native_client_tool_call(
+            {
+                "output": [
+                    {
+                        "type": "function_call",
+                        "id": "fc_transport",
+                        "call_id": "call_transport",
+                        "name": "run_officejs",
+                        "arguments": json.dumps(
+                            {
+                                "code": json.dumps(
+                                    {
+                                        "name": "computer_use.js",
+                                        "arguments": {"code": "await computer.use()"},
+                                    }
+                                )
+                            }
+                        ),
+                    }
+                ]
+            },
+            source,
+        )
+        self.assertEqual(tool_call["name"], "js")
+        self.assertEqual(tool_call["namespace"], "computer_use")
+        self.assertEqual(
+            json.loads(tool_call["arguments"]),
+            {"code": "await computer.use()"},
+        )
 
     def test_compaction_trigger_stays_final_after_tool_reminder(self):
         body = excel_upstream.prepare_responses_body(

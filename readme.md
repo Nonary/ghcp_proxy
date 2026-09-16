@@ -186,9 +186,9 @@ session API. Token values are not printed or written to logs. The macOS session
 remains memory-only, but GHCP Proxy reloads it after restarts. If the token
 expires, refresh the ChatGPT Excel task pane so Excel writes a current token.
 After priming, select `gpt-excel` in Codex. Requests for all other models still
-use GitHub Copilot. The Excel service currently accepts `gpt-5.5` on the wire
-but may report the actual routed model (observed as `gpt-5.6-sol`) in Responses
-events.
+use GitHub Copilot. The Excel service currently accepts `gpt-5.6-sol` on the
+wire and exposes `low`, `medium`, `high`, and `xhigh` reasoning efforts
+(`x-high` is accepted as an input alias).
 
 Basispoints rejects client-supplied tool schemas and injects its own
 Excel-specific tools. GHCP Proxy therefore removes client tool declarations and

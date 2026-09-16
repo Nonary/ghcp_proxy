@@ -667,7 +667,72 @@ def _configured_upstream_http2(proxy_configured: bool) -> tuple[bool, str]:
 
 
 _UPSTREAM_CLIENT: "httpx.AsyncClient | None" = None
+_EXCEL_UPSTREAM_CLIENT: "httpx.AsyncClient | None" = None
 _UPSTREAM_CLIENT_LOCK = threading.Lock()
+_UPSTREAM_CLIENT_SHUTDOWN_REGISTERED = False
+_EXCEL_NON_STREAMING_RETRY_ATTEMPTS = 2
+
+
+def _build_upstream_client(
+    *,
+    http2_override: bool | None = None,
+) -> "httpx.AsyncClient":
+    proxy_aliases = _apply_upstream_proxy_env_aliases()
+    if proxy_aliases:
+        print(
+            f"Configured upstream proxy environment aliases: {', '.join(proxy_aliases)}",
+            flush=True,
+        )
+    proxy_configured = _upstream_proxy_configured()
+    tls_verify, tls_verify_source = _configured_upstream_tls_verify(proxy_configured)
+    if http2_override is None:
+        upstream_http2, upstream_http2_source = _configured_upstream_http2(proxy_configured)
+    else:
+        upstream_http2, upstream_http2_source = http2_override, "client_override"
+    if not tls_verify and tls_verify_source == "proxy_default":
+        print(
+            "Upstream proxy detected: defaulting GHCP upstream TLS verification off. "
+            "Set GHCP_UPSTREAM_TLS_VERIFY=1 once a trusted proxy CA bundle is configured.",
+            flush=True,
+        )
+    elif not tls_verify:
+        print(
+            "GHCP_UPSTREAM_TLS_VERIFY disabled: upstream TLS certificates will not be validated.",
+            flush=True,
+        )
+    if not upstream_http2 and upstream_http2_source == "proxy_default":
+        print(
+            "Upstream proxy detected: defaulting GHCP upstream HTTP/2 off for compatibility.",
+            flush=True,
+        )
+    timeout = httpx.Timeout(configured_upstream_timeout_seconds())
+    limits = httpx.Limits(
+        max_connections=8,
+        max_keepalive_connections=4,
+        keepalive_expiry=300.0,
+    )
+    try:
+        return httpx.AsyncClient(
+            http2=upstream_http2,
+            timeout=timeout,
+            limits=limits,
+            verify=tls_verify,
+            trust_env=True,
+        )
+    except (ImportError, RuntimeError):
+        return httpx.AsyncClient(
+            timeout=timeout,
+            limits=limits,
+            verify=tls_verify,
+            trust_env=True,
+        )
+
+
+def _ensure_upstream_client_shutdown_registered() -> None:
+    global _UPSTREAM_CLIENT_SHUTDOWN_REGISTERED
+    if not _UPSTREAM_CLIENT_SHUTDOWN_REGISTERED:
+        atexit.register(_shutdown_upstream_client)
+        _UPSTREAM_CLIENT_SHUTDOWN_REGISTERED = True
 
 
 def _get_upstream_client() -> "httpx.AsyncClient":
@@ -675,56 +740,22 @@ def _get_upstream_client() -> "httpx.AsyncClient":
     if _UPSTREAM_CLIENT is not None:
         return _UPSTREAM_CLIENT
     with _UPSTREAM_CLIENT_LOCK:
-        if _UPSTREAM_CLIENT is not None:
-            return _UPSTREAM_CLIENT
-        proxy_aliases = _apply_upstream_proxy_env_aliases()
-        if proxy_aliases:
-            print(
-                f"Configured upstream proxy environment aliases: {', '.join(proxy_aliases)}",
-                flush=True,
-            )
-        proxy_configured = _upstream_proxy_configured()
-        tls_verify, tls_verify_source = _configured_upstream_tls_verify(proxy_configured)
-        upstream_http2, upstream_http2_source = _configured_upstream_http2(proxy_configured)
-        if not tls_verify and tls_verify_source == "proxy_default":
-            print(
-                "Upstream proxy detected: defaulting GHCP upstream TLS verification off. "
-                "Set GHCP_UPSTREAM_TLS_VERIFY=1 once a trusted proxy CA bundle is configured.",
-                flush=True,
-            )
-        elif not tls_verify:
-            print(
-                "GHCP_UPSTREAM_TLS_VERIFY disabled: upstream TLS certificates will not be validated.",
-                flush=True,
-            )
-        if not upstream_http2 and upstream_http2_source == "proxy_default":
-            print(
-                "Upstream proxy detected: defaulting GHCP upstream HTTP/2 off for compatibility.",
-                flush=True,
-            )
-        timeout = httpx.Timeout(configured_upstream_timeout_seconds())
-        limits = httpx.Limits(
-            # Avoid cross-origin head-of-line blocking when Copilot and Excel
-            # upstream requests are in flight at the same time.
-            max_connections=8,
-            max_keepalive_connections=4,
-            keepalive_expiry=300.0,
-        )
-        try:
-            _UPSTREAM_CLIENT = httpx.AsyncClient(
-                http2=upstream_http2,
-                timeout=timeout,
-                limits=limits,
-                verify=tls_verify,
-            )
-        except (ImportError, RuntimeError):
-            _UPSTREAM_CLIENT = httpx.AsyncClient(
-                timeout=timeout,
-                limits=limits,
-                verify=tls_verify,
-            )
-        atexit.register(_shutdown_upstream_client)
+        if _UPSTREAM_CLIENT is None:
+            _UPSTREAM_CLIENT = _build_upstream_client()
+            _ensure_upstream_client_shutdown_registered()
     return _UPSTREAM_CLIENT
+
+
+def _get_excel_upstream_client() -> "httpx.AsyncClient":
+    """Keep Excel traffic isolated from the shared Copilot transport pool."""
+    global _EXCEL_UPSTREAM_CLIENT
+    if _EXCEL_UPSTREAM_CLIENT is not None:
+        return _EXCEL_UPSTREAM_CLIENT
+    with _UPSTREAM_CLIENT_LOCK:
+        if _EXCEL_UPSTREAM_CLIENT is None:
+            _EXCEL_UPSTREAM_CLIENT = _build_upstream_client(http2_override=False)
+            _ensure_upstream_client_shutdown_registered()
+    return _EXCEL_UPSTREAM_CLIENT
 
 
 class _DownstreamDisconnectedBeforeResponse(RuntimeError):
@@ -839,15 +870,21 @@ async def _open_streaming_upstream(
 
 
 def _shutdown_upstream_client() -> None:
-    global _UPSTREAM_CLIENT
-    client = _UPSTREAM_CLIENT
+    global _UPSTREAM_CLIENT, _EXCEL_UPSTREAM_CLIENT
+    clients = [
+        client
+        for client in (_UPSTREAM_CLIENT, _EXCEL_UPSTREAM_CLIENT)
+        if client is not None
+    ]
     _UPSTREAM_CLIENT = None
-    if client is None:
+    _EXCEL_UPSTREAM_CLIENT = None
+    if not clients:
         return
     try:
         loop = asyncio.new_event_loop()
         try:
-            loop.run_until_complete(client.aclose())
+            for client in clients:
+                loop.run_until_complete(client.aclose())
         finally:
             loop.close()
     except Exception:
@@ -4063,6 +4100,7 @@ async def proxy_streaming_response(
     stream_transform=None,
     trace_details_factory=None,
     sync_replay_ids: bool | None = None,
+    upstream_client: httpx.AsyncClient | None = None,
 ) -> Response:
     """
     Relay an upstream SSE response while preserving upstream error statuses.
@@ -4080,7 +4118,7 @@ async def proxy_streaming_response(
     active_stream = _register_active_responses_stream(trace_plan)
     try:
         await _supersede_active_responses_streams(trace_plan, active_stream)
-        client = _get_upstream_client()
+        client = upstream_client or _get_upstream_client()
         request = client.build_request("POST", upstream_url, headers=headers, json=body)
         try:
             upstream = await _open_streaming_upstream(
@@ -5835,56 +5873,104 @@ def _excel_tool_stream_transform(source_body: dict):
     return transform
 
 
+async def _read_excel_non_streaming_response_payload(
+    upstream: httpx.Response,
+) -> dict | None:
+    completed_payload: dict | None = None
+    try:
+        async for event_name, data in format_translation.iter_sse_messages(
+            upstream.aiter_bytes()
+        ):
+            if not _is_response_completed_event(event_name, data):
+                continue
+            try:
+                parsed = json.loads(data or "")
+            except json.JSONDecodeError:
+                continue
+            response_payload = parsed.get("response") if isinstance(parsed, dict) else None
+            if isinstance(response_payload, dict):
+                completed_payload = response_payload
+    except httpx.RemoteProtocolError:
+        # Basispoints sometimes emits a malformed final chunk after the
+        # complete response event. The completed Responses payload is still
+        # valid and is safe to return to a non-streaming caller.
+        if completed_payload is None:
+            raise
+    return completed_payload
+
+
 async def _post_excel_non_streaming_request(
     plan: UpstreamRequestPlan,
     *,
     client_body: dict,
 ) -> Response:
-    try:
-        client = _get_upstream_client()
-        upstream = await throttled_client_post(
-            client,
-            plan.upstream_url,
-            headers=plan.headers,
-            json=plan.body,
-        )
-    except httpx.RequestError as exc:
-        status_code, message = format_translation.upstream_request_error_status_and_message(exc)
-        _finish_usage_and_trace(plan, status_code, response_text=message)
-        return format_translation.openai_error_response(status_code, message)
-    except Exception:
-        _finish_usage_and_trace(plan, 599)
-        raise
+    client = _get_excel_upstream_client()
+    upstream: httpx.Response | None = None
+    response_payload: dict | None = None
+    for attempt in range(_EXCEL_NON_STREAMING_RETRY_ATTEMPTS):
+        upstream = None
+        try:
+            request = client.build_request(
+                "POST",
+                plan.upstream_url,
+                headers=plan.headers,
+                json=plan.body,
+            )
+            upstream = await throttled_client_send(client, request, stream=True)
+            if upstream.status_code >= 400:
+                await upstream.aread()
+                return _handle_upstream_error(
+                    upstream,
+                    trace_plan=plan,
+                    caller_protocol="responses",
+                    stream=False,
+                    model=excel_upstream.MODEL_ID,
+                    fallback_error_response=proxy_non_streaming_response,
+                )
+            if "text/event-stream" in upstream.headers.get("content-type", "").lower():
+                response_payload = await _read_excel_non_streaming_response_payload(upstream)
+            else:
+                await upstream.aread()
+                response_payload = _extract_upstream_json_payload(upstream)
+        except httpx.RemoteProtocolError as exc:
+            if attempt + 1 < _EXCEL_NON_STREAMING_RETRY_ATTEMPTS:
+                continue
+            status_code, message = format_translation.upstream_request_error_status_and_message(exc)
+            _finish_usage_and_trace(plan, status_code, response_text=message)
+            return format_translation.openai_error_response(status_code, message)
+        except httpx.RequestError as exc:
+            status_code, message = format_translation.upstream_request_error_status_and_message(exc)
+            _finish_usage_and_trace(plan, status_code, response_text=message)
+            return format_translation.openai_error_response(status_code, message)
+        except Exception:
+            _finish_usage_and_trace(plan, 599)
+            raise
+        finally:
+            if upstream is not None:
+                await upstream.aclose()
+        break
 
-    if upstream.status_code >= 400:
-        return _handle_upstream_error(
-            upstream,
-            trace_plan=plan,
-            caller_protocol="responses",
-            stream=False,
-            model=excel_upstream.MODEL_ID,
-            fallback_error_response=proxy_non_streaming_response,
-        )
-    response_payload = _extract_upstream_json_payload(upstream)
+    if not isinstance(response_payload, dict):
+        message = "Upstream response did not include a completed Responses payload"
+        _finish_usage_and_trace(plan, 502, response_text=message)
+        return format_translation.openai_error_response(502, message)
+
     translated_payload = response_payload
-    if isinstance(response_payload, dict):
-        response_text = format_translation.extract_response_output_text(
-            response_payload
+    response_text = format_translation.extract_response_output_text(response_payload)
+    tool_call = excel_upstream.extract_client_tool_call(
+        response_text,
+        excel_upstream.client_tool_types(client_body),
+    )
+    if tool_call is None:
+        tool_call = excel_upstream.extract_native_client_tool_call(
+            response_payload,
+            client_body,
         )
-        tool_call = excel_upstream.extract_client_tool_call(
-            response_text,
-            excel_upstream.client_tool_types(client_body),
+    if tool_call is not None:
+        translated_payload = excel_upstream.response_payload_with_tool_call(
+            response_payload,
+            tool_call,
         )
-        if tool_call is None:
-            tool_call = excel_upstream.extract_native_client_tool_call(
-                response_payload,
-                client_body,
-            )
-        if tool_call is not None:
-            translated_payload = excel_upstream.response_payload_with_tool_call(
-                response_payload,
-                tool_call,
-            )
     _finish_usage_and_trace(
         plan,
         upstream.status_code,
@@ -5966,6 +6052,7 @@ async def _handle_excel_responses(
             caller_model=excel_upstream.MODEL_ID,
             stream_transform=_excel_tool_stream_transform(body),
             sync_replay_ids=False,
+            upstream_client=_get_excel_upstream_client(),
         )
     return await _post_excel_non_streaming_request(plan, client_body=body)
 

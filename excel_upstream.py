@@ -26,7 +26,16 @@ from app_paths import user_state_dir
 
 
 MODEL_ID = "gpt-excel"
-UPSTREAM_MODEL = "gpt-5.5"
+UPSTREAM_MODEL = (
+    os.environ.get("GHCP_EXCEL_UPSTREAM_MODEL", "gpt-5.6-sol").strip()
+    or "gpt-5.6-sol"
+)
+EXCEL_REASONING_EFFORTS = ("low", "medium", "high", "xhigh")
+_REASONING_EFFORT_ALIASES = {
+    "x-high": "xhigh",
+    "extra-high": "xhigh",
+    "extra_high": "xhigh",
+}
 EXTERNAL_CLIENT_INSTRUCTIONS = (
     "This request is relayed by an external OpenAI Responses API client, not by "
     "the live Excel workbook. Do not call server-injected Excel, Office, connector, "
@@ -134,7 +143,7 @@ LOCAL_MODEL_CAPABILITIES = {
         "model_picker_enabled": True,
         "parallel_tool_calls": False,
         "provider": "OpenAI Excel",
-        "reasoning_efforts": ["medium", "xhigh"],
+        "reasoning_efforts": list(EXCEL_REASONING_EFFORTS),
         "supported_endpoints": ["/responses"],
         "vision": False,
     }
@@ -143,6 +152,14 @@ LOCAL_MODEL_CAPABILITIES = {
 
 def is_excel_model(model: object) -> bool:
     return isinstance(model, str) and model.strip().lower() == MODEL_ID
+
+
+def _normalize_reasoning_effort(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower()
+    normalized = _REASONING_EFFORT_ALIASES.get(normalized, normalized)
+    return normalized if normalized in EXCEL_REASONING_EFFORTS else None
 
 
 def local_model_payload() -> dict[str, object]:
@@ -171,23 +188,41 @@ def merge_local_models_payload(payload: dict | None) -> dict:
     return result
 
 
-def client_tool_types(source: dict) -> dict[str, str]:
-    if str(source.get("tool_choice") or "").strip().lower() == "none":
-        return {}
-    result: dict[str, str] = {}
-    tools = source.get("tools")
+def _client_tool_key(name: str, namespace: str | None = None) -> str:
+    return f"{namespace}.{name}" if namespace else name
+
+
+def _iter_client_tools(tools: object, namespace: str | None = None):
+    """Yield callable leaves from Codex dynamic tool namespaces."""
     if not isinstance(tools, list):
-        return result
+        return
     for tool in tools:
         if not isinstance(tool, dict):
             continue
         tool_type = str(tool.get("type") or "").strip().lower()
         name = tool.get("name")
-        if tool_type not in {"function", "custom"} or not isinstance(name, str):
-            continue
-        normalized_name = name.strip()
-        if normalized_name:
-            result[normalized_name] = tool_type
+        if tool_type in {"function", "custom"} and isinstance(name, str):
+            normalized_name = name.strip()
+            if normalized_name:
+                yield (
+                    _client_tool_key(normalized_name, namespace),
+                    normalized_name,
+                    namespace,
+                    tool_type,
+                    tool,
+                )
+        if tool_type == "namespace" and isinstance(name, str) and name.strip():
+            yield from _iter_client_tools(tool.get("tools"), name.strip())
+
+
+def client_tool_types(source: dict) -> dict[str, str]:
+    if str(source.get("tool_choice") or "").strip().lower() == "none":
+        return {}
+    result: dict[str, str] = {}
+    for key, _name, _namespace, tool_type, _tool in _iter_client_tools(
+        source.get("tools")
+    ):
+        result[key] = tool_type
     return result
 
 
@@ -234,17 +269,17 @@ def _remembered_native_call(call_id: object) -> dict | None:
 
 
 def _client_tool_specs(source: dict) -> dict[str, dict]:
-    allowed_tools = client_tool_types(source)
     result: dict[str, dict] = {}
-    tools = source.get("tools")
-    if not isinstance(tools, list):
-        return result
-    for tool in tools:
-        if not isinstance(tool, dict):
-            continue
-        name = tool.get("name")
-        if isinstance(name, str) and name in allowed_tools:
-            result[name] = tool
+    for key, name, namespace, tool_type, tool in _iter_client_tools(
+        source.get("tools")
+    ):
+        result[key] = {
+            "key": key,
+            "name": name,
+            "namespace": namespace,
+            "type": tool_type,
+            "spec": tool,
+        }
     return result
 
 
@@ -486,8 +521,9 @@ def extract_native_client_tool_call(
     )
     if name is None or name not in specs:
         return None
-    spec = specs[name]
-    expected_type = str(spec.get("type") or "").strip().lower()
+    tool_info = specs[name]
+    spec = tool_info["spec"]
+    expected_type = tool_info["type"]
     if expected_type == "function":
         if envelope is not None:
             arguments = envelope.get("arguments")
@@ -510,7 +546,12 @@ def extract_native_client_tool_call(
             return None
         if envelope is None:
             arguments = _normalize_native_function_arguments(name, arguments)
-        if not _value_matches_schema(arguments, spec.get("parameters")):
+        input_schema = (
+            spec.get("parameters")
+            or spec.get("inputSchema")
+            or spec.get("input_schema")
+        )
+        if not _value_matches_schema(arguments, input_schema):
             return None
         native_call_id = native.get("call_id")
         call_id = (
@@ -520,7 +561,7 @@ def extract_native_client_tool_call(
         )
         native_item_id = native.get("id")
         _remember_native_call(native)
-        return {
+        result = {
             "type": "function_call",
             "id": (
                 native_item_id
@@ -528,13 +569,16 @@ def extract_native_client_tool_call(
                 else f"fc_{call_id}"
             ),
             "call_id": call_id,
-            "name": name,
+            "name": tool_info["name"],
             "arguments": json.dumps(
                 arguments,
                 separators=(",", ":"),
                 ensure_ascii=False,
             ),
         }
+        if tool_info["namespace"]:
+            result["namespace"] = tool_info["namespace"]
+        return result
     if expected_type == "custom":
         custom_input = (
             envelope.get("input")
@@ -577,22 +621,25 @@ def _client_tool_protocol_instructions(source: dict) -> str:
         return EXTERNAL_CLIENT_INSTRUCTIONS
 
     tool_catalog: list[dict[str, object]] = []
-    for tool in source.get("tools", []):
-        if not isinstance(tool, dict):
-            continue
-        name = tool.get("name")
-        if not isinstance(name, str) or name not in allowed_tools:
-            continue
-        tool_type = allowed_tools[name]
+    for key, name, namespace, tool_type, tool in _iter_client_tools(
+        source.get("tools")
+    ):
         entry: dict[str, object] = {
             "type": tool_type,
-            "name": name,
+            "name": key,
         }
+        if namespace:
+            entry["namespace"] = namespace
+            entry["tool"] = name
         description = tool.get("description")
         if isinstance(description, str) and description:
             entry["description"] = description
         if tool_type == "function":
-            parameters = tool.get("parameters")
+            parameters = (
+                tool.get("parameters")
+                or tool.get("inputSchema")
+                or tool.get("input_schema")
+            )
             entry["parameters"] = parameters if isinstance(parameters, dict) else {}
         else:
             custom_format = tool.get("format")
@@ -1041,6 +1088,7 @@ class ExcelSessionStore:
         headers.update(
             {
                 "accept": "text/event-stream" if stream else "application/json",
+                "accept-encoding": "identity",
                 "content-type": "application/json",
                 "origin": "https://bps.openai.com",
             }
@@ -1397,18 +1445,9 @@ def prepare_responses_body(
         if isinstance(reasoning, dict)
         else source.get("reasoning_effort")
     )
-    normalized_effort = (
-        requested_effort.strip().lower()
-        if isinstance(requested_effort, str)
-        else ""
-    )
-    # Direct Basispoints probes confirm only these two wire values. Unknown or
-    # stale catalog values fall back to medium rather than producing a 422.
-    output["reasoning_effort"] = (
-        normalized_effort
-        if normalized_effort in {"medium", "xhigh"}
-        else "medium"
-    )
+    # Keep the public picker and the Basispoints wire value aligned. Unknown
+    # or stale catalog values fall back to medium rather than producing a 422.
+    output["reasoning_effort"] = _normalize_reasoning_effort(requested_effort) or "medium"
 
     context_management = source.get("context_management")
     output["context_management"] = (
