@@ -214,11 +214,8 @@ _DEBUG_DETAIL_REQUEST_SNAPSHOTS_BY_ID: OrderedDict[str, dict] = OrderedDict()
 _DEBUG_DETAIL_SESSION_CAPTURED_REQUEST_IDS: OrderedDict[str, set[str]] = OrderedDict()
 _DEBUG_DETAIL_SNAPSHOT_SEQUENCE = 0
 
-# Upstream Responses prompt-cache settle. Successful agent/tool continuations
-# and related root-turn handoffs get a short quiet window so a just-written
-# upstream cache entry becomes visible. Same-turn user steering is deliberately
-# not delayed: native Copilot sends that shape immediately after cancelling or
-# completing the prior generation and keeps the task/interaction identity.
+# Cache-settle bookkeeping remains for trace compatibility, but production
+# requests never pause for upstream cache visibility.
 _PROMPT_CACHE_SETTLE_LOCK = threading.Lock()
 _PROMPT_CACHE_LAST_FINISH_BY_FAMILY: dict[tuple[str, str], tuple[str, float]] = {}
 _PROMPT_CACHE_LAST_PRUNE_AT = 0.0
