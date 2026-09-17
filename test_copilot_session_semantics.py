@@ -509,7 +509,7 @@ def _cache_settle_plan(*, request_id: str, model: str, steering: bool) -> Upstre
     )
 
 
-def test_all_models_use_one_cache_settle_default(monkeypatch):
+def test_cache_settle_is_disabled_by_default(monkeypatch):
     monkeypatch.delenv("GHCP_PROXY_RESPONSES_CACHE_SETTLE_DELAY_SECONDS", raising=False)
     model = "future-responses-model"
     continuation = _cache_settle_plan(
@@ -523,8 +523,8 @@ def test_all_models_use_one_cache_settle_default(monkeypatch):
         steering=True,
     )
 
-    assert proxy._prompt_cache_settle_delay_seconds(continuation) == 3.0
-    assert proxy._prompt_cache_settle_delay_seconds(steering) == 3.0
+    assert proxy._prompt_cache_settle_delay_seconds(continuation) == 0.0
+    assert proxy._prompt_cache_settle_delay_seconds(steering) == 0.0
 
 
 def test_same_lineage_steering_does_not_wait_for_cache_settle(monkeypatch):

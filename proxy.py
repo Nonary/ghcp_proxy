@@ -219,7 +219,6 @@ _DEBUG_DETAIL_SNAPSHOT_SEQUENCE = 0
 # upstream cache entry becomes visible. Same-turn user steering is deliberately
 # not delayed: native Copilot sends that shape immediately after cancelling or
 # completing the prior generation and keeps the task/interaction identity.
-RESPONSES_CACHE_SETTLE_DELAY_SECONDS = 0.0
 _PROMPT_CACHE_SETTLE_LOCK = threading.Lock()
 _PROMPT_CACHE_LAST_FINISH_BY_FAMILY: dict[tuple[str, str], tuple[str, float]] = {}
 _PROMPT_CACHE_LAST_PRUNE_AT = 0.0
@@ -1157,14 +1156,7 @@ def _responses_plan_is_user_steering(plan: "UpstreamRequestPlan | None") -> bool
 
 def _prompt_cache_settle_delay_seconds(plan: "UpstreamRequestPlan | None" = None) -> float:
     del plan
-    default = RESPONSES_CACHE_SETTLE_DELAY_SECONDS
-    raw_value = os.environ.get("GHCP_PROXY_RESPONSES_CACHE_SETTLE_DELAY_SECONDS")
-    if raw_value is None:
-        return default
-    try:
-        return max(0.0, float(str(raw_value).strip()))
-    except (TypeError, ValueError):
-        return default
+    return 0.0
 
 
 def _responses_plan_header_value(
