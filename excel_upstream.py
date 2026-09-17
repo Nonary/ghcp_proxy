@@ -54,6 +54,9 @@ CLIENT_TOOL_RELAY_PREFIX = "codex_client__"
 CLIENT_MARKER_CALL_ID_PREFIX = "call_ghcp_excel_marker_"
 NATIVE_FALLBACK_CALL_ID_PREFIX = "call_ghcp_excel_native_"
 CLIENT_TOOL_TRANSPORT_NAME = "run_officejs"
+CLIENT_TOOL_TRANSPORT_ALIASES = frozenset(
+    {CLIENT_TOOL_TRANSPORT_NAME, f"functions.{CLIENT_TOOL_TRANSPORT_NAME}"}
+)
 TOOLS_VERSION_METADATA_KEY = "bps_tools_version_id"
 _TOOLS_VERSION_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,160}$")
 _NATIVE_CALL_CACHE_LIMIT = 512
@@ -326,10 +329,14 @@ def _decode_transport_code(code: object) -> dict | None:
     return envelope if isinstance(envelope, dict) else None
 
 
+def _is_transport_name(name: object) -> bool:
+    return isinstance(name, str) and name in CLIENT_TOOL_TRANSPORT_ALIASES
+
+
 def _transport_envelope(native: dict) -> dict | None:
     if (
         native.get("type") != "function_call"
-        or native.get("name") != CLIENT_TOOL_TRANSPORT_NAME
+        or not _is_transport_name(native.get("name"))
     ):
         return None
     raw_arguments = native.get("arguments")
@@ -343,7 +350,7 @@ def _transport_envelope(native: dict) -> dict | None:
         return None
     envelope = _decode_transport_code(arguments.get("code"))
     for _ in range(2):
-        if envelope is None or envelope.get("name") != CLIENT_TOOL_TRANSPORT_NAME:
+        if envelope is None or not _is_transport_name(envelope.get("name")):
             break
         nested_arguments = envelope.get("arguments")
         if isinstance(nested_arguments, str):
@@ -354,7 +361,7 @@ def _transport_envelope(native: dict) -> dict | None:
         if not isinstance(nested_arguments, dict):
             return None
         envelope = _decode_transport_code(nested_arguments.get("code"))
-    if envelope is not None and envelope.get("name") == CLIENT_TOOL_TRANSPORT_NAME:
+    if envelope is not None and _is_transport_name(envelope.get("name")):
         return None
     return envelope
 
@@ -530,7 +537,7 @@ def extract_native_client_tool_call(
     native = native_calls[0]
     allowed_tools = client_tool_types(source)
     envelope = _transport_envelope(native)
-    if native.get("name") == CLIENT_TOOL_TRANSPORT_NAME and envelope is None:
+    if _is_transport_name(native.get("name")) and envelope is None:
         return None
     name = (
         _original_client_tool_name(envelope.get("name"), allowed_tools)
@@ -681,12 +688,17 @@ def _client_tool_protocol_instructions(source: dict) -> str:
         "Never claim shell, filesystem, or workspace access is unavailable when the "
         "catalog contains a suitable tool. For repository inspection, invoke "
         "shell_command through run_officejs when shell_command is present. "
-        "To invoke a function client tool, call native run_officejs with: summary "
-        "and extended_summary describing the action; code containing exactly one "
-        'compact JSON object {"name":"TOOL_NAME","arguments":{...}}; '
-        "destructive=false; and references=[]. To invoke a custom client tool, "
-        'put {"name":"TOOL_NAME","input":"RAW_INPUT"} in code instead. Do not put '
-        "JavaScript or OfficeJS in code. TOOL_NAME and its payload must follow the "
+        "Transport has two layers and they must not be mixed: the outer native "
+        "tool is run_officejs (some hosts display it as functions.run_officejs); "
+        "the inner code value is exactly one compact JSON object for one catalog "
+        "client tool. The inner name is never run_officejs or functions.run_officejs. "
+        "For a function tool, use this shape: outer arguments include summary, "
+        "extended_summary, destructive=false, references=[], and code equal to "
+        '{"name":"exec_command","arguments":{"cmd":"pwd"}}. '
+        "For a custom tool, code instead contains "
+        '{"name":"TOOL_NAME","input":"RAW_INPUT"}. '
+        "Do not put JavaScript, OfficeJS, a second run_officejs envelope, or a "
+        "functions.run_officejs wrapper inside code. TOOL_NAME and its payload must follow the "
         "catalog exactly. The proxy converts this native function call into the "
         "real client tool call, then replays the original run_officejs identity "
         "with the client tool result on the next request. Interpret that result as "
@@ -697,8 +709,9 @@ def _client_tool_protocol_instructions(source: dict) -> str:
         "repeat a tool request whose output is already present. Available client "
         "tools:\n"
         + catalog_json
-        + "\nRemember: client tool use must be a native run_officejs function call "
-        "whose code field is the JSON transport envelope. It is not Office code."
+        + "\nRemember: call the outer native run_officejs tool once; put exactly one "
+        "catalog-tool JSON object in its code field. A host prefix such as "
+        "functions. is only display syntax, not an inner client-tool name."
     )
 
 
@@ -718,11 +731,13 @@ def _client_tool_protocol_reminder(source: dict) -> str:
     if not allowed_tools:
         return ""
     reminder = (
-        "Reminder: run_officejs is the proxy-owned client-tool transport and "
-        "never executes Office code for this request. To use a client tool, make "
-        "the native run_officejs call now with the JSON transport envelope in its "
-        "code field, following the catalog above. Do not merely say you will act "
-        "or that access is unavailable. Client tools: "
+        "Reminder: use the outer native run_officejs transport (a host may display "
+        "it as functions.run_officejs); it never executes Office code here. Put "
+        "exactly one JSON object in code, with name set to one catalog client tool "
+        "below. Never set the inner name to run_officejs or functions.run_officejs, "
+        "and never nest another transport envelope. Example inner code: "
+        '{"name":"exec_command","arguments":{"cmd":"pwd"}}. '
+        "Do not merely say you will act or that access is unavailable. Client tools: "
         + ", ".join(sorted(allowed_tools))
         + ". Other native tools are unavailable."
     )

@@ -100,6 +100,9 @@ class ExcelUpstreamTests(unittest.TestCase):
         tool_prompt = body["input"][1]["content"][0]["text"]
         self.assertIn("external Codex Responses API client", tool_prompt)
         self.assertIn("native run_officejs", tool_prompt)
+        self.assertIn("functions.run_officejs", tool_prompt)
+        self.assertIn("inner name is never run_officejs", tool_prompt)
+        self.assertIn('\"name\":\"exec_command\"', tool_prompt)
         self.assertIn('"name":"demo"', tool_prompt)
         self.assertEqual(body["input"][2]["role"], "user")
         self.assertNotIn("tools", body)
@@ -511,6 +514,42 @@ class ExcelUpstreamTests(unittest.TestCase):
         self.assertEqual(replay[0], native)
         self.assertEqual(replay[1]["output"], "ok")
 
+    def test_namespaced_run_officejs_transport_alias_is_accepted(self):
+        source = {
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "exec_command",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"cmd": {"type": "string"}},
+                        "required": ["cmd"],
+                        "additionalProperties": False,
+                    },
+                }
+            ]
+        }
+        native = {
+            "type": "function_call",
+            "call_id": "call_namespaced_transport",
+            "name": "functions.run_officejs",
+            "arguments": json.dumps(
+                {
+                    "code": json.dumps(
+                        {"name": "exec_command", "arguments": {"cmd": "pwd"}},
+                        separators=(",", ":"),
+                    )
+                }
+            ),
+        }
+
+        tool_call = excel_upstream.extract_native_client_tool_call(
+            {"output": [native]}, source
+        )
+
+        self.assertEqual(tool_call["name"], "exec_command")
+        self.assertEqual(json.loads(tool_call["arguments"]), {"cmd": "pwd"})
+
     def test_run_officejs_transport_unwraps_double_nested_envelope(self):
         source = {
             "tools": [
@@ -782,6 +821,8 @@ class ExcelUpstreamTests(unittest.TestCase):
         self.assertEqual(last["role"], "developer")
         reminder = last["content"][0]["text"]
         self.assertIn("run_officejs", reminder)
+        self.assertIn("functions.run_officejs", reminder)
+        self.assertIn("Never set the inner name", reminder)
         self.assertIn("demo", reminder)
         # The trailing message re-bills on every turn, so it must stay small
         # relative to the catalog it replaces.
