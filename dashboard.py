@@ -637,6 +637,13 @@ def _usage_display_total_tokens(usage: dict, *, input_tokens: int, output_tokens
     reads and cache writes separately; showing fresh input plus output here
     made normal cached turns appear to consume only a few tokens.
     """
+    # A stored ``total_tokens`` value may have been calculated from gross
+    # input before the explicit fresh-input field was added. Prefer the
+    # normalized display input whenever that field is present so old events do
+    # not reintroduce cached reads into the dashboard total.
+    if usage.get("fresh_input_tokens") is not None or usage.get("billable_input_tokens") is not None:
+        return max(0, input_tokens) + max(0, output_tokens)
+
     total_tokens = _coerce_int(usage.get("total_tokens"), default=None)
     if total_tokens is not None:
         return max(0, total_tokens)

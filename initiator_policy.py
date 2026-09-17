@@ -6,6 +6,8 @@ import re
 from threading import Lock
 from typing import Callable
 
+import codex_agent_compat
+
 AGENT_INITIATOR = "agent"
 USER_INITIATOR = "user"
 AGENT_INITIATOR_PREFIX = "_"
@@ -51,12 +53,13 @@ def _is_subagent_request(subagent: str | None) -> bool:
     return isinstance(subagent, str) and bool(subagent.strip())
 
 
-# Codex tags every spawned subagent with `x-openai-subagent: <name>`. Only
-# the `guardian` subagent is the approval / security-monitor flow whose
-# model we want to override via the routing-config approval mapping. Other
-# named subagents (e.g. `review`, `general-purpose`, `explorer`) are
-# user-initiated helpers that should keep using the user's selected model.
-# We still treat them as agent-initiated traffic for safeguard purposes.
+# Older Codex builds tag spawned subagents with `x-openai-subagent: <name>`.
+# Current builds also carry the semantic role in client metadata. Only the
+# `guardian` subagent is the approval / security-monitor flow whose model we
+# want to override via the routing-config approval mapping. Other named
+# subagents (e.g. `review`, `general-purpose`, `explorer`) are user-initiated
+# helpers that should keep using the user's selected model. We still treat
+# them as agent-initiated traffic for safeguard purposes.
 _APPROVAL_SUBAGENT_NAMES = frozenset({"guardian"})
 
 
@@ -1320,6 +1323,8 @@ def is_approval_agent_request(
         system/developer instructions.
     """
     if _is_approval_subagent(subagent):
+        return True
+    if codex_agent_compat.codex_subagent_role(body) == "guardian":
         return True
     return _request_includes_security_monitor_prompt(
         inbound_protocol=inbound_protocol,

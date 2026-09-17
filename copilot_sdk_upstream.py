@@ -1275,9 +1275,8 @@ def _event_name(event: Any) -> str:
 
 def _usage_from_event(data: Any) -> dict[str, int]:
     # ``input_tokens`` from AssistantUsageData is the *total* input (fresh +
-    # cached).  Subtract ``cache_read_tokens`` so that the flat dict we return
-    # is consistent with the shape produced by ``_usage_delta``, where
-    # ``input_tokens`` == total and ``fresh_input_tokens`` == uncached portion.
+    # cached).  Keep that raw figure for the Responses API breakdown, but use
+    # the fresh portion only for the displayed total, matching the REST path.
     input_tokens = int(getattr(data, "input_tokens", 0) or 0)
     output_tokens = int(getattr(data, "output_tokens", 0) or 0)
     cached_tokens = int(getattr(data, "cache_read_tokens", 0) or 0)
@@ -1289,7 +1288,7 @@ def _usage_from_event(data: Any) -> dict[str, int]:
     return {
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
-        "total_tokens": input_tokens + output_tokens,
+        "total_tokens": fresh + output_tokens,
         "cached_input_tokens": cached_tokens,
         "cache_creation_input_tokens": cache_write_tokens,
         "fresh_input_tokens": fresh,
@@ -1367,7 +1366,7 @@ def _extract_shutdown_usage(data: Any) -> dict[str, int]:
         "pricing_cache_creation_input_tokens": cwrite,
         "output_tokens": out,
         "reasoning_output_tokens": reas,
-        "total_tokens": total_inp + out,
+        "total_tokens": fresh + out,
     }
 
 
@@ -1391,7 +1390,7 @@ def _usage_delta(current: dict[str, int], previous: dict[str, int] | None) -> di
         "pricing_cached_input_tokens": cread,
         "pricing_cache_creation_input_tokens": cwrite,
         "reasoning_output_tokens": reas,
-        "total_tokens": inp + out,
+        "total_tokens": fresh + out,
     }
 
 
@@ -1404,7 +1403,7 @@ def _add_usage(total: dict[str, int], usage: dict[str, int]) -> None:
     """
     for key in _USAGE_KEYS:
         total[key] = total.get(key, 0) + max(0, int(usage.get(key, 0) or 0))
-    total["total_tokens"] = total.get("input_tokens", 0) + total.get("output_tokens", 0)
+    total["total_tokens"] = total.get("fresh_input_tokens", 0) + total.get("output_tokens", 0)
 
 
 _USAGE_KEYS = (
@@ -1519,7 +1518,13 @@ def _format_client_usage(usage: dict[str, int] | None) -> dict[str, Any]:
         )
         or 0
     )
-    total_tokens = int(usage.get("total_tokens") or (input_tokens + output_tokens))
+    # Preserve gross input and cache details for Responses API clients, while
+    # reporting only fresh input plus output in the user-visible total.  Cache
+    # writes are part of fresh input; cache reads are excluded.
+    fresh_input_tokens = usage.get("fresh_input_tokens")
+    if fresh_input_tokens is None:
+        fresh_input_tokens = max(0, input_tokens - cached_tokens)
+    total_tokens = max(0, int(fresh_input_tokens or 0)) + output_tokens
 
     input_details: dict[str, int] = {"cached_tokens": cached_tokens}
     if cache_creation_tokens:

@@ -274,6 +274,7 @@ class CopilotSdkTranslationTests(unittest.TestCase):
         usage = payload["usage"]
         self.assertEqual(usage["input_tokens"], 1000)
         self.assertEqual(usage["output_tokens"], 150)
+        self.assertEqual(usage["total_tokens"], 350)
         self.assertEqual(usage["cached_input_tokens"], 800)
         self.assertEqual(usage["input_tokens_details"]["cached_tokens"], 800)
         self.assertEqual(usage["input_tokens_details"]["cache_creation_input_tokens"], 50)
@@ -351,7 +352,7 @@ class CopilotSdkEventTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(u["pricing_cached_input_tokens"], 200)
         self.assertEqual(u["output_tokens"], 50)
         self.assertEqual(u["reasoning_output_tokens"], 10)
-        self.assertEqual(u["total_tokens"], 350)
+        self.assertEqual(u["total_tokens"], 150)
 
     async def test_usage_event_no_cached_tokens_fresh_equals_total(self):
         """When cache_read_tokens is zero, fresh_input_tokens == input_tokens."""
@@ -401,7 +402,7 @@ class CopilotSdkEventTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outcome.usage["fresh_input_tokens"], 110)
         self.assertEqual(outcome.usage["cache_creation_input_tokens"], 2)
         self.assertEqual(outcome.usage["reasoning_output_tokens"], 5)
-        self.assertEqual(outcome.usage["total_tokens"], 170)
+        self.assertEqual(outcome.usage["total_tokens"], 140)
 
     async def test_shutdown_usage_wins_over_per_call_usage_events(self):
         """The two sources describe the same tokens; exactly one must win."""
@@ -938,9 +939,10 @@ class CopilotSdkEventTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(usage["pricing_fresh_input_tokens"], 282 + 255349)
         # Reasoning only ever appears under modelMetrics.
         self.assertEqual(usage["reasoning_output_tokens"], 26418)
+        self.assertEqual(usage["total_tokens"], usage["fresh_input_tokens"] + usage["output_tokens"])
 
-    def test_dashboard_keeps_cached_sdk_tokens_in_total_volume(self):
-        """Fresh input is a cost bucket, not the request's token total."""
+    def test_dashboard_excludes_cached_sdk_tokens_from_total_volume(self):
+        """SDK totals match REST: fresh input plus output only."""
         import dashboard
 
         event = {
@@ -958,7 +960,7 @@ class CopilotSdkEventTests(unittest.IsolatedAsyncioTestCase):
 
         prepared = dashboard._prepare_usage_event(event)
         self.assertEqual(prepared["input_tokens"], 10_189)
-        self.assertEqual(prepared["total_tokens"], 66_023)
+        self.assertEqual(prepared["total_tokens"], 11_125)
 
     def test_cache_creation_is_part_of_fresh_input_but_not_double_billed(self):
         import util

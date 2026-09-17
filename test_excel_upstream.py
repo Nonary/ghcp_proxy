@@ -829,6 +829,20 @@ class ExcelUpstreamTests(unittest.TestCase):
         # relative to the catalog it replaces.
         self.assertLess(len(reminder), len(catalog) / 2)
 
+    def test_protocol_reminder_clarifies_custom_transport_input(self):
+        reminder = excel_upstream._client_tool_protocol_reminder(
+            {
+                "tools": [
+                    {"type": "function", "name": "exec_command"},
+                    {"type": "custom", "name": "apply_patch"},
+                ]
+            }
+        )
+
+        self.assertIn("transport exec_command", reminder)
+        self.assertIn("Custom tools use input, not arguments", reminder)
+        self.assertIn("never use arguments.patch", reminder)
+
     def test_nested_plugin_tools_are_forwarded_in_catalog(self):
         source = {
             "model": "gpt-5.6-sol-excel",

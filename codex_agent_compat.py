@@ -145,6 +145,26 @@ def codex_subagent_identity(body: dict | None) -> str | None:
     return "codex:subagent"
 
 
+def codex_subagent_role(body: dict | None) -> str | None:
+    """Return the semantic role of a current Codex child thread."""
+    mappings = _metadata_mappings(body)
+    if not mappings:
+        return None
+
+    nested = []
+    for mapping in mappings:
+        agent_mapping = _nested_agent_mapping(mapping)
+        if agent_mapping is not None:
+            nested.append(agent_mapping)
+
+    for mapping in [*reversed(nested), *reversed(mappings)]:
+        for key in ("agent_role", "agent_name", "agent_nickname", "role"):
+            value = _non_empty_string(mapping.get(key))
+            if value:
+                return value
+    return None
+
+
 def codex_parent_affinity(body: dict | None) -> str | None:
     """Return the explicit parent-thread affinity for a current Codex child.
 
@@ -322,6 +342,7 @@ __all__ = [
     "codex_parent_affinity",
     "codex_session_id",
     "codex_subagent_identity",
+    "codex_subagent_role",
     "codex_thread_id",
     "codex_thread_source",
     "codex_turn_id",

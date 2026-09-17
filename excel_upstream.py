@@ -686,8 +686,8 @@ def _client_tool_protocol_instructions(source: dict) -> str:
         "that transport. Other native server-injected Excel, Office, connector, "
         "workbook, list_skills, and web-search tools are unavailable. "
         "Never claim shell, filesystem, or workspace access is unavailable when the "
-        "catalog contains a suitable tool. For repository inspection, invoke "
-        "shell_command through run_officejs when shell_command is present. "
+        "catalog contains a suitable tool. For repository inspection, invoke a "
+        "suitable catalog shell tool (for example exec_command) through run_officejs. "
         "Transport has two layers and they must not be mixed: the outer native "
         "tool is run_officejs (some hosts display it as functions.run_officejs); "
         "the inner code value is exactly one compact JSON object for one catalog "
@@ -743,6 +743,21 @@ def _client_tool_protocol_reminder(source: dict) -> str:
     )
     if "shell_command" in allowed_tools:
         reminder += " For repository inspection transport shell_command."
+    elif "exec_command" in allowed_tools:
+        reminder += " For repository inspection transport exec_command."
+    custom_tools = sorted(
+        name for name, tool_type in allowed_tools.items() if tool_type == "custom"
+    )
+    if custom_tools:
+        reminder += (
+            " Custom tools use input, not arguments: "
+            '{"name":"TOOL_NAME","input":"RAW_INPUT"}. '
+        )
+    if allowed_tools.get("apply_patch") == "custom":
+        reminder += (
+            "For apply_patch, put the complete raw patch in input; "
+            "never use arguments.patch."
+        )
     if "update_plan" in allowed_tools:
         reminder += (
             " Native update_plan is allowed for progress; after its result, "
