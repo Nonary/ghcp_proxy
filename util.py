@@ -139,16 +139,22 @@ def normalize_usage_payload(usage: dict | None) -> dict | None:
         output_tokens = usage.get("completion_tokens")
 
     cached_tokens = usage.get("cache_read_input_tokens")
-    cached_tokens_from_raw_details = False
+    # OpenAI/Responses-style ``cached_input_tokens`` is a subset of gross
+    # ``input_tokens``.  Keep this separate from Anthropic's
+    # ``cache_read_input_tokens``, which is reported alongside fresh input.
+    # Without an explicit fresh-input field, treating the former as additive
+    # prices the same cached tokens twice.
+    cached_tokens_are_subset_of_input = False
     if cached_tokens is None:
         cached_tokens = usage.get("cached_input_tokens")
+        cached_tokens_are_subset_of_input = cached_tokens is not None
     if cached_tokens is None:
         for details_key in ("input_tokens_details", "prompt_tokens_details"):
             details = usage.get(details_key)
             if isinstance(details, dict):
                 cached_tokens = details.get("cached_tokens")
                 if cached_tokens is not None:
-                    cached_tokens_from_raw_details = True
+                    cached_tokens_are_subset_of_input = True
                     break
 
     cache_creation_tokens = usage.get("cache_creation_input_tokens")
@@ -187,7 +193,7 @@ def normalize_usage_payload(usage: dict | None) -> dict | None:
         fresh_input_tokens = usage.get("billable_input_tokens")
     if fresh_input_tokens is not None:
         normalized["fresh_input_tokens"] = _coerce_int(fresh_input_tokens, default=0)
-    elif cached_tokens_from_raw_details and normalized_cached_tokens > 0:
+    elif cached_tokens_are_subset_of_input and normalized_cached_tokens > 0:
         normalized["fresh_input_tokens"] = max(0, normalized_input_tokens - normalized_cached_tokens)
     pricing_fresh_input_tokens = usage.get("pricing_fresh_input_tokens")
     if pricing_fresh_input_tokens is not None:

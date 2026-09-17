@@ -1033,7 +1033,7 @@ class ExcelUpstreamTests(unittest.TestCase):
         for item in first["input"] + second["input"]:
             self.assertNotIn("internal_chat_message_metadata_passthrough", item)
 
-    def test_client_turn_ids_stay_out_of_prompt_but_preserve_request_identity(self):
+    def test_client_turn_ids_stay_out_of_prompt_and_task_identity(self):
         def request(turn_id):
             return {
                 "model": "gpt-5.6-sol-excel",
@@ -1052,8 +1052,31 @@ class ExcelUpstreamTests(unittest.TestCase):
         first = excel_upstream.prepare_responses_body(request("turn-one"))
         second = excel_upstream.prepare_responses_body(request("turn-two"))
         self.assertEqual(first["input"], second["input"])
-        self.assertNotEqual(first["metadata"]["task_id"], second["metadata"]["task_id"])
+        self.assertEqual(first["metadata"]["task_id"], second["metadata"]["task_id"])
         self.assertNotEqual(first["metadata"]["turn_id"], second["metadata"]["turn_id"])
+
+    def test_client_metadata_session_is_excel_cache_key(self):
+        def request(turn_id):
+            return {
+                "model": "gpt-5.6-sol-excel",
+                "client_metadata": {"session_id": "root-session"},
+                "input": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "hello"}],
+                        "internal_chat_message_metadata_passthrough": {
+                            "turn_id": turn_id,
+                        },
+                    }
+                ],
+            }
+
+        first = excel_upstream.prepare_responses_body(request("turn-one"))
+        second = excel_upstream.prepare_responses_body(request("turn-two"))
+        self.assertEqual(first["prompt_cache_key"], "root-session")
+        self.assertEqual(second["prompt_cache_key"], "root-session")
+        self.assertEqual(first["metadata"]["task_id"], second["metadata"]["task_id"])
 
     def test_catalog_position_escape_hatch_restores_suffix_layout(self):
         source = {

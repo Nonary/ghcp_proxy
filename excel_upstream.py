@@ -1380,6 +1380,15 @@ def _cache_key(source: dict) -> str | None:
         value = source.get(key)
         if isinstance(value, str) and value.strip():
             return value.strip()
+
+    # Codex carries its stable root session in client_metadata. Prefer it only
+    # as a fallback, leaving an explicit caller cache key authoritative.
+    client_metadata = source.get("client_metadata")
+    if isinstance(client_metadata, dict):
+        for key in ("session_id", "sessionId"):
+            value = client_metadata.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
     return None
 
 
@@ -1461,12 +1470,10 @@ def prepare_responses_body(
     input_items = translate_input_items(raw_input, client_tool_types(source))
     # Captured before the prologue is prepended: the injected instructions and
     # catalog are identical across conversations, so only the caller's own
-    # first history item identifies this conversation. Use the raw items here
-    # so client turn metadata can still disambiguate otherwise identical
-    # no-cache-key conversations without leaking into the cached prompt.
-    history_root = _conversation_fingerprint(
-        raw_input if isinstance(raw_input, list) else input_items
-    )
+    # first history item identifies this conversation. Use translated items:
+    # Codex changes private per-turn metadata on a new user turn, but that
+    # metadata must not create a new Excel task/session.
+    history_root = _conversation_fingerprint(input_items)
 
     # Prompt layout is chosen for the upstream prompt cache: everything that is
     # stable across a conversation leads, so each turn only re-bills the newly
