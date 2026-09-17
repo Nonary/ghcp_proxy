@@ -443,6 +443,15 @@ def _usage_event_model_name(event: dict | None) -> str | None:
     if not isinstance(event, dict):
         return None
 
+    # Credit-billed proxy aliases must survive an upstream response that reports
+    # only the underlying base model. Otherwise Excel usage is aggregated under
+    # the base GPT-5.6 model and rendered as Copilot AIC instead of OpenAI Credits.
+    for key in ("resolved_model", "requested_model"):
+        normalized = _normalize_model_name(event.get(key))
+        pricing = MODEL_PRICING.get(normalized) if normalized else None
+        if isinstance(pricing, dict) and pricing.get("credit_unit_usd") is not None:
+            return normalized
+
     for key in ("response_model", "resolved_model", "requested_model"):
         model_name = event.get(key)
         normalized = _normalize_model_name(model_name)

@@ -381,10 +381,33 @@ MODEL_PRICING = {
         "cached_input_per_million": 0.50,
         "output_per_million": 30.00,
     },
-    # The Excel add-in backend routes gpt-excel to GPT-5.6 (observed as
-    # gpt-5.6-sol), so it bills at those token rates. OpenAI meters this
-    # consumption in Credits at $0.04 per Credit (not Copilot AIC).
-    "gpt-excel": {
+    # Excel-routed models use the matching GPT-5.6 token rates. OpenAI meters
+    # this consumption in Credits at $0.04 per Credit (not Copilot AIC).
+    "gpt-5.6-luna-excel": {
+        "provider": "OpenAI Excel",
+        "credit_unit_usd": 0.04,
+        "input_per_million": 0.20,
+        "cached_input_per_million": 0.02,
+        "cache_write_per_million": 0.25,
+        "output_per_million": 1.20,
+        "long_context_threshold": 272_000,
+        "long_context_input_per_million": 0.40,
+        "long_context_cached_input_per_million": 0.04,
+        "long_context_cache_write_per_million": 0.50,
+        "long_context_output_per_million": 1.80,
+    },
+    "gpt-5.6-terra-excel": {
+        "provider": "OpenAI Excel",
+        "credit_unit_usd": 0.04,
+        "input_per_million": 2.50,
+        "cached_input_per_million": 0.25,
+        "output_per_million": 15.00,
+        "long_context_threshold": 272_000,
+        "long_context_input_per_million": 5.00,
+        "long_context_cached_input_per_million": 0.50,
+        "long_context_output_per_million": 22.50,
+    },
+    "gpt-5.6-sol-excel": {
         "provider": "OpenAI Excel",
         "credit_unit_usd": 0.04,
         "input_per_million": 5.00,
@@ -503,8 +526,11 @@ MODEL_PRICING_ALIASES = {
     "gpt-5 mini": "gpt-5-mini",
     "gpt-5-mini": "gpt-5-mini",
     "gpt-5.6 luna": "gpt-5.6-luna",
+    "gpt-5.6 luna excel": "gpt-5.6-luna-excel",
     "gpt-5.6 sol": "gpt-5.6-sol",
+    "gpt-5.6 sol excel": "gpt-5.6-sol-excel",
     "gpt-5.6 terra": "gpt-5.6-terra",
+    "gpt-5.6 terra excel": "gpt-5.6-terra-excel",
 }
 
 # ─── Safeguard defaults ──────────────────────────────────────────────────────

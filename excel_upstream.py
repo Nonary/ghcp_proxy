@@ -25,11 +25,15 @@ from uuid import NAMESPACE_URL, uuid4, uuid5
 from app_paths import user_state_dir
 
 
-MODEL_ID = "gpt-excel"
-UPSTREAM_MODEL = (
-    os.environ.get("GHCP_EXCEL_UPSTREAM_MODEL", "gpt-5.6-sol").strip()
-    or "gpt-5.6-sol"
-)
+EXCEL_MODEL_UPSTREAMS = {
+    "gpt-5.6-luna-excel": "gpt-5.6-luna",
+    "gpt-5.6-terra-excel": "gpt-5.6-terra",
+    "gpt-5.6-sol-excel": "gpt-5.6-sol",
+}
+MODEL_IDS = tuple(EXCEL_MODEL_UPSTREAMS)
+MODEL_ID = "gpt-5.6-sol-excel"
+_UPSTREAM_MODEL_OVERRIDE = os.environ.get("GHCP_EXCEL_UPSTREAM_MODEL", "").strip()
+UPSTREAM_MODEL = _UPSTREAM_MODEL_OVERRIDE or EXCEL_MODEL_UPSTREAMS[MODEL_ID]
 EXCEL_REASONING_EFFORTS = ("low", "medium", "high", "xhigh")
 _REASONING_EFFORT_ALIASES = {
     "x-high": "xhigh",
@@ -133,12 +137,12 @@ _DEFAULT_CLIENT_HEADERS = {
 }
 
 LOCAL_MODEL_CAPABILITIES = {
-    MODEL_ID: {
+    model_id: {
         "auto_compact_token_limit": 180_000,
-        "context_window": 200_000,
-        "display_name": "GPT Excel",
+        "context_window": 200_000 if "luna" in model_id else 272_000,
+        "display_name": model_id.removesuffix("-excel").upper().replace("GPT-", "GPT "),
         "input_modalities": ["text"],
-        "max_context_window": 200_000,
+        "max_context_window": 200_000 if "luna" in model_id else 272_000,
         "messages_endpoint_supported": False,
         "model_picker_enabled": True,
         "parallel_tool_calls": False,
@@ -147,11 +151,24 @@ LOCAL_MODEL_CAPABILITIES = {
         "supported_endpoints": ["/responses"],
         "vision": False,
     }
+    for model_id in MODEL_IDS
 }
 
 
 def is_excel_model(model: object) -> bool:
-    return isinstance(model, str) and model.strip().lower() == MODEL_ID
+    return excel_model_id(model) is not None
+
+
+def excel_model_id(model: object) -> str | None:
+    if not isinstance(model, str):
+        return None
+    normalized = model.strip().lower()
+    return normalized if normalized in EXCEL_MODEL_UPSTREAMS else None
+
+
+def upstream_model_for(model: object) -> str:
+    model_id = excel_model_id(model) or MODEL_ID
+    return _UPSTREAM_MODEL_OVERRIDE or EXCEL_MODEL_UPSTREAMS[model_id]
 
 
 def _normalize_reasoning_effort(value: object) -> str | None:
@@ -162,9 +179,9 @@ def _normalize_reasoning_effort(value: object) -> str | None:
     return normalized if normalized in EXCEL_REASONING_EFFORTS else None
 
 
-def local_model_payload() -> dict[str, object]:
+def local_model_payload(model_id: str) -> dict[str, object]:
     return {
-        "id": MODEL_ID,
+        "id": model_id,
         "object": "model",
         "created": 0,
         "owned_by": "openai-excel",
@@ -181,8 +198,9 @@ def merge_local_models_payload(payload: dict | None) -> dict:
     result = dict(payload or {})
     raw_data = result.get("data")
     data = [dict(item) for item in raw_data if isinstance(item, dict)] if isinstance(raw_data, list) else []
-    if not any(item.get("id") == MODEL_ID for item in data):
-        data.append(local_model_payload())
+    data = [item for item in data if item.get("id") != "gpt-excel"]
+    existing_ids = {item.get("id") for item in data}
+    data.extend(local_model_payload(model_id) for model_id in MODEL_IDS if model_id not in existing_ids)
     result["object"] = result.get("object") or "list"
     result["data"] = data
     return result
@@ -779,13 +797,15 @@ def extract_client_tool_call(
 def response_payload_with_tool_call(
     response: dict | None,
     tool_call: dict[str, str],
+    *,
+    model_id: str = MODEL_ID,
 ) -> dict[str, object]:
     result = dict(response or {})
     result.setdefault("id", f"resp_{uuid4().hex}")
     result.setdefault("object", "response")
     result.setdefault("created_at", int(time.time()))
     result["status"] = "completed"
-    result["model"] = MODEL_ID
+    result["model"] = model_id
     result["output"] = [{**tool_call, "status": "completed"}]
     result["error"] = None
     result["incomplete_details"] = None
@@ -1392,7 +1412,7 @@ def prepare_responses_body(
 ) -> dict:
     """Translate a standard Responses request to the Excel add-in wire shape."""
     output: dict[str, object] = {
-        "model": UPSTREAM_MODEL,
+        "model": upstream_model_for(source.get("model")),
         "stream": bool(source.get("stream", False)),
         "store": False,
     }

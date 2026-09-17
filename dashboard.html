@@ -3256,10 +3256,12 @@
         const numeric = Number(value);
         return Number.isFinite(numeric) ? `${this.aicLabel(numeric)} · ${this.money(numeric)}` : '-';
       },
-      // OpenAI meters gpt-excel consumption in Credits: $0.04 = 1 Credit.
+      // OpenAI meters Excel-routed model consumption in Credits: $0.04 = 1 Credit.
       // Copilot AIC does not apply to that upstream.
       isExcelCostRow(row) {
-        const isExcel = (name) => String(name || '').trim().toLowerCase() === 'gpt-excel';
+        const isExcel = (name) => /^gpt-5\.6-(luna|terra|sol)-excel$/.test(
+          String(name || '').trim().toLowerCase()
+        );
         if (typeof row === 'string') return isExcel(row);
         if (!row || typeof row !== 'object') return false;
         if ([row.requested_model, row.resolved_model, row.response_model, row.model].some(isExcel)) return true;

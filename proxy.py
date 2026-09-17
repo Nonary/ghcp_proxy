@@ -5846,6 +5846,8 @@ def _excel_tool_stream_transform(source_body: dict):
                     response_payload = excel_upstream.response_payload_with_tool_call(
                         response,
                         tool_call,
+                        model_id=excel_upstream.excel_model_id(source_body.get("model"))
+                        or excel_upstream.MODEL_ID,
                     )
                     for chunk in _excel_tool_call_event_bytes(tool_call, response_payload):
                         yield chunk
@@ -5904,6 +5906,10 @@ async def _post_excel_non_streaming_request(
     *,
     client_body: dict,
 ) -> Response:
+    excel_model_id = (
+        excel_upstream.excel_model_id(client_body.get("model"))
+        or excel_upstream.MODEL_ID
+    )
     client = _get_excel_upstream_client()
     upstream: httpx.Response | None = None
     response_payload: dict | None = None
@@ -5924,7 +5930,7 @@ async def _post_excel_non_streaming_request(
                     trace_plan=plan,
                     caller_protocol="responses",
                     stream=False,
-                    model=excel_upstream.MODEL_ID,
+                    model=excel_model_id,
                     fallback_error_response=proxy_non_streaming_response,
                 )
             if "text/event-stream" in upstream.headers.get("content-type", "").lower():
@@ -5955,7 +5961,8 @@ async def _post_excel_non_streaming_request(
         _finish_usage_and_trace(plan, 502, response_text=message)
         return format_translation.openai_error_response(502, message)
 
-    translated_payload = response_payload
+    translated_payload = dict(response_payload)
+    translated_payload["model"] = excel_model_id
     response_text = format_translation.extract_response_output_text(response_payload)
     tool_call = excel_upstream.extract_client_tool_call(
         response_text,
@@ -5970,6 +5977,7 @@ async def _post_excel_non_streaming_request(
         translated_payload = excel_upstream.response_payload_with_tool_call(
             response_payload,
             tool_call,
+            model_id=excel_model_id,
         )
     _finish_usage_and_trace(
         plan,
@@ -5998,6 +6006,9 @@ async def _handle_excel_responses(
     *,
     source_body: dict | None = None,
 ) -> Response:
+    excel_model_id = (
+        excel_upstream.excel_model_id(body.get("model")) or excel_upstream.MODEL_ID
+    )
     excel_session_capture.refresh_macos_excel_session(
         excel_upstream.excel_session_store,
         force=True,
@@ -6020,8 +6031,8 @@ async def _handle_excel_responses(
     plan, error_response = _prepare_upstream_request(
         request,
         body=upstream_body,
-        requested_model=excel_upstream.MODEL_ID,
-        resolved_model=excel_upstream.MODEL_ID,
+        requested_model=excel_model_id,
+        resolved_model=excel_model_id,
         upstream_path="/basispoints/api/responses",
         upstream_url=excel_upstream.RESPONSES_URL,
         header_builder=lambda _api_key, _request_id: dict(excel_headers),
@@ -6049,7 +6060,7 @@ async def _handle_excel_responses(
             trace_plan=plan,
             downstream_request=request,
             caller_protocol="responses",
-            caller_model=excel_upstream.MODEL_ID,
+            caller_model=excel_model_id,
             stream_transform=_excel_tool_stream_transform(body),
             sync_replay_ids=False,
             upstream_client=_get_excel_upstream_client(),

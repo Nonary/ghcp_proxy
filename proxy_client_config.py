@@ -48,7 +48,11 @@ def _format_token_rate(value: object) -> str:
 
 
 def _model_token_pricing_description(model_name: str) -> str:
-    if model_name == "gpt-excel":
+    if model_name.endswith("-excel") and model_name in {
+        "gpt-5.6-luna-excel",
+        "gpt-5.6-terra-excel",
+        "gpt-5.6-sol-excel",
+    }:
         return "ChatGPT subscription usage; not API-token billing"
     pricing = MODEL_PRICING.get(model_name)
     if not isinstance(pricing, Mapping):
@@ -1109,8 +1113,10 @@ class ProxyClientConfigService:
         *,
         model_name: str | None = None,
     ) -> tuple[list[dict[str, str]], str | None]:
-        is_gpt_56 = self._normalize_model_name(model_name).startswith(_GPT_56_MODEL_PREFIX)
-        supports_max = is_gpt_56 or family == "claude"
+        normalized_model_name = self._normalize_model_name(model_name)
+        is_gpt_56 = normalized_model_name.startswith(_GPT_56_MODEL_PREFIX)
+        is_excel_model = normalized_model_name.endswith("-excel")
+        supports_max = (is_gpt_56 and not is_excel_model) or family == "claude"
         efforts: list[str] = []
         if isinstance(raw_efforts, (list, tuple)):
             for item in raw_efforts:
@@ -1124,7 +1130,7 @@ class ProxyClientConfigService:
                         normalized = "max"
                     if normalized in _REASONING_EFFORT_RANK and normalized not in efforts:
                         efforts.append(normalized)
-        if is_gpt_56 and efforts and ({"xhigh", "max"} & set(efforts)):
+        if is_gpt_56 and not is_excel_model and efforts and ({"xhigh", "max"} & set(efforts)):
             # GPT-5.6 exposes both levels. Some capability payloads only list
             # one even though the client can request the other distinct level.
             for gpt_56_effort in ("xhigh", "max"):
@@ -1132,7 +1138,11 @@ class ProxyClientConfigService:
                     efforts.append(gpt_56_effort)
         if not efforts:
             if family == "gpt":
-                efforts = list(_GPT_56_REASONING_EFFORTS if is_gpt_56 else _DEFAULT_REASONING_EFFORTS)
+                efforts = list(
+                    _GPT_56_REASONING_EFFORTS
+                    if is_gpt_56 and not is_excel_model
+                    else _DEFAULT_REASONING_EFFORTS
+                )
             else:
                 # Without an upstream signal, only assume reasoning support for GPT.
                 return ([], None)
@@ -1160,7 +1170,9 @@ class ProxyClientConfigService:
     ) -> list[str]:
         family_order = {"gpt": 0, "claude": 1, "gemini": 2, "grok": 3}
         preferred_order = {
-            "gpt-excel": -24,
+            "gpt-5.6-sol-excel": -26,
+            "gpt-5.6-terra-excel": -25,
+            "gpt-5.6-luna-excel": -24,
             "gpt-5.6-sol": -23,
             "gpt-5.6-terra": -22,
             "gpt-5.6-luna": -21,

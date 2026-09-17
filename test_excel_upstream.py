@@ -74,7 +74,7 @@ class ExcelUpstreamTests(unittest.TestCase):
 
     def test_responses_body_uses_excel_wire_shape(self):
         source = {
-            "model": "gpt-excel",
+            "model": "gpt-5.6-sol-excel",
             "instructions": "Use the client tools.",
             "input": "Hello",
             "prompt_cache_key": "conversation-1",
@@ -119,21 +119,38 @@ class ExcelUpstreamTests(unittest.TestCase):
             with self.subTest(requested=requested):
                 body = excel_upstream.prepare_responses_body(
                     {
-                        "model": "gpt-excel",
+                        "model": "gpt-5.6-sol-excel",
                         "input": "Hello",
                         "reasoning": {"effort": requested},
                     }
                 )
                 self.assertEqual(body["reasoning_effort"], forwarded)
 
-        self.assertEqual(
-            excel_upstream.LOCAL_MODEL_CAPABILITIES["gpt-excel"]["reasoning_efforts"],
-            ["low", "medium", "high", "xhigh"],
-        )
+        for model_id in excel_upstream.MODEL_IDS:
+            with self.subTest(model_id=model_id):
+                self.assertEqual(
+                    excel_upstream.LOCAL_MODEL_CAPABILITIES[model_id]["reasoning_efforts"],
+                    ["low", "medium", "high", "xhigh"],
+                )
+
+    def test_each_excel_alias_routes_to_matching_upstream_model(self):
+        expected = {
+            "gpt-5.6-luna-excel": "gpt-5.6-luna",
+            "gpt-5.6-terra-excel": "gpt-5.6-terra",
+            "gpt-5.6-sol-excel": "gpt-5.6-sol",
+        }
+        for requested, upstream in expected.items():
+            with self.subTest(requested=requested):
+                body = excel_upstream.prepare_responses_body(
+                    {"model": requested, "input": "Hello"}
+                )
+                self.assertEqual(body["model"], upstream)
+                self.assertTrue(excel_upstream.is_excel_model(requested))
+        self.assertFalse(excel_upstream.is_excel_model("gpt-excel"))
 
     def test_task_identity_is_stable_for_a_conversation(self):
         source = {
-            "model": "gpt-excel",
+            "model": "gpt-5.6-sol-excel",
             "input": "Hello",
             "prompt_cache_key": "conversation-1",
         }
@@ -174,7 +191,7 @@ class ExcelUpstreamTests(unittest.TestCase):
 
     def test_identical_requests_serialize_to_identical_bytes(self):
         source = {
-            "model": "gpt-excel",
+            "model": "gpt-5.6-sol-excel",
             "instructions": "Be terse.",
             "prompt_cache_key": "conversation-1",
             "tools": [{"type": "function", "name": "demo"}],
@@ -193,7 +210,7 @@ class ExcelUpstreamTests(unittest.TestCase):
 
     def test_turn_identity_is_derived_without_a_cache_key(self):
         base = {
-            "model": "gpt-excel",
+            "model": "gpt-5.6-sol-excel",
             "input": [
                 {
                     "type": "message",
@@ -696,7 +713,7 @@ class ExcelUpstreamTests(unittest.TestCase):
 
         body = excel_upstream.prepare_responses_body(
             {
-                "model": "gpt-excel",
+                "model": "gpt-5.6-sol-excel",
                 "input": [
                     {
                         "type": "custom_tool_call",
@@ -730,7 +747,7 @@ class ExcelUpstreamTests(unittest.TestCase):
     def test_tools_version_is_forwarded_as_authoritative_metadata(self):
         body = excel_upstream.prepare_responses_body(
             {
-                "model": "gpt-excel",
+                "model": "gpt-5.6-sol-excel",
                 "input": "Hello",
                 "metadata": {
                     "bps_tools_version_id": "caller-must-not-override",
@@ -746,7 +763,7 @@ class ExcelUpstreamTests(unittest.TestCase):
     def test_catalog_leads_and_only_a_compact_reminder_trails(self):
         body = excel_upstream.prepare_responses_body(
             {
-                "model": "gpt-excel",
+                "model": "gpt-5.6-sol-excel",
                 "input": "Hello",
                 "tools": [
                     {
@@ -770,7 +787,7 @@ class ExcelUpstreamTests(unittest.TestCase):
 
     def test_nested_plugin_tools_are_forwarded_in_catalog(self):
         source = {
-            "model": "gpt-excel",
+            "model": "gpt-5.6-sol-excel",
             "input": "Open Calendar.",
             "tools": [
                 {
@@ -838,7 +855,7 @@ class ExcelUpstreamTests(unittest.TestCase):
     def test_compaction_trigger_stays_final_after_tool_reminder(self):
         body = excel_upstream.prepare_responses_body(
             {
-                "model": "gpt-excel",
+                "model": "gpt-5.6-sol-excel",
                 "input": [
                     {
                         "type": "message",
@@ -860,7 +877,7 @@ class ExcelUpstreamTests(unittest.TestCase):
 
     def test_catalog_is_the_only_message_without_tools(self):
         without_tools = excel_upstream.prepare_responses_body(
-            {"model": "gpt-excel", "input": "Hello"}
+            {"model": "gpt-5.6-sol-excel", "input": "Hello"}
         )
         self.assertEqual(
             without_tools["input"][0]["content"][0]["text"],
@@ -870,7 +887,7 @@ class ExcelUpstreamTests(unittest.TestCase):
 
     def test_growing_conversation_keeps_a_stable_cache_prefix(self):
         source = {
-            "model": "gpt-excel",
+            "model": "gpt-5.6-sol-excel",
             "instructions": "Be terse.",
             "prompt_cache_key": "conversation-1",
             "tools": [{"type": "function", "name": "shell_command"}],
@@ -918,7 +935,7 @@ class ExcelUpstreamTests(unittest.TestCase):
                 }
             }
             return {
-                "model": "gpt-excel",
+                "model": "gpt-5.6-sol-excel",
                 "instructions": "You are Codex.",
                 "prompt_cache_key": cache_key,
                 "tools": [{"type": "function", "name": "shell_command"}],
@@ -961,7 +978,7 @@ class ExcelUpstreamTests(unittest.TestCase):
     def test_client_turn_ids_stay_out_of_prompt_but_preserve_request_identity(self):
         def request(turn_id):
             return {
-                "model": "gpt-excel",
+                "model": "gpt-5.6-sol-excel",
                 "input": [
                     {
                         "type": "message",
@@ -982,7 +999,7 @@ class ExcelUpstreamTests(unittest.TestCase):
 
     def test_catalog_position_escape_hatch_restores_suffix_layout(self):
         source = {
-            "model": "gpt-excel",
+            "model": "gpt-5.6-sol-excel",
             "input": "Hello",
             "tools": [{"type": "function", "name": "demo"}],
         }
@@ -1001,7 +1018,7 @@ class ExcelUpstreamTests(unittest.TestCase):
 
     def test_suffix_catalog_precedes_terminal_compaction_trigger(self):
         source = {
-            "model": "gpt-excel",
+            "model": "gpt-5.6-sol-excel",
             "input": [
                 {
                     "type": "message",
@@ -1111,7 +1128,7 @@ class ExcelUpstreamTests(unittest.TestCase):
     def test_unsupported_reasoning_effort_falls_back_to_medium(self):
         body = excel_upstream.prepare_responses_body(
             {
-                "model": "gpt-excel",
+                "model": "gpt-5.6-sol-excel",
                 "input": "Hello",
                 "reasoning": {"effort": "ultra"},
             }
@@ -1121,7 +1138,7 @@ class ExcelUpstreamTests(unittest.TestCase):
     def test_function_tool_marker_is_converted_only_for_allowed_tool(self):
         marker = (
             '<codex_tool_call>{"name":"codex_client__shell_command","arguments":'
-            '{"command":"rg -n gpt-excel excel_upstream.py"}}</codex_tool_call>'
+            '{"command":"rg -n gpt-5.6-sol-excel excel_upstream.py"}}</codex_tool_call>'
         )
         tool_call = excel_upstream.extract_client_tool_call(
             marker,
@@ -1136,7 +1153,7 @@ class ExcelUpstreamTests(unittest.TestCase):
         )
         self.assertEqual(
             json.loads(tool_call["arguments"]),
-            {"command": "rg -n gpt-excel excel_upstream.py"},
+            {"command": "rg -n gpt-5.6-sol-excel excel_upstream.py"},
         )
         self.assertIsNone(
             excel_upstream.extract_client_tool_call(
@@ -1189,7 +1206,7 @@ class ExcelUpstreamTests(unittest.TestCase):
             },
             tool_call,
         )
-        self.assertEqual(payload["model"], "gpt-excel")
+        self.assertEqual(payload["model"], "gpt-5.6-sol-excel")
         self.assertEqual(payload["output"][0]["type"], "function_call")
         self.assertEqual(payload["usage"]["output_tokens"], 2)
 
@@ -1328,7 +1345,12 @@ class ExcelUpstreamTests(unittest.TestCase):
         payload = excel_upstream.merge_local_models_payload(payload)
         self.assertEqual(
             [item["id"] for item in payload["data"]],
-            ["gpt-5.5", "gpt-excel"],
+            [
+                "gpt-5.5",
+                "gpt-5.6-luna-excel",
+                "gpt-5.6-terra-excel",
+                "gpt-5.6-sol-excel",
+            ],
         )
 
 class ExcelStreamTransformTests(unittest.TestCase):
@@ -1463,7 +1485,7 @@ class ExcelStreamTransformTests(unittest.TestCase):
         completed = dict(events)[
             "response.completed"
         ]["response"]
-        self.assertEqual(completed["model"], "gpt-excel")
+        self.assertEqual(completed["model"], "gpt-5.6-sol-excel")
         self.assertEqual(completed["output"][0]["type"], "function_call")
         self.assertEqual(completed["output"][0]["name"], "shell_command")
         self.assertEqual(completed["usage"]["output_tokens"], 7)
@@ -1716,7 +1738,7 @@ class ExcelStreamTransformTests(unittest.TestCase):
             {"plan": [{"step": "Inspect the repository", "status": "in_progress"}]},
         )
         completed = dict(events)["response.completed"]["response"]
-        self.assertEqual(completed["model"], "gpt-excel")
+        self.assertEqual(completed["model"], "gpt-5.6-sol-excel")
         self.assertEqual(completed["output"][0]["type"], "function_call")
         self.assertEqual(completed["output"][0]["id"], "fc_upstream")
         self.assertEqual(completed["output"][0]["call_id"], "call_upstream")

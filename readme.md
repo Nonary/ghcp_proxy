@@ -136,8 +136,9 @@ http://localhost:8000/
 
 ## GPT Excel Upstream
 
-`gpt-excel` is a Responses-only model that sends requests to the official
-ChatGPT Excel add-in backend instead of GitHub Copilot. It is experimental and
+`gpt-5.6-luna-excel`, `gpt-5.6-terra-excel`, and `gpt-5.6-sol-excel` are
+Responses-only models that send requests to the matching official ChatGPT
+Excel add-in backend model instead of GitHub Copilot. They are experimental and
 unofficial. The backend may change without notice, and using an add-in session
 outside the add-in may be unsupported by OpenAI. Use only your own account and
 session.
@@ -145,7 +146,7 @@ session.
 The Excel credential is deliberately separate from GitHub authentication. On
 Windows it is encrypted with the current user's DPAPI key. On both Windows and
 macOS it is read automatically from the Excel add-in cache at startup and
-before `gpt-excel` requests when a fresh session is needed. The bearer token
+before Excel-routed requests when a fresh session is needed. The bearer token
 and account ID are never returned to the dashboard.
 
 Windows prerequisites:
@@ -176,7 +177,7 @@ Mac prerequisites:
 - Excel desktop with the official ChatGPT add-in open and signed in.
 
 GHCP Proxy loads the session automatically at startup and again whenever a
-`gpt-excel` request finds no session or an expired token. There is no macOS
+Excel-routed request finds no session or an expired token. There is no macOS
 capture button or certificate/proxy setup.
 
 The reader searches Excel's WebKit `WebsiteData/Default` profiles for the
@@ -185,10 +186,11 @@ account identifiers required by GHCP Proxy and submits them to the loopback
 session API. Token values are not printed or written to logs. The macOS session
 remains memory-only, but GHCP Proxy reloads it after restarts. If the token
 expires, refresh the ChatGPT Excel task pane so Excel writes a current token.
-After priming, select `gpt-excel` in Codex. Requests for all other models still
-use GitHub Copilot. The Excel service currently accepts `gpt-5.6-sol` on the
-wire and exposes `low`, `medium`, `high`, and `xhigh` reasoning efforts
-(`x-high` is accepted as an input alias).
+After priming, select `gpt-5.6-luna-excel`, `gpt-5.6-terra-excel`, or
+`gpt-5.6-sol-excel` in Codex. Requests for all other models still use GitHub
+Copilot. Each Excel alias sends its matching base model on the wire and exposes
+`low`, `medium`, `high`, and `xhigh` reasoning efforts (`x-high` is accepted as
+an input alias).
 
 Basispoints rejects client-supplied tool schemas and injects its own
 Excel-specific tools. GHCP Proxy therefore removes client tool declarations and
@@ -201,7 +203,7 @@ receives a standard Responses `function_call` or `custom_tool_call` and executes
 it locally under its normal approval policy. The result is replayed under the
 original native call identity on the next request. The bridge intentionally
 requests one client tool at a time; parallel client tool calls are not exposed
-for `gpt-excel`.
+for Excel-routed models.
 
 Replayed history keeps its native Responses shape: Basispoints accepts
 `function_call` / `function_call_output` items for tools it never declared
@@ -255,10 +257,10 @@ Codex's `prompt_cache_key` is forwarded for cache routing (disable with
 `GHCP_EXCEL_FORWARD_PROMPT_CACHE_KEY=0`), and the `task_id` metadata is derived
 from it so one conversation keeps one task identity across turns.
 
-Cost tracking prices `gpt-excel` at GPT-5.6 token rates (the observed routed
-model), including the 272k long-context tier. The dashboard shows that spend
-in OpenAI Credits ($0.04 = 1 Credit) instead of Copilot AIC; aggregate totals
-that mix providers remain in AIC.
+Cost tracking prices each Excel alias at its matching GPT-5.6 token rates,
+including applicable long-context tiers. The dashboard shows that spend in
+OpenAI Credits ($0.04 = 1 Credit) instead of Copilot AIC; aggregate totals that
+mix providers remain in AIC.
 
 Clear the active session and, on Windows, its encrypted copy without stopping
 the proxy:
