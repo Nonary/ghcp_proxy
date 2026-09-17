@@ -88,6 +88,7 @@ class ExcelUpstreamTests(unittest.TestCase):
         body = excel_upstream.prepare_responses_body(source)
 
         self.assertEqual(body["model"], "gpt-5.6-sol")
+        self.assertEqual(body["model_selection"], "explicit")
         self.assertFalse(body["store"])
         self.assertEqual(body["reasoning_effort"], "xhigh")
         self.assertEqual(body["prompt_cache_key"], "conversation-1")
@@ -145,6 +146,7 @@ class ExcelUpstreamTests(unittest.TestCase):
                     {"model": requested, "input": "Hello"}
                 )
                 self.assertEqual(body["model"], upstream)
+                self.assertEqual(body["model_selection"], "explicit")
                 self.assertTrue(excel_upstream.is_excel_model(requested))
         self.assertFalse(excel_upstream.is_excel_model("gpt-excel"))
 

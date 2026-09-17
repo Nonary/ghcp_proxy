@@ -1413,6 +1413,10 @@ def prepare_responses_body(
     """Translate a standard Responses request to the Excel add-in wire shape."""
     output: dict[str, object] = {
         "model": upstream_model_for(source.get("model")),
+        # Match the official Excel add-in wire shape. The add-in marks picker
+        # choices as explicit so the Basispoints backend does not apply its
+        # automatic/default model routing to an otherwise valid model slug.
+        "model_selection": "explicit",
         "stream": bool(source.get("stream", False)),
         "store": False,
     }
