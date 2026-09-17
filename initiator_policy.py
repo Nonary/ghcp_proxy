@@ -60,7 +60,16 @@ def _is_subagent_request(subagent: str | None) -> bool:
 # subagents (e.g. `review`, `general-purpose`, `explorer`) are user-initiated
 # helpers that should keep using the user's selected model. We still treat
 # them as agent-initiated traffic for safeguard purposes.
-_APPROVAL_SUBAGENT_NAMES = frozenset({"guardian"})
+_APPROVAL_SUBAGENT_NAMES = frozenset(
+    {
+        "guardian",
+        "approval",
+        "approver",
+        "approval-agent",
+        "security-monitor",
+        "security_monitor",
+    }
+)
 
 
 def _is_approval_subagent(subagent: str | None) -> bool:
@@ -1324,7 +1333,7 @@ def is_approval_agent_request(
     """
     if _is_approval_subagent(subagent):
         return True
-    if codex_agent_compat.codex_subagent_role(body) == "guardian":
+    if _is_approval_subagent(codex_agent_compat.codex_subagent_role(body)):
         return True
     return _request_includes_security_monitor_prompt(
         inbound_protocol=inbound_protocol,

@@ -3473,6 +3473,11 @@ def _prepare_upstream_request(
         prompt_preview=stored_prompt_preview,
         initiator_verdict=initiator_verdict if isinstance(initiator_verdict, dict) else None,
     )
+    if isinstance(trace_metadata, dict):
+        for key in ("approval_agent", "subagent"):
+            value = trace_metadata.get(key)
+            if value is not None:
+                usage_event[key] = value
     reasoning_effort = _request_reasoning_effort(body)
     if reasoning_effort is None:
         reasoning_effort = _request_reasoning_effort(source_body)
@@ -6297,6 +6302,11 @@ async def _handle_copilot_sdk_responses(
 
     sdk_body = dict(body)
     sdk_body["model"] = resolved_model
+    if approval_agent and resolved_model and resolved_model.startswith("gpt-5.6-luna"):
+        sdk_body["reasoning_effort"] = "high"
+        reasoning = sdk_body.get("reasoning")
+        if isinstance(reasoning, dict):
+            sdk_body["reasoning"] = {**reasoning, "effort": "high"}
     if is_compact:
         # Compaction is a pure summarization turn.  The generic fake compact
         # request intentionally retains tool declarations for cache affinity,

@@ -431,6 +431,16 @@ class ProtocolBridgePlanner:
         if mapped_model is None:
             mapped_model = self._routing_config_service.resolve_target_model(requested_model)
         resolved_model = normalize_routing_model_name(mapped_model or requested_model)
+        routed_body = body
+        if approval_agent and resolved_model and resolved_model.startswith("gpt-5.6-luna"):
+            routed_body = dict(body)
+            reasoning = routed_body.get("reasoning")
+            routed_body["reasoning"] = (
+                {**reasoning, "effort": "high"}
+                if isinstance(reasoning, dict)
+                else {"effort": "high"}
+            )
+            routed_body.pop("reasoning_effort", None)
         target_family = model_provider_family(resolved_model)
         if target_family is None:
             raise ValueError(f"Unsupported mapped model family: {resolved_model}")
@@ -445,7 +455,7 @@ class ProtocolBridgePlanner:
             capability_override=capability_override,
         )
         plan = await strategy.build_plan(
-            body,
+            routed_body,
             requested_model=requested_model,
             resolved_model=resolved_model,
             api_base=api_base,

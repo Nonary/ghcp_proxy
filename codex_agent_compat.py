@@ -44,16 +44,31 @@ def _metadata_mappings(body: dict | None) -> list[Mapping]:
     if client_metadata is None:
         return []
 
-    mappings: list[Mapping] = [client_metadata]
-    for key in (
-        "x-codex-turn-metadata",
-        "x_codex_turn_metadata",
-        "codex_turn_metadata",
-        "turn_metadata",
-    ):
-        parsed = _json_mapping(client_metadata.get(key))
-        if parsed is not None:
-            mappings.append(parsed)
+    mappings: list[Mapping] = []
+    seen: set[int] = set()
+
+    def visit(value, *, depth: int = 0) -> None:
+        if depth > 4:
+            return
+        mapping = _json_mapping(value)
+        if mapping is None or id(mapping) in seen:
+            return
+        seen.add(id(mapping))
+        mappings.append(mapping)
+        for child in mapping.values():
+            if isinstance(child, (Mapping, list)) or (
+                isinstance(child, str) and child.lstrip().startswith("{")
+            ):
+                if isinstance(child, list):
+                    for item in child:
+                        visit(item, depth=depth + 1)
+                else:
+                    visit(child, depth=depth + 1)
+
+    # Codex currently nests lifecycle metadata under several client-specific
+    # keys. Walk the compact metadata envelope rather than relying on a fixed
+    # key list so new nesting does not silently lose the approval role.
+    visit(client_metadata)
     return mappings
 
 
@@ -80,7 +95,7 @@ def _source_is_subagent(value) -> bool:
                     return True
             elif candidate is True:
                 return True
-    for key in ("type", "kind", "name"):
+    for key in ("type", "kind", "name", "agent_type"):
         candidate = value.get(key)
         if isinstance(candidate, str) and candidate.strip().lower() in {
             "subagent",
@@ -137,6 +152,7 @@ def codex_subagent_identity(body: dict | None) -> str | None:
         "session_id",
         "agent_nickname",
         "agent_role",
+        "agent_type",
     ):
         for mapping in identity_sources:
             value = _non_empty_string(mapping.get(key))
@@ -158,7 +174,13 @@ def codex_subagent_role(body: dict | None) -> str | None:
             nested.append(agent_mapping)
 
     for mapping in [*reversed(nested), *reversed(mappings)]:
-        for key in ("agent_role", "agent_name", "agent_nickname", "role"):
+        for key in (
+            "agent_role",
+            "agent_name",
+            "agent_nickname",
+            "agent_type",
+            "role",
+        ):
             value = _non_empty_string(mapping.get(key))
             if value:
                 return value

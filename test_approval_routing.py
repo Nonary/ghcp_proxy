@@ -44,6 +44,30 @@ class ApprovalRoutingTests(unittest.TestCase):
             )
         )
 
+    def test_nested_approval_metadata_is_detected(self):
+        body = {
+            "client_metadata": {
+                "turn": json.dumps(
+                    {
+                        "metadata": {
+                            "thread_source": "subagent",
+                            "agent_type": "approval",
+                        }
+                    }
+                )
+            }
+        }
+
+        self.assertEqual(codex_subagent_identity(body), "codex:approval")
+        self.assertEqual(codex_subagent_role(body), "approval")
+        self.assertTrue(
+            is_approval_agent_request(
+                subagent=codex_subagent_identity(body),
+                inbound_protocol="responses",
+                body=body,
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
