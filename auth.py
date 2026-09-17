@@ -311,10 +311,15 @@ def _complete_browser_auth_flow(
             expires_in=expires_in,
         )
         warning = ""
-        try:
-            _refresh_api_key(access_token)
-        except Exception as exc:
-            warning = f"Authorized, but the API key refresh failed: {exc}"
+        # The v2 Codex path passes the GitHub OAuth token to the official SDK;
+        # it neither needs nor should eagerly exchange it through Copilot's
+        # private REST token endpoint. Legacy REST/Claude routes refresh lazily
+        # through get_api_key() when they are actually used.
+        if os.getenv("GHCP_RESPONSES_UPSTREAM", "sdk").strip().lower() == "rest":
+            try:
+                _refresh_api_key(access_token)
+            except Exception as exc:
+                warning = f"Authorized, but the API key refresh failed: {exc}"
 
         with _AUTH_FLOW_LOCK:
             if _AUTH_FLOW_STATE.get("flow_id") != flow_id:

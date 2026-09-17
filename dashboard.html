@@ -2458,10 +2458,10 @@
               <article class="detail-block" v-if="selectedRequest.usage">
                 <div class="detail-label">Request Usage</div>
                 <div class="detail-grid">
-                  <div><div class="detail-label">Input Tokens</div><div class="detail-value">{{ compact(displayInputTokens(selectedRequest.usage)) }}</div></div>
+                  <div><div class="detail-label">Input Tokens</div><div class="detail-value">{{ compact(requestInputTokens(selectedRequest)) }}</div></div>
                   <div><div class="detail-label">Output Tokens</div><div class="detail-value">{{ compact(displayOutputTokens(selectedRequest.usage)) }}</div></div>
                   <div><div class="detail-label">Cached Input Tokens</div><div class="detail-value">{{ compact(cachedInputTokens(selectedRequest)) }}</div></div>
-                  <div><div class="detail-label">Total Tokens</div><div class="detail-value">{{ compact(displayTotalTokens(selectedRequest.usage)) }}</div></div>
+                  <div><div class="detail-label">Total Tokens</div><div class="detail-value">{{ compact(requestTotalTokens(selectedRequest)) }}</div></div>
                 </div>
               </article>
               <article class="detail-block" v-if="selectedRequest.request_prompt_available || selectedRequestPrompt">
@@ -3483,15 +3483,18 @@
 
     function displayTotalTokensFromUsage(usage) {
       if (!usage || typeof usage !== 'object') return 0;
-      const input = displayInputTokensFromUsage(usage);
       const output = Math.max(0, Number(usage.output_tokens || 0));
-      const hasNetInput = usage.fresh_input_tokens != null
-        || usage.billable_input_tokens != null
-        || Boolean((usage.input_tokens_details || usage.prompt_tokens_details)?.cached_tokens != null);
-      if (hasNetInput) return input + output;
       const total = Number(usage.total_tokens);
       if (Number.isFinite(total) && total > 0) return total;
-      return input + output;
+      // fresh_input_tokens is only the non-cache portion of the prompt.  It
+      // must not replace gross input in token-volume totals: Copilot SDK turns
+      // commonly have a few fresh tokens plus substantial cache reads/writes.
+      const grossInput = Number(usage.input_tokens);
+      if (Number.isFinite(grossInput) && grossInput >= 0) return grossInput + output;
+      const freshInput = displayInputTokensFromUsage(usage);
+      const cachedInput = Math.max(0, Number(usage.cached_input_tokens ?? usage.cache_read_input_tokens ?? 0) || 0);
+      const cacheCreation = Math.max(0, Number(usage.cache_creation_input_tokens || 0) || 0);
+      return freshInput + cachedInput + cacheCreation + output;
     }
 
     function mergeUsageRows(rows) {
@@ -3802,7 +3805,7 @@
           const rows = [
             { label: 'Input (fresh)',    tokens: freshInput,                                     field: 'input_fresh',             color: '#ff8752' },
             { label: 'Input (cached)',   tokens: Number(u.cached_input_tokens || 0),             field: 'cached_input',            color: '#6ee7c8' },
-            { label: 'Cache Creation',   tokens: Number(u.cache_creation_tokens || 0),           field: 'cache_creation',          color: '#f6b16d' },
+            { label: 'Cache Creation (of fresh)', tokens: Number(u.cache_creation_tokens || 0),  field: 'cache_creation',          color: '#f6b16d' },
             { label: 'Output',           tokens: outputTokens,                                   field: 'output_tokens',           color: '#7eaaff' },
           ].filter(r => r.tokens > 0);
           const exactCosts = {
@@ -3971,6 +3974,7 @@
           if (normalized === 'claude') return 'Claude';
           if (normalized === 'codex') return 'Codex (proxied)';
           if (normalized === 'codex_native') return 'Codex (native)';
+          if (normalized === 'copilot_sdk') return 'Copilot SDK';
           if (!normalized) return 'Unknown';
           return normalized.charAt(0).toUpperCase() + normalized.slice(1);
         },
@@ -3979,6 +3983,7 @@
           if (normalized === 'claude') return 'tone-claude';
           if (normalized === 'codex') return 'tone-codex';
           if (normalized === 'codex_native') return 'tone-codex-native';
+          if (normalized === 'copilot_sdk') return 'tone-codex';
           return 'tone-other';
         },
         shareValue(row) {
@@ -5341,6 +5346,14 @@
         displayTotalTokens(usage) {
           return displayTotalTokensFromUsage(usage);
         },
+        requestInputTokens(row) {
+          const usage = row?.usage || (row && typeof row === 'object' && row.input_tokens != null ? row : {});
+          return Math.max(0, Number(usage.input_tokens ?? row?.input_tokens ?? 0) || 0);
+        },
+        requestTotalTokens(row) {
+          const usage = row?.usage || (row && typeof row === 'object' && row.total_tokens != null ? row : {});
+          return this.displayTotalTokens(usage);
+        },
         displayOutputTokens(usage) {
           // reasoning_output_tokens is a subset retained for diagnostics.
           if (!usage || typeof usage !== 'object') return 0;
@@ -6375,6 +6388,7 @@
           if (normalized === 'claude') return 'Claude';
           if (normalized === 'codex') return 'Codex (proxied)';
           if (normalized === 'codex_native') return 'Codex (native)';
+          if (normalized === 'copilot_sdk') return 'Copilot SDK';
           if (!normalized || normalized === 'unknown') return 'Unknown';
           return normalized.charAt(0).toUpperCase() + normalized.slice(1);
         },
@@ -6426,11 +6440,9 @@
         },
         shortTokens(row) {
           const usage = row?.usage || {};
-          const i = Number(
-            typeof this.displayInputTokens === 'function'
-              ? this.displayInputTokens(usage, row?.input_tokens)
-              : displayInputTokensFromUsage(usage, row?.input_tokens)
-          );
+          const i = typeof this.requestInputTokens === 'function'
+            ? this.requestInputTokens(row)
+            : Number(usage.input_tokens ?? row?.input_tokens ?? 0);
           const o = Number((typeof this.displayOutputTokens === 'function' ? this.displayOutputTokens(usage) : (usage.output_tokens || 0))) ||
                     Number(row?.output_tokens || 0);
           if (!i && !o) return '—';

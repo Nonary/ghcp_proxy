@@ -1,14 +1,15 @@
 # GHCP Proxy
 
-Local reverse proxy for Codex and Claude Code using GitHub Copilot upstream.
+Local compatibility proxy for Codex and Claude Code using GitHub Copilot.
 
 ## Read This First
 
-GHCP Proxy is an unofficial local proxy. It uses GitHub Copilot upstream in a
-way GitHub may not support, and you should assume that misuse can violate
-GitHub's terms or acceptable-use rules. GitHub's API terms say abusive or
-excessive requests can lead to temporary or permanent suspension of API access,
-and GitHub's acceptable-use rules include service usage limits.
+The v2 Codex path uses GitHub's official Copilot SDK and bundled runtime. The
+OpenAI Responses compatibility layer in this project is unofficial, as are the
+legacy REST, Claude Code, and GPT Excel paths. You should still assume that
+misuse can violate GitHub's terms or acceptable-use rules. GitHub's API terms
+say abusive or excessive requests can lead to temporary or permanent suspension
+of API access, and GitHub's acceptable-use rules include service usage limits.
 
 Use your own account, respect GitHub's limits, and do not use this project to
 evade billing or quotas. Rate limits make runaway usage less likely than it used
@@ -25,7 +26,7 @@ GitHub remains the source of truth for billing and enforcement:
 
 ## Setup
 
-You need Python 3.10 or newer, a GitHub account with Copilot access, and Codex
+You need Python 3.11 or newer, a GitHub account with Copilot access, and Codex
 or Claude Code installed if you want GHCP Proxy to configure those clients.
 
 From this folder, start the proxy:
@@ -57,6 +58,44 @@ In the dashboard:
 
 That is the normal setup. You do not need Node.js, `npx`, or hand-edited
 `~/.codex` / `~/.claude` config files.
+
+## Codex v2 Upstream
+
+Codex Responses requests use the official `github-copilot-sdk` package by
+default. The SDK downloads and manages its matching Copilot runtime, owns the
+GitHub-supported authentication/model transport, and persists its session state.
+GHCP Proxy translates between OpenAI Responses items and SDK session events.
+
+Client tools are registered as SDK declaration-only tools. When Copilot asks to
+call one, the SDK suspends its turn; GHCP Proxy returns the call to Codex and
+encodes the SDK session and request IDs in `call_id`. Codex executes the tool,
+then its next Responses request resumes that exact SDK turn. Parallel calls are
+batched and the encoded continuation survives proxy restarts.
+
+Reasoning effort, including `max` for supported models, is forwarded to the SDK.
+New caller instructions accompanying tool results are delivered as immediate
+steering before those results release the next model call.
+
+The SDK session stays connected across that tool round-trip instead of being
+destroyed after every response, so the runtime's own background compaction
+(infinite sessions) can finish and take effect. A session parked on a tool
+result is dropped after `GHCP_SDK_SESSION_IDLE_SECONDS` (default 300) if the
+result never arrives. When Codex compacts its own transcript, the proxy keeps
+the same SDK session -- the one that wrote the summary -- and only sends what
+follows the summary, rather than replaying the summary into a fresh session.
+If the model, effort, instructions, or tool configuration changes, the proxy
+reconnects to the same SDK session with the updated options. Unchanged requests
+continue using the existing connection.
+
+To temporarily restore the old direct REST implementation while diagnosing a
+regression, start the proxy with:
+
+```bash
+GHCP_RESPONSES_UPSTREAM=rest python proxy.py
+```
+
+This switch applies to Codex Responses and model discovery. The legacy chat and
+Anthropic compatibility routes continue to use their existing implementation.
 
 ## Token Pricing And Billing
 
@@ -276,14 +315,14 @@ Start here if setup does not work.
 ### Python Command Not Found
 
 If `python3 --version` or `py -3 --version` fails, Python is not available in
-that terminal. Install Python 3.10 or newer, then close and reopen the terminal.
+that terminal. Install Python 3.11 or newer, then close and reopen the terminal.
 
 On Windows, keep the Python launcher enabled during install. If `python` opens
 the Microsoft Store instead of Python, use `py -3` commands.
 
 ### `venv` Creation Fails
 
-Make sure you are using Python 3.10 or newer:
+Make sure you are using Python 3.11 or newer:
 
 ```bash
 python3 --version

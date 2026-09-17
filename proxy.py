@@ -57,6 +57,7 @@ import auto_update
 import background_proxy
 import codex_agent_compat
 import codex_native_ingest
+import copilot_sdk_upstream
 import dashboard as dashboard_module
 import excel_session_capture
 import excel_upstream
@@ -98,7 +99,7 @@ from bridge_streams import (
 )
 from initiator_policy import InitiatorPolicy, is_approval_agent_request
 from event_bus import EventBus
-from model_routing_config import ModelRoutingConfig, ModelRoutingConfigService, model_provider_family
+from model_routing_config import ModelRoutingConfig, ModelRoutingConfigService, model_provider_family, normalize_routing_model_name
 from protocol_bridge import BridgeExecutionPlan, ProtocolBridgePlanner
 from proxy_client_config import (
     ProxyClientConfig,
@@ -218,7 +219,7 @@ _DEBUG_DETAIL_SNAPSHOT_SEQUENCE = 0
 # upstream cache entry becomes visible. Same-turn user steering is deliberately
 # not delayed: native Copilot sends that shape immediately after cancelling or
 # completing the prior generation and keeps the task/interaction identity.
-RESPONSES_CACHE_SETTLE_DELAY_SECONDS = 3.0
+RESPONSES_CACHE_SETTLE_DELAY_SECONDS = 0.0
 _PROMPT_CACHE_SETTLE_LOCK = threading.Lock()
 _PROMPT_CACHE_LAST_FINISH_BY_FAMILY: dict[tuple[str, str], tuple[str, float]] = {}
 _PROMPT_CACHE_LAST_PRUNE_AT = 0.0
@@ -932,18 +933,30 @@ try:
 except Exception as _codex_ingest_exc:  # pragma: no cover - best effort
     print(f"codex_native_ingest: disabled ({_codex_ingest_exc})", flush=True)
 
+try:
+    _copilot_sdk_interval = float(os.environ.get("GHCP_COPILOT_SDK_INGEST_INTERVAL", "5") or 5)
+    if _copilot_sdk_interval > 0:
+        copilot_sdk_upstream.start_background_scanner(
+            usage_tracker.record_usage_event,
+            interval_seconds=_copilot_sdk_interval,
+        )
+except Exception as _sdk_ingest_exc:  # pragma: no cover - best effort
+    print(f"copilot_sdk_ingest: disabled ({_sdk_ingest_exc})", flush=True)
+
 
 @app.on_event("startup")
 async def _app_startup_restore_client_proxy_configs():
     excel_upstream.excel_session_store.load()
-    excel_session_capture.refresh_macos_excel_session(
+    asyncio.create_task(asyncio.to_thread(
+        excel_session_capture.refresh_macos_excel_session,
         excel_upstream.excel_session_store,
         force=True,
-    )
-    excel_session_capture.refresh_windows_excel_session(
+    ))
+    asyncio.create_task(asyncio.to_thread(
+        excel_session_capture.refresh_windows_excel_session,
         excel_upstream.excel_session_store,
         force=True,
-    )
+    ))
     restore_client_proxy_configs_on_startup()
     auto_update_runtime_controller.start_periodic_checks()
 
@@ -951,6 +964,7 @@ async def _app_startup_restore_client_proxy_configs():
 @app.on_event("shutdown")
 async def _app_shutdown_revert_client_proxy_configs():
     await auto_update_runtime_controller.stop_periodic_checks()
+    await copilot_sdk_upstream.shutdown()
     revert_client_proxy_configs_on_shutdown()
 
 
@@ -3412,6 +3426,7 @@ def _prepare_upstream_request(
     source_body: dict | None = None,
     trace_metadata: dict | None = None,
     replay_subagent: str | None = None,
+    force_initiator: str | None = None,
 ) -> tuple[UpstreamRequestPlan | None, Response | None]:
     request_id = uuid4().hex
 
@@ -3436,6 +3451,10 @@ def _prepare_upstream_request(
 
     headers = header_builder(effective_api_key, request_id)
     initiator_header = header_value("X-Initiator")
+    # Callers that already know the initiator (e.g. compaction turns, which
+    # carry no X-Initiator header) can override what the client sent.
+    if isinstance(force_initiator, str) and force_initiator.strip():
+        initiator_header = force_initiator.strip()
     initiator = str(initiator_header or "").strip().lower()
     initiator_verdict = None
     if isinstance(trace_metadata, dict):
@@ -3812,6 +3831,13 @@ def _translate_bridge_success_payload(bridge_plan: BridgeExecutionPlan, payload:
         return format_translation.anthropic_response_to_responses(
             payload, fallback_model=bridge_plan.resolved_model,
         )
+    if bridge_plan.caller_protocol == "responses" and bridge_plan.upstream_protocol == "responses":
+        if bridge_plan.is_compact:
+            return format_translation.responses_to_compaction_response(
+                payload,
+                fallback_model=bridge_plan.resolved_model,
+            )
+        return format_translation.normalize_response_reasoning_for_client(payload)
     return payload
 
 
@@ -4835,6 +4861,187 @@ async def proxy_responses_from_anthropic_streaming_response(
     )
 
 
+def _responses_reasoning_stream_transform():
+    """Stream transform adapting upstream Responses SSE reasoning events for Codex/Electron."""
+    async def transform(byte_iter):
+        reasoning_states: dict[str, dict] = {}
+
+        async for event_name, data in format_translation.iter_sse_messages(byte_iter):
+            if data == "[DONE]":
+                yield b"data: [DONE]\n\n"
+                continue
+            try:
+                payload = json.loads(data)
+            except (json.JSONDecodeError, TypeError):
+                yield format_translation.sse_encode(event_name or "message", data)
+                continue
+            if not isinstance(payload, dict):
+                yield format_translation.sse_encode(event_name or "message", payload)
+                continue
+
+            event_type = str(event_name or payload.get("type") or "").strip().lower()
+
+            if event_type == "response.output_item.added":
+                item = payload.get("item")
+                if isinstance(item, dict) and item.get("type") == "reasoning":
+                    item_id = item.get("id") or "rs"
+                    out_idx = payload.get("output_index", 0)
+                    reasoning_states[item_id] = {
+                        "output_index": out_idx,
+                        "summary_started": False,
+                        "header_sent": False,
+                        "text_parts": [],
+                    }
+                    item.setdefault("summary", [])
+                    item.setdefault("content", [])
+                yield format_translation.sse_encode(event_type, payload)
+                continue
+
+            if event_type == "response.reasoning_summary_part.added":
+                item_id = payload.get("item_id")
+                if item_id in reasoning_states:
+                    reasoning_states[item_id]["summary_started"] = True
+                yield format_translation.sse_encode(event_type, payload)
+                continue
+
+            if event_type == "response.reasoning_text.delta":
+                item_id = payload.get("item_id")
+                delta = payload.get("delta")
+                out_idx = payload.get("output_index", 0)
+                state = reasoning_states.setdefault(
+                    item_id,
+                    {
+                        "output_index": out_idx,
+                        "summary_started": False,
+                        "header_sent": False,
+                        "text_parts": [],
+                    },
+                )
+                if not state["summary_started"]:
+                    state["summary_started"] = True
+                    yield format_translation.sse_encode(
+                        "response.reasoning_summary_part.added",
+                        {
+                            "type": "response.reasoning_summary_part.added",
+                            "item_id": item_id,
+                            "output_index": out_idx,
+                            "summary_index": 0,
+                            "part": {"type": "summary_text", "text": ""},
+                        },
+                    )
+                if isinstance(delta, str) and delta:
+                    if not state["header_sent"]:
+                        state["header_sent"] = True
+                        if not delta.lstrip().startswith("**") and not delta.lstrip().startswith("#"):
+                            header = format_translation._CODEX_THINKING_SUMMARY_HEADER
+                            state["text_parts"].append(header)
+                            yield format_translation.sse_encode(
+                                "response.reasoning_summary_text.delta",
+                                {
+                                    "type": "response.reasoning_summary_text.delta",
+                                    "item_id": item_id,
+                                    "output_index": out_idx,
+                                    "summary_index": 0,
+                                    "delta": header,
+                                },
+                            )
+                    state["text_parts"].append(delta)
+                    yield format_translation.sse_encode(
+                        "response.reasoning_summary_text.delta",
+                        {
+                            "type": "response.reasoning_summary_text.delta",
+                            "item_id": item_id,
+                            "output_index": out_idx,
+                            "summary_index": 0,
+                            "delta": delta,
+                        },
+                    )
+                yield format_translation.sse_encode(event_type, payload)
+                continue
+
+            if event_type == "response.reasoning_summary_text.delta":
+                item_id = payload.get("item_id")
+                delta = payload.get("delta")
+                out_idx = payload.get("output_index", 0)
+                state = reasoning_states.setdefault(
+                    item_id,
+                    {
+                        "output_index": out_idx,
+                        "summary_started": True,
+                        "header_sent": False,
+                        "text_parts": [],
+                    },
+                )
+                if isinstance(delta, str) and delta:
+                    if not state["header_sent"]:
+                        state["header_sent"] = True
+                        if not delta.lstrip().startswith("**") and not delta.lstrip().startswith("#"):
+                            header = format_translation._CODEX_THINKING_SUMMARY_HEADER
+                            state["text_parts"].append(header)
+                            yield format_translation.sse_encode(
+                                "response.reasoning_summary_text.delta",
+                                {
+                                    "type": "response.reasoning_summary_text.delta",
+                                    "item_id": item_id,
+                                    "output_index": out_idx,
+                                    "summary_index": 0,
+                                    "delta": header,
+                                },
+                            )
+                    state["text_parts"].append(delta)
+                yield format_translation.sse_encode(event_type, payload)
+                continue
+
+            if event_type == "response.reasoning_text.done":
+                item_id = payload.get("item_id")
+                out_idx = payload.get("output_index", 0)
+                state = reasoning_states.get(item_id)
+                full_text = "".join(state["text_parts"]) if state else (payload.get("text") or "")
+                yield format_translation.sse_encode(
+                    "response.reasoning_summary_text.done",
+                    {
+                        "type": "response.reasoning_summary_text.done",
+                        "item_id": item_id,
+                        "output_index": out_idx,
+                        "summary_index": 0,
+                        "text": full_text,
+                    },
+                )
+                yield format_translation.sse_encode(
+                    "response.reasoning_summary_part.done",
+                    {
+                        "type": "response.reasoning_summary_part.done",
+                        "item_id": item_id,
+                        "output_index": out_idx,
+                        "summary_index": 0,
+                        "part": {"type": "summary_text", "text": full_text},
+                    },
+                )
+                yield format_translation.sse_encode(event_type, payload)
+                continue
+
+            if event_type == "response.output_item.done":
+                item = payload.get("item")
+                if isinstance(item, dict) and item.get("type") == "reasoning":
+                    item_id = item.get("id")
+                    state = reasoning_states.get(item_id)
+                    text = "".join(state["text_parts"]) if (state and state["text_parts"]) else ""
+                    format_translation.normalize_reasoning_item_for_client(item, fallback_text=text)
+                yield format_translation.sse_encode(event_type, payload)
+                continue
+
+            if event_type in {"response.completed", "response.failed", "response.incomplete"}:
+                resp = payload.get("response")
+                if isinstance(resp, dict):
+                    format_translation.normalize_response_reasoning_for_client(resp)
+                yield format_translation.sse_encode(event_type, payload)
+                continue
+
+            yield format_translation.sse_encode(event_type or "message", payload)
+
+    return transform
+
+
 async def _proxy_bridge_streaming_response(
     plan: UpstreamRequestPlan,
     bridge_plan: BridgeExecutionPlan,
@@ -4851,6 +5058,7 @@ async def _proxy_bridge_streaming_response(
             stream_type="responses",
             trace_plan=plan,
             downstream_request=downstream_request,
+            stream_transform=_responses_reasoning_stream_transform(),
         )
     if bridge_plan.caller_protocol == "responses" and bridge_plan.upstream_protocol == "chat":
         return await proxy_responses_from_chat_streaming_response(
@@ -5818,12 +6026,18 @@ def _excel_tool_stream_transform(source_body: dict):
                 ):
                     held_events.append(encoded)
                     continue
+                if item_type == "reasoning":
+                    format_translation.normalize_reasoning_item_for_client(item)
+                    yield format_translation.sse_encode(event_type, payload)
+                    continue
                 yield encoded
                 continue
 
             if event_type in {"response.completed", "response.failed", "response.incomplete"}:
                 response = payload.get("response")
                 response = response if isinstance(response, dict) else None
+                if response:
+                    format_translation.normalize_response_reasoning_for_client(response)
                 tool_call = None
                 if event_type == "response.completed":
                     completed_text = full_text or (
@@ -5979,6 +6193,9 @@ async def _post_excel_non_streaming_request(
             tool_call,
             model_id=excel_model_id,
         )
+        if isinstance(translated_payload, dict):
+            format_translation.normalize_response_reasoning_for_client(translated_payload)
+
     _finish_usage_and_trace(
         plan,
         upstream.status_code,
@@ -6068,6 +6285,80 @@ async def _handle_excel_responses(
     return await _post_excel_non_streaming_request(plan, client_body=body)
 
 
+async def _handle_copilot_sdk_responses(
+    request: Request,
+    body: dict,
+    *,
+    source_body: dict | None = None,
+    is_compact: bool = False,
+) -> Response:
+    effective_subagent = _responses_effective_subagent(request, body)
+    approval_agent = is_approval_agent_request(
+        subagent=effective_subagent,
+        inbound_protocol="responses",
+        body=body if isinstance(body, dict) else None,
+    )
+    requested_model = body.get("model")
+    mapped_model = None
+    if approval_agent:
+        mapped_model = model_routing_config_service.resolve_approval_target_model(requested_model)
+    if mapped_model is None:
+        mapped_model = model_routing_config_service.resolve_target_model(requested_model)
+    resolved_model = normalize_routing_model_name(mapped_model or requested_model)
+
+    sdk_body = dict(body)
+    sdk_body["model"] = resolved_model
+    if is_compact:
+        # Compaction is a pure summarization turn.  The generic fake compact
+        # request intentionally retains tool declarations for cache affinity,
+        # but the SDK executes declared tools unless explicitly disabled.
+        sdk_body["tool_choice"] = "none"
+
+    raw_input = sdk_body.get("input")
+    has_compaction_input = format_translation.input_contains_compaction(raw_input)
+    if raw_input is not None:
+        sdk_body["input"] = format_translation.sanitize_input(
+            raw_input,
+            native_responses_passthrough=False,
+        )
+
+    upstream_path = "/v1/responses/compact" if is_compact else "/v1/responses"
+    upstream_url = f"copilot-sdk://responses{'/compact' if is_compact else ''}"
+    plan, error_response = _prepare_upstream_request(
+        request,
+        body=sdk_body,
+        requested_model=requested_model,
+        resolved_model=resolved_model,
+        upstream_path=upstream_path,
+        upstream_url=upstream_url,
+        header_builder=lambda _api_key, _request_id: dict(request.headers),
+        error_response=format_translation.openai_error_response,
+        api_key="copilot-sdk",
+        source_body=source_body if isinstance(source_body, dict) else body,
+        force_initiator="agent" if (has_compaction_input or is_compact) else None,
+        trace_metadata={
+            "sdk": True,
+            "strategy_name": "copilot_sdk_compact" if is_compact else "copilot_sdk_responses",
+            "caller_protocol": "responses",
+            "upstream_protocol": "sdk",
+            "subagent": effective_subagent,
+            "approval_agent": approval_agent,
+            "is_compact": is_compact,
+        },
+    )
+    if error_response is not None:
+        return error_response
+
+    return await copilot_sdk_upstream.handle_responses(
+        request,
+        sdk_body,
+        plan=plan,
+        is_compact=is_compact,
+        finish_usage_callback=_finish_usage_and_trace,
+        mark_first_output_callback=(lambda: usage_tracker.mark_first_output(plan.usage_event)) if plan else None,
+    )
+
+
 @app.post("/responses")
 @app.post("/v1/responses")
 async def responses(request: Request):
@@ -6086,6 +6377,15 @@ async def responses(request: Request):
     )
     if excel_upstream.is_excel_model(body.get("model")):
         return await _handle_excel_responses(request, body)
+    if copilot_sdk_upstream.enabled():
+        if copilot_sdk_upstream.is_compaction_request(body):
+            return await _handle_copilot_sdk_responses(
+                request,
+                format_translation.build_fake_compaction_request(body),
+                source_body=body,
+                is_compact=True,
+            )
+        return await _handle_copilot_sdk_responses(request, body)
 
     effective_subagent = _responses_effective_subagent(request, body)
 
@@ -6193,6 +6493,13 @@ async def responses_compact(request: Request):
             summary_request,
             source_body=body,
         )
+    if copilot_sdk_upstream.enabled():
+        return await _handle_copilot_sdk_responses(
+            request,
+            summary_request,
+            source_body=body,
+            is_compact=True,
+        )
 
     try:
         api_key = auth.get_api_key()
@@ -6294,6 +6601,8 @@ async def chat_completions(request: Request):
 @app.get("/models")
 @app.get("/v1/models")
 async def models():
+    if copilot_sdk_upstream.enabled():
+        return await copilot_sdk_upstream.models_response()
     return await _proxy_models_request()
 
 
@@ -6387,6 +6696,7 @@ if __name__ == "__main__":
     # browser dashboard instead of blocking on a terminal prompt.
     print("Starting GHCP proxy on http://127.0.0.1:8000 (loopback only)", flush=True)
     print("  Responses API : POST /v1/responses", flush=True)
+    print(f"  Codex upstream: {copilot_sdk_upstream.responses_upstream()}", flush=True)
     print("  Compaction    : POST /v1/responses/compact", flush=True)
     print("  Chat API      : POST /v1/chat/completions", flush=True)
     print("  Dashboard     : GET  /ui", flush=True)
