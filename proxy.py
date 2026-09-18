@@ -6305,8 +6305,11 @@ async def _handle_copilot_sdk_responses(
     if approval_agent and resolved_model and resolved_model.startswith("gpt-5.6-luna"):
         sdk_body["reasoning_effort"] = "high"
         reasoning = sdk_body.get("reasoning")
-        if isinstance(reasoning, dict):
-            sdk_body["reasoning"] = {**reasoning, "effort": "high"}
+        sdk_body["reasoning"] = (
+            {**reasoning, "effort": "high"}
+            if isinstance(reasoning, dict)
+            else {"effort": "high"}
+        )
     if is_compact:
         # Compaction is a pure summarization turn.  The generic fake compact
         # request intentionally retains tool declarations for cache affinity,

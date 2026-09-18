@@ -68,6 +68,14 @@ class ApprovalRoutingTests(unittest.TestCase):
             )
         )
 
+    def test_qualified_guardian_identity_is_detected(self):
+        self.assertTrue(
+            is_approval_agent_request(
+                subagent="codex:guardian",
+                inbound_protocol="responses",
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

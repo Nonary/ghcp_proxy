@@ -75,7 +75,13 @@ _APPROVAL_SUBAGENT_NAMES = frozenset(
 def _is_approval_subagent(subagent: str | None) -> bool:
     if not isinstance(subagent, str):
         return False
-    return subagent.strip().lower() in _APPROVAL_SUBAGENT_NAMES
+    normalized = subagent.strip().lower()
+    if normalized in _APPROVAL_SUBAGENT_NAMES:
+        return True
+    # Current Codex metadata is surfaced as a qualified identity such as
+    # ``codex:guardian``. Keep the namespace for diagnostics, but classify
+    # the terminal worker name the same way as the legacy header value.
+    return normalized.rsplit(":", 1)[-1] in _APPROVAL_SUBAGENT_NAMES
 
 
 def _parse_event_time(value: str | None) -> datetime | None:

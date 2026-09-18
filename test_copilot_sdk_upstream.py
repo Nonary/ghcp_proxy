@@ -109,6 +109,20 @@ class CopilotSdkTranslationTests(unittest.TestCase):
                     requested,
                 )
 
+    def test_top_level_reasoning_effort_is_forwarded(self):
+        class _Model:
+            id = "gpt-5.6-luna"
+            supported_reasoning_efforts = ["low", "high"]
+            capabilities = None
+
+        class _Client:
+            async def list_models(self):
+                return [_Model()]
+
+        body = {"model": "gpt-5.6-luna", "reasoning_effort": "high"}
+        effort = asyncio.run(sdk._reasoning_effort_for_client(body, _Client()))
+        self.assertEqual(effort, "high")
+
     def test_recognizes_terminal_in_band_compaction_trigger(self):
         self.assertTrue(
             sdk.is_compaction_request(

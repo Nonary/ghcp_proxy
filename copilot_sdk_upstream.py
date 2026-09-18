@@ -735,6 +735,9 @@ async def _get_client():
 
 
 def _reasoning_effort(body: dict) -> str | None:
+    top_level_effort = body.get("reasoning_effort")
+    if top_level_effort in {"low", "medium", "high", "xhigh", "max"}:
+        return top_level_effort
     reasoning = body.get("reasoning")
     effort = reasoning.get("effort") if isinstance(reasoning, dict) else None
     return effort if effort in {"low", "medium", "high", "xhigh", "max"} else None
