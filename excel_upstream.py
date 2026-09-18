@@ -78,7 +78,7 @@ FORWARD_PROMPT_CACHE_KEY = os.environ.get(
     "GHCP_EXCEL_FORWARD_PROMPT_CACHE_KEY", "1"
 ).strip().lower() not in {"0", "false", "no", "off"}
 # Escape hatch back to the pre-cache-fix layout (full catalog as the prompt
-# suffix) in case the compact trailing reminder ever stops holding the model to
+# suffix) in case the stable-prefix reminder ever stops holding the model to
 # the client-tool transport protocol. See _client_tool_protocol_reminder.
 CATALOG_AT_PROMPT_END = os.environ.get(
     "GHCP_EXCEL_CATALOG_AT_PROMPT_END", "0"
@@ -143,7 +143,11 @@ LOCAL_MODEL_CAPABILITIES = {
     model_id: {
         "auto_compact_token_limit": 180_000,
         "context_window": 200_000 if "luna" in model_id else 272_000,
-        "display_name": model_id.removesuffix("-excel").upper().replace("GPT-", "GPT "),
+        "display_name": {
+            "gpt-5.6-luna-excel": "5.6-Luna Excel",
+            "gpt-5.6-terra-excel": "5.6-Terra Excel",
+            "gpt-5.6-sol-excel": "5.6-Sol Excel",
+        }.get(model_id, model_id.removesuffix("-excel").upper().replace("GPT-", "GPT ")),
         "input_modalities": ["text"],
         "max_context_window": 200_000 if "luna" in model_id else 272_000,
         "messages_endpoint_supported": False,
@@ -716,7 +720,7 @@ def _client_tool_protocol_instructions(source: dict) -> str:
 
 
 def _client_tool_protocol_reminder(source: dict) -> str:
-    """Compact recency cue that stands in for the full catalog at the tail.
+    """Compact protocol cue that stays inside the cached prompt prefix.
 
     The catalog itself is ~3.5k tokens.  While it sat at the end of the prompt
     it re-billed as fresh input on *every* turn: the upstream prompt cache can
@@ -724,8 +728,10 @@ def _client_tool_protocol_reminder(source: dict) -> str:
     new history in front of a trailing catalog puts that divergence right at
     the catalog's first byte.  Wire captures showed a hard floor of ~3.8k fresh
     input tokens per request for exactly that reason.  So the catalog moved
-    into the cached prefix and this reminder - a couple of hundred bytes -
-    carries the recency that the original A/B replays showed the model needs.
+    into the cached prefix. This reminder must stay there too: appending it
+    after conversation history would make the next request insert new items
+    before the previous request's final item and break the strict extension
+    needed for the upstream cache to reuse the growing conversation.
     """
     allowed_tools = client_tool_types(source)
     if not allowed_tools:
@@ -1494,12 +1500,12 @@ def prepare_responses_body(
     else:
         prologue.append(catalog)
         reminder = _client_tool_protocol_reminder(source)
-        input_items = prologue + input_items
         if reminder:
-            input_items = _append_before_terminal_compaction_trigger(
-                input_items,
-                [_message_item("developer", reminder)],
-            )
+            # Stable protocol instructions must precede conversation history.
+            # A trailing reminder would become an insertion point on the next
+            # turn and force the upstream cache to stop at that earlier byte.
+            prologue.append(_message_item("developer", reminder))
+        input_items = prologue + input_items
     output["input"] = input_items
 
     cache_key = _cache_key(source)

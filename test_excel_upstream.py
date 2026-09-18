@@ -104,7 +104,7 @@ class ExcelUpstreamTests(unittest.TestCase):
         self.assertIn("inner name is never run_officejs", tool_prompt)
         self.assertIn('\"name\":\"exec_command\"', tool_prompt)
         self.assertIn('"name":"demo"', tool_prompt)
-        self.assertEqual(body["input"][2]["role"], "user")
+        self.assertEqual(body["input"][3]["role"], "user")
         self.assertNotIn("tools", body)
         self.assertNotIn("include", body)
         self.assertNotIn("text", body)
@@ -802,7 +802,7 @@ class ExcelUpstreamTests(unittest.TestCase):
             "tools-excel-core-2026-06-16-3af59f22",
         )
 
-    def test_catalog_leads_and_only_a_compact_reminder_trails(self):
+    def test_catalog_and_reminder_lead_the_cached_prefix(self):
         body = excel_upstream.prepare_responses_body(
             {
                 "model": "gpt-5.6-sol-excel",
@@ -818,15 +818,15 @@ class ExcelUpstreamTests(unittest.TestCase):
         )
         catalog = body["input"][0]["content"][0]["text"]
         self.assertIn('"name":"demo"', catalog)
-        last = body["input"][-1]
-        self.assertEqual(last["role"], "developer")
-        reminder = last["content"][0]["text"]
+        reminder_item = body["input"][1]
+        self.assertEqual(reminder_item["role"], "developer")
+        reminder = reminder_item["content"][0]["text"]
         self.assertIn("run_officejs", reminder)
         self.assertIn("functions.run_officejs", reminder)
         self.assertIn("Never set the inner name", reminder)
         self.assertIn("demo", reminder)
-        # The trailing message re-bills on every turn, so it must stay small
-        # relative to the catalog it replaces.
+        self.assertEqual(body["input"][-1]["role"], "user")
+        # Keep the compact cue small relative to the full catalog.
         self.assertLess(len(reminder), len(catalog) / 2)
 
     def test_protocol_reminder_clarifies_custom_transport_input(self):
@@ -878,7 +878,7 @@ class ExcelUpstreamTests(unittest.TestCase):
         self.assertIn('"tool":"js"', catalog)
         self.assertIn('"required":["code"]', catalog)
         self.assertIn("Control desktop applications.", catalog)
-        self.assertIn("computer_use.js", body["input"][-1]["content"][0]["text"])
+        self.assertIn("computer_use.js", body["input"][1]["content"][0]["text"])
 
         tool_call = excel_upstream.extract_native_client_tool_call(
             {
@@ -927,10 +927,10 @@ class ExcelUpstreamTests(unittest.TestCase):
         )
 
         self.assertEqual(body["input"][-1], {"type": "compaction_trigger"})
-        self.assertEqual(body["input"][-2]["role"], "developer")
+        self.assertEqual(body["input"][1]["role"], "developer")
         self.assertIn(
             "run_officejs",
-            body["input"][-2]["content"][0]["text"],
+            body["input"][1]["content"][0]["text"],
         )
 
     def test_catalog_is_the_only_message_without_tools(self):
@@ -978,12 +978,9 @@ class ExcelUpstreamTests(unittest.TestCase):
             }
         )
 
-        # Everything the first turn sent, minus its trailing reminder, must
-        # still be a byte-identical prefix of the second turn: that prefix is
-        # exactly what the upstream prompt cache can reuse.
-        first_prefix = first["input"][:-1]
-        self.assertEqual(second["input"][: len(first_prefix)], first_prefix)
-        self.assertEqual(first["input"][-1], second["input"][-1])
+        # The second turn must be a strict extension of the first turn. That
+        # is the prefix shape the upstream prompt cache can reuse.
+        self.assertEqual(second["input"][: len(first["input"])], first["input"])
 
     def test_client_turn_ids_do_not_break_shared_prompt_prefix(self):
         def source(turn_id, task, cache_key):
