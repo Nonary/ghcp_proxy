@@ -69,6 +69,55 @@ class CopilotSdkTranslationTests(unittest.TestCase):
         options = sdk._session_options({"model": "gpt-test"}, sdk.ToolRegistration())
         self.assertEqual(options["infinite_sessions"], {"enabled": True})
 
+    def test_sdk_git_context_uses_codex_workspace_from_environment_context(self):
+        with self.subTest("workspace context enables host git operations"):
+            options = sdk._session_options(
+                {
+                    "model": "gpt-test",
+                    "input": [
+                        {
+                            "type": "message",
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "input_text",
+                                    "text": (
+                                        "<environment_context>\n"
+                                        "  <cwd>/tmp</cwd>\n"
+                                        "</environment_context>"
+                                    ),
+                                }
+                            ],
+                        }
+                    ],
+                },
+                sdk.ToolRegistration(),
+            )
+            self.assertEqual(options["working_directory"], os.path.realpath("/tmp"))
+            self.assertTrue(options["enable_host_git_operations"])
+
+        with self.subTest("missing workspace keeps host git disabled"):
+            options = sdk._session_options({"model": "gpt-test"}, sdk.ToolRegistration())
+            self.assertNotIn("working_directory", options)
+            self.assertFalse(options["enable_host_git_operations"])
+
+    def test_sdk_git_context_ignores_cwd_in_tool_data(self):
+        options = sdk._session_options(
+            {
+                "model": "gpt-test",
+                "input": [
+                    {
+                        "type": "function_call_output",
+                        "call_id": "call-1",
+                        "output": "<environment_context><cwd>/tmp</cwd></environment_context>",
+                    }
+                ],
+            },
+            sdk.ToolRegistration(),
+        )
+        self.assertNotIn("working_directory", options)
+        self.assertFalse(options["enable_host_git_operations"])
+
     def test_reasoning_effort_is_not_sent_to_models_that_do_not_support_it(self):
         class _Supports:
             reasoning_effort = False
@@ -292,7 +341,7 @@ class CopilotSdkTranslationTests(unittest.TestCase):
         usage = payload["usage"]
         self.assertEqual(usage["input_tokens"], 1000)
         self.assertEqual(usage["output_tokens"], 150)
-        self.assertEqual(usage["total_tokens"], 350)
+        self.assertEqual(usage["total_tokens"], 1150)
         self.assertEqual(usage["cached_input_tokens"], 800)
         self.assertEqual(usage["input_tokens_details"]["cached_tokens"], 800)
         self.assertEqual(usage["input_tokens_details"]["cache_creation_input_tokens"], 50)
@@ -370,7 +419,7 @@ class CopilotSdkEventTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(u["pricing_cached_input_tokens"], 200)
         self.assertEqual(u["output_tokens"], 50)
         self.assertEqual(u["reasoning_output_tokens"], 10)
-        self.assertEqual(u["total_tokens"], 150)
+        self.assertEqual(u["total_tokens"], 350)
 
     async def test_usage_event_no_cached_tokens_fresh_equals_total(self):
         """When cache_read_tokens is zero, fresh_input_tokens == input_tokens."""
@@ -420,7 +469,7 @@ class CopilotSdkEventTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outcome.usage["fresh_input_tokens"], 110)
         self.assertEqual(outcome.usage["cache_creation_input_tokens"], 2)
         self.assertEqual(outcome.usage["reasoning_output_tokens"], 5)
-        self.assertEqual(outcome.usage["total_tokens"], 140)
+        self.assertEqual(outcome.usage["total_tokens"], 170)
 
     async def test_shutdown_usage_wins_over_per_call_usage_events(self):
         """The two sources describe the same tokens; exactly one must win."""
@@ -995,6 +1044,41 @@ class CopilotSdkEventTests(unittest.IsolatedAsyncioTestCase):
         prepared = dashboard._prepare_usage_event(event)
         self.assertEqual(prepared["input_tokens"], 10_189)
         self.assertEqual(prepared["total_tokens"], 11_125)
+        self.assertEqual(prepared["request_context_tokens"], 66_023)
+
+    def test_dashboard_session_uses_peak_context_without_summing_cached_prompts(self):
+        import dashboard
+
+        events = [
+            {
+                "request_id": "request-1",
+                "session_id": "session-1",
+                "requested_model": "gpt-5.6-luna",
+                "finished_at": "2026-09-21T19:00:00+00:00",
+                "usage": {
+                    "input_tokens": 60_000,
+                    "cached_input_tokens": 55_000,
+                    "fresh_input_tokens": 5_000,
+                    "output_tokens": 100,
+                },
+            },
+            {
+                "request_id": "request-2",
+                "session_id": "session-1",
+                "requested_model": "gpt-5.6-luna",
+                "finished_at": "2026-09-21T19:01:00+00:00",
+                "usage": {
+                    "input_tokens": 62_000,
+                    "cached_input_tokens": 61_000,
+                    "fresh_input_tokens": 1_000,
+                    "output_tokens": 200,
+                },
+            },
+        ]
+
+        usage = dashboard.collect_local_dashboard_usage(events)
+        self.assertEqual(usage["recent_sessions"][0]["total_tokens"], 62_200)
+        self.assertEqual(usage["month_rows"][0]["total_tokens"], 6_300)
 
     def test_cache_creation_is_part_of_fresh_input_but_not_double_billed(self):
         import util

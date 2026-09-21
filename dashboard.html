@@ -2291,7 +2291,7 @@
           <div style="overflow-x:auto;">
             <table class="req-table">
               <thead>
-                <tr><th>Source</th><th>Session</th><th>Model</th><th>Last Activity</th><th>Duration</th><th>Activity</th><th>Tokens</th><th>Cost</th></tr>
+                <tr><th>Source</th><th>Session</th><th>Model</th><th>Last Activity</th><th>Duration</th><th>Activity</th><th>Peak Context</th><th>Cost</th></tr>
               </thead>
               <tbody>
                 <tr v-for="row in filteredSessions" :key="row.session_key"
@@ -2330,7 +2330,7 @@
             </div>
             <div class="subtle" style="text-align:right; line-height:1.5;">
               <div>{{ integer(selectedSession.session_request_count || selectedSession.request_count) }} {{ sessionActivityUnit(selectedSession) }} · {{ shortDuration(selectedSession.wall_duration_ms) }} wall · {{ shortDuration(selectedSession.api_duration_ms) }} {{ sessionDurationMetricLabel(selectedSession) }}</div>
-              <div>{{ compact(selectedSession.total_tokens) }} tokens · <span class="cost-inline">{{ rowCostLabel(selectedSession) }} · {{ money(selectedSession.cost_usd) }}</span></div>
+              <div>{{ compact(selectedSession.total_tokens) }} peak context tokens · <span class="cost-inline">{{ rowCostLabel(selectedSession) }} · {{ money(selectedSession.cost_usd) }}</span></div>
               <div class="cost-breakdown-inline">{{ costBreakdownLabel(selectedSession) }}</div>
               <div v-if="selectedSession.first_activity">First {{ shortStamp(selectedSession.first_activity) }} · Last {{ shortStamp(selectedSession.last_activity) }}</div>
             </div>

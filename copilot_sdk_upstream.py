@@ -79,6 +79,10 @@ _VALID_TOOL_NAME = re.compile(r"^[A-Za-z0-9_-]+$")
 _TURN_TIMEOUT_SECONDS = float(os.environ.get("GHCP_UPSTREAM_TIMEOUT_SECONDS", "1800") or 1800)
 _KEEPALIVE_INTERVAL_SECONDS = 15.0
 _PARALLEL_TOOL_SETTLE_SECONDS = 0.5
+_ENVIRONMENT_CONTEXT_RE = re.compile(
+    r"<environment_context\b[^>]*>.*?<cwd>\s*(?P<cwd>[^<\r\n]+?)\s*</cwd>.*?</environment_context>",
+    re.IGNORECASE | re.DOTALL,
+)
 _SDK_STATE_DIR = os.path.join(TOKEN_DIR, "copilot-sdk")
 _SESSION_LEDGER_NAME = "proxy-sessions.json"
 _SESSION_ALIASES_NAME = "proxy-session-aliases.json"
@@ -825,6 +829,63 @@ def _reasoning_summary(body: dict) -> str:
     return "detailed"
 
 
+def _input_text_fragments(value: Any):
+    """Yield text fields from Responses input items without flattening tool data.
+
+    Codex sends the active workspace in a user ``<environment_context>`` item.
+    Keeping this traversal limited to message content avoids treating an
+    arbitrary ``<cwd>`` string in a tool result or function argument as the
+    workspace for host Git context.
+    """
+    if isinstance(value, str):
+        yield value
+        return
+    if isinstance(value, list):
+        for item in value:
+            yield from _input_text_fragments(item)
+        return
+    if not isinstance(value, dict):
+        return
+
+    if value.get("type") == "message" or value.get("role") in {
+        "user",
+        "developer",
+        "system",
+    }:
+        yield from _input_text_fragments(value.get("content"))
+        return
+    if value.get("type") in {"input_text", "output_text", "text"}:
+        text = value.get("text")
+        if isinstance(text, str):
+            yield text
+
+
+def _workspace_from_request(body: dict) -> str | None:
+    """Return the existing workspace advertised by Codex, if present.
+
+    The proxy process is normally started from the proxy checkout, while the
+    desktop client can use the same proxy for any open workspace.  The SDK's
+    host Git setting is session-scoped, so using ``os.getcwd()`` here would
+    make Git context resolve against the wrong repository.  Only accept an
+    absolute, existing directory from Codex's structured environment context;
+    otherwise leave host Git operations disabled rather than guessing.
+    """
+    if not isinstance(body, dict):
+        return None
+
+    matches: list[str] = []
+    for fragment in _input_text_fragments(body.get("input")):
+        matches.extend(
+            match.group("cwd").strip()
+            for match in _ENVIRONMENT_CONTEXT_RE.finditer(fragment)
+        )
+    for candidate in reversed(matches):
+        if not os.path.isabs(candidate) or not os.path.isdir(candidate):
+            continue
+        return os.path.realpath(candidate)
+    return None
+
+
 def _session_options(
     body: dict,
     registration: ToolRegistration,
@@ -834,6 +895,7 @@ def _session_options(
     instructions = body.get("instructions")
     if reasoning_effort is ...:
         reasoning_effort = _reasoning_effort(body)
+    working_directory = _workspace_from_request(body)
     options: dict[str, Any] = {
         "model": body.get("model") if isinstance(body.get("model"), str) else None,
         "reasoning_effort": reasoning_effort,
@@ -858,8 +920,16 @@ def _session_options(
         "skip_custom_instructions": True,
         "enable_skills": False,
         "enable_file_hooks": False,
-        "enable_host_git_operations": False,
+        # ChatGPT's commit UI performs the actual commit through the local
+        # Codex app-server.  The SDK still needs workspace-scoped Git context
+        # for model turns such as commit-message generation.  Do not enable it
+        # without an explicit workspace: this proxy is itself a Git checkout,
+        # and falling back to os.getcwd() would leak the proxy repo's context
+        # into an unrelated desktop workspace.
+        "enable_host_git_operations": working_directory is not None,
     }
+    if working_directory is not None:
+        options["working_directory"] = working_directory
     if isinstance(instructions, str) and instructions:
         options["system_message"] = {"mode": "replace", "content": instructions}
     return {key: value for key, value in options.items() if value is not None}
@@ -1541,13 +1611,11 @@ def _format_client_usage(usage: dict[str, int] | None) -> dict[str, Any]:
         )
         or 0
     )
-    # Preserve gross input and cache details for Responses API clients, while
-    # reporting only fresh input plus output in the user-visible total.  Cache
-    # writes are part of fresh input; cache reads are excluded.
-    fresh_input_tokens = usage.get("fresh_input_tokens")
-    if fresh_input_tokens is None:
-        fresh_input_tokens = max(0, input_tokens - cached_tokens)
-    total_tokens = max(0, int(fresh_input_tokens or 0)) + output_tokens
+    # Responses API ``total_tokens`` is the gross request total.  Cached input
+    # remains part of the model's context window even though it is priced at a
+    # different rate.  Replacing it with fresh input made a 60k-token request
+    # look like a ~1k-token request to clients such as Codex and Excel.
+    total_tokens = max(0, input_tokens) + max(0, output_tokens)
 
     input_details: dict[str, int] = {"cached_tokens": cached_tokens}
     if cache_creation_tokens:
