@@ -992,6 +992,64 @@ class CopilotSdkEventTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(completed["output"][1]["id"], message_added["item"]["id"])
         self.assertEqual(completed["output"][1]["type"], "message")
 
+    async def test_stream_emits_sequential_reasoning_completions_for_codex_desktop(self):
+        session = _FakeSession()
+
+        async def dispatch():
+            session.emit(
+                "assistant.reasoning_delta",
+                AssistantReasoningDeltaData(delta_content="first", reasoning_id="r-1"),
+            )
+            session.emit(
+                "assistant.reasoning_delta",
+                AssistantReasoningDeltaData(delta_content="second", reasoning_id="r-1"),
+            )
+            session.emit(
+                "assistant.message_delta",
+                AssistantMessageDeltaData(delta_content="reply", message_id="m-1"),
+            )
+            session.emit("session.idle", SessionIdleData())
+
+        events: list[tuple[str, dict]] = []
+        async for chunk in sdk._stream_turn(
+            _ConnectedRequest(),
+            {
+                "model": "gpt-test",
+                "stream_options": {"reasoning_summary_delivery": "sequential_cutoff"},
+            },
+            session,
+            dispatch,
+            sdk.ToolRegistration(),
+        ):
+            text = chunk.decode()
+            for block in text.strip().split("\n\n"):
+                if not block.strip():
+                    continue
+                lines = block.splitlines()
+                event_name = lines[0].replace("event: ", "").strip()
+                events.append((event_name, json.loads(lines[1].replace("data: ", ""))))
+
+        sequential_done = [
+            data
+            for name, data in events
+            if name == "response.reasoning_summary_text.done"
+        ]
+        self.assertEqual(
+            [data["text"] for data in sequential_done],
+            ["**Thinking**\n\nfirst", "second"],
+        )
+        self.assertEqual([data["summary_index"] for data in sequential_done], [0, 0])
+        self.assertNotIn(
+            "response.reasoning_summary_text.delta",
+            [name for name, _ in events],
+        )
+
+        completed = events[-1][1]["response"]
+        self.assertEqual(
+            completed["output"][0]["summary"],
+            [{"type": "summary_text", "text": "**Thinking**\n\nfirstsecond"}],
+        )
+
     def test_extract_shutdown_usage_prefers_token_details_over_model_metrics(self):
         """tokenDetails is the session-wide superset; modelMetrics undercounts."""
         usage = sdk._extract_shutdown_usage({

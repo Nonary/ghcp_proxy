@@ -1944,6 +1944,12 @@ async def _stream_turn(
     reasoning_output_index = 0
     saw_reasoning_delta = False
     reasoning_header_sent = False
+    stream_options = body.get("stream_options")
+    sequential_reasoning_summaries = (
+        isinstance(stream_options, dict)
+        and stream_options.get("reasoning_summary_delivery") == "sequential_cutoff"
+    )
+    emitted_sequential_summary = False
 
     message_started = False
     message_closed = False
@@ -1988,70 +1994,109 @@ async def _stream_turn(
         reasoning_started = True
         reasoning_output_index = output_index
         output_index += 1
-        return [
+        chunks = [
             _sse(
                 "response.output_item.added",
                 output_index=reasoning_output_index,
                 item=_reasoning_item("", item_id=outcome.reasoning_id, completed=False),
             ),
+        ]
+        chunks.append(
             _sse(
                 "response.reasoning_summary_part.added",
                 item_id=outcome.reasoning_id,
                 output_index=reasoning_output_index,
                 summary_index=0,
                 part={"type": "summary_text", "text": ""},
-            ),
-        ]
+            )
+        )
+        return chunks
 
     def emit_reasoning_done() -> list[bytes]:
         nonlocal reasoning_closed
         if not reasoning_started or reasoning_closed:
             return []
         reasoning_closed = True
-        return [
-            _sse(
-                "response.reasoning_summary_text.done",
-                item_id=outcome.reasoning_id,
-                output_index=reasoning_output_index,
-                summary_index=0,
-                text=outcome.reasoning,
-            ),
-            _sse(
-                "response.reasoning_summary_part.done",
-                item_id=outcome.reasoning_id,
-                output_index=reasoning_output_index,
-                summary_index=0,
-                part={"type": "summary_text", "text": outcome.reasoning},
-            ),
-            _sse(
-                "response.output_item.done",
-                output_index=reasoning_output_index,
-                item=_reasoning_item(outcome.reasoning, item_id=outcome.reasoning_id, completed=True),
-            ),
-        ]
+        chunks: list[bytes] = []
+        if not sequential_reasoning_summaries or not emitted_sequential_summary:
+            chunks.append(
+                _sse(
+                    "response.reasoning_summary_text.done",
+                    item_id=outcome.reasoning_id,
+                    output_index=reasoning_output_index,
+                    summary_index=0,
+                    text=outcome.reasoning,
+                )
+            )
+        chunks.extend(
+            [
+                _sse(
+                    "response.reasoning_summary_part.done",
+                    item_id=outcome.reasoning_id,
+                    output_index=reasoning_output_index,
+                    summary_index=0,
+                    part={"type": "summary_text", "text": outcome.reasoning},
+                ),
+                _sse(
+                    "response.output_item.done",
+                    output_index=reasoning_output_index,
+                    item=_reasoning_item(
+                        outcome.reasoning,
+                        item_id=outcome.reasoning_id,
+                        completed=True,
+                    ),
+                ),
+            ]
+        )
+        return chunks
 
     def emit_reasoning_delta(delta: str) -> list[bytes]:
         """Emit ChatGPT-compatible summary deltas and retain normalized text."""
-        nonlocal reasoning_header_sent
+        nonlocal emitted_sequential_summary, reasoning_header_sent
         if not isinstance(delta, str) or not delta:
             return []
 
         chunks: list[bytes] = []
+        displayed_delta = delta
+        header_delta = ""
         if not reasoning_header_sent:
             reasoning_header_sent = True
             if not delta.lstrip().startswith("**") and not delta.lstrip().startswith("#"):
                 header = format_translation._CODEX_THINKING_SUMMARY_HEADER
                 outcome.reasoning += header
-                chunks.append(
-                    _sse(
-                        "response.reasoning_summary_text.delta",
-                        item_id=outcome.reasoning_id,
-                        output_index=reasoning_output_index,
-                        summary_index=0,
-                        delta=header,
-                    )
-                )
+                header_delta = header
+                displayed_delta = header + delta
         outcome.reasoning += delta
+        if sequential_reasoning_summaries:
+            # The native Codex client ignores summary `.delta` events when
+            # `reasoning_summary_delivery` is `sequential_cutoff`.  It treats
+            # the `.done` text value as a visible reasoning update, so
+            # forward each SDK delta instead of buffering all reasoning until
+            # the turn finishes.
+            emitted_sequential_summary = True
+            chunks.append(
+                _sse(
+                    "response.reasoning_summary_text.done",
+                    item_id=outcome.reasoning_id,
+                    output_index=reasoning_output_index,
+                    # Copilot SDK deltas are fragments of one summary, not
+                    # independent summary sections. Keep them on index zero
+                    # so the desktop client appends them to one live item.
+                    summary_index=0,
+                    text=displayed_delta,
+                )
+            )
+            return chunks
+        if header_delta:
+            chunks.append(
+                _sse(
+                    "response.reasoning_summary_text.delta",
+                    item_id=outcome.reasoning_id,
+                    output_index=reasoning_output_index,
+                    summary_index=0,
+                    delta=header_delta,
+                )
+            )
         chunks.append(
             _sse(
                 "response.reasoning_summary_text.delta",
