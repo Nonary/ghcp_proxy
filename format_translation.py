@@ -2345,6 +2345,16 @@ def sanitize_input(
             result.append(item)
             continue
 
+        # Codex Electron includes this client-only envelope on replayed input
+        # items.  Its contents (including executed tool-call details and turn
+        # IDs) are rewritten after a tool completes, so forwarding it changes
+        # historical function_call_output items on the next request.  It is
+        # not part of the Responses item schema and must never influence the
+        # upstream prompt-cache prefix, including on native Codex passthrough.
+        if "internal_chat_message_metadata_passthrough" in item:
+            item = dict(item)
+            item.pop("internal_chat_message_metadata_passthrough", None)
+
         if _is_subagent_notification_message(item):
             continue
 

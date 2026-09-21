@@ -56,6 +56,38 @@ class ReasoningTranslationTests(unittest.IsolatedAsyncioTestCase):
             [{"type": "summary_text", "text": "**Thinking**\n\n*Thinking process completed.*"}],
         )
 
+    def test_native_responses_sanitization_keeps_replayed_tool_output_stable(self):
+        def tool_output(turn_id, executed_command):
+            return {
+                "type": "function_call_output",
+                "id": "fco_1",
+                "call_id": "call_1",
+                "output": "done",
+                "internal_chat_message_metadata_passthrough": {
+                    "turn_id": turn_id,
+                    "executed_tool_calls": [{"arguments": {"cmd": executed_command}}],
+                },
+            }
+
+        first = format_translation.sanitize_input(
+            [tool_output("turn-one", "pwd")],
+            native_responses_passthrough=True,
+        )
+        second = format_translation.sanitize_input(
+            [
+                tool_output("turn-two", "git status"),
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "continue"}],
+                },
+            ],
+            native_responses_passthrough=True,
+        )
+
+        self.assertEqual(second[: len(first)], first)
+        self.assertNotIn("internal_chat_message_metadata_passthrough", first[0])
+
     def test_chat_completion_to_response_extracts_reasoning(self):
         payload = {
             "id": "chatcmpl-1",
