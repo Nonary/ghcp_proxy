@@ -900,6 +900,7 @@ class CopilotSdkEventTests(unittest.IsolatedAsyncioTestCase):
             "response.output_item.added",
             "response.reasoning_summary_part.added",
             "response.reasoning_summary_text.delta",
+            "response.reasoning_summary_text.delta",
             "response.reasoning_summary_text.done",
             "response.reasoning_summary_part.done",
             "response.output_item.done",
@@ -913,6 +914,13 @@ class CopilotSdkEventTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertEqual(event_names, expected_names)
 
+        reasoning_deltas = [
+            data["delta"]
+            for name, data in events
+            if name == "response.reasoning_summary_text.delta"
+        ]
+        self.assertEqual(reasoning_deltas, ["**Thinking**\n\n", "thought"])
+
         # Verify reasoning item has output_index 0 and message has output_index 1
         reasoning_added = next(d for name, d in events if name == "response.output_item.added" and d["item"]["type"] == "reasoning")
         message_added = next(d for name, d in events if name == "response.output_item.added" and d["item"]["type"] == "message")
@@ -924,6 +932,14 @@ class CopilotSdkEventTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(completed["output"]), 2)
         self.assertEqual(completed["output"][0]["id"], reasoning_added["item"]["id"])
         self.assertEqual(completed["output"][0]["type"], "reasoning")
+        self.assertEqual(
+            completed["output"][0]["summary"],
+            [{"type": "summary_text", "text": "**Thinking**\n\nthought"}],
+        )
+        self.assertEqual(
+            completed["output"][0]["content"],
+            [{"type": "reasoning_text", "text": "**Thinking**\n\nthought"}],
+        )
         self.assertEqual(completed["output"][1]["id"], message_added["item"]["id"])
         self.assertEqual(completed["output"][1]["type"], "message")
 

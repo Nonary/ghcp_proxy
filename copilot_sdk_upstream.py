@@ -1875,6 +1875,7 @@ async def _stream_turn(
     reasoning_closed = False
     reasoning_output_index = 0
     saw_reasoning_delta = False
+    reasoning_header_sent = False
 
     message_started = False
     message_closed = False
@@ -1960,6 +1961,39 @@ async def _stream_turn(
                 item=_reasoning_item(outcome.reasoning, item_id=outcome.reasoning_id, completed=True),
             ),
         ]
+
+    def emit_reasoning_delta(delta: str) -> list[bytes]:
+        """Emit ChatGPT-compatible summary deltas and retain normalized text."""
+        nonlocal reasoning_header_sent
+        if not isinstance(delta, str) or not delta:
+            return []
+
+        chunks: list[bytes] = []
+        if not reasoning_header_sent:
+            reasoning_header_sent = True
+            if not delta.lstrip().startswith("**") and not delta.lstrip().startswith("#"):
+                header = format_translation._CODEX_THINKING_SUMMARY_HEADER
+                outcome.reasoning += header
+                chunks.append(
+                    _sse(
+                        "response.reasoning_summary_text.delta",
+                        item_id=outcome.reasoning_id,
+                        output_index=reasoning_output_index,
+                        summary_index=0,
+                        delta=header,
+                    )
+                )
+        outcome.reasoning += delta
+        chunks.append(
+            _sse(
+                "response.reasoning_summary_text.delta",
+                item_id=outcome.reasoning_id,
+                output_index=reasoning_output_index,
+                summary_index=0,
+                delta=delta,
+            )
+        )
+        return chunks
 
     def emit_text_start() -> list[bytes]:
         nonlocal message_started, message_output_index, output_index
@@ -2065,82 +2099,46 @@ async def _stream_turn(
             if isinstance(data, AssistantReasoningDeltaData):
                 for chunk in emit_reasoning_start():
                     yield chunk
-                outcome.reasoning += data.delta_content
                 saw_reasoning_delta = True
-                yield _sse(
-                    "response.reasoning_summary_text.delta",
-                    item_id=outcome.reasoning_id,
-                    output_index=reasoning_output_index,
-                    summary_index=0,
-                    delta=data.delta_content,
-                )
+                for chunk in emit_reasoning_delta(data.delta_content):
+                    yield chunk
             elif isinstance(data, AssistantReasoningData):
                 if not saw_reasoning_delta and data.content:
                     for chunk in emit_reasoning_start():
                         yield chunk
-                    outcome.reasoning = data.content
-                    yield _sse(
-                        "response.reasoning_summary_text.delta",
-                        item_id=outcome.reasoning_id,
-                        output_index=reasoning_output_index,
-                        summary_index=0,
-                        delta=data.content,
-                    )
+                    for chunk in emit_reasoning_delta(data.content):
+                        yield chunk
             elif isinstance(data, AssistantIntentData):
                 if not saw_reasoning_delta and not outcome.reasoning and data.intent:
                     for chunk in emit_reasoning_start():
                         yield chunk
-                    outcome.reasoning = data.intent
-                    yield _sse(
-                        "response.reasoning_summary_text.delta",
-                        item_id=outcome.reasoning_id,
-                        output_index=reasoning_output_index,
-                        summary_index=0,
-                        delta=data.intent,
-                    )
+                    for chunk in emit_reasoning_delta(data.intent):
+                        yield chunk
             elif (SubagentStartedData is not None and isinstance(data, SubagentStartedData)) or _event_name(event) == "subagent.started":
                 agent_name = getattr(data, "agent_display_name", None) or getattr(data, "agent_name", "subagent")
                 notice = f"[Subagent '{agent_name}' started]\n"
                 for chunk in emit_reasoning_start():
                     yield chunk
-                outcome.reasoning += notice
                 saw_reasoning_delta = True
-                yield _sse(
-                    "response.reasoning_summary_text.delta",
-                    item_id=outcome.reasoning_id,
-                    output_index=reasoning_output_index,
-                    summary_index=0,
-                    delta=notice,
-                )
+                for chunk in emit_reasoning_delta(notice):
+                    yield chunk
             elif (SubagentCompletedData is not None and isinstance(data, SubagentCompletedData)) or _event_name(event) == "subagent.completed":
                 agent_name = getattr(data, "agent_display_name", None) or getattr(data, "agent_name", "subagent")
                 notice = f"[Subagent '{agent_name}' completed]\n"
                 for chunk in emit_reasoning_start():
                     yield chunk
-                outcome.reasoning += notice
                 saw_reasoning_delta = True
-                yield _sse(
-                    "response.reasoning_summary_text.delta",
-                    item_id=outcome.reasoning_id,
-                    output_index=reasoning_output_index,
-                    summary_index=0,
-                    delta=notice,
-                )
+                for chunk in emit_reasoning_delta(notice):
+                    yield chunk
             elif (SubagentFailedData is not None and isinstance(data, SubagentFailedData)) or _event_name(event) == "subagent.failed":
                 agent_name = getattr(data, "agent_display_name", None) or getattr(data, "agent_name", "subagent")
                 err_msg = getattr(data, "error", "error")
                 notice = f"[Subagent '{agent_name}' failed: {err_msg}]\n"
                 for chunk in emit_reasoning_start():
                     yield chunk
-                outcome.reasoning += notice
                 saw_reasoning_delta = True
-                yield _sse(
-                    "response.reasoning_summary_text.delta",
-                    item_id=outcome.reasoning_id,
-                    output_index=reasoning_output_index,
-                    summary_index=0,
-                    delta=notice,
-                )
+                for chunk in emit_reasoning_delta(notice):
+                    yield chunk
             elif (
                 (SessionCompactionCompleteData is not None and isinstance(data, SessionCompactionCompleteData))
                 or _event_name(event) in {"session.compaction_start", "session.compaction_complete"}
@@ -2151,15 +2149,9 @@ async def _stream_turn(
                 if _is_subagent_message_event(event, data):
                     for chunk in emit_reasoning_start():
                         yield chunk
-                    outcome.reasoning += data.delta_content
                     saw_reasoning_delta = True
-                    yield _sse(
-                        "response.reasoning_summary_text.delta",
-                        item_id=outcome.reasoning_id,
-                        output_index=reasoning_output_index,
-                        summary_index=0,
-                        delta=data.delta_content,
-                    )
+                    for chunk in emit_reasoning_delta(data.delta_content):
+                        yield chunk
                 else:
                     for chunk in emit_text_start():
                         yield chunk
@@ -2179,26 +2171,14 @@ async def _stream_turn(
                         for chunk in emit_reasoning_start():
                             yield chunk
                         reasoning_text = message_reasoning or data.content
-                        outcome.reasoning += reasoning_text
-                        yield _sse(
-                            "response.reasoning_summary_text.delta",
-                            item_id=outcome.reasoning_id,
-                            output_index=reasoning_output_index,
-                            summary_index=0,
-                            delta=reasoning_text,
-                        )
+                        for chunk in emit_reasoning_delta(reasoning_text):
+                            yield chunk
                 else:
                     if not saw_reasoning_delta and message_reasoning:
                         for chunk in emit_reasoning_start():
                             yield chunk
-                        outcome.reasoning += message_reasoning
-                        yield _sse(
-                            "response.reasoning_summary_text.delta",
-                            item_id=outcome.reasoning_id,
-                            output_index=reasoning_output_index,
-                            summary_index=0,
-                            delta=message_reasoning,
-                        )
+                        for chunk in emit_reasoning_delta(message_reasoning):
+                            yield chunk
                     if not saw_delta and data.content:
                         for chunk in emit_text_start():
                             yield chunk
