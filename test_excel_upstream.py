@@ -515,6 +515,38 @@ class ExcelUpstreamTests(unittest.TestCase):
         self.assertEqual(replay[0], native)
         self.assertEqual(replay[1]["output"], "ok")
 
+    def test_run_officejs_transport_repairs_invalid_shell_backslashes(self):
+        source = {
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "exec_command",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"cmd": {"type": "string"}},
+                        "required": ["cmd"],
+                    },
+                }
+            ]
+        }
+        malformed_inner = r'{"name":"exec_command","arguments":{"cmd":"rg -n \( pattern"}}'
+        native = {
+            "type": "function_call",
+            "call_id": "call_repair_invalid_backslash",
+            "name": "run_officejs",
+            "arguments": json.dumps({"code": malformed_inner}),
+        }
+
+        tool_call = excel_upstream.extract_native_client_tool_call(
+            {"output": [native]}, source
+        )
+
+        self.assertEqual(tool_call["name"], "exec_command")
+        self.assertEqual(
+            json.loads(tool_call["arguments"]),
+            {"cmd": r"rg -n \( pattern"},
+        )
+
     def test_namespaced_run_officejs_transport_alias_is_accepted(self):
         source = {
             "tools": [
@@ -842,6 +874,30 @@ class ExcelUpstreamTests(unittest.TestCase):
         self.assertIn("transport exec_command", reminder)
         self.assertIn("Custom tools use input, not arguments", reminder)
         self.assertIn("never use arguments.patch", reminder)
+        self.assertIn("code field is not JavaScript", reminder)
+        self.assertIn("escape backslashes and quotes", reminder)
+
+    def test_unsupported_transport_output_becomes_actionable_guidance(self):
+        replay = excel_upstream.translate_input_items(
+            [
+                {
+                    "type": "function_call",
+                    "id": "fc_bad_transport",
+                    "call_id": "call_bad_transport",
+                    "name": "run_officejs",
+                    "arguments": "{}",
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_bad_transport",
+                    "output": "unsupported call: run_officejs",
+                },
+            ],
+            {"exec_command": "function"},
+        )
+
+        self.assertIn("transport envelope was malformed", replay[1]["output"])
+        self.assertNotEqual(replay[1]["output"], "unsupported call: run_officejs")
 
     def test_nested_plugin_tools_are_forwarded_in_catalog(self):
         source = {
