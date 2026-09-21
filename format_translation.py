@@ -11,6 +11,7 @@ import httpx
 from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse
 import effort_mapping
+import responses_replay_ids
 import util
 
 from constants import (
@@ -965,7 +966,7 @@ def _response_replay_status(source: dict) -> str | None:
 
 def _response_function_item_id(source: dict, call_id: str) -> str:
     del source
-    return f"fc_{call_id}"
+    return responses_replay_ids.function_item_id(call_id)
 
 
 def _chat_content_item_to_response_content(item: dict, *, role: str = "user") -> dict | None:
@@ -1456,7 +1457,7 @@ def chat_completion_to_response(payload: dict, fallback_model=None) -> dict:
             output.append(
                 {
                     "type": "function_call",
-                    "id": f"fc_{call_id}",
+                    "id": responses_replay_ids.function_item_id(call_id),
                     "call_id": call_id,
                     "name": function.get("name", ""),
                     "arguments": function.get("arguments", "") if isinstance(function.get("arguments"), str) else json.dumps(function.get("arguments", {}), separators=(",", ":"), ensure_ascii=False),

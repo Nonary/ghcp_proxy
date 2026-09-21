@@ -114,7 +114,7 @@ class ChatToResponsesStreamTranslator:
             output.append(
                 {
                     "type": "function_call",
-                    "id": f"fc_{tool.call_id}",
+                    "id": responses_replay_ids.function_item_id(tool.call_id),
                     "call_id": tool.call_id,
                     "name": tool.name,
                     "arguments": tool.arguments,
@@ -261,7 +261,7 @@ class ChatToResponsesStreamTranslator:
                     "output_index": state.output_index,
                     "item": {
                         "type": "function_call",
-                        "id": f"fc_{state.call_id}",
+                        "id": responses_replay_ids.function_item_id(state.call_id),
                         "call_id": state.call_id,
                         "name": state.name,
                         "arguments": "",
@@ -453,7 +453,7 @@ class ChatToResponsesStreamTranslator:
                     "output_index": tool_state.output_index,
                     "item": {
                         "type": "function_call",
-                        "id": f"fc_{tool_state.call_id}",
+                        "id": responses_replay_ids.function_item_id(tool_state.call_id),
                         "call_id": tool_state.call_id,
                         "name": tool_state.name,
                         "arguments": tool_state.arguments,
@@ -502,7 +502,7 @@ class ResponsesStreamIdSyncer:
         call_id = item.get("call_id")
         if not isinstance(call_id, str) or not call_id.strip():
             return None
-        return f"fc_{call_id.strip()}"
+        return responses_replay_ids.function_item_id(call_id.strip())
 
     def fix_event_data(self, event_name: str | None, data: str) -> str:
         if not data or data == "[DONE]":
@@ -1369,7 +1369,7 @@ class AnthropicToResponsesStreamTranslator:
         self._next_output_index += 1
         call_id = content_block.get("id") if isinstance(content_block.get("id"), str) else f"call_{uuid4().hex}"
         name = content_block.get("name") if isinstance(content_block.get("name"), str) else ""
-        item_id = f"fc_{call_id}"
+        item_id = responses_replay_ids.function_item_id(call_id)
         # Seed arguments from content_block.input when present so streams that
         # never emit input_json_delta still produce valid JSON arguments.
         seeded_input = content_block.get("input")

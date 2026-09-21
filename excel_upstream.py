@@ -23,6 +23,7 @@ from collections import OrderedDict
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from app_paths import user_state_dir
+import responses_replay_ids
 
 
 EXCEL_MODEL_UPSTREAMS = {
@@ -658,7 +659,7 @@ def extract_native_client_tool_call(
             "id": (
                 native_item_id
                 if isinstance(native_item_id, str) and native_item_id
-                else f"fc_{call_id}"
+                else responses_replay_ids.function_item_id(call_id)
             ),
             "call_id": call_id,
             "name": tool_info["name"],
@@ -873,7 +874,7 @@ def extract_client_tool_call(
         call_id = f"{CLIENT_MARKER_CALL_ID_PREFIX}{uuid4().hex}"
         return {
             "type": "function_call",
-            "id": f"fc_{call_id}",
+            "id": responses_replay_ids.function_item_id(call_id),
             "call_id": call_id,
             "name": name,
             "arguments": json.dumps(
@@ -1267,7 +1268,7 @@ def _normalized_tool_output(
         and call_id
         and normalized.get("type") == "function_call_output"
     ):
-        canonical_id = f"fc_{call_id}"
+        canonical_id = responses_replay_ids.function_item_id(call_id)
         if normalized.get("id") != canonical_id:
             normalized = {**normalized, "id": canonical_id}
     output_text = _item_text(normalized.get("output"))
@@ -1313,7 +1314,7 @@ def _fallback_transport_call(item: dict) -> dict:
     }
     return {
         "type": "function_call",
-        "id": f"fc_{call_id}",
+        "id": responses_replay_ids.function_item_id(call_id),
         "call_id": call_id,
         "name": CLIENT_TOOL_TRANSPORT_NAME,
         "arguments": json.dumps(

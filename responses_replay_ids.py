@@ -13,6 +13,7 @@ from request_headers import responses_replay_affinity_value
 
 _MAX_LINEAGE_STATES = 256
 _MAX_IDS_PER_STATE = 4096
+_MAX_RESPONSES_ITEM_ID_LENGTH = 64
 
 
 def _normalized_non_empty_string(value) -> str | None:
@@ -159,8 +160,13 @@ def _reasoning_fingerprint(item: dict) -> str | None:
     return _sha256_text(encrypted_content)
 
 
-def _function_item_id(call_id: str) -> str:
-    return f"fc_{call_id}"
+def function_item_id(call_id: str) -> str:
+    """Return a stable function item id within GHCP's 64-character limit."""
+    candidate = f"fc_{call_id}"
+    if len(candidate) <= _MAX_RESPONSES_ITEM_ID_LENGTH:
+        return candidate
+    digest_length = _MAX_RESPONSES_ITEM_ID_LENGTH - len("fc_")
+    return f"fc_{hashlib.sha256(call_id.encode('utf-8')).hexdigest()[:digest_length]}"
 
 
 def _trim_ordered_map(mapping: OrderedDict) -> None:
@@ -184,7 +190,7 @@ class ReplayIdState:
         return f"{fingerprint}:{ordinal}"
 
     def _remember_function_id_locked(self, call_id: str) -> None:
-        self._function_item_ids[call_id] = _function_item_id(call_id)
+        self._function_item_ids[call_id] = function_item_id(call_id)
         self._function_item_ids.move_to_end(call_id)
         _trim_ordered_map(self._function_item_ids)
 
@@ -298,7 +304,7 @@ class ReplayIdState:
             call_id = _normalized_non_empty_string(item.get("call_id"))
             if not call_id:
                 return None
-            return _function_item_id(call_id)
+            return function_item_id(call_id)
 
         if item_type == "reasoning":
             fingerprint = _reasoning_fingerprint(item)
@@ -338,7 +344,7 @@ class ReplayIdState:
                 if item_type in {"function_call", "function_call_output"}:
                     call_id = _normalized_non_empty_string(item.get("call_id"))
                     if call_id:
-                        canonical_id = _function_item_id(call_id)
+                        canonical_id = function_item_id(call_id)
                         if item_id != canonical_id:
                             item = {**item, "id": canonical_id}
                             item_id = canonical_id
