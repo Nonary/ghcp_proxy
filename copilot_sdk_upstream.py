@@ -1276,6 +1276,26 @@ def _event_name(event: Any) -> str:
     return getattr(value, "value", value) or ""
 
 
+def _is_subagent_message_event(event: Any, data: Any) -> bool:
+    """Return whether an assistant message belongs to a sub-agent.
+
+    Older SDKs marked sub-agent message deltas with
+    ``parent_tool_call_id`` on the payload.  Current SDKs mark the same
+    streaming events on the ``SessionEvent.agent_id`` envelope instead.
+    Treat either form as internal thought text rather than final output.
+    """
+    if getattr(data, "parent_tool_call_id", None):
+        return True
+    agent_id = getattr(event, "agent_id", None)
+    return isinstance(agent_id, str) and bool(agent_id.strip())
+
+
+def _assistant_message_reasoning_text(data: Any) -> str:
+    """Extract terminal reasoning text carried on ``assistant.message``."""
+    value = getattr(data, "reasoning_text", None)
+    return value if isinstance(value, str) else ""
+
+
 def _usage_from_event(data: Any) -> dict[str, int]:
     # ``input_tokens`` from AssistantUsageData is the *total* input (fresh +
     # cached).  Keep that raw figure for the Responses API breakdown, but use
@@ -1618,7 +1638,7 @@ async def _wait_for_outcome(
                 continue
             data = getattr(event, "data", None)
             if isinstance(data, AssistantMessageDeltaData):
-                if getattr(data, "parent_tool_call_id", None):
+                if _is_subagent_message_event(event, data):
                     outcome.reasoning += data.delta_content
                     saw_reasoning_delta = True
                 else:
@@ -1634,10 +1654,13 @@ async def _wait_for_outcome(
                 if not saw_reasoning_delta and not outcome.reasoning and data.intent:
                     outcome.reasoning = data.intent
             elif isinstance(data, AssistantMessageData):
-                if getattr(data, "parent_tool_call_id", None):
-                    if not saw_reasoning_delta and data.content:
-                        outcome.reasoning = data.content
+                message_reasoning = _assistant_message_reasoning_text(data)
+                if _is_subagent_message_event(event, data):
+                    if not saw_reasoning_delta and (message_reasoning or data.content):
+                        outcome.reasoning = message_reasoning or data.content
                 else:
+                    if not saw_reasoning_delta and message_reasoning:
+                        outcome.reasoning = message_reasoning
                     if not saw_delta:
                         outcome.text = data.content or outcome.text
             elif (
@@ -2028,12 +2051,15 @@ async def _stream_turn(
                     outcome.reasoning = data.content
                 continue
             if is_compact and isinstance(data, AssistantMessageDeltaData):
-                if not getattr(data, "parent_tool_call_id", None):
+                if not _is_subagent_message_event(event, data):
                     outcome.text += data.delta_content
                     saw_delta = True
                 continue
             if is_compact and isinstance(data, AssistantMessageData):
-                if not getattr(data, "parent_tool_call_id", None) and not saw_delta:
+                message_reasoning = _assistant_message_reasoning_text(data)
+                if not saw_reasoning_delta and message_reasoning:
+                    outcome.reasoning = message_reasoning
+                if not _is_subagent_message_event(event, data) and not saw_delta:
                     outcome.text = data.content or outcome.text
                 continue
             if isinstance(data, AssistantReasoningDeltaData):
@@ -2122,7 +2148,7 @@ async def _stream_turn(
                 # Internal bookkeeping, not downstream response text.
                 pass
             elif isinstance(data, AssistantMessageDeltaData):
-                if getattr(data, "parent_tool_call_id", None):
+                if _is_subagent_message_event(event, data):
                     for chunk in emit_reasoning_start():
                         yield chunk
                     outcome.reasoning += data.delta_content
@@ -2147,19 +2173,32 @@ async def _stream_turn(
                         delta=data.delta_content,
                     )
             elif isinstance(data, AssistantMessageData):
-                if getattr(data, "parent_tool_call_id", None):
-                    if not saw_reasoning_delta and data.content:
+                message_reasoning = _assistant_message_reasoning_text(data)
+                if _is_subagent_message_event(event, data):
+                    if not saw_reasoning_delta and (message_reasoning or data.content):
                         for chunk in emit_reasoning_start():
                             yield chunk
-                        outcome.reasoning += data.content
+                        reasoning_text = message_reasoning or data.content
+                        outcome.reasoning += reasoning_text
                         yield _sse(
                             "response.reasoning_summary_text.delta",
                             item_id=outcome.reasoning_id,
                             output_index=reasoning_output_index,
                             summary_index=0,
-                            delta=data.content,
+                            delta=reasoning_text,
                         )
                 else:
+                    if not saw_reasoning_delta and message_reasoning:
+                        for chunk in emit_reasoning_start():
+                            yield chunk
+                        outcome.reasoning += message_reasoning
+                        yield _sse(
+                            "response.reasoning_summary_text.delta",
+                            item_id=outcome.reasoning_id,
+                            output_index=reasoning_output_index,
+                            summary_index=0,
+                            delta=message_reasoning,
+                        )
                     if not saw_delta and data.content:
                         for chunk in emit_text_start():
                             yield chunk

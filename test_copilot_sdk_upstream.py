@@ -37,8 +37,12 @@ class _FakeSession:
 
         return unsubscribe
 
-    def emit(self, event_type, data):
-        event = SimpleNamespace(type=SimpleNamespace(value=event_type), data=data)
+    def emit(self, event_type, data, *, agent_id=None):
+        event = SimpleNamespace(
+            type=SimpleNamespace(value=event_type),
+            data=data,
+            agent_id=agent_id,
+        )
         for handler in list(self.handlers):
             handler(event)
 
@@ -1181,7 +1185,8 @@ class CopilotSdkEventTests(unittest.IsolatedAsyncioTestCase):
         async def dispatch():
             session.emit(
                 "assistant.message_delta",
-                AssistantMessageDeltaData(delta_content="subagent thought", message_id="msg-sub", parent_tool_call_id="call-sub"),
+                AssistantMessageDeltaData(delta_content="subagent thought", message_id="msg-sub"),
+                agent_id="subagent-1",
             )
             session.emit(
                 "assistant.message_delta",
@@ -1213,6 +1218,76 @@ class CopilotSdkEventTests(unittest.IsolatedAsyncioTestCase):
         # Check that main delta was emitted as output text delta
         text_deltas = [d.get("delta") for name, d in events if name == "response.output_text.delta"]
         self.assertIn("final output", text_deltas)
+
+    async def test_agent_scoped_subagent_delta_routes_to_reasoning(self):
+        session = _FakeSession()
+
+        async def dispatch():
+            session.emit(
+                "assistant.message_delta",
+                AssistantMessageDeltaData(delta_content="agent thought", message_id="msg-sub"),
+                agent_id="subagent-1",
+            )
+            session.emit(
+                "assistant.message_delta",
+                AssistantMessageDeltaData(delta_content="final answer", message_id="msg-main"),
+            )
+            session.emit("session.idle", SessionIdleData())
+
+        outcome = await sdk._wait_for_outcome(session, dispatch, sdk.ToolRegistration())
+        self.assertEqual(outcome.reasoning, "agent thought")
+        self.assertEqual(outcome.text, "final answer")
+
+    async def test_terminal_message_reasoning_text_reaches_stream_and_payload(self):
+        session = _FakeSession()
+
+        async def dispatch():
+            session.emit(
+                "assistant.message",
+                AssistantMessageData(
+                    content="final answer",
+                    message_id="msg-main",
+                    reasoning_text="terminal thought",
+                ),
+            )
+            session.emit("session.idle", SessionIdleData())
+
+        outcome = await sdk._wait_for_outcome(session, dispatch, sdk.ToolRegistration())
+        self.assertEqual(outcome.reasoning, "terminal thought")
+        self.assertEqual(outcome.text, "final answer")
+
+        events: list[tuple[str, dict]] = []
+        async for chunk in sdk._stream_turn(
+            _ConnectedRequest(),
+            {"model": "gpt-test"},
+            session,
+            dispatch,
+            sdk.ToolRegistration(),
+        ):
+            text = chunk.decode()
+            for block in text.strip().split("\n\n"):
+                if not block.strip():
+                    continue
+                lines = block.splitlines()
+                events.append(
+                    (
+                        lines[0].replace("event: ", "").strip(),
+                        json.loads(lines[1].replace("data: ", "")),
+                    )
+                )
+
+        reasoning_deltas = [
+            data.get("delta")
+            for name, data in events
+            if name == "response.reasoning_summary_text.delta"
+        ]
+        text_deltas = [
+            data.get("delta")
+            for name, data in events
+            if name == "response.output_text.delta"
+        ]
+        self.assertIn("terminal thought", reasoning_deltas)
+        self.assertIn("final answer", text_deltas)
 
     async def test_handle_responses_sets_session_id_on_plan_and_triggers_finish(self):
         session = _FakeSession()
