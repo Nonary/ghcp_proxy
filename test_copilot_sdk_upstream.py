@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -83,7 +84,7 @@ class CopilotSdkTranslationTests(unittest.TestCase):
                                     "type": "input_text",
                                     "text": (
                                         "<environment_context>\n"
-                                        "  <cwd>/tmp</cwd>\n"
+                                    f"  <cwd>{tempfile.gettempdir()}</cwd>\n"
                                         "</environment_context>"
                                     ),
                                 }
@@ -93,7 +94,7 @@ class CopilotSdkTranslationTests(unittest.TestCase):
                 },
                 sdk.ToolRegistration(),
             )
-            self.assertEqual(options["working_directory"], os.path.realpath("/tmp"))
+            self.assertEqual(options["working_directory"], os.path.realpath(tempfile.gettempdir()))
             self.assertTrue(options["enable_host_git_operations"])
 
         with self.subTest("missing workspace keeps host git disabled"):
@@ -1451,7 +1452,7 @@ class CopilotSdkEventTests(unittest.IsolatedAsyncioTestCase):
         session = _FakeSession()
         session.session_id = "custom-sdk-session-id"
 
-        async def fake_open(body, registration):
+        async def fake_open(body, registration, **kwargs):
             async def dispatch():
                 session.emit(
                     "assistant.message_delta",
@@ -1741,6 +1742,7 @@ class CopilotSdkCompactionContinuityTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(self._sdk_state.__exit__, None, None, None)
         sdk._live_sessions.clear()
         self.addCleanup(sdk._live_sessions.clear)
+        self.addAsyncCleanup(sdk._evict_all_live_sessions)
 
     @staticmethod
     def _compaction_item(summary="Summary of the earlier work"):
@@ -1847,13 +1849,13 @@ class CopilotSdkCompactionContinuityTests(unittest.IsolatedAsyncioTestCase):
         )
         compact_body["session_id"] = "thread-A"
         await turn(compact_body)
-        self.assertEqual(resumed, ["sdk-session-1"])
+        self.assertEqual(resumed, [])
         self.assertTrue(sent[-1].startswith("User: Please create a detailed summary"))
 
         after = {"input": [history[0], self._compaction_item()], "session_id": "thread-A"}
         session = await turn(after)
         self.assertEqual(session.session_id, "sdk-session-1")
-        self.assertEqual(resumed, ["sdk-session-1", "sdk-session-1"])
+        self.assertEqual(resumed, [])
         self.assertEqual(len(created), 1)
         self.assertEqual(sent[-1], sdk._CONTINUE_AFTER_COMPACTION_PROMPT)
 
@@ -1911,10 +1913,10 @@ class CopilotSdkCompactionContinuityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resumed, [])
         self.assertEqual([req.request_id for req in handled], ["req-1"])
 
-        # The turn finished without further calls: now the session goes away.
+        # A final answer must also retain the live reasoning history.
         await sdk._release_session(session, sdk.TurnOutcome(), completed=True)
-        self.assertTrue(session.disconnected)
-        self.assertNotIn("sdk-sess-live", sdk._live_sessions)
+        self.assertFalse(session.disconnected)
+        self.assertIn("sdk-sess-live", sdk._live_sessions)
 
     async def test_new_user_message_discards_a_session_parked_on_a_tool_call(self):
         resumed = []
@@ -1957,7 +1959,7 @@ class CopilotSdkCompactionContinuityTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNot(replacement, session)
         self.assertEqual(resumed, [False])
 
-    async def test_release_waits_for_a_background_compaction_before_disconnecting(self):
+    async def test_release_keeps_completed_compaction_alive_until_idle_timeout(self):
         session = _FakeSession()
         entry = await sdk._track_live_session(session)
         session.emit("session.compaction_start", SimpleNamespace())
@@ -1969,8 +1971,11 @@ class CopilotSdkCompactionContinuityTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(session.disconnected)
         self.assertIsNotNone(entry.reaper)
 
-        session.emit("session.compaction_complete", SimpleNamespace())
-        await asyncio.wait_for(entry.reaper, 1)
+        with patch.object(sdk, "_LIVE_SESSION_IDLE_SECONDS", 0.02):
+            session.emit("session.compaction_complete", SimpleNamespace())
+            await asyncio.sleep(0)
+            self.assertFalse(session.disconnected)
+            await asyncio.wait_for(entry.reaper, 1)
         self.assertTrue(session.disconnected)
         self.assertNotIn(session.session_id, sdk._live_sessions)
 
@@ -1982,6 +1987,24 @@ class CopilotSdkCompactionContinuityTests(unittest.IsolatedAsyncioTestCase):
         await sdk._release_session(session, outcome, completed=False)
         self.assertTrue(session.disconnected)
         self.assertEqual(sdk._live_sessions, {})
+
+    async def test_client_replacement_clears_retained_runtime_sessions(self):
+        session = _FakeSession()
+        await sdk._track_live_session(session)
+        await sdk._release_session(session, sdk.TurnOutcome(), completed=True)
+        old_client = SimpleNamespace(stop=AsyncMock())
+        new_client = SimpleNamespace(start=AsyncMock())
+        with patch.object(sdk, "_client", old_client), \
+             patch.object(sdk, "_client_token", "old-synthetic-token"), \
+             patch.object(sdk, "_client_lock", None), \
+             patch.object(sdk, "_client_pruned", True), \
+             patch.object(sdk.auth, "load_access_token", return_value="new-synthetic-token"), \
+             patch.object(sdk, "CopilotClient", return_value=new_client):
+            self.assertIs(await sdk._get_client(), new_client)
+        self.assertTrue(session.disconnected)
+        self.assertEqual(sdk._live_sessions, {})
+        old_client.stop.assert_awaited_once()
+        new_client.start.assert_awaited_once()
 
 
 class CopilotSdkRequestContinuityTests(unittest.IsolatedAsyncioTestCase):
@@ -2062,6 +2085,65 @@ class CopilotSdkRequestContinuityTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(session, original)
         self.client.resume_session.assert_not_awaited()
         self.assertEqual(self.actions, [("result", "pending-1", "Inspection done")])
+
+    async def test_final_answer_then_new_user_turn_keeps_reasoning_session_live(self):
+        # The trace's failure boundary: tool result -> final answer -> new user.
+        original = await self.begin()
+        body = self.continuation()
+        session, dispatch = await self.open(body)
+        await dispatch()
+        sdk._commit_alias_watermark(session.session_id, success=True)
+        await sdk._release_session(session, sdk.TurnOutcome(text="Done"), completed=True)
+        self.assertFalse(original.disconnected)
+        self.actions.clear()
+        body = {**body, "input": [*body["input"],
+            {"type": "reasoning", "summary": [{"type": "summary_text", "text": "Summary"}]},
+            {"role": "assistant", "content": "Done"},
+            {"role": "user", "content": "Next step"},
+        ]}
+        diagnostics = {}
+        session, dispatch = await sdk._open_session(
+            body, sdk.build_tool_registration(body), diagnostics=diagnostics,
+        )
+        await dispatch()
+        self.assertIs(session, original)
+        self.client.resume_session.assert_not_awaited()
+        self.client.create_session.assert_awaited_once()
+        self.assertEqual(self.actions, [("send", "User: Next step", {})])
+        self.assertEqual(diagnostics["operation"], "reuse_live")
+
+    async def test_completed_session_expires_and_diagnoses_lossy_disk_resume(self):
+        session, dispatch = await self.open(self.body)
+        await dispatch()
+        sdk._commit_alias_watermark(session.session_id, success=True)
+        with patch.object(sdk, "_LIVE_SESSION_IDLE_SECONDS", 0):
+            await sdk._release_session(session, sdk.TurnOutcome(), completed=True)
+            await asyncio.wait_for(sdk._live_sessions[session.session_id].reaper, 1)
+        self.assertTrue(session.disconnected)
+        body = {**self.body, "input": [*self.body["input"],
+            {"role": "assistant", "content": "Done"},
+            {"role": "user", "content": "Next"},
+        ]}
+        diagnostics = {}
+        await sdk._open_session(body, sdk.build_tool_registration(body), diagnostics=diagnostics)
+        self.assertEqual(diagnostics["operation"], "resume_disk")
+        self.assertEqual(diagnostics["reuse_miss"], "not_connected")
+
+    async def test_idle_capacity_evicts_oldest_completed_session_only(self):
+        active, pending, oldest, newest = [self.new_session() for _ in range(4)]
+        for number, session in enumerate((active, pending, oldest, newest)):
+            session.session_id = f"capacity-{number}"
+            await sdk._track_live_session(session)
+        with patch.object(sdk, "_MAX_IDLE_SESSIONS", 1):
+            await sdk._release_session(pending, sdk.TurnOutcome(calls=[
+                sdk.ToolCall("pending", "inspect", "function", {}),
+            ]), completed=True)
+            await sdk._release_session(oldest, sdk.TurnOutcome(), completed=True)
+            await sdk._release_session(newest, sdk.TurnOutcome(), completed=True)
+        self.assertTrue(oldest.disconnected)
+        for session in (active, pending, newest):
+            self.assertFalse(session.disconnected)
+            self.assertIn(session.session_id, sdk._live_sessions)
 
     async def test_changed_model_effort_instructions_and_tools_reconfigure_pending_session(self):
         changes = [

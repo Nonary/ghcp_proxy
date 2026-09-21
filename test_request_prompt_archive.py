@@ -2,6 +2,8 @@ import json
 import os
 import tempfile
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import proxy
 import util
@@ -21,6 +23,30 @@ class RequestPromptArchiveTests(unittest.TestCase):
         with proxy._REQUEST_PROMPT_LOCK:
             proxy._REQUEST_PROMPT_ACTIVE_IDS.clear()
         self._temp_dir.cleanup()
+
+    def test_truncated_preview_does_not_destroy_upstream_prefix_fingerprints(self):
+        body = {"model": "gpt-test", "input": [
+            {"type": "message", "role": "developer", "content": "Stable " * 2000},
+            {"type": "function_call", "call_id": "call", "name": "inspect", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call", "output": "late result"},
+        ]}
+        request = SimpleNamespace(url=SimpleNamespace(path="/v1/responses"), method="POST")
+        with patch.object(proxy, "_build_debug_detail_snapshot", return_value={}), \
+             patch.object(proxy, "_register_debug_detail_snapshot", return_value=({"enabled": True}, [])), \
+             patch.object(proxy, "_prompt_trace_value", side_effect=lambda value: value), \
+             patch.object(proxy, "_dump_outbound_request_body"), \
+             patch.object(proxy, "_append_request_trace") as append:
+            proxy._emit_request_trace_start(
+                request_id="synthetic", request=request, upstream_url="https://example.invalid/responses",
+                upstream_path="/responses", requested_model="gpt-test", resolved_model="gpt-test",
+                request_body=body, upstream_body=body, outbound_headers={}, prompt_preview={"user": "fixture"},
+            )
+        row = append.call_args.args[0]
+        self.assertTrue(row["upstream_body"]["_truncated"])
+        sequence = row["upstream_body_summary"]["input"]["sequence"]
+        self.assertEqual(len(sequence), 3)
+        self.assertEqual(sequence[1]["arguments_hash"], proxy._trace_hash("{}"))
+        self.assertEqual(sequence[2]["output_hash"], proxy._trace_hash("late result"))
 
     def test_extract_request_prompt_text_formats_readable_transcript(self):
         body = {

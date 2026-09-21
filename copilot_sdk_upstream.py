@@ -716,6 +716,9 @@ async def _get_client():
         if _client is not None and token == _client_token:
             return _client
         if _client is not None:
+            # Retained idle sessions belong to this runtime connection. Never
+            # reuse their Python wrappers after replacing the authenticated client.
+            await _evict_all_live_sessions()
             await _client.stop()
         # The SDK's first-run runtime downloader uses urllib rather than httpx.
         # Framework builds of Python on macOS commonly lack a usable system CA
@@ -949,9 +952,13 @@ def _session_options(
 # minutes on one session, with the context never shrinking.  Keeping the
 # session connected across the tool round-trip lets the turn run the way the
 # SDK expects (result -> model -> ... -> turn end), so a compaction that
-# starts during a turn can finish and take effect.
+# starts during a turn can finish and take effect. Completed user turns must
+# stay connected too: SDK session persistence omits encrypted reasoning. A
+# destroy/resume cycle removes historical reasoning from the next model input
+# even when the caller replays an unchanged Responses prefix.
 
-_LIVE_SESSION_IDLE_SECONDS = float(os.environ.get("GHCP_SDK_SESSION_IDLE_SECONDS", "300") or 300)
+_LIVE_SESSION_IDLE_SECONDS = float(os.environ.get("GHCP_SDK_SESSION_IDLE_SECONDS", "1800") or 1800)
+_MAX_IDLE_SESSIONS = 32
 _LIVE_COMPACTION_WAIT_SECONDS = 600.0
 
 
@@ -966,6 +973,7 @@ class _LiveSession:
     compaction_settled: asyncio.Event = field(default_factory=asyncio.Event)
     unsubscribe: Callable[[], None] | None = None
     reaper: asyncio.Task | None = None
+    released_at: float = 0.0
 
 
 _live_sessions: dict[str, _LiveSession] = {}
@@ -1037,7 +1045,8 @@ async def _track_live_session(
 
 
 async def _reuse_live_session(
-    session_id: str, *, allow_pending: bool, options: dict[str, Any]
+    session_id: str, *, allow_pending: bool, options: dict[str, Any],
+    diagnostics: dict | None = None,
 ) -> Any | None:
     """Hand back a connected session for ``session_id`` if one is idle.
 
@@ -1050,11 +1059,21 @@ async def _reuse_live_session(
     stay connected so ordinary tool round-trips preserve background compaction.
     """
     entry = _live_sessions.get(session_id)
+    if diagnostics is not None:
+        diagnostics["reuse_miss"] = "not_connected" if entry is None else "in_use" if entry.in_use else None
     if entry is None or entry.in_use:
         return None
     if (entry.pending_calls and not allow_pending) or entry.options != options:
+        if diagnostics is not None:
+            diagnostics["reuse_miss"] = "pending_work" if entry.pending_calls and not allow_pending else "configuration_changed"
+            diagnostics["changed_options"] = sorted(
+                key for key in set(entry.options or {}) | set(options)
+                if (entry.options or {}).get(key) != options.get(key)
+            )
         await _evict_live_session(session_id)
         return None
+    if diagnostics is not None:
+        diagnostics["operation"] = "reuse_live"
     entry.in_use = True
     if entry.reaper is not None:
         entry.reaper.cancel()
@@ -1124,8 +1143,7 @@ async def _reap_live_session(session_id: str, entry: _LiveSession) -> None:
                 await asyncio.wait_for(entry.compaction_settled.wait(), _LIVE_COMPACTION_WAIT_SECONDS)
             except TimeoutError:
                 pass
-        if entry.pending_calls:
-            await asyncio.sleep(_LIVE_SESSION_IDLE_SECONDS)
+        await asyncio.sleep(_LIVE_SESSION_IDLE_SECONDS)
     except asyncio.CancelledError:
         return
     if entry.in_use or _live_sessions.get(session_id) is not entry:
@@ -1136,10 +1154,10 @@ async def _reap_live_session(session_id: str, entry: _LiveSession) -> None:
 async def _release_session(session: Any, outcome: "TurnOutcome | None", *, completed: bool) -> None:
     """Finish a request's use of ``session``.
 
-    The session stays connected when the caller owes it a tool result or the
-    SDK is compacting it in the background; a reaper disconnects it if
-    neither resolves.  Everything else disconnects immediately, which is
-    also what closes out per-session usage on the SDK side.
+    Keep successful turns, including final answers, connected for the next
+    request. Disk resume is not a lossless substitute for the live reasoning
+    history. Failed turns still disconnect; idle sessions have a time limit
+    and completed idle sessions also have an LRU capacity limit.
     """
     entry = _live_sessions.get(session.session_id)
     if entry is None or entry.session is not session:
@@ -1149,12 +1167,22 @@ async def _release_session(session: Any, outcome: "TurnOutcome | None", *, compl
             pass
         return
     pending = bool(completed and outcome is not None and outcome.calls)
-    if not completed or not (pending or entry.compaction_in_flight):
+    if not completed:
         await _evict_live_session(session.session_id)
         return
     entry.in_use = False
     entry.pending_calls = pending
+    entry.released_at = time.monotonic()
     entry.reaper = asyncio.create_task(_reap_live_session(session.session_id, entry))
+    idle = sorted(
+        ((key, value) for key, value in _live_sessions.items()
+         if not value.in_use and not value.pending_calls and not value.compaction_in_flight),
+        key=lambda pair: pair[1].released_at,
+    )
+    for key, candidate in idle[:max(0, len(idle) - _MAX_IDLE_SESSIONS)]:
+        # An awaited disconnect can let another request claim a candidate.
+        if _live_sessions.get(key) is candidate and not candidate.in_use:
+            await _evict_live_session(key)
 
 
 async def _evict_all_live_sessions() -> None:
@@ -1162,13 +1190,19 @@ async def _evict_all_live_sessions() -> None:
         await _evict_live_session(session_id)
 
 
-async def _open_session(body: dict, registration: ToolRegistration):
+async def _open_session(body: dict, registration: ToolRegistration, *, diagnostics: dict | None = None):
     client = await _get_client()
     continuation = resolve_tool_continuation(body.get("input"))
     reasoning_effort = await _reasoning_effort_for_client(body, client)
     options = _session_options(body, registration, reasoning_effort=reasoning_effort)
     segments = _render_input_segments(body.get("input"))
     fingerprints = _segment_fingerprints(segments)
+    if diagnostics is not None:
+        diagnostics.update({
+            "operation": "create",
+            "input_segments": len(fingerprints),
+            "tool_continuation": continuation is not None,
+        })
     if continuation is None:
         alias = _session_alias(body)
 
@@ -1188,6 +1222,7 @@ async def _open_session(body: dict, registration: ToolRegistration):
                 if new_text:
                     session = await _reuse_live_session(
                         known_session_id, allow_pending=False, options=options,
+                        diagnostics=diagnostics,
                     )
                     if session is None:
                         try:
@@ -1196,6 +1231,8 @@ async def _open_session(body: dict, registration: ToolRegistration):
                                 continue_pending_work=False,
                                 **options,
                             )
+                            if diagnostics is not None:
+                                diagnostics["operation"] = "resume_disk"
                         except Exception:
                             # The SDK discarded the session; fall through to a
                             # fresh one carrying the full transcript.
@@ -1205,6 +1242,8 @@ async def _open_session(body: dict, registration: ToolRegistration):
         if session is None:
             session = await client.create_session(**options)
             prompt = "\n\n".join(text for _, text in segments)
+            if diagnostics is not None:
+                diagnostics["operation"] = "create"
 
         await _track_live_session(session, options=options, fingerprints=fingerprints)
         _remember_session(session.session_id)
@@ -1222,7 +1261,7 @@ async def _open_session(body: dict, registration: ToolRegistration):
     # Read the old watermark before reconfiguration can evict the live entry.
     steering_prompt = _continuation_prompt(body, session_id, segments, fingerprints)
     pending_work = True
-    session = await _reuse_live_session(session_id, allow_pending=True, options=options)
+    session = await _reuse_live_session(session_id, allow_pending=True, options=options, diagnostics=diagnostics)
     if session is None and _owns_session(session_id):
         try:
             session = await client.resume_session(
@@ -1230,6 +1269,8 @@ async def _open_session(body: dict, registration: ToolRegistration):
                 continue_pending_work=True,
                 **options,
             )
+            if diagnostics is not None:
+                diagnostics["operation"] = "resume_disk"
         except Exception:
             pending_work = False
             try:
@@ -1238,6 +1279,8 @@ async def _open_session(body: dict, registration: ToolRegistration):
                     continue_pending_work=False,
                     **options,
                 )
+                if diagnostics is not None:
+                    diagnostics["operation"] = "resume_disk_without_pending_work"
             except Exception:
                 session = None
 
@@ -1246,6 +1289,8 @@ async def _open_session(body: dict, registration: ToolRegistration):
         # was pruned or state file lost), fall back to creating a fresh session
         # carrying the transcript up to and including the tool output.
         session = await client.create_session(**options)
+        if diagnostics is not None:
+            diagnostics["operation"] = "create_after_lost_continuation"
         prompt = "\n\n".join(text for _, text in segments)
         await _track_live_session(session, options=options, fingerprints=fingerprints)
         _remember_session(session.session_id)
@@ -2432,8 +2477,11 @@ async def handle_responses(
     if body.get("input") is None:
         return format_translation.openai_error_response(400, "input is required")
     registration = build_tool_registration(body)
+    session_diagnostics: dict = {}
+    if plan is not None and isinstance(getattr(plan, "trace_context", None), dict):
+        plan.trace_context["copilot_sdk_session"] = session_diagnostics
     try:
-        session, dispatch = await _open_session(body, registration)
+        session, dispatch = await _open_session(body, registration, diagnostics=session_diagnostics)
     except Exception as exc:
         if finish_usage_callback is not None and plan is not None:
             try:

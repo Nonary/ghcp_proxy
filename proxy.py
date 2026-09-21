@@ -2388,6 +2388,8 @@ def _trace_input_sequence(input_value: list) -> list[dict]:
         if "output" in item:
             entry["output_chars"] = _trace_text_chars(item.get("output"))
             entry["output_hash"] = _trace_hash(item.get("output"))
+        if "arguments" in item:
+            entry["arguments_hash"] = _trace_hash(item.get("arguments"))
         encrypted = item.get("encrypted_content")
         if isinstance(encrypted, str) and encrypted:
             entry["encrypted_content_chars"] = len(encrypted)
@@ -3268,6 +3270,7 @@ def _emit_request_trace_start(
         context["debug_detail_capture"] = debug_detail_capture
         if "request_prompt" in debug_detail_snapshot:
             context["request_prompt"] = debug_detail_snapshot["request_prompt"]
+    upstream_summary = _trace_body_summary(upstream_body)
     payload = {
         "event": "request_started",
         "time": util.utc_now_iso(),
@@ -3276,7 +3279,10 @@ def _emit_request_trace_start(
         "requested_model": requested_model,
         "resolved_model": resolved_model,
         "request_body": _trace_body_summary(request_body),
-        "upstream_body": _trace_body_summary(upstream_body),
+        "upstream_body": upstream_summary,
+        # Debug previews below are bounded, but must not replace the only
+        # complete upstream item fingerprints needed for prefix comparison.
+        "upstream_body_summary": upstream_summary,
         "outbound_headers": _header_trace_subset(outbound_headers),
         "trace": trace_details,
     }
@@ -6343,6 +6349,7 @@ async def _handle_copilot_sdk_responses(
             "strategy_name": "copilot_sdk_compact" if is_compact else "copilot_sdk_responses",
             "caller_protocol": "responses",
             "upstream_protocol": "sdk",
+            "upstream_body_representation": "sdk_adapter_input_not_model_wire",
             "subagent": effective_subagent,
             "approval_agent": approval_agent,
             "is_compact": is_compact,
