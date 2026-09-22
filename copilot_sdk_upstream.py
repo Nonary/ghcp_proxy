@@ -1989,6 +1989,7 @@ async def _stream_turn(
     reasoning_output_index = 0
     saw_reasoning_delta = False
     reasoning_header_sent = False
+    reasoning_summary_index = 0
     stream_options = body.get("stream_options")
     sequential_reasoning_summaries = (
         isinstance(stream_options, dict)
@@ -2073,31 +2074,32 @@ async def _stream_turn(
                     text=outcome.reasoning,
                 )
             )
-        chunks.extend(
-            [
+        if not sequential_reasoning_summaries or not emitted_sequential_summary:
+            chunks.append(
                 _sse(
                     "response.reasoning_summary_part.done",
                     item_id=outcome.reasoning_id,
                     output_index=reasoning_output_index,
                     summary_index=0,
                     part={"type": "summary_text", "text": outcome.reasoning},
+                )
+            )
+        chunks.append(
+            _sse(
+                "response.output_item.done",
+                output_index=reasoning_output_index,
+                item=_reasoning_item(
+                    outcome.reasoning,
+                    item_id=outcome.reasoning_id,
+                    completed=True,
                 ),
-                _sse(
-                    "response.output_item.done",
-                    output_index=reasoning_output_index,
-                    item=_reasoning_item(
-                        outcome.reasoning,
-                        item_id=outcome.reasoning_id,
-                        completed=True,
-                    ),
-                ),
-            ]
+            )
         )
         return chunks
 
     def emit_reasoning_delta(delta: str) -> list[bytes]:
         """Emit ChatGPT-compatible summary deltas and retain normalized text."""
-        nonlocal emitted_sequential_summary, reasoning_header_sent
+        nonlocal emitted_sequential_summary, reasoning_header_sent, reasoning_summary_index
         if not isinstance(delta, str) or not delta:
             return []
 
@@ -2114,21 +2116,39 @@ async def _stream_turn(
         outcome.reasoning += delta
         if sequential_reasoning_summaries:
             # The native Codex client ignores summary `.delta` events when
-            # `reasoning_summary_delivery` is `sequential_cutoff`.  It treats
-            # the `.done` text value as a visible reasoning update, so
-            # forward each SDK delta instead of buffering all reasoning until
-            # the turn finishes.
+            # `reasoning_summary_delivery` is `sequential_cutoff`.  It only
+            # releases a thought update when the corresponding summary part
+            # is complete, so model each SDK delta as a short, fully closed
+            # summary part instead of emitting repeated `.done` events for
+            # one still-open part.
+            if emitted_sequential_summary:
+                reasoning_summary_index += 1
+                chunks.append(
+                    _sse(
+                        "response.reasoning_summary_part.added",
+                        item_id=outcome.reasoning_id,
+                        output_index=reasoning_output_index,
+                        summary_index=reasoning_summary_index,
+                        part={"type": "summary_text", "text": ""},
+                    )
+                )
             emitted_sequential_summary = True
             chunks.append(
                 _sse(
                     "response.reasoning_summary_text.done",
                     item_id=outcome.reasoning_id,
                     output_index=reasoning_output_index,
-                    # Copilot SDK deltas are fragments of one summary, not
-                    # independent summary sections. Keep them on index zero
-                    # so the desktop client appends them to one live item.
-                    summary_index=0,
+                    summary_index=reasoning_summary_index,
                     text=displayed_delta,
+                )
+            )
+            chunks.append(
+                _sse(
+                    "response.reasoning_summary_part.done",
+                    item_id=outcome.reasoning_id,
+                    output_index=reasoning_output_index,
+                    summary_index=reasoning_summary_index,
+                    part={"type": "summary_text", "text": displayed_delta},
                 )
             )
             return chunks

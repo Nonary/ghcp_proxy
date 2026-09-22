@@ -1039,7 +1039,17 @@ class CopilotSdkEventTests(unittest.IsolatedAsyncioTestCase):
             [data["text"] for data in sequential_done],
             ["**Thinking**\n\nfirst", "second"],
         )
-        self.assertEqual([data["summary_index"] for data in sequential_done], [0, 0])
+        self.assertEqual([data["summary_index"] for data in sequential_done], [0, 1])
+        summary_part_done = [
+            data
+            for name, data in events
+            if name == "response.reasoning_summary_part.done"
+        ]
+        self.assertEqual([data["summary_index"] for data in summary_part_done], [0, 1])
+        self.assertEqual(
+            [data["summary_index"] for name, data in events if name == "response.reasoning_summary_part.added"],
+            [0, 1],
+        )
         self.assertNotIn(
             "response.reasoning_summary_text.delta",
             [name for name, _ in events],
