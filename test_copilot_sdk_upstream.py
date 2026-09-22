@@ -2306,6 +2306,8 @@ class CopilotSdkRequestContinuityTests(unittest.IsolatedAsyncioTestCase):
         response = await sdk.handle_responses(_ConnectedRequest(), body)
         self.assertIsInstance(response, sdk.StreamingResponse)
         self.assertEqual(sdk._live_sessions["sdk-review"].summary_delivery, "sequential_cutoff")
+        # Runtime model calls are traced into this request's diagnostics.
+        self.assertEqual(sdk._live_sessions["sdk-review"].diagnostics.get("operation"), "create")
 
     async def test_unchanged_options_keep_the_live_session_and_do_not_replay_input(self):
         original = await self.begin()

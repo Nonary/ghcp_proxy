@@ -3103,6 +3103,7 @@ async def handle_responses(
         entry.summary_delivery = (
             _requested_summary_delivery(body) if body.get("stream") and not is_compact else None
         )
+        entry.diagnostics = session_diagnostics
 
     if bool(body.get("stream")):
         return StreamingResponse(
@@ -3120,7 +3121,6 @@ async def handle_responses(
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
-        entry.diagnostics = session_diagnostics
 
     response_id = _new_id("resp")
     succeeded = False
