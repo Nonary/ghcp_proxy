@@ -950,6 +950,9 @@ class CopilotSdkEventTests(unittest.IsolatedAsyncioTestCase):
             "response.output_item.added",
             "response.reasoning_summary_part.added",
             "response.reasoning_summary_text.delta",
+            "response.reasoning_summary_text.done",
+            "response.reasoning_summary_part.done",
+            "response.reasoning_summary_part.added",
             "response.reasoning_summary_text.delta",
             "response.reasoning_summary_text.done",
             "response.reasoning_summary_part.done",
@@ -965,11 +968,11 @@ class CopilotSdkEventTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(event_names, expected_names)
 
         reasoning_deltas = [
-            data["delta"]
+            (data["summary_index"], data["delta"])
             for name, data in events
             if name == "response.reasoning_summary_text.delta"
         ]
-        self.assertEqual(reasoning_deltas, ["**Thinking**\n\n", "thought"])
+        self.assertEqual(reasoning_deltas, [(0, "**Thinking**"), (1, "thought")])
 
         # Verify reasoning item has output_index 0 and message has output_index 1
         reasoning_added = next(d for name, d in events if name == "response.output_item.added" and d["item"]["type"] == "reasoning")
@@ -993,72 +996,117 @@ class CopilotSdkEventTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(completed["output"][1]["id"], message_added["item"]["id"])
         self.assertEqual(completed["output"][1]["type"], "message")
 
-    async def test_stream_emits_sequential_reasoning_completions_for_codex_desktop(self):
-        session = _FakeSession()
-
-        async def dispatch():
-            session.emit(
-                "assistant.reasoning_delta",
-                AssistantReasoningDeltaData(delta_content="first", reasoning_id="r-1"),
-            )
-            session.emit(
-                "assistant.reasoning_delta",
-                AssistantReasoningDeltaData(delta_content="second", reasoning_id="r-1"),
-            )
-            session.emit(
-                "assistant.message_delta",
-                AssistantMessageDeltaData(delta_content="reply", message_id="m-1"),
-            )
-            session.emit("session.idle", SessionIdleData())
-
-        events: list[tuple[str, dict]] = []
-        async for chunk in sdk._stream_turn(
-            _ConnectedRequest(),
-            {
-                "model": "gpt-test",
-                "stream_options": {"reasoning_summary_delivery": "sequential_cutoff"},
-            },
-            session,
-            dispatch,
-            sdk.ToolRegistration(),
+    async def test_stream_closes_reasoning_summary_parts_as_paragraphs_finish(self):
+        # Delta shapes observed from the SDK runtime: a blank line can arrive
+        # split across deltas, as its own delta, or inside a larger delta.
+        sdk_deltas = [
+            "**Planning ", "the ", "fix**\n", "\n",
+            "I need ", "to look.",
+            "\n\n",
+            "**Checking ", "order**\n\nThe client ", "drops deltas.",
+        ]
+        expected_parts = [
+            "**Planning the fix**",
+            "I need to look.",
+            "**Checking order**",
+            "The client drops deltas.",
+        ]
+        streams = {}
+        # Codex ignores summary deltas whenever concurrent reasoning summaries
+        # are enabled, even when it omits stream_options for a model without a
+        # summary parameter, so the stream must not depend on that option.
+        for label, extra in (
+            ("sequential_cutoff", {"stream_options": {"reasoning_summary_delivery": "sequential_cutoff"}}),
+            ("no_stream_options", {}),
         ):
-            text = chunk.decode()
-            for block in text.strip().split("\n\n"):
-                if not block.strip():
-                    continue
-                lines = block.splitlines()
-                event_name = lines[0].replace("event: ", "").strip()
-                events.append((event_name, json.loads(lines[1].replace("data: ", ""))))
+            session = _FakeSession()
 
-        sequential_done = [
-            data
-            for name, data in events
-            if name == "response.reasoning_summary_text.done"
-        ]
-        self.assertEqual(
-            [data["text"] for data in sequential_done],
-            ["**Thinking**\n\nfirst", "second"],
-        )
-        self.assertEqual([data["summary_index"] for data in sequential_done], [0, 1])
-        summary_part_done = [
-            data
-            for name, data in events
-            if name == "response.reasoning_summary_part.done"
-        ]
-        self.assertEqual([data["summary_index"] for data in summary_part_done], [0, 1])
-        self.assertEqual(
-            [data["summary_index"] for name, data in events if name == "response.reasoning_summary_part.added"],
-            [0, 1],
-        )
-        self.assertNotIn(
-            "response.reasoning_summary_text.delta",
-            [name for name, _ in events],
-        )
+            async def dispatch(session=session):
+                for delta in sdk_deltas:
+                    session.emit(
+                        "assistant.reasoning_delta",
+                        AssistantReasoningDeltaData(delta_content=delta, reasoning_id="r-1"),
+                    )
+                session.emit(
+                    "assistant.message_delta",
+                    AssistantMessageDeltaData(delta_content="reply", message_id="m-1"),
+                )
+                session.emit("session.idle", SessionIdleData())
 
-        completed = events[-1][1]["response"]
+            events: list[tuple[str, dict]] = []
+            async for chunk in sdk._stream_turn(
+                _ConnectedRequest(),
+                {"model": "gpt-test", **extra},
+                session,
+                dispatch,
+                sdk.ToolRegistration(),
+            ):
+                for block in chunk.decode().strip().split("\n\n"):
+                    if not block.strip():
+                        continue
+                    lines = block.splitlines()
+                    event_name = lines[0].replace("event: ", "").strip()
+                    events.append((event_name, json.loads(lines[1].replace("data: ", ""))))
+            streams[label] = events
+
+        for label, events in streams.items():
+            with self.subTest(label):
+                reasoning_id = next(
+                    data["item"]["id"]
+                    for name, data in events
+                    if name == "response.output_item.added" and data["item"]["type"] == "reasoning"
+                )
+                done = [data for name, data in events if name == "response.reasoning_summary_text.done"]
+                self.assertEqual([data["text"] for data in done], expected_parts)
+                self.assertEqual([data["summary_index"] for data in done], [0, 1, 2, 3])
+                self.assertTrue(all(data["item_id"] == reasoning_id for data in done))
+                for name in (
+                    "response.reasoning_summary_part.added",
+                    "response.reasoning_summary_part.done",
+                ):
+                    self.assertEqual(
+                        [data["summary_index"] for event, data in events if event == name],
+                        [0, 1, 2, 3],
+                    )
+
+                # Legacy clients render deltas; they must rebuild each part.
+                for index, text in enumerate(expected_parts):
+                    self.assertEqual(
+                        "".join(
+                            data["delta"]
+                            for name, data in events
+                            if name == "response.reasoning_summary_text.delta"
+                            and data["summary_index"] == index
+                        ),
+                        text,
+                    )
+
+                # Each part completes before the next part starts streaming, not
+                # only when reasoning ends.
+                positions = {
+                    (name, data.get("summary_index")): position
+                    for position, (name, data) in reversed(list(enumerate(events)))
+                }
+                for index in range(len(expected_parts) - 1):
+                    self.assertLess(
+                        positions[("response.reasoning_summary_text.done", index)],
+                        positions[("response.reasoning_summary_text.delta", index + 1)],
+                    )
+
+                # Codex joins parts with a blank line; that must equal the item.
+                completed = events[-1][1]["response"]
+                self.assertEqual(
+                    completed["output"][0]["summary"],
+                    [{"type": "summary_text", "text": "\n\n".join(expected_parts)}],
+                )
+
         self.assertEqual(
-            completed["output"][0]["summary"],
-            [{"type": "summary_text", "text": "**Thinking**\n\nfirstsecond"}],
+            [(name, data.get("summary_index"), data.get("text"), data.get("delta"))
+             for name, data in streams["sequential_cutoff"]
+             if name.startswith("response.reasoning_summary")],
+            [(name, data.get("summary_index"), data.get("text"), data.get("delta"))
+             for name, data in streams["no_stream_options"]
+             if name.startswith("response.reasoning_summary")],
         )
 
     def test_extract_shutdown_usage_prefers_token_details_over_model_metrics(self):

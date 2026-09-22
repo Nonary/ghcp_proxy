@@ -1954,6 +1954,113 @@ def _sse(event_type: str, **payload: Any) -> bytes:
     return f"event: {event_type}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n".encode()
 
 
+# A blank line, optionally padded, ends a reasoning summary paragraph.  The SDK
+# also uses one to separate upstream summary parts it flattens into one stream.
+_SUMMARY_PART_BREAK_RE = re.compile(r"[^\S\n]*\n[^\S\n]*\n\s*")
+
+
+class _ReasoningSummaryParts:
+    """Stream flat SDK reasoning text as Responses reasoning summary parts.
+
+    Codex renders summaries in one of two ways.  Legacy clients append
+    ``reasoning_summary_text.delta`` events.  Clients with concurrent reasoning
+    summaries (``stream_options.reasoning_summary_delivery=sequential_cutoff``)
+    ignore deltas entirely and render each ``reasoning_summary_text.done`` as
+    one finished part.  Codex also ignores deltas when that feature is on but it
+    omitted ``stream_options`` because the model lacks a summary parameter, so
+    the request body cannot tell us which renderer is active.
+
+    Emitting the complete standard part lifecycle serves both renderers.  A
+    part closes at every blank line, so a bold heading or finished paragraph
+    reaches sequential clients as soon as it is written, not when reasoning
+    ends.  Both Codex renderers join parts with a blank line, so the displayed
+    text matches the unsplit summary.
+    """
+
+    def __init__(self, item_id: str, output_index: int) -> None:
+        self.item_id = item_id
+        self.output_index = output_index
+        self.summary_index = 0
+        self.part_open = False
+        self.part_text = ""
+        # Trailing whitespace that may be the first half of a blank line.
+        self.held = ""
+
+    def feed(self, text: str) -> list[bytes]:
+        chunks: list[bytes] = []
+        pending = self.held + text
+        self.held = ""
+        while pending:
+            match = _SUMMARY_PART_BREAK_RE.search(pending)
+            if match is None:
+                body = pending.rstrip()
+                if "\n" in pending[len(body):]:
+                    self.held = pending[len(body):]
+                    pending = body
+                chunks.extend(self._append(pending))
+                break
+            chunks.extend(self._append(pending[: match.start()]))
+            chunks.extend(self.close())
+            pending = pending[match.end():]
+        return chunks
+
+    def close(self) -> list[bytes]:
+        """Complete the open part, dropping any held trailing whitespace."""
+        self.held = ""
+        if not self.part_open:
+            return []
+        part = {"type": "summary_text", "text": self.part_text}
+        chunks = [
+            _sse(
+                "response.reasoning_summary_text.done",
+                item_id=self.item_id,
+                output_index=self.output_index,
+                summary_index=self.summary_index,
+                text=self.part_text,
+            ),
+            _sse(
+                "response.reasoning_summary_part.done",
+                item_id=self.item_id,
+                output_index=self.output_index,
+                summary_index=self.summary_index,
+                part=part,
+            ),
+        ]
+        self.summary_index += 1
+        self.part_open = False
+        self.part_text = ""
+        return chunks
+
+    def _append(self, text: str) -> list[bytes]:
+        if not self.part_open:
+            text = text.lstrip()
+        if not text:
+            return []
+        chunks: list[bytes] = []
+        if not self.part_open:
+            self.part_open = True
+            chunks.append(
+                _sse(
+                    "response.reasoning_summary_part.added",
+                    item_id=self.item_id,
+                    output_index=self.output_index,
+                    summary_index=self.summary_index,
+                    part={"type": "summary_text", "text": ""},
+                )
+            )
+        self.part_text += text
+        chunks.append(
+            _sse(
+                "response.reasoning_summary_text.delta",
+                item_id=self.item_id,
+                output_index=self.output_index,
+                summary_index=self.summary_index,
+                delta=text,
+            )
+        )
+        return chunks
+
+
 async def _stream_turn(
     request: Request,
     body: dict,
@@ -1989,13 +2096,7 @@ async def _stream_turn(
     reasoning_output_index = 0
     saw_reasoning_delta = False
     reasoning_header_sent = False
-    reasoning_summary_index = 0
-    stream_options = body.get("stream_options")
-    sequential_reasoning_summaries = (
-        isinstance(stream_options, dict)
-        and stream_options.get("reasoning_summary_delivery") == "sequential_cutoff"
-    )
-    emitted_sequential_summary = False
+    reasoning_parts: _ReasoningSummaryParts | None = None
 
     message_started = False
     message_closed = False
@@ -2033,57 +2134,28 @@ async def _stream_turn(
                     pass
 
     def emit_reasoning_start() -> list[bytes]:
-        nonlocal reasoning_started, reasoning_output_index, output_index
+        nonlocal reasoning_started, reasoning_output_index, output_index, reasoning_parts
         if reasoning_started:
             return []
         mark_first()
         reasoning_started = True
         reasoning_output_index = output_index
         output_index += 1
-        chunks = [
+        reasoning_parts = _ReasoningSummaryParts(outcome.reasoning_id, reasoning_output_index)
+        return [
             _sse(
                 "response.output_item.added",
                 output_index=reasoning_output_index,
                 item=_reasoning_item("", item_id=outcome.reasoning_id, completed=False),
             ),
         ]
-        chunks.append(
-            _sse(
-                "response.reasoning_summary_part.added",
-                item_id=outcome.reasoning_id,
-                output_index=reasoning_output_index,
-                summary_index=0,
-                part={"type": "summary_text", "text": ""},
-            )
-        )
-        return chunks
 
     def emit_reasoning_done() -> list[bytes]:
         nonlocal reasoning_closed
         if not reasoning_started or reasoning_closed:
             return []
         reasoning_closed = True
-        chunks: list[bytes] = []
-        if not sequential_reasoning_summaries or not emitted_sequential_summary:
-            chunks.append(
-                _sse(
-                    "response.reasoning_summary_text.done",
-                    item_id=outcome.reasoning_id,
-                    output_index=reasoning_output_index,
-                    summary_index=0,
-                    text=outcome.reasoning,
-                )
-            )
-        if not sequential_reasoning_summaries or not emitted_sequential_summary:
-            chunks.append(
-                _sse(
-                    "response.reasoning_summary_part.done",
-                    item_id=outcome.reasoning_id,
-                    output_index=reasoning_output_index,
-                    summary_index=0,
-                    part={"type": "summary_text", "text": outcome.reasoning},
-                )
-            )
+        chunks = reasoning_parts.close() if reasoning_parts is not None else []
         chunks.append(
             _sse(
                 "response.output_item.done",
@@ -2098,80 +2170,22 @@ async def _stream_turn(
         return chunks
 
     def emit_reasoning_delta(delta: str) -> list[bytes]:
-        """Emit ChatGPT-compatible summary deltas and retain normalized text."""
-        nonlocal emitted_sequential_summary, reasoning_header_sent, reasoning_summary_index
+        """Emit ChatGPT-compatible summary parts and retain normalized text."""
+        nonlocal reasoning_header_sent
         if not isinstance(delta, str) or not delta:
             return []
 
-        chunks: list[bytes] = []
-        displayed_delta = delta
-        header_delta = ""
+        text = delta
         if not reasoning_header_sent:
             reasoning_header_sent = True
             if not delta.lstrip().startswith("**") and not delta.lstrip().startswith("#"):
-                header = format_translation._CODEX_THINKING_SUMMARY_HEADER
-                outcome.reasoning += header
-                header_delta = header
-                displayed_delta = header + delta
-        outcome.reasoning += delta
-        if sequential_reasoning_summaries:
-            # The native Codex client ignores summary `.delta` events when
-            # `reasoning_summary_delivery` is `sequential_cutoff`.  It only
-            # releases a thought update when the corresponding summary part
-            # is complete, so model each SDK delta as a short, fully closed
-            # summary part instead of emitting repeated `.done` events for
-            # one still-open part.
-            if emitted_sequential_summary:
-                reasoning_summary_index += 1
-                chunks.append(
-                    _sse(
-                        "response.reasoning_summary_part.added",
-                        item_id=outcome.reasoning_id,
-                        output_index=reasoning_output_index,
-                        summary_index=reasoning_summary_index,
-                        part={"type": "summary_text", "text": ""},
-                    )
-                )
-            emitted_sequential_summary = True
-            chunks.append(
-                _sse(
-                    "response.reasoning_summary_text.done",
-                    item_id=outcome.reasoning_id,
-                    output_index=reasoning_output_index,
-                    summary_index=reasoning_summary_index,
-                    text=displayed_delta,
-                )
-            )
-            chunks.append(
-                _sse(
-                    "response.reasoning_summary_part.done",
-                    item_id=outcome.reasoning_id,
-                    output_index=reasoning_output_index,
-                    summary_index=reasoning_summary_index,
-                    part={"type": "summary_text", "text": displayed_delta},
-                )
-            )
-            return chunks
-        if header_delta:
-            chunks.append(
-                _sse(
-                    "response.reasoning_summary_text.delta",
-                    item_id=outcome.reasoning_id,
-                    output_index=reasoning_output_index,
-                    summary_index=0,
-                    delta=header_delta,
-                )
-            )
-        chunks.append(
-            _sse(
-                "response.reasoning_summary_text.delta",
-                item_id=outcome.reasoning_id,
-                output_index=reasoning_output_index,
-                summary_index=0,
-                delta=delta,
-            )
-        )
-        return chunks
+                text = format_translation._CODEX_THINKING_SUMMARY_HEADER + delta
+        outcome.reasoning += text
+        if reasoning_closed or reasoning_parts is None:
+            # The reasoning item is already done; events for it now would be
+            # attached by the client to whichever item is active instead.
+            return []
+        return reasoning_parts.feed(text)
 
     def emit_text_start() -> list[bytes]:
         nonlocal message_started, message_output_index, output_index
