@@ -231,6 +231,44 @@ class CopilotSdkTranslationTests(unittest.TestCase):
             "string",
         )
 
+    def test_responses_lite_additional_tools_are_registered_with_their_namespace(self):
+        # Codex 0.156 "Responses Lite" shape: no top-level tools; namespaced
+        # declarations ride in an additional_tools input item.
+        body = {"tools": None, "input": [
+            {"type": "additional_tools", "id": "at_1", "role": "developer", "tools": [
+                {"type": "namespace", "name": "functions", "description": "", "tools": [
+                    {"type": "custom", "name": "exec", "description": "Run JavaScript",
+                     "format": {"type": "grammar", "syntax": "lark", "definition": "start: /.+/"}},
+                    {"type": "function", "name": "wait", "strict": False, "parameters": {
+                        "type": "object", "properties": {"cell_id": {"type": "string"}}}},
+                ]},
+                {"type": "namespace", "name": "mcp__docs__", "description": "Docs server", "tools": [
+                    {"type": "function", "name": "search", "parameters": {"type": "object", "properties": {}}},
+                ]},
+                {"type": "web_search"},
+            ]},
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+        ]}
+        registration = sdk.build_tool_registration(body)
+        self.assertEqual([tool.name for tool in registration.tools],
+                         ["ghcp_custom_exec", "wait", "mcp__docs__search"])
+
+        def returned(tool_name, arguments):
+            call = sdk._tool_call(
+                SimpleNamespace(request_id="request-1", tool_name=tool_name, arguments=arguments),
+                registration,
+            )
+            return sdk._tool_item("session-1", call)
+
+        exec_item = returned("ghcp_custom_exec", {"input": "await tools.exec_command({cmd: 'ls'})"})
+        self.assertEqual((exec_item["type"], exec_item["name"]), ("custom_tool_call", "exec"))
+        self.assertNotIn("namespace", exec_item)
+        search_item = returned("mcp__docs__search", {"q": "x"})
+        self.assertEqual((search_item["type"], search_item["name"], search_item["namespace"]),
+                         ("function_call", "search", "mcp__docs__"))
+        # The declarations are not rendered into the SDK prompt as text.
+        self.assertEqual(sdk.input_to_prompt(body["input"]), "User: hi")
+
     def test_custom_runtime_alias_maps_back_to_the_original_tool_name(self):
         registration = sdk.build_tool_registration(
             {"tools": [{"type": "custom", "name": "apply_patch"}]}

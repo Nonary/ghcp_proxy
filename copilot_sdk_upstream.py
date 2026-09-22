@@ -399,6 +399,7 @@ def _sanitize_tool_name(name: str, used: set[str]) -> str:
 class ToolMetadata:
     original_name: str
     tool_type: str
+    namespace: str | None = None
 
 
 @dataclass
@@ -407,21 +408,52 @@ class ToolRegistration:
     names: dict[str, ToolMetadata] = field(default_factory=dict)
 
 
+# Codex's namespace for top-level tools; calls in it need no namespace field.
+_DEFAULT_TOOL_NAMESPACE = "functions"
+
+
+def _flatten_tool_specs(specs: Any, namespace: str | None = None):
+    for spec in specs if isinstance(specs, list) else []:
+        if not isinstance(spec, dict):
+            continue
+        if spec.get("type") == "namespace":
+            name = spec.get("name")
+            yield from _flatten_tool_specs(spec.get("tools"), name if isinstance(name, str) and name else namespace)
+        else:
+            yield (None if namespace == _DEFAULT_TOOL_NAMESPACE else namespace), spec
+
+
+def _declared_tool_specs(body: dict):
+    """Yield ``(namespace, spec)`` for every tool the caller declared.
+
+    Codex's Responses Lite requests carry no top-level ``tools``: the tool
+    list travels in an ``additional_tools`` input item, grouped into
+    ``namespace`` entries.
+    """
+    yield from _flatten_tool_specs(body.get("tools"))
+    items = body.get("input")
+    for item in items if isinstance(items, list) else []:
+        if isinstance(item, dict) and item.get("type") == "additional_tools":
+            yield from _flatten_tool_specs(item.get("tools"))
+
+
 def build_tool_registration(body: dict) -> ToolRegistration:
     registration = ToolRegistration()
     if body.get("tool_choice") == "none" or Tool is None:
         return registration
     used: set[str] = set()
-    for spec in body.get("tools") or []:
-        if not isinstance(spec, dict):
-            continue
+    declared: set[tuple[str | None, str]] = set()
+    for namespace, spec in _declared_tool_specs(body):
         tool_type = spec.get("type")
         if tool_type not in {"function", "custom"}:
             continue
         name = spec.get("name")
-        if not isinstance(name, str) or not name:
+        if not isinstance(name, str) or not name or (namespace, name) in declared:
             continue
-        safe_name = _sanitize_tool_name(name, used)
+        declared.add((namespace, name))
+        # Codex names a namespaced tool by prefixing its namespace, e.g.
+        # ``mcp__server__`` + ``read``.
+        safe_name = _sanitize_tool_name(f"{namespace or ''}{name}", used)
         if tool_type == "custom":
             # ``apply_patch`` (and potentially other names from the CLI's
             # built-in catalog) is a free-form runtime tool.  Registering a
@@ -450,7 +482,7 @@ def build_tool_registration(body: dict) -> ToolRegistration:
             parameters = spec.get("parameters")
             if not isinstance(parameters, dict):
                 parameters = {"type": "object", "properties": {}}
-        registration.names[safe_name] = ToolMetadata(name, tool_type)
+        registration.names[safe_name] = ToolMetadata(name, tool_type, namespace)
         registration.tools.append(
             Tool(
                 name=safe_name,
@@ -1845,6 +1877,7 @@ class ToolCall:
     tool_type: str
     arguments: Any
     item_id: str = field(default_factory=lambda: _new_id("fc"))
+    namespace: str | None = None
 
 
 @dataclass
@@ -2177,6 +2210,7 @@ def _tool_call(data: Any, registration: ToolRegistration) -> ToolCall:
         tool_type=metadata.tool_type,
         arguments=getattr(data, "arguments", {}) or {},
         item_id=_new_id(prefix),
+        namespace=metadata.namespace,
     )
 
 
@@ -2373,6 +2407,8 @@ def _tool_item(session_id: str, call: ToolCall, *, completed: bool = True) -> di
         "name": call.name,
         "status": "completed" if completed else "in_progress",
     }
+    if call.namespace:
+        item["namespace"] = call.namespace
     item["input" if call.tool_type == "custom" else "arguments"] = _arguments_json(call)
     return item
 
