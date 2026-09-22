@@ -2108,7 +2108,18 @@ class CopilotSdkCompactionContinuityTests(unittest.IsolatedAsyncioTestCase):
 
 
 class CopilotSdkUpstreamRequestHandlerTests(unittest.IsolatedAsyncioTestCase):
+    """Summary delivery; cache continuity is covered by CopilotSdkCacheContinuityTests."""
+
     def setUp(self):
+        state = tempfile.TemporaryDirectory()
+        self.addCleanup(state.cleanup)
+        for name, value in (
+            ("_INJECT_PROMPT_CACHE_KEY", False),
+            ("_reasoning_ledger", sdk.sdk_reasoning_ledger.ReasoningLedger(lambda: state.name)),
+        ):
+            patcher = patch.object(sdk, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
         patcher = patch.object(sdk, "_live_sessions", {
             "wants-cutoff": sdk._LiveSession(session=_FakeSession(), summary_delivery="sequential_cutoff"),
             "plain": sdk._LiveSession(session=_FakeSession()),

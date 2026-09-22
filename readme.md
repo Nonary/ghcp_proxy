@@ -90,12 +90,30 @@ If the model, effort, instructions, or tool configuration changes, the proxy
 reconnects to the same SDK session with the updated options. Unchanged requests
 continue using the existing connection.
 
+An interrupted turn keeps its session too, once the runtime confirms the abort.
+
+The runtime reaches Copilot over a WebSocket that chains `previous_response_id`
+(Sol, and tool-using sessions generally), and Copilot caches along that chain:
+a full-history request only reuses earlier *full* requests. The proxy's request
+handler therefore keeps an idle upstream WebSocket when the runtime drops it and
+hands it to the session's next connection; the full history a disk-resumed
+session opens with is sent as a continuation of that chain when it matches it
+item for item (`GHCP_SDK_WEBSOCKET_POOL_SECONDS`, default 600). If Copilot rejects
+the continuation, the full request is sent instead. The handler also records
+each session's encrypted reasoning (under `copilot-sdk/reasoning/`, pruned with
+the session) and restores it into full-history requests that lost it, and gives
+each session its own `prompt_cache_key` (disable with
+`GHCP_SDK_PROMPT_CACHE_KEY=0`).
+
 Request-finished traces include `copilot_sdk_session.operation` to distinguish
-live reuse from disk resume. SDK request bodies in traces are adapter inputs,
-not the actual model-wire requests. A disk resume after expiration, eviction,
-restart, or configuration changes can still lose reasoning history. See
-[the cache investigation](docs/prompt-cache-investigation-2026-09-21.md) for the
-trace evidence and a credential-free runtime replay command.
+live reuse from disk resume, and `copilot_sdk_session.model_calls` for the
+runtime's actual model calls: transport, whether each was a chained
+continuation, restored reasoning, resumed chains, and (WebSocket) per-call
+cached tokens. SDK request bodies in traces are adapter inputs, not the
+model-wire requests. See
+[the 2026-09-22 cache investigation](docs/prompt-cache-investigation-2026-09-22.md)
+and [the 2026-09-21 investigation](docs/prompt-cache-investigation-2026-09-21.md)
+for the evidence.
 
 To temporarily restore the old direct REST implementation while diagnosing a
 regression, start the proxy with:

@@ -2,7 +2,13 @@
 
 Accepts a request-trace.jsonl or ZIP containing it. Outputs CSV; token counts
 come from usage, prefix lengths from recorded item fingerprints. SDK adapter
-inputs are not the runtime's model-wire requests, and are labelled accordingly.
+inputs are not the runtime's model-wire requests, and are labelled accordingly;
+the runtime's model calls are summarized from ``copilot_sdk_session.model_calls``.
+
+``input_shortfall`` is input_tokens - previous input_tokens - previous
+output_tokens.  Near zero, the upstream saw the previous prompt and output
+intact, so a cache miss is upstream routing or expiry.  Clearly negative, the
+history was rewritten (typically encrypted reasoning dropped by a disk resume).
 """
 
 from __future__ import annotations
@@ -29,9 +35,35 @@ def trace_file(path):
             yield handle
 
 
+def _usage(finished_event):
+    return (finished_event.get("response") or {}).get("usage") or {}
+
+
+def _shortfall(usage, previous_usage):
+    try:
+        return usage["input_tokens"] - previous_usage["input_tokens"] - previous_usage["output_tokens"]
+    except (KeyError, TypeError):
+        return ""
+
+
+def _model_calls(finished_event):
+    calls = (finished_event.get("copilot_sdk_session") or {}).get("model_calls") or []
+    return {
+        "sdk_model_calls": len(calls) if calls else "",
+        "sdk_full_resends": sum(1 for call in calls if not call.get("continuation")) if calls else "",
+        "sdk_resumed_chain": sum(1 for call in calls if call.get("resumed_chain_items")) if calls else "",
+        "sdk_restored_reasoning": sum(call.get("restored_reasoning") or 0 for call in calls) if calls else "",
+        "sdk_call_cached": ";".join(
+            f"{call['cached_tokens']}/{call['input_tokens']}" for call in calls
+            if call.get("input_tokens") is not None
+        ),
+    }
+
+
 def compare(events):
     finished = {r["request_id"]: r for r in events if r.get("event") == "request_finished"}
     previous = {}
+    previous_usage = {}
     for event in events:
         if event.get("event") != "request_started":
             continue
@@ -54,7 +86,10 @@ def compare(events):
             ))
         elif old:
             difference = "append_only" if shared == len(old_sequence) else "input_shortened"
-        usage = finished.get(event["request_id"], {}).get("response", {}).get("usage", {})
+        finished_event = finished.get(event["request_id"], {})
+        usage = _usage(finished_event)
+        sdk_session = finished_event.get("copilot_sdk_session") or {}
+        appended = sequence[len(old_sequence):] if old and difference == "append_only" else []
         source = event.get("source_body", {})
         yield {
             "time": event["time"], "request_id": event["request_id"],
@@ -72,9 +107,16 @@ def compare(events):
             ),
             "last_input_type": sequence[-1].get("type", "") if sequence else "",
             "last_input_role": sequence[-1].get("role", "") if sequence else "",
-            "sdk_operation": finished.get(event["request_id"], {}).get("copilot_sdk_session", {}).get("operation", "unrecorded"),
+            "turn_boundary": any(
+                item.get("type") == "message" and item.get("role") == "user" for item in appended
+            ),
+            "input_shortfall": _shortfall(usage, previous_usage.get(key)) if old else "",
+            "sdk_operation": sdk_session.get("operation", "unrecorded"),
+            "sdk_reuse_miss": sdk_session.get("reuse_miss") or "",
+            **_model_calls(finished_event),
         }
         previous[key] = body
+        previous_usage[key] = usage
 
 
 def main():

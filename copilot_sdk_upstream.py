@@ -20,6 +20,7 @@ import re
 import tempfile
 import threading
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Awaitable, Callable
 from uuid import uuid4
@@ -32,12 +33,13 @@ import httpx
 import auth
 import excel_upstream
 import format_translation
+import sdk_reasoning_ledger
 import util
 from constants import TOKEN_DIR
 
 try:
     from copilot import CopilotClient, Tool
-    from copilot.copilot_request_handler import CopilotRequestHandler
+    from copilot.copilot_request_handler import CopilotRequestHandler, CopilotWebSocketForwarder
     from copilot.rpc import ExternalToolTextResultForLlm, HandlePendingToolCallRequest
     from copilot.session import PermissionHandler
     from copilot.session_events import (
@@ -61,6 +63,7 @@ try:
 except ImportError as exc:  # pragma: no cover - exercised only on broken installs
     CopilotClient = None  # type: ignore[assignment,misc]
     CopilotRequestHandler = object  # type: ignore[assignment,misc]
+    CopilotWebSocketForwarder = object  # type: ignore[assignment,misc]
     Tool = None  # type: ignore[assignment,misc]
     ExternalToolTextResultForLlm = None  # type: ignore[assignment,misc]
     _SDK_IMPORT_ERROR: Exception | None = exc
@@ -295,6 +298,8 @@ async def _prune_abandoned_sessions(client: Any) -> None:
         pruned.add(session_id)
     _forget_session_aliases(pruned)
     _forget_shutdown_baselines(pruned)
+    _reasoning_ledger.forget(pruned)
+    _reasoning_ledger.prune_older_than(cutoff)
 
 
 async def _delete_owned_session(session_id: str) -> None:
@@ -308,6 +313,7 @@ async def _delete_owned_session(session_id: str) -> None:
     _forget_session(session_id)
     _forget_session_aliases({session_id})
     _forget_shutdown_baselines({session_id})
+    _reasoning_ledger.forget({session_id})
 
 
 def responses_upstream() -> str:
@@ -726,6 +732,7 @@ async def _get_client():
             # Retained idle sessions belong to this runtime connection. Never
             # reuse their Python wrappers after replacing the authenticated client.
             await _evict_all_live_sessions()
+            await _close_websocket_pool()
             await _client.stop()
         # The SDK's first-run runtime downloader uses urllib rather than httpx.
         # Framework builds of Python on macOS commonly lack a usable system CA
@@ -985,6 +992,8 @@ class _LiveSession:
     # The current caller's reasoning summary delivery, for model calls the
     # SDK issues on this session (see _UpstreamRequestHandler).
     summary_delivery: str | None = None
+    # The current request's trace diagnostics; model calls are added to it.
+    diagnostics: dict | None = None
 
 
 _live_sessions: dict[str, _LiveSession] = {}
@@ -1162,12 +1171,16 @@ async def _reap_live_session(session_id: str, entry: _LiveSession) -> None:
     await _evict_live_session(session_id)
 
 
-async def _release_session(session: Any, outcome: "TurnOutcome | None", *, completed: bool) -> None:
+async def _release_session(
+    session: Any, outcome: "TurnOutcome | None", *, completed: bool, park: bool = False,
+) -> None:
     """Finish a request's use of ``session``.
 
     Keep successful turns, including final answers, connected for the next
     request. Disk resume is not a lossless substitute for the live reasoning
-    history. Failed turns still disconnect; idle sessions have a time limit
+    history. ``park`` keeps an incomplete turn's session too: the caller
+    interrupted it and the runtime confirmed the abort, so the session is idle
+    and intact. Failed turns still disconnect; idle sessions have a time limit
     and completed idle sessions also have an LRU capacity limit.
     """
     entry = _live_sessions.get(session.session_id)
@@ -1178,9 +1191,10 @@ async def _release_session(session: Any, outcome: "TurnOutcome | None", *, compl
             pass
         return
     pending = bool(completed and outcome is not None and outcome.calls)
-    if not completed:
+    if not completed and not park:
         await _evict_live_session(session.session_id)
         return
+    entry.diagnostics = None
     entry.in_use = False
     entry.pending_calls = pending
     entry.released_at = time.monotonic()
@@ -1221,53 +1235,421 @@ def _with_request_body(request: httpx.Request, content: bytes) -> httpx.Request:
     )
 
 
-class _UpstreamRequestHandler(CopilotRequestHandler):
-    """Pass the caller's reasoning summary delivery on to Copilot model calls.
+# Copilot's runtime sends no prompt_cache_key, so every Codex conversation --
+# all sharing the same instructions and tool prefix -- reaches the upstream
+# cache with the same routing hint.  A per-session key keeps each
+# conversation's requests on the replicas that hold its prefix.
+_INJECT_PROMPT_CACHE_KEY = os.environ.get("GHCP_SDK_PROMPT_CACHE_KEY", "1") != "0"
+_MAX_TRACED_MODEL_CALLS = 32
 
-    Codex asks for ``stream_options.reasoning_summary_delivery=sequential_cutoff``
-    so reasoning summaries are written while the model is still thinking.  The
-    SDK builds its own model request and drops the option.  Without it Copilot
-    sent the first summary about 20s into a turn instead of about 3s
-    (tools/diagnose-sdk-reasoning-stream.py).  Like Codex, add it only to
+_reasoning_ledger = sdk_reasoning_ledger.ReasoningLedger(
+    lambda: os.path.join(_SDK_STATE_DIR, "reasoning"),
+)
+
+
+def _note_model_call(session_id: str | None, record: dict) -> None:
+    """Attach one runtime model call to the current request's trace."""
+    entry = _live_sessions.get(session_id) if session_id else None
+    diagnostics = entry.diagnostics if entry is not None else None
+    if isinstance(diagnostics, dict):
+        calls = diagnostics.setdefault("model_calls", [])
+        if len(calls) < _MAX_TRACED_MODEL_CALLS:
+            calls.append(record)
+
+
+class _UpstreamRequestHandler(CopilotRequestHandler):
+    """Adjust the runtime's Copilot model calls for cache continuity.
+
+    Restores encrypted reasoning a disk-resumed session lost (see
+    sdk_reasoning_ledger) and gives each session its own prompt_cache_key.
+
+    Also passes the caller's reasoning summary delivery on.  Codex asks for
+    ``stream_options.reasoning_summary_delivery=sequential_cutoff`` so reasoning
+    summaries are written while the model is still thinking.  The SDK builds
+    its own model request and drops the option.  Without it Copilot sent the
+    first summary about 20s into a turn instead of about 3s
+    (tools/diagnose-sdk-reasoning-stream.py).  Like Codex, add it only to HTTP
     Responses calls that request a summary, and only for sessions whose current
-    caller asked for it.  A model that rejects it is retried once without the
-    option and is not sent it again.
+    caller asked for it.
+
+    An HTTP call rejected with any of these changes is retried once as the
+    runtime sent it, and the changes are not applied to that model (or, for
+    restored reasoning, that session) again.
     """
 
     def __init__(self) -> None:
         self._rejected_models: set[Any] = set()
+        self._cache_key_rejected_models: set[Any] = set()
+
+    def _prepare(self, session_id: str | None, body: dict, transport: str) -> tuple[bool, dict]:
+        """Adjust one Responses model call in place; return (changed, trace record)."""
+        model = body.get("model")
+        continued = bool(body.get("previous_response_id"))
+        items = body.get("input")
+        record: dict[str, Any] = {
+            "transport": transport,
+            "continuation": continued,
+            "input_items": len(items) if isinstance(items, list) else None,
+        }
+        changed = False
+        if not continued:
+            # A request without previous_response_id carries the whole history.
+            restored_items, restored = _reasoning_ledger.restore(session_id, model, items)
+            if restored:
+                body["input"] = restored_items
+                record["restored_reasoning"] = restored
+                changed = True
+            _reasoning_ledger.record_input(session_id, model, body.get("input"))
+        if isinstance(body.get("input"), list):
+            record["reasoning_items"] = sum(
+                1 for item in body["input"] if isinstance(item, dict) and item.get("type") == "reasoning"
+            )
+        if (
+            _INJECT_PROMPT_CACHE_KEY
+            and session_id
+            and not body.get("prompt_cache_key")
+            and model not in self._cache_key_rejected_models
+        ):
+            body["prompt_cache_key"] = session_id
+            record["prompt_cache_key"] = "session"
+            changed = True
+        entry = _live_sessions.get(session_id) if session_id else None
+        delivery = entry.summary_delivery if entry is not None else None
+        reasoning = body.get("reasoning")
+        if (
+            transport == "http"
+            and delivery is not None
+            and isinstance(reasoning, dict)
+            and reasoning.get("summary")
+            and model not in self._rejected_models
+        ):
+            stream_options = body.get("stream_options")
+            body["stream_options"] = {
+                **(stream_options if isinstance(stream_options, dict) else {}),
+                "reasoning_summary_delivery": delivery,
+            }
+            record["summary_delivery"] = delivery
+            changed = True
+        return changed, record
+
+    def _reject(self, session_id: str | None, model: Any, record: dict | None) -> None:
+        if not record:
+            return
+        record["rejected"] = True
+        if record.get("summary_delivery"):
+            self._rejected_models.add(model)
+        if record.get("prompt_cache_key"):
+            self._cache_key_rejected_models.add(model)
+        if record.get("restored_reasoning"):
+            _reasoning_ledger.disable(session_id, model)
 
     async def send_request(self, request: httpx.Request, ctx: Any) -> httpx.Response:
-        entry = _live_sessions.get(ctx.session_id) if ctx.session_id else None
-        delivery = entry.summary_delivery if entry is not None else None
-        if delivery is None or request.method != "POST":
+        if request.method != "POST":
             return await super().send_request(request, ctx)
         original = await request.aread()
         try:
             body = json.loads(original)
         except ValueError:
             body = None
-        reasoning = body.get("reasoning") if isinstance(body, dict) else None
-        if (
-            not isinstance(reasoning, dict)
-            or not reasoning.get("summary")
-            or "input" not in body
-            or body.get("model") in self._rejected_models
-        ):
+        if not isinstance(body, dict) or "input" not in body:
             return await super().send_request(request, ctx)
-        stream_options = body.get("stream_options")
-        body["stream_options"] = {
-            **(stream_options if isinstance(stream_options, dict) else {}),
-            "reasoning_summary_delivery": delivery,
-        }
+        changed, record = self._prepare(ctx.session_id, body, "http")
+        _note_model_call(ctx.session_id, record)
+        if not changed:
+            return await super().send_request(request, ctx)
         response = await super().send_request(_with_request_body(request, json.dumps(body).encode()), ctx)
         if response.status_code not in {400, 422}:
             return response
         await response.aclose()
         retry = await super().send_request(_with_request_body(request, original), ctx)
         if retry.status_code not in {400, 422}:
-            self._rejected_models.add(body.get("model"))
+            self._reject(ctx.session_id, body.get("model"), record)
         return retry
+
+    async def open_websocket(self, ctx: Any) -> Any:
+        return _UpstreamWebSocket(ctx, self)
+
+
+def _history_keys(items: list) -> list[str | None]:
+    return [
+        sdk_reasoning_ledger.anchor_key(item)
+        for item in items
+        if not (isinstance(item, dict) and item.get("type") == "reasoning")
+    ]
+
+
+@dataclass
+class _UpstreamChain:
+    """The history an upstream WebSocket's latest response continues from.
+
+    Copilot caches a WebSocket conversation along its ``previous_response_id``
+    chain.  A full-history request -- even byte-identical, even on the same
+    connection -- only reuses earlier full requests, which is the first user
+    message of a chained conversation.  Tracking which items the chain covers
+    lets a full resend become a continuation again.
+    """
+
+    model: Any = None
+    covered: list[str | None] = field(default_factory=list)
+    last_response_id: str | None = None
+    in_flight: bool = False
+
+    def continuation_items(self, body: dict) -> list | None:
+        """Items of a full request after the chain's history, if it extends it."""
+        items = body.get("input")
+        if (
+            not self.last_response_id
+            or self.in_flight
+            or body.get("model") != self.model
+            or not isinstance(items, list)
+            or not self.covered
+            or None in self.covered
+        ):
+            return None
+        matched = 0
+        for index, item in enumerate(items):
+            if isinstance(item, dict) and item.get("type") == "reasoning":
+                continue
+            if matched == len(self.covered):
+                return items[index:]
+            if sdk_reasoning_ledger.anchor_key(item) != self.covered[matched]:
+                return None
+            matched += 1
+        return None
+
+    def sent(self, body: dict) -> None:
+        items = body.get("input") if isinstance(body.get("input"), list) else []
+        if body.get("previous_response_id"):
+            self.covered = self.covered + _history_keys(items)
+        else:
+            self.covered = _history_keys(items)
+        self.model = body.get("model")
+        self.in_flight = True
+
+    def completed(self, response: dict) -> None:
+        response_id = response.get("id")
+        output = response.get("output")
+        self.last_response_id = response_id if isinstance(response_id, str) and response_id else None
+        self.covered = self.covered + _history_keys(output if isinstance(output, list) else [])
+        self.in_flight = False
+
+    def broken(self) -> None:
+        self.last_response_id = None
+        self.in_flight = False
+
+
+# Idle upstream WebSockets kept for the session's next runtime connection.
+# A disk resume (interrupt with a pending tool call, configuration change,
+# failed turn, eviction) reconnects immediately, so entries are short-lived.
+_WEBSOCKET_POOL_SECONDS = float(os.environ.get("GHCP_SDK_WEBSOCKET_POOL_SECONDS", "600") or 600)
+_MAX_POOLED_WEBSOCKETS = 32
+@dataclass
+class _PooledWebSocket:
+    upstream: Any
+    chain: _UpstreamChain
+    # The previous handler's receive loop, cancelled when the socket was kept.
+    reader: asyncio.Task | None
+    pooled_at: float = field(default_factory=time.monotonic)
+
+
+_websocket_pool: "OrderedDict[str, _PooledWebSocket]" = OrderedDict()
+_websocket_closers: set[asyncio.Task] = set()
+
+
+def _websocket_open(upstream: Any) -> bool:
+    return getattr(getattr(upstream, "state", None), "name", None) == "OPEN"
+
+
+def _close_websocket_later(upstream: Any) -> None:
+    try:
+        task = asyncio.get_running_loop().create_task(upstream.close())
+    except Exception:
+        return
+    _websocket_closers.add(task)
+    task.add_done_callback(_websocket_closers.discard)
+
+
+def _pool_websocket(session_id: str, entry: _PooledWebSocket) -> None:
+    previous = _websocket_pool.pop(session_id, None)
+    if previous is not None:
+        _close_websocket_later(previous.upstream)
+    _websocket_pool[session_id] = entry
+    while len(_websocket_pool) > _MAX_POOLED_WEBSOCKETS:
+        _, oldest = _websocket_pool.popitem(last=False)
+        _close_websocket_later(oldest.upstream)
+
+
+def _take_pooled_websocket(session_id: str | None) -> _PooledWebSocket | None:
+    cutoff = time.monotonic() - _WEBSOCKET_POOL_SECONDS
+    for key in [key for key, entry in _websocket_pool.items() if entry.pooled_at < cutoff]:
+        _close_websocket_later(_websocket_pool.pop(key).upstream)
+    entry = _websocket_pool.pop(session_id, None) if session_id else None
+    if entry is None:
+        return None
+    if not _websocket_open(entry.upstream):
+        _close_websocket_later(entry.upstream)
+        return None
+    return entry
+
+
+async def _close_websocket_pool() -> None:
+    while _websocket_pool:
+        _, entry = _websocket_pool.popitem()
+        try:
+            await entry.upstream.close()
+        except Exception:
+            pass
+
+
+def _parse_event(text: str) -> dict | None:
+    """Parse only the WebSocket events this forwarder acts on."""
+    if not any(marker in text for marker in (
+        "response.created", "response.completed", "response.failed", "response.incomplete", '"error"',
+    )):
+        return None
+    try:
+        event = json.loads(text)
+    except ValueError:
+        return None
+    return event if isinstance(event, dict) else None
+
+
+def _is_invalid_request(event: dict) -> bool:
+    """Whether a WebSocket error rejects the request itself (not rate limits etc.)."""
+    error = event.get("error")
+    if not isinstance(error, dict) and isinstance(event.get("response"), dict):
+        error = event["response"].get("error")
+    if not isinstance(error, dict):
+        return False
+    return any("invalid" in str(error.get(key) or "") for key in ("type", "code"))
+
+
+class _UpstreamWebSocket(CopilotWebSocketForwarder):
+    """One runtime model WebSocket (Sol) with cache continuity.
+
+    Requests chain ``previous_response_id`` and carry only new items, so the
+    session's reasoning is recorded from each completed response.  When the
+    runtime drops the connection with no response in flight, the upstream
+    connection is kept for the session's next runtime connection; the full
+    history that connection opens with is sent as a continuation of the kept
+    chain.  If the upstream rejects that continuation before starting a
+    response, the full request goes out instead.
+    """
+
+    def __init__(self, context: Any, owner: _UpstreamRequestHandler) -> None:
+        super().__init__(context)
+        self._owner = owner
+        self._chain = _UpstreamChain()
+        self._last_input_key: str | None = None
+        self._record: dict | None = None
+        self._changed = False
+        self._fallback: tuple[str, dict] | None = None
+
+    async def open(self) -> None:
+        pooled = _take_pooled_websocket(self.context.session_id)
+        if pooled is None:
+            await super().open()
+            return
+        if pooled.reader is not None and not pooled.reader.done():
+            # A websocket allows one reader; let the old loop finish cancelling.
+            await asyncio.wait({pooled.reader}, timeout=1.0)
+        self._upstream, self._chain = pooled.upstream, pooled.chain
+        self._receive_task = asyncio.create_task(self._receive_loop())
+
+    def _keep_for_reuse(self) -> None:
+        upstream = self._upstream
+        session_id = self.context.session_id
+        if (
+            upstream is None
+            or not session_id
+            or self._chain.in_flight
+            or not self._chain.last_response_id
+            or not _websocket_open(upstream)
+        ):
+            return
+        reader = self._receive_task
+        if reader is asyncio.current_task():
+            reader = None
+        elif reader is not None:
+            reader.cancel()
+        self._upstream = None
+        _pool_websocket(session_id, _PooledWebSocket(upstream, self._chain, reader))
+
+    async def close(self, status: Any = None) -> None:
+        self._keep_for_reuse()
+        await super().close(status)
+
+    async def aclose(self) -> None:
+        self._keep_for_reuse()
+        await super().aclose()
+
+    async def send_request_message(self, data: str | bytes) -> None:
+        try:
+            message = json.loads(data)
+        except (TypeError, ValueError):
+            message = None
+        body = None
+        if isinstance(message, dict) and message.get("type") == "response.create":
+            body = message["response"] if isinstance(message.get("response"), dict) else message
+        if isinstance(body, dict) and isinstance(body.get("input"), list):
+            session_id = self.context.session_id
+            self._changed, self._record = self._owner._prepare(session_id, body, "websocket")
+            _note_model_call(session_id, self._record)
+            items = body["input"]
+            self._last_input_key = sdk_reasoning_ledger.anchor_key(items[-1]) if items else None
+            self._fallback = None
+            tail = None if body.get("previous_response_id") else self._chain.continuation_items(body)
+            if tail:
+                self._fallback = (json.dumps(message), copy.deepcopy(body))
+                body["previous_response_id"] = self._chain.last_response_id
+                body["input"] = tail
+                self._record.update(continuation=True, resumed_chain_items=len(tail))
+                self._changed = True
+            self._chain.sent(body)
+            if self._changed:
+                data = json.dumps(message)
+        await super().send_request_message(data)
+
+    async def send_response_message(self, data: str | bytes) -> None:
+        text = data.decode("utf-8", "replace") if isinstance(data, bytes) else data
+        event = _parse_event(text) if isinstance(text, str) else None
+        kind = event.get("type") if event is not None else None
+        if kind == "response.created":
+            self._fallback = None
+        elif kind in {"error", "response.failed"} and self._fallback is not None and self._upstream is not None:
+            # The kept chain was not continuable; the runtime never saw it.
+            full, body = self._fallback
+            self._fallback = None
+            if self._record is not None:
+                self._record["resumed_chain_rejected"] = True
+            self._chain.broken()
+            self._chain.sent(body)
+            await self._upstream.send(full)
+            return
+        elif kind == "response.completed":
+            self._observe_completed(event)
+        elif kind in {"error", "response.failed", "response.incomplete"}:
+            self._chain.broken()
+            if self._changed and _is_invalid_request(event):
+                # A WebSocket rejection cannot be retried here; stop applying
+                # the changes so the runtime's own retry goes out unmodified.
+                self._owner._reject(self.context.session_id, self._chain.model, self._record)
+        await super().send_response_message(data)
+
+    def _observe_completed(self, event: dict) -> None:
+        response = event.get("response")
+        if not isinstance(response, dict):
+            return
+        self._chain.completed(response)
+        _reasoning_ledger.record_output(
+            self.context.session_id, self._chain.model, self._last_input_key, response.get("output"),
+        )
+        usage = response.get("usage")
+        if self._record is not None and isinstance(usage, dict):
+            details = usage.get("input_tokens_details")
+            self._record["input_tokens"] = usage.get("input_tokens")
+            self._record["cached_tokens"] = details.get("cached_tokens") if isinstance(details, dict) else None
+        self._record = None
 
 
 def _request_handler_options() -> dict[str, Any]:
@@ -1808,6 +2190,28 @@ def _event_queue(session: Any) -> tuple[asyncio.Queue, Callable[[], None]]:
     return queue, session.on(handler)
 
 
+_ABORT_SETTLE_SECONDS = 5.0
+
+
+async def _abort_and_settle(session: Any, queue: asyncio.Queue) -> bool:
+    """Abort the running turn; return True once the runtime reports idle.
+
+    Only a settled session can be parked for the next request: a late
+    ``session.idle`` from the aborted turn would end the next turn early.
+    """
+    await session.abort()
+    deadline = time.monotonic() + _ABORT_SETTLE_SECONDS
+    while (remaining := deadline - time.monotonic()) > 0:
+        try:
+            event = await asyncio.wait_for(queue.get(), remaining)
+        except TimeoutError:
+            return False
+        data = getattr(event, "data", None)
+        if (SessionIdleData is not None and isinstance(data, SessionIdleData)) or _event_name(event) == "session.idle":
+            return True
+    return False
+
+
 async def _wait_for_outcome(
     session: Any,
     dispatch: Callable[[], Awaitable[None]],
@@ -2190,6 +2594,7 @@ async def _stream_turn(
     outcome = TurnOutcome()
     output_index = 0
     final_payload: dict | None = None
+    abort_settled = False
     usage_finished = False
 
     reasoning_started = False
@@ -2578,7 +2983,10 @@ async def _stream_turn(
         )
     except asyncio.CancelledError:
         try:
-            await asyncio.shield(session.abort())
+            if dispatch_task.done() and not dispatch_task.cancelled() and dispatch_task.exception() is None:
+                abort_settled = await asyncio.shield(_abort_and_settle(session, queue))
+            else:
+                await asyncio.shield(session.abort())
         except asyncio.CancelledError:
             pass
         except Exception:
@@ -2607,7 +3015,14 @@ async def _stream_turn(
         finish_usage()
         try:
             await asyncio.shield(
-                _release_session(session, outcome, completed=final_payload is not None)
+                _release_session(
+                    session,
+                    outcome,
+                    completed=final_payload is not None,
+                    # An interrupted turn keeps its live session (and the
+                    # encrypted reasoning a disk resume would drop).
+                    park=final_payload is None and abort_settled,
+                )
             )
         except asyncio.CancelledError:
             # The shielded release continues independently; lifecycle
@@ -2669,6 +3084,7 @@ async def handle_responses(
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
+        entry.diagnostics = session_diagnostics
 
     response_id = _new_id("resp")
     succeeded = False
@@ -2741,6 +3157,7 @@ async def shutdown() -> None:
     _client_token = None
     _client_pruned = False
     await _evict_all_live_sessions()
+    await _close_websocket_pool()
     if client is not None:
         await client.stop()
 
