@@ -1690,12 +1690,136 @@ class ExcelStreamTransformTests(unittest.TestCase):
         ]
         events = self._collect(chunks)
         completed = dict(events)["response.completed"]["response"]
-        self.assertEqual(completed["output"][0]["type"], "function_call")
-        self.assertEqual(completed["output"][0]["name"], "shell_command")
+        self.assertEqual(completed["output"][0]["type"], "message")
+        self.assertEqual(completed["output"][1]["type"], "function_call")
+        self.assertEqual(completed["output"][1]["name"], "shell_command")
         self.assertEqual(
-            json.loads(completed["output"][0]["arguments"]),
+            json.loads(completed["output"][1]["arguments"]),
             {"command": "Get-ChildItem"},
         )
+        self.assertNotIn("run_officejs", json.dumps(events))
+
+    def test_native_client_tool_keeps_upstream_output_index_after_reasoning(self):
+        native_item = {
+            "type": "function_call",
+            "id": "fc_transport_question",
+            "call_id": "call_transport_question",
+            "name": "run_officejs",
+            "status": "completed",
+            "arguments": json.dumps(
+                {
+                    "summary": "Ask setup questions",
+                    "extended_summary": "Collect the required workbook setup choices",
+                    "code": json.dumps(
+                        {
+                            "name": "request_user_input",
+                            "arguments": {
+                                "questions": [
+                                    {
+                                        "id": "mode",
+                                        "header": "Mode",
+                                        "question": "Which mode should I use?",
+                                        "options": [
+                                            {
+                                                "label": "Default",
+                                                "description": "Use the standard mode.",
+                                            },
+                                            {
+                                                "label": "Advanced",
+                                                "description": "Use advanced controls.",
+                                            },
+                                        ],
+                                    }
+                                ]
+                            },
+                        },
+                        separators=(",", ":"),
+                    ),
+                    "destructive": False,
+                    "references": [],
+                },
+                separators=(",", ":"),
+            ),
+        }
+        reasoning_item = {
+            "type": "reasoning",
+            "id": "rs_before_question",
+            "summary": [],
+        }
+        chunks = [
+            self._sse(
+                "response.created",
+                {"type": "response.created", "response": {"id": "resp_question"}},
+            ),
+            self._sse(
+                "response.output_item.added",
+                {
+                    "type": "response.output_item.added",
+                    "output_index": 0,
+                    "item": reasoning_item,
+                },
+            ),
+            self._sse(
+                "response.output_item.done",
+                {
+                    "type": "response.output_item.done",
+                    "output_index": 0,
+                    "item": reasoning_item,
+                },
+            ),
+            self._sse(
+                "response.output_item.done",
+                {
+                    "type": "response.output_item.done",
+                    "output_index": 1,
+                    "item": native_item,
+                },
+            ),
+            self._sse(
+                "response.completed",
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_question",
+                        "status": "completed",
+                        "model": "gpt-5.5",
+                        "output": [reasoning_item, native_item],
+                    },
+                },
+            ),
+        ]
+
+        events = self._collect(
+            chunks,
+            {
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "request_user_input",
+                        "parameters": {"type": "object"},
+                    }
+                ]
+            },
+        )
+        tool_events = [
+            payload
+            for name, payload in events
+            if name
+            in {
+                "response.output_item.added",
+                "response.function_call_arguments.delta",
+                "response.function_call_arguments.done",
+                "response.output_item.done",
+            }
+            and payload.get("output_index") == 1
+        ]
+
+        self.assertEqual(len(tool_events), 4)
+        self.assertTrue(all(event["output_index"] == 1 for event in tool_events))
+        self.assertEqual(tool_events[-1]["item"]["name"], "request_user_input")
+        completed = dict(events)["response.completed"]["response"]
+        self.assertEqual(completed["output"][0]["type"], "reasoning")
+        self.assertEqual(completed["output"][1]["name"], "request_user_input")
         self.assertNotIn("run_officejs", json.dumps(events))
 
     def test_plain_text_streams_through_incrementally(self):

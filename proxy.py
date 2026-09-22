@@ -5842,7 +5842,12 @@ async def background_proxy_config_api(request: Request):
     return JSONResponse(content={**result, "message": message})
 
 
-def _excel_tool_call_event_bytes(tool_call: dict, response_payload: dict) -> list[bytes]:
+def _excel_tool_call_event_bytes(
+    tool_call: dict,
+    response_payload: dict,
+    *,
+    output_index: int,
+) -> list[bytes]:
     item = dict(tool_call)
     item["status"] = "in_progress"
     if tool_call["type"] == "function_call":
@@ -5860,7 +5865,7 @@ def _excel_tool_call_event_bytes(tool_call: dict, response_payload: dict) -> lis
             "response.output_item.added",
             {
                 "type": "response.output_item.added",
-                "output_index": 0,
+                "output_index": output_index,
                 "item": item,
             },
         ),
@@ -5868,7 +5873,7 @@ def _excel_tool_call_event_bytes(tool_call: dict, response_payload: dict) -> lis
             delta_event,
             {
                 "type": delta_event,
-                "output_index": 0,
+                "output_index": output_index,
                 "item_id": tool_call["id"],
                 "delta": tool_call[value_key],
             },
@@ -5877,7 +5882,7 @@ def _excel_tool_call_event_bytes(tool_call: dict, response_payload: dict) -> lis
             done_event,
             {
                 "type": done_event,
-                "output_index": 0,
+                "output_index": output_index,
                 "item_id": tool_call["id"],
                 value_key: tool_call[value_key],
             },
@@ -5886,7 +5891,7 @@ def _excel_tool_call_event_bytes(tool_call: dict, response_payload: dict) -> lis
             "response.output_item.done",
             {
                 "type": "response.output_item.done",
-                "output_index": 0,
+                "output_index": output_index,
                 "item": {**tool_call, "status": "completed"},
             },
         ),
@@ -5921,6 +5926,7 @@ def _excel_tool_stream_transform(source_body: dict):
         held_events: list[bytes] = []
         delta_template: dict = {}
         done_seen = False
+        native_tool_output_index: int | None = None
 
         def flush_text() -> list[bytes]:
             nonlocal emitted_upto
@@ -5946,6 +5952,7 @@ def _excel_tool_stream_transform(source_body: dict):
             if not isinstance(payload, dict):
                 continue
             event_type = str(event_name or payload.get("type") or "").strip().lower()
+            event_output_index = payload.get("output_index")
             encoded = format_translation.sse_encode(event_type or "message", payload)
 
             if event_type == "response.output_text.delta":
@@ -6017,6 +6024,8 @@ def _excel_tool_stream_transform(source_body: dict):
                     item.get("type") if isinstance(item, dict) else None
                 )
                 if item_type in {"function_call", "custom_tool_call"}:
+                    if isinstance(event_output_index, int) and event_output_index >= 0:
+                        native_tool_output_index = event_output_index
                     held_events.append(encoded)
                     continue
                 if (
@@ -6063,7 +6072,16 @@ def _excel_tool_stream_transform(source_body: dict):
                         model_id=excel_upstream.excel_model_id(source_body.get("model"))
                         or excel_upstream.MODEL_ID,
                     )
-                    for chunk in _excel_tool_call_event_bytes(tool_call, response_payload):
+                    tool_output_index = (
+                        native_tool_output_index
+                        if native_tool_output_index is not None
+                        else 0
+                    )
+                    for chunk in _excel_tool_call_event_bytes(
+                        tool_call,
+                        response_payload,
+                        output_index=tool_output_index,
+                    ):
                         yield chunk
                     continue
                 # Not a tool call after all: release everything that was held

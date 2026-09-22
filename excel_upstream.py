@@ -910,7 +910,22 @@ def response_payload_with_tool_call(
     result.setdefault("created_at", int(time.time()))
     result["status"] = "completed"
     result["model"] = model_id
-    result["output"] = [{**tool_call, "status": "completed"}]
+    completed_tool_call = {**tool_call, "status": "completed"}
+    existing_output = result.get("output")
+    replaced_native_call = False
+    output: list[dict] = []
+    if isinstance(existing_output, list):
+        for item in existing_output:
+            if (
+                not replaced_native_call
+                and isinstance(item, dict)
+                and item.get("type") in {"function_call", "custom_tool_call"}
+            ):
+                output.append(completed_tool_call)
+                replaced_native_call = True
+            elif isinstance(item, dict):
+                output.append(item)
+    result["output"] = output if replaced_native_call else [completed_tool_call]
     result["error"] = None
     result["incomplete_details"] = None
     return result
