@@ -13,6 +13,7 @@ import base64
 import binascii
 import copy
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -26,6 +27,7 @@ from uuid import uuid4
 from fastapi import Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 import certifi
+import httpx
 
 import auth
 import excel_upstream
@@ -35,6 +37,7 @@ from constants import TOKEN_DIR
 
 try:
     from copilot import CopilotClient, Tool
+    from copilot.copilot_request_handler import CopilotRequestHandler
     from copilot.rpc import ExternalToolTextResultForLlm, HandlePendingToolCallRequest
     from copilot.session import PermissionHandler
     from copilot.session_events import (
@@ -57,6 +60,7 @@ try:
     )
 except ImportError as exc:  # pragma: no cover - exercised only on broken installs
     CopilotClient = None  # type: ignore[assignment,misc]
+    CopilotRequestHandler = object  # type: ignore[assignment,misc]
     Tool = None  # type: ignore[assignment,misc]
     ExternalToolTextResultForLlm = None  # type: ignore[assignment,misc]
     _SDK_IMPORT_ERROR: Exception | None = exc
@@ -79,6 +83,9 @@ _VALID_TOOL_NAME = re.compile(r"^[A-Za-z0-9_-]+$")
 _TURN_TIMEOUT_SECONDS = float(os.environ.get("GHCP_UPSTREAM_TIMEOUT_SECONDS", "1800") or 1800)
 _KEEPALIVE_INTERVAL_SECONDS = 15.0
 _PARALLEL_TOOL_SETTLE_SECONDS = 0.5
+# A reasoning summary paragraph still open after this long without SDK
+# reasoning events is treated as finished (see _stream_turn).
+_REASONING_PART_IDLE_SECONDS = 0.5
 _ENVIRONMENT_CONTEXT_RE = re.compile(
     r"<environment_context\b[^>]*>.*?<cwd>\s*(?P<cwd>[^<\r\n]+?)\s*</cwd>.*?</environment_context>",
     re.IGNORECASE | re.DOTALL,
@@ -732,6 +739,7 @@ async def _get_client():
             base_directory=_SDK_STATE_DIR,
             log_level=os.getenv("GHCP_SDK_LOG_LEVEL", "error"),
             mode="empty",
+            **_request_handler_options(),
         )
         await _client.start()
         _client_token = token
@@ -974,6 +982,9 @@ class _LiveSession:
     unsubscribe: Callable[[], None] | None = None
     reaper: asyncio.Task | None = None
     released_at: float = 0.0
+    # The current caller's reasoning summary delivery, for model calls the
+    # SDK issues on this session (see _UpstreamRequestHandler).
+    summary_delivery: str | None = None
 
 
 _live_sessions: dict[str, _LiveSession] = {}
@@ -1188,6 +1199,87 @@ async def _release_session(session: Any, outcome: "TurnOutcome | None", *, compl
 async def _evict_all_live_sessions() -> None:
     for session_id in list(_live_sessions):
         await _evict_live_session(session_id)
+
+
+_SEQUENTIAL_CUTOFF = "sequential_cutoff"
+
+
+def _requested_summary_delivery(body: dict) -> str | None:
+    stream_options = body.get("stream_options")
+    if (
+        isinstance(stream_options, dict)
+        and stream_options.get("reasoning_summary_delivery") == _SEQUENTIAL_CUTOFF
+    ):
+        return _SEQUENTIAL_CUTOFF
+    return None
+
+
+def _with_request_body(request: httpx.Request, content: bytes) -> httpx.Request:
+    headers = [(k, v) for k, v in request.headers.multi_items() if k.lower() != "content-length"]
+    return httpx.Request(
+        request.method, request.url, headers=headers, content=content, extensions=request.extensions,
+    )
+
+
+class _UpstreamRequestHandler(CopilotRequestHandler):
+    """Pass the caller's reasoning summary delivery on to Copilot model calls.
+
+    Codex asks for ``stream_options.reasoning_summary_delivery=sequential_cutoff``
+    so reasoning summaries are written while the model is still thinking.  The
+    SDK builds its own model request and drops the option.  Without it Copilot
+    sent the first summary about 20s into a turn instead of about 3s
+    (tools/diagnose-sdk-reasoning-stream.py).  Like Codex, add it only to
+    Responses calls that request a summary, and only for sessions whose current
+    caller asked for it.  A model that rejects it is retried once without the
+    option and is not sent it again.
+    """
+
+    def __init__(self) -> None:
+        self._rejected_models: set[Any] = set()
+
+    async def send_request(self, request: httpx.Request, ctx: Any) -> httpx.Response:
+        entry = _live_sessions.get(ctx.session_id) if ctx.session_id else None
+        delivery = entry.summary_delivery if entry is not None else None
+        if delivery is None or request.method != "POST":
+            return await super().send_request(request, ctx)
+        original = await request.aread()
+        try:
+            body = json.loads(original)
+        except ValueError:
+            body = None
+        reasoning = body.get("reasoning") if isinstance(body, dict) else None
+        if (
+            not isinstance(reasoning, dict)
+            or not reasoning.get("summary")
+            or "input" not in body
+            or body.get("model") in self._rejected_models
+        ):
+            return await super().send_request(request, ctx)
+        stream_options = body.get("stream_options")
+        body["stream_options"] = {
+            **(stream_options if isinstance(stream_options, dict) else {}),
+            "reasoning_summary_delivery": delivery,
+        }
+        response = await super().send_request(_with_request_body(request, json.dumps(body).encode()), ctx)
+        if response.status_code not in {400, 422}:
+            return response
+        await response.aclose()
+        retry = await super().send_request(_with_request_body(request, original), ctx)
+        if retry.status_code not in {400, 422}:
+            self._rejected_models.add(body.get("model"))
+        return retry
+
+
+def _request_handler_options() -> dict[str, Any]:
+    # A request handler routes every runtime model call through Python,
+    # including WebSocket connections, which the SDK forwards with the optional
+    # ``websockets`` package.  Without it, keep the runtime's own transport
+    # rather than risk breaking WebSocket model calls.
+    if os.environ.get("GHCP_SDK_REQUEST_HANDLER", "1") == "0":
+        return {}
+    if importlib.util.find_spec("websockets") is None:
+        return {}
+    return {"request_handler": _UpstreamRequestHandler()}
 
 
 async def _open_session(body: dict, registration: ToolRegistration, *, diagnostics: dict | None = None):
@@ -1957,6 +2049,9 @@ def _sse(event_type: str, **payload: Any) -> bytes:
 # A blank line, optionally padded, ends a reasoning summary paragraph.  The SDK
 # also uses one to separate upstream summary parts it flattens into one stream.
 _SUMMARY_PART_BREAK_RE = re.compile(r"[^\S\n]*\n[^\S\n]*\n\s*")
+# Endings after which a paused summary paragraph is treated as finished; the
+# closing ``**`` ends a bold section heading.
+_SUMMARY_SENTENCE_ENDINGS = (".", "!", "?", ":", ";", "**", ")", "`", '"', "”", "…")
 
 
 class _ReasoningSummaryParts:
@@ -2003,6 +2098,12 @@ class _ReasoningSummaryParts:
             chunks.extend(self.close())
             pending = pending[match.end():]
         return chunks
+
+    def at_sentence_end(self) -> bool:
+        """Whether the open part stops at a line or sentence boundary."""
+        return self.part_open and (
+            bool(self.held) or self.part_text.rstrip().endswith(_SUMMARY_SENTENCE_ENDINGS)
+        )
 
     def close(self) -> list[bytes]:
         """Complete the open part, dropping any held trailing whitespace."""
@@ -2251,13 +2352,30 @@ async def _stream_turn(
             if await request.is_disconnected():
                 await session.abort()
                 return
-            timeout = _PARALLEL_TOOL_SETTLE_SECONDS if outcome.calls else _KEEPALIVE_INTERVAL_SECONDS
+            reasoning_part_open = (
+                reasoning_parts is not None and reasoning_parts.part_open and not reasoning_closed
+            )
+            if outcome.calls:
+                timeout = _PARALLEL_TOOL_SETTLE_SECONDS
+            elif reasoning_part_open and reasoning_parts.at_sentence_end():
+                timeout = _REASONING_PART_IDLE_SECONDS
+            else:
+                timeout = _KEEPALIVE_INTERVAL_SECONDS
             try:
                 event = await asyncio.wait_for(queue.get(), timeout=timeout)
                 start_wait_time = time.time()
             except TimeoutError:
                 if outcome.calls:
                     break
+                if reasoning_part_open:
+                    # Copilot sends each summary section as a burst, then goes
+                    # quiet while the model thinks.  The blank line that would
+                    # close the section's last paragraph arrives only with the
+                    # next section, so finish the paragraph now.  A paragraph
+                    # paused mid-sentence gets the longer keepalive wait.
+                    for chunk in reasoning_parts.close():
+                        yield chunk
+                    continue
                 if (time.time() - start_wait_time) >= _TURN_TIMEOUT_SECONDS:
                     raise TimeoutError(f"Timed out waiting for the Copilot SDK turn after {_TURN_TIMEOUT_SECONDS}s")
                 yield b": keep-alive\n\n"
@@ -2528,6 +2646,12 @@ async def handle_responses(
         if not plan.usage_event.get("session_id"):
             plan.usage_event["session_id"] = session.session_id
             plan.usage_event["session_id_origin"] = "copilot_sdk"
+
+    entry = _live_sessions.get(session.session_id)
+    if entry is not None and entry.session is session:
+        entry.summary_delivery = (
+            _requested_summary_delivery(body) if body.get("stream") and not is_compact else None
+        )
 
     if bool(body.get("stream")):
         return StreamingResponse(

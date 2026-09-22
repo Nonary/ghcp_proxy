@@ -6,6 +6,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+import httpx
+from copilot import copilot_request_handler
 from copilot.session_events import (
     AssistantMessageData,
     AssistantMessageDeltaData,
@@ -1109,6 +1111,46 @@ class CopilotSdkEventTests(unittest.IsolatedAsyncioTestCase):
              if name.startswith("response.reasoning_summary")],
         )
 
+    async def test_stream_finishes_a_paused_reasoning_paragraph_before_the_next_section(self):
+        # Copilot sends a summary section as a burst, then goes quiet while the
+        # model keeps thinking; the next section's blank line comes much later.
+        session = _FakeSession()
+
+        async def dispatch():
+            for delta in ["**First**\n\n", "Body of"]:
+                session.emit("assistant.reasoning_delta",
+                             AssistantReasoningDeltaData(delta_content=delta, reasoning_id="r-1"))
+            # Copilot also pauses mid-sentence; that must not split the paragraph.
+            await asyncio.sleep(0.2)
+            session.emit("assistant.reasoning_delta",
+                         AssistantReasoningDeltaData(delta_content=" the first section.", reasoning_id="r-1"))
+            await asyncio.sleep(0.4)
+            for delta in ["\n\n", "**Second**\n\n", "More."]:
+                session.emit("assistant.reasoning_delta",
+                             AssistantReasoningDeltaData(delta_content=delta, reasoning_id="r-1"))
+            session.emit("assistant.message_delta",
+                         AssistantMessageDeltaData(delta_content="reply", message_id="m-1"))
+            session.emit("session.idle", SessionIdleData())
+
+        timed: list[tuple[float, str, dict]] = []
+        loop = asyncio.get_running_loop()
+        with patch.object(sdk, "_REASONING_PART_IDLE_SECONDS", 0.05):
+            async for chunk in sdk._stream_turn(
+                _ConnectedRequest(), {"model": "gpt-test"}, session, dispatch, sdk.ToolRegistration(),
+            ):
+                for block in chunk.decode().strip().split("\n\n"):
+                    lines = block.splitlines()
+                    if len(lines) == 2:
+                        timed.append((loop.time(), lines[0][7:], json.loads(lines[1][6:])))
+
+        done = [(t, data["text"]) for t, name, data in timed
+                if name == "response.reasoning_summary_text.done"]
+        self.assertEqual([text for _, text in done],
+                         ["**First**", "Body of the first section.", "**Second**", "More."])
+        second_started = next(t for t, name, data in timed
+                              if name == "response.reasoning_summary_text.delta" and data["delta"] == "**Second**")
+        self.assertLess(done[1][0], second_started - 0.2)
+
     def test_extract_shutdown_usage_prefers_token_details_over_model_metrics(self):
         """tokenDetails is the session-wide superset; modelMetrics undercounts."""
         usage = sdk._extract_shutdown_usage({
@@ -2065,6 +2107,79 @@ class CopilotSdkCompactionContinuityTests(unittest.IsolatedAsyncioTestCase):
         new_client.start.assert_awaited_once()
 
 
+class CopilotSdkUpstreamRequestHandlerTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        patcher = patch.object(sdk, "_live_sessions", {
+            "wants-cutoff": sdk._LiveSession(session=_FakeSession(), summary_delivery="sequential_cutoff"),
+            "plain": sdk._LiveSession(session=_FakeSession()),
+        })
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.sent: list[bytes] = []
+        self.reject_stream_options = False
+
+        def respond(request):
+            self.sent.append(request.content)
+            if self.reject_stream_options and b"stream_options" in request.content:
+                return httpx.Response(400, json={"error": {"message": "Unrecognized argument: stream_options"}})
+            return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=b"data: {}\n\n")
+
+        client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+        self.addAsyncCleanup(client.aclose)
+        patcher = patch.object(copilot_request_handler, "_get_shared_http_client", return_value=client)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.handler = sdk._UpstreamRequestHandler()
+
+    async def send(self, session_id, body):
+        request = httpx.Request("POST", "https://api.githubcopilot.com/responses", json=body)
+        response = await self.handler.send_request(request, SimpleNamespace(session_id=session_id))
+        await response.aread()
+        return response
+
+    def model_call(self, model="gpt-5.6-luna"):
+        return {"model": model, "input": [], "stream": True,
+                "reasoning": {"effort": "high", "summary": "auto"}}
+
+    async def test_adds_sequential_cutoff_for_sessions_whose_caller_requested_it(self):
+        await self.send("wants-cutoff", self.model_call())
+        sent = json.loads(self.sent[0])
+        self.assertEqual(sent["stream_options"], {"reasoning_summary_delivery": "sequential_cutoff"})
+        self.assertEqual({k: v for k, v in sent.items() if k != "stream_options"}, self.model_call())
+
+    async def test_leaves_other_requests_byte_for_byte_unchanged(self):
+        no_summary = {**self.model_call(), "reasoning": {"effort": "high"}}
+        cases = [
+            ("plain", self.model_call()),
+            ("unknown-session", self.model_call()),
+            (None, self.model_call()),
+            ("wants-cutoff", no_summary),
+            ("wants-cutoff", {"model": "claude", "messages": []}),
+        ]
+        for session_id, body in cases:
+            with self.subTest(session_id=session_id, body=body):
+                self.sent.clear()
+                request = httpx.Request("POST", "https://api.githubcopilot.com/responses", json=body)
+                original = request.read()
+                await self.handler.send_request(request, SimpleNamespace(session_id=session_id))
+                self.assertEqual(self.sent, [original])
+
+    async def test_rejected_option_is_retried_without_it_and_not_sent_again(self):
+        self.reject_stream_options = True
+        response = await self.send("wants-cutoff", self.model_call())
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(["stream_options" in json.loads(body) for body in self.sent], [True, False])
+
+        self.sent.clear()
+        await self.send("wants-cutoff", self.model_call())
+        self.assertEqual(["stream_options" in json.loads(body) for body in self.sent], [False])
+
+        # Another model is still offered the option.
+        self.sent.clear()
+        await self.send("wants-cutoff", self.model_call("gpt-5.6-sol"))
+        self.assertEqual(["stream_options" in json.loads(body) for body in self.sent], [True, False])
+
+
 class CopilotSdkRequestContinuityTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.state = _IsolatedSdkState()
@@ -2135,6 +2250,13 @@ class CopilotSdkRequestContinuityTests(unittest.IsolatedAsyncioTestCase):
         result = {"type": "function_call_output", "call_id": self.call_id, "output": "Inspection done"}
         tail = [call, result, *messages] if after_result else [call, *messages, result]
         return {**self.body, "input": [*self.body["input"], *tail]}
+
+    async def test_streaming_request_records_its_summary_delivery_on_the_live_session(self):
+        body = {**self.body, "stream": True,
+                "stream_options": {"reasoning_summary_delivery": "sequential_cutoff"}}
+        response = await sdk.handle_responses(_ConnectedRequest(), body)
+        self.assertIsInstance(response, sdk.StreamingResponse)
+        self.assertEqual(sdk._live_sessions["sdk-review"].summary_delivery, "sequential_cutoff")
 
     async def test_unchanged_options_keep_the_live_session_and_do_not_replay_input(self):
         original = await self.begin()

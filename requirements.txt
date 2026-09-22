@@ -7,3 +7,6 @@ uvicorn>=0.46.0,<1
 zstandard>=0.25.0,<1
 cryptography>=48.0.0,<49
 github-copilot-sdk>=1.0.11,<2
+# The proxy's SDK request handler routes runtime model calls through Python;
+# the SDK forwards WebSocket model connections with this package.
+websockets>=14,<17
