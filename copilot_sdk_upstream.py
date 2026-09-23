@@ -89,6 +89,10 @@ _PARALLEL_TOOL_SETTLE_SECONDS = 0.5
 # A reasoning summary paragraph still open after this long without SDK
 # reasoning events is treated as finished (see _stream_turn).
 _REASONING_PART_IDLE_SECONDS = 0.5
+# Codex renders completed sequential summary parts, rather than their raw
+# delta events. Bound a continuous SDK paragraph so it still becomes visible
+# as small live thinking updates when Copilot does not insert blank lines.
+_REASONING_PART_MAX_CHARS = 160
 _ENVIRONMENT_CONTEXT_RE = re.compile(
     r"<environment_context\b[^>]*>.*?<cwd>\s*(?P<cwd>[^<\r\n]+?)\s*</cwd>.*?</environment_context>",
     re.IGNORECASE | re.DOTALL,
@@ -946,9 +950,25 @@ def _session_options(
     if reasoning_effort is ...:
         reasoning_effort = _reasoning_effort(body)
     working_directory = _workspace_from_request(body)
+    if registration.tools:
+        available_tools: list[str] | None = [
+            f"custom:{tool.name}" for tool in registration.tools
+        ]
+    else:
+        # Codex's null/omitted or explicitly empty tools declaration means no
+        # caller-owned tools. The SDK still requires an explicit allowlist in
+        # mode="empty"; [] is its representation of that declaration.
+        available_tools = []
     options: dict[str, Any] = {
         "model": body.get("model") if isinstance(body.get("model"), str) else None,
         "reasoning_effort": reasoning_effort,
+        # The SDK's CAPI WebSocket Responses transport coalesces/withholds
+        # reasoning summary updates before it emits session events.  The HTTP
+        # transport delivers the same summaries as small
+        # ``assistant.reasoning_delta`` events, which is what Codex's live
+        # thinking UI consumes.  Keep the SDK's session/tool mechanics while
+        # explicitly selecting that proven transport.
+        "capi": {"enable_web_socket_responses": False},
         # The SDK does not emit Copilot's reasoning/intent timeline events
         # unless a reasoning summary mode is selected.  Without this, Codex
         # receives only the final answer and tool calls.
@@ -957,7 +977,7 @@ def _session_options(
         "tools": registration.tools,
         # Resume may retain previously registered tools when the new list is
         # empty. An explicit allowlist also enforces removals/tool_choice=none.
-        "available_tools": [f"custom:{tool.name}" for tool in registration.tools],
+        "available_tools": available_tools,
         "include_sub_agent_streaming_events": True,
         "on_permission_request": PermissionHandler.approve_all,
         # Resumed SDK sessions own their conversation history, so they also
@@ -1299,7 +1319,7 @@ class _UpstreamRequestHandler(CopilotRequestHandler):
     ``stream_options.reasoning_summary_delivery=sequential_cutoff`` so reasoning
     summaries are written while the model is still thinking.  The SDK builds
     its own model request and drops the option.  Without it Copilot sent the
-    first summary about 20s into a turn instead of about 3s
+    first summary about 20s into a turn instead of about 3s.
     (tools/diagnose-sdk-reasoning-stream.py).  Like Codex, add it only to HTTP
     Responses calls that request a summary, and only for sessions whose current
     caller asked for it.
@@ -1349,7 +1369,7 @@ class _UpstreamRequestHandler(CopilotRequestHandler):
         delivery = entry.summary_delivery if entry is not None else None
         reasoning = body.get("reasoning")
         if (
-            transport == "http"
+            transport in {"http", "websocket"}
             and delivery is not None
             and isinstance(reasoning, dict)
             and reasoning.get("summary")
@@ -1884,6 +1904,11 @@ class ToolCall:
 class TurnOutcome:
     text: str = ""
     reasoning: str = ""
+    # ``assistant.intent`` is Copilot's short current-activity update.  It is
+    # distinct from ``assistant.reasoning_delta`` and must remain in the
+    # Responses reasoning summary instead of being appended to the live
+    # reasoning-text channel.
+    intent: str = ""
     reasoning_id: str = field(default_factory=lambda: _new_id("rs"))
     message_id: str = field(default_factory=lambda: _new_id("msg"))
     calls: list[ToolCall] = field(default_factory=list)
@@ -2294,8 +2319,12 @@ async def _wait_for_outcome(
                 if not saw_reasoning_delta and data.content:
                     outcome.reasoning = data.content
             elif isinstance(data, AssistantIntentData):
-                if not saw_reasoning_delta and not outcome.reasoning and data.intent:
-                    outcome.reasoning = data.intent
+                if data.intent:
+                    intent = data.intent.strip()
+                    if intent and intent not in outcome.intent.split("\n\n"):
+                        outcome.intent += ("\n\n" if outcome.intent else "") + (
+                            intent if intent.startswith(("**", "#")) else f"**{intent}**"
+                        )
             elif isinstance(data, AssistantMessageData):
                 message_reasoning = _assistant_message_reasoning_text(data)
                 if _is_subagent_message_event(event, data):
@@ -2423,22 +2452,52 @@ def _message_item(text: str, *, item_id: str | None = None, completed: bool = Tr
     }
 
 
-def _reasoning_item(text: str, *, item_id: str | None = None, completed: bool = True) -> dict:
-    formatted_text = format_translation.ensure_codex_reasoning_header(text) if (completed and text) else text
+def _reasoning_item(
+    summary_text: str,
+    *,
+    content_text: str | None = None,
+    item_id: str | None = None,
+    completed: bool = True,
+) -> dict:
+    """Build a reasoning item without conflating its summary and content.
+
+    The Copilot SDK emits a short ``assistant.intent`` status separately from
+    the live ``assistant.reasoning_delta`` stream.  ChatGPT/Codex consumes
+    those through the summary and reasoning-text lifecycles respectively.
+    """
+    if content_text is None:
+        content_text = summary_text
+    formatted_summary = (
+        format_translation.ensure_codex_reasoning_header(summary_text)
+        if (completed and summary_text)
+        else summary_text
+    )
+    formatted_content = (
+        format_translation.ensure_codex_reasoning_header(content_text)
+        if (completed and content_text)
+        else content_text
+    )
     return {
         "type": "reasoning",
         "id": item_id or _new_id("rs"),
         "status": "completed" if completed else "in_progress",
-        "summary": ([{"type": "summary_text", "text": formatted_text}] if (completed and formatted_text) else []),
-        "content": ([{"type": "reasoning_text", "text": formatted_text}] if (completed and formatted_text) else []),
+        "summary": ([{"type": "summary_text", "text": formatted_summary}] if (completed and formatted_summary) else []),
+        "content": ([{"type": "reasoning_text", "text": formatted_content}] if (completed and formatted_content) else []),
         "encrypted_content": None,
     }
 
 
 def _response_payload(body: dict, session_id: str, outcome: TurnOutcome, response_id: str) -> dict:
     output: list[dict] = []
-    if outcome.reasoning:
-        output.append(_reasoning_item(outcome.reasoning, item_id=outcome.reasoning_id, completed=True))
+    if outcome.reasoning or outcome.intent:
+        output.append(
+            _reasoning_item(
+                outcome.intent or outcome.reasoning,
+                content_text=outcome.reasoning,
+                item_id=outcome.reasoning_id,
+                completed=True,
+            )
+        )
     if outcome.text:
         output.append(_message_item(outcome.text, item_id=outcome.message_id, completed=True))
     output.extend(_tool_item(session_id, call, completed=True) for call in outcome.calls)
@@ -2599,6 +2658,16 @@ class _ReasoningSummaryParts:
                 delta=text,
             )
         )
+        # ``sequential_cutoff`` clients render a completed summary part, not
+        # its raw delta events. Copilot can stream a long, unbroken paragraph
+        # token-by-token, so wait for a natural sentence boundary and then
+        # complete a bounded chunk instead of holding the whole paragraph
+        # until the model pauses or the turn ends.
+        if (
+            len(self.part_text) >= _REASONING_PART_MAX_CHARS
+            and self.at_sentence_end()
+        ):
+            chunks.extend(self.close())
         return chunks
 
 
@@ -2639,6 +2708,13 @@ async def _stream_turn(
     saw_reasoning_delta = False
     reasoning_header_sent = False
     reasoning_parts: _ReasoningSummaryParts | None = None
+    reasoning_content_started = False
+    # ChatGPT desktop sends this metadata and consumes the full reasoning
+    # content lifecycle.  Keep old Responses callers on the summary-only
+    # fallback when they do not identify themselves this way.
+    reasoning_content_streamed = bool(body.get("client_metadata"))
+    saw_intent = False
+    latest_intent = ""
 
     message_started = False
     message_closed = False
@@ -2692,18 +2768,55 @@ async def _stream_turn(
             ),
         ]
 
+    def emit_reasoning_content_start() -> list[bytes]:
+        nonlocal reasoning_content_started
+        if not reasoning_content_streamed or reasoning_content_started or reasoning_closed:
+            return []
+        reasoning_content_started = True
+        return [
+            _sse(
+                "response.content_part.added",
+                item_id=outcome.reasoning_id,
+                output_index=reasoning_output_index,
+                content_index=0,
+                part={"type": "reasoning_text", "text": ""},
+            )
+        ]
+
     def emit_reasoning_done() -> list[bytes]:
         nonlocal reasoning_closed
         if not reasoning_started or reasoning_closed:
             return []
         reasoning_closed = True
-        chunks = reasoning_parts.close() if reasoning_parts is not None else []
+        chunks: list[bytes] = []
+        if reasoning_content_started:
+            chunks.extend(
+                [
+                    _sse(
+                        "response.reasoning_text.done",
+                        item_id=outcome.reasoning_id,
+                        output_index=reasoning_output_index,
+                        content_index=0,
+                        text=outcome.reasoning,
+                    ),
+                    _sse(
+                        "response.content_part.done",
+                        item_id=outcome.reasoning_id,
+                        output_index=reasoning_output_index,
+                        content_index=0,
+                        part={"type": "reasoning_text", "text": outcome.reasoning},
+                    ),
+                ]
+            )
+        if reasoning_parts is not None:
+            chunks.extend(reasoning_parts.close())
         chunks.append(
             _sse(
                 "response.output_item.done",
                 output_index=reasoning_output_index,
                 item=_reasoning_item(
-                    outcome.reasoning,
+                    outcome.intent or outcome.reasoning,
+                    content_text=outcome.reasoning,
                     item_id=outcome.reasoning_id,
                     completed=True,
                 ),
@@ -2711,8 +2824,8 @@ async def _stream_turn(
         )
         return chunks
 
-    def emit_reasoning_delta(delta: str) -> list[bytes]:
-        """Emit ChatGPT-compatible summary parts and retain normalized text."""
+    def emit_reasoning_summary_delta(delta: str) -> list[bytes]:
+        """Emit a Responses reasoning-summary delta without touching raw content."""
         nonlocal reasoning_header_sent
         if not isinstance(delta, str) or not delta:
             return []
@@ -2722,12 +2835,66 @@ async def _stream_turn(
             reasoning_header_sent = True
             if not delta.lstrip().startswith("**") and not delta.lstrip().startswith("#"):
                 text = format_translation._CODEX_THINKING_SUMMARY_HEADER + delta
-        outcome.reasoning += text
         if reasoning_closed or reasoning_parts is None:
             # The reasoning item is already done; events for it now would be
             # attached by the client to whichever item is active instead.
             return []
         return reasoning_parts.feed(text)
+
+    def emit_intent(intent: str) -> list[bytes]:
+        """Send Copilot's short current-activity update as a completed summary part."""
+        nonlocal saw_intent, latest_intent
+        if not isinstance(intent, str):
+            return []
+        text = intent.strip()
+        if not text or text == latest_intent:
+            return []
+        saw_intent = True
+        latest_intent = text
+        # Intent events are snapshots, not deltas. Give each update a
+        # self-contained heading so Codex can render the most recent activity
+        # immediately instead of concatenating it with model reasoning.
+        summary = text if text.startswith(("**", "#")) else f"**{text}**"
+        if outcome.intent:
+            outcome.intent += "\n\n"
+        outcome.intent += summary
+        chunks = list(emit_reasoning_start())
+        if reasoning_closed or reasoning_parts is None:
+            return chunks
+        chunks.extend(reasoning_parts.feed(summary))
+        chunks.extend(reasoning_parts.close())
+        return chunks
+
+    def emit_live_reasoning_delta(delta: str) -> list[bytes]:
+        """Route live reasoning apart from the current-activity summary."""
+        if not isinstance(delta, str) or not delta:
+            return []
+        outcome.reasoning += delta
+        if reasoning_closed:
+            return []
+        chunks: list[bytes] = []
+        if reasoning_content_streamed:
+            # ChatGPT's message envelope expects the content-part lifecycle
+            # even before the SDK happens to publish an intent event.
+            chunks.extend(emit_reasoning_content_start())
+            chunks.append(
+                _sse(
+                    "response.reasoning_text.delta",
+                    item_id=outcome.reasoning_id,
+                    output_index=reasoning_output_index,
+                    content_index=0,
+                    delta=delta,
+                )
+            )
+        # Once an intent is present, it exclusively owns the short summary
+        # channel. Keep live model reasoning in reasoning_text so the two do
+        # not overlap in the desktop UI.
+        if saw_intent:
+            return chunks
+        # The SDK does not always emit intent. Preserve Excel-equivalent
+        # visible reasoning summaries for those turns and for legacy callers.
+        chunks.extend(emit_reasoning_summary_delta(delta))
+        return chunks
 
     def emit_text_start() -> list[bytes]:
         nonlocal message_started, message_output_index, output_index
@@ -2851,27 +3018,24 @@ async def _stream_turn(
                 for chunk in emit_reasoning_start():
                     yield chunk
                 saw_reasoning_delta = True
-                for chunk in emit_reasoning_delta(data.delta_content):
+                for chunk in emit_live_reasoning_delta(data.delta_content):
                     yield chunk
             elif isinstance(data, AssistantReasoningData):
                 if not saw_reasoning_delta and data.content:
                     for chunk in emit_reasoning_start():
                         yield chunk
-                    for chunk in emit_reasoning_delta(data.content):
+                    for chunk in emit_live_reasoning_delta(data.content):
                         yield chunk
             elif isinstance(data, AssistantIntentData):
-                if not saw_reasoning_delta and not outcome.reasoning and data.intent:
-                    for chunk in emit_reasoning_start():
-                        yield chunk
-                    for chunk in emit_reasoning_delta(data.intent):
-                        yield chunk
+                for chunk in emit_intent(data.intent):
+                    yield chunk
             elif (SubagentStartedData is not None and isinstance(data, SubagentStartedData)) or _event_name(event) == "subagent.started":
                 agent_name = getattr(data, "agent_display_name", None) or getattr(data, "agent_name", "subagent")
                 notice = f"[Subagent '{agent_name}' started]\n"
                 for chunk in emit_reasoning_start():
                     yield chunk
                 saw_reasoning_delta = True
-                for chunk in emit_reasoning_delta(notice):
+                for chunk in emit_live_reasoning_delta(notice):
                     yield chunk
             elif (SubagentCompletedData is not None and isinstance(data, SubagentCompletedData)) or _event_name(event) == "subagent.completed":
                 agent_name = getattr(data, "agent_display_name", None) or getattr(data, "agent_name", "subagent")
@@ -2879,7 +3043,7 @@ async def _stream_turn(
                 for chunk in emit_reasoning_start():
                     yield chunk
                 saw_reasoning_delta = True
-                for chunk in emit_reasoning_delta(notice):
+                for chunk in emit_live_reasoning_delta(notice):
                     yield chunk
             elif (SubagentFailedData is not None and isinstance(data, SubagentFailedData)) or _event_name(event) == "subagent.failed":
                 agent_name = getattr(data, "agent_display_name", None) or getattr(data, "agent_name", "subagent")
@@ -2888,7 +3052,7 @@ async def _stream_turn(
                 for chunk in emit_reasoning_start():
                     yield chunk
                 saw_reasoning_delta = True
-                for chunk in emit_reasoning_delta(notice):
+                for chunk in emit_live_reasoning_delta(notice):
                     yield chunk
             elif (
                 (SessionCompactionCompleteData is not None and isinstance(data, SessionCompactionCompleteData))
@@ -2901,7 +3065,7 @@ async def _stream_turn(
                     for chunk in emit_reasoning_start():
                         yield chunk
                     saw_reasoning_delta = True
-                    for chunk in emit_reasoning_delta(data.delta_content):
+                    for chunk in emit_live_reasoning_delta(data.delta_content):
                         yield chunk
                 else:
                     for chunk in emit_text_start():
@@ -2922,13 +3086,13 @@ async def _stream_turn(
                         for chunk in emit_reasoning_start():
                             yield chunk
                         reasoning_text = message_reasoning or data.content
-                        for chunk in emit_reasoning_delta(reasoning_text):
+                        for chunk in emit_live_reasoning_delta(reasoning_text):
                             yield chunk
                 else:
                     if not saw_reasoning_delta and message_reasoning:
                         for chunk in emit_reasoning_start():
                             yield chunk
-                        for chunk in emit_reasoning_delta(message_reasoning):
+                        for chunk in emit_live_reasoning_delta(message_reasoning):
                             yield chunk
                     if not saw_delta and data.content:
                         for chunk in emit_text_start():

@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, patch
 import httpx
 from copilot import copilot_request_handler
 from copilot.session_events import (
+    AssistantIntentData,
     AssistantMessageData,
     AssistantMessageDeltaData,
     AssistantReasoningData,
@@ -71,6 +72,27 @@ class CopilotSdkTranslationTests(unittest.TestCase):
     def test_sdk_sessions_enable_automatic_context_compaction(self):
         options = sdk._session_options({"model": "gpt-test"}, sdk.ToolRegistration())
         self.assertEqual(options["infinite_sessions"], {"enabled": True})
+
+    def test_sdk_tool_filter_maps_codex_null_tools_to_empty_sdk_allowlist(self):
+        for body in ({"model": "gpt-test"}, {"model": "gpt-test", "tools": None}):
+            with self.subTest(body=body):
+                options = sdk._session_options(body, sdk.ToolRegistration())
+                self.assertEqual(options["tools"], [])
+                self.assertEqual(options["available_tools"], [])
+
+    def test_sdk_tool_filter_keeps_explicit_empty_tools_restrictive(self):
+        for body in (
+            {"model": "gpt-test", "tools": []},
+            {"model": "gpt-test", "tools": None, "tool_choice": "none"},
+        ):
+            with self.subTest(body=body):
+                options = sdk._session_options(body, sdk.ToolRegistration())
+                self.assertEqual(options["tools"], [])
+                self.assertEqual(options["available_tools"], [])
+
+    def test_sdk_sessions_use_http_responses_for_incremental_reasoning(self):
+        options = sdk._session_options({"model": "gpt-test", "stream": True}, sdk.ToolRegistration())
+        self.assertEqual(options["capi"], {"enable_web_socket_responses": False})
 
     def test_sdk_git_context_uses_codex_workspace_from_environment_context(self):
         with self.subTest("workspace context enables host git operations"):
@@ -1189,6 +1211,23 @@ class CopilotSdkEventTests(unittest.IsolatedAsyncioTestCase):
                               if name == "response.reasoning_summary_text.delta" and data["delta"] == "**Second**")
         self.assertLess(done[1][0], second_started - 0.2)
 
+    def test_reasoning_parts_flush_continuous_sdk_streams_at_sentence_boundaries(self):
+        parts = sdk._ReasoningSummaryParts("r-1", 0)
+        with patch.object(sdk, "_REASONING_PART_MAX_CHARS", 20):
+            chunks = parts.feed("First complete thought.")
+            chunks.extend(parts.feed(" Second complete thought."))
+        events = []
+        for chunk in chunks:
+            lines = chunk.decode().strip().splitlines()
+            events.append((
+                lines[0].removeprefix("event: "),
+                json.loads(lines[1].removeprefix("data: ")),
+            ))
+        self.assertEqual(
+            [data["text"] for name, data in events if name == "response.reasoning_summary_text.done"],
+            ["First complete thought.", "Second complete thought."],
+        )
+
     def test_extract_shutdown_usage_prefers_token_details_over_model_metrics(self):
         """tokenDetails is the session-wide superset; modelMetrics undercounts."""
         usage = sdk._extract_shutdown_usage({
@@ -1585,6 +1624,78 @@ class CopilotSdkEventTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertIn("terminal thought", reasoning_deltas)
         self.assertIn("final answer", text_deltas)
+
+    async def test_intent_summary_and_live_reasoning_use_separate_channels(self):
+        """Copilot's activity status must not be concatenated with reasoning deltas."""
+        session = _FakeSession()
+
+        async def dispatch():
+            session.emit(
+                "assistant.intent",
+                AssistantIntentData(intent="Inspecting the stream protocol"),
+            )
+            session.emit(
+                "assistant.reasoning_delta",
+                AssistantReasoningDeltaData(
+                    delta_content="The model is checking the event lifecycle.",
+                    reasoning_id="r-1",
+                ),
+            )
+            session.emit(
+                "assistant.intent",
+                AssistantIntentData(intent="Verifying the response envelope"),
+            )
+            session.emit(
+                "assistant.message_delta",
+                AssistantMessageDeltaData(delta_content="fixed", message_id="m-1"),
+            )
+            session.emit("session.idle", SessionIdleData())
+
+        events: list[tuple[str, dict]] = []
+        async for chunk in sdk._stream_turn(
+            _ConnectedRequest(),
+            {"model": "gpt-test", "client_metadata": {"client": "chatgpt"}},
+            session,
+            dispatch,
+            sdk.ToolRegistration(),
+        ):
+            for block in chunk.decode().strip().split("\n\n"):
+                if not block.strip():
+                    continue
+                lines = block.splitlines()
+                events.append((
+                    lines[0].removeprefix("event: "),
+                    json.loads(lines[1].removeprefix("data: ")),
+                ))
+
+        summary_deltas = [
+            data.get("delta")
+            for name, data in events
+            if name == "response.reasoning_summary_text.delta"
+        ]
+        live_reasoning_deltas = [
+            data.get("delta")
+            for name, data in events
+            if name == "response.reasoning_text.delta"
+        ]
+        self.assertEqual(
+            summary_deltas,
+            ["**Inspecting the stream protocol**", "**Verifying the response envelope**"],
+        )
+        self.assertEqual(live_reasoning_deltas, ["The model is checking the event lifecycle."])
+        self.assertNotIn("The model is checking the event lifecycle.", summary_deltas)
+        self.assertTrue(any(name == "response.content_part.added" for name, _ in events))
+        self.assertTrue(any(name == "response.reasoning_text.done" for name, _ in events))
+
+        completed_reasoning = next(
+            data["item"]
+            for name, data in events
+            if name == "response.output_item.done" and data.get("item", {}).get("type") == "reasoning"
+        )
+        self.assertIn("Inspecting the stream protocol", completed_reasoning["summary"][0]["text"])
+        self.assertIn("Verifying the response envelope", completed_reasoning["summary"][0]["text"])
+        self.assertIn("The model is checking the event lifecycle.", completed_reasoning["content"][0]["text"])
+        self.assertNotIn("Inspecting the stream protocol", completed_reasoning["content"][0]["text"])
 
     async def test_handle_responses_sets_session_id_on_plan_and_triggers_finish(self):
         session = _FakeSession()
@@ -2195,6 +2306,13 @@ class CopilotSdkUpstreamRequestHandlerTests(unittest.IsolatedAsyncioTestCase):
         sent = json.loads(self.sent[0])
         self.assertEqual(sent["stream_options"], {"reasoning_summary_delivery": "sequential_cutoff"})
         self.assertEqual({k: v for k, v in sent.items() if k != "stream_options"}, self.model_call())
+
+    async def test_adds_sequential_cutoff_to_websocket_model_calls(self):
+        body = self.model_call()
+        changed, record = self.handler._prepare("wants-cutoff", body, "websocket")
+        self.assertTrue(changed)
+        self.assertEqual(body["stream_options"], {"reasoning_summary_delivery": "sequential_cutoff"})
+        self.assertEqual(record["summary_delivery"], "sequential_cutoff")
 
     async def test_leaves_other_requests_byte_for_byte_unchanged(self):
         no_summary = {**self.model_call(), "reasoning": {"effort": "high"}}
