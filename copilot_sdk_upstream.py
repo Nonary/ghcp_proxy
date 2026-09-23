@@ -1930,6 +1930,10 @@ class TurnOutcome:
     intent: str = ""
     reasoning_id: str = field(default_factory=lambda: _new_id("rs"))
     message_id: str = field(default_factory=lambda: _new_id("msg"))
+    # Responses message phase.  Text sent beside tool calls is a commentary
+    # progress update; the app shows it between tool calls instead of treating
+    # it as the turn's final answer.
+    phase: str | None = None
     calls: list[ToolCall] = field(default_factory=list)
     usage: dict[str, int] = field(default_factory=dict)
     # Two independent usage sources; ``_finalize_usage`` picks between them.
@@ -2346,6 +2350,8 @@ async def _wait_for_outcome(
                         )
             elif isinstance(data, AssistantMessageData):
                 message_reasoning = _assistant_message_reasoning_text(data)
+                if not _is_subagent_message_event(event, data):
+                    _record_message_phase(outcome, data)
                 if _is_subagent_message_event(event, data):
                     if not saw_reasoning_delta and (message_reasoning or data.content):
                         outcome.reasoning = message_reasoning or data.content
@@ -2461,14 +2467,36 @@ def _tool_item(session_id: str, call: ToolCall, *, completed: bool = True) -> di
     return item
 
 
-def _message_item(text: str, *, item_id: str | None = None, completed: bool = True) -> dict:
-    return {
+def _message_item(
+    text: str,
+    *,
+    item_id: str | None = None,
+    completed: bool = True,
+    phase: str | None = None,
+) -> dict:
+    item = {
         "type": "message",
         "id": item_id or _new_id("msg"),
         "role": "assistant",
         "status": "completed" if completed else "in_progress",
         "content": ([{"type": "output_text", "text": text, "annotations": []}] if completed else []),
     }
+    if phase:
+        item["phase"] = phase
+    return item
+
+
+def _message_phase(outcome: TurnOutcome) -> str | None:
+    if outcome.phase in {"commentary", "final_answer"}:
+        return outcome.phase
+    return "commentary" if outcome.calls else None
+
+
+def _record_message_phase(outcome: TurnOutcome, data: Any) -> None:
+    phase = getattr(data, "phase", None)
+    phase = getattr(phase, "value", phase)
+    if phase in {"commentary", "final_answer"}:
+        outcome.phase = phase
 
 
 def _reasoning_item(
@@ -2518,7 +2546,12 @@ def _response_payload(body: dict, session_id: str, outcome: TurnOutcome, respons
             )
         )
     if outcome.text:
-        output.append(_message_item(outcome.text, item_id=outcome.message_id, completed=True))
+        output.append(_message_item(
+            outcome.text,
+            item_id=outcome.message_id,
+            completed=True,
+            phase=_message_phase(outcome),
+        ))
     output.extend(_tool_item(session_id, call, completed=True) for call in outcome.calls)
     return {
         "id": response_id,
@@ -2928,7 +2961,12 @@ async def _stream_turn(
             _sse(
                 "response.output_item.added",
                 output_index=message_output_index,
-                item=_message_item("", item_id=outcome.message_id, completed=False),
+                item=_message_item(
+                    "",
+                    item_id=outcome.message_id,
+                    completed=False,
+                    phase=outcome.phase,
+                ),
             ),
             _sse(
                 "response.content_part.added",
@@ -2945,7 +2983,12 @@ async def _stream_turn(
         if not message_started or message_closed:
             return []
         message_closed = True
-        completed_message = _message_item(outcome.text, item_id=outcome.message_id, completed=True)
+        completed_message = _message_item(
+            outcome.text,
+            item_id=outcome.message_id,
+            completed=True,
+            phase=_message_phase(outcome),
+        )
         return [
             _sse(
                 "response.output_text.done",
@@ -3008,6 +3051,9 @@ async def _stream_turn(
                 yield b": keep-alive\n\n"
                 continue
             data = getattr(event, "data", None)
+            if _event_name(event) == "assistant.message_start" and not _is_subagent_message_event(event, data):
+                # Known before the first text delta, so the added item carries it.
+                _record_message_phase(outcome, data)
             # A compact response is a different Responses item type.  Do not
             # leak the SDK's ordinary assistant/tool items into that stream:
             # remote compaction v2 validates the streamed output and requires
@@ -3100,6 +3146,8 @@ async def _stream_turn(
                     )
             elif isinstance(data, AssistantMessageData):
                 message_reasoning = _assistant_message_reasoning_text(data)
+                if not _is_subagent_message_event(event, data):
+                    _record_message_phase(outcome, data)
                 if _is_subagent_message_event(event, data):
                     if not saw_reasoning_delta and (message_reasoning or data.content):
                         for chunk in emit_reasoning_start():

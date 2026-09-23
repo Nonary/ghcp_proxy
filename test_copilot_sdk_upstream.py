@@ -931,6 +931,76 @@ class CopilotSdkEventTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(positions, sorted(positions))
         self.assertTrue(session.disconnected)
 
+    async def test_stream_marks_text_beside_tool_calls_as_commentary(self):
+        session = _FakeSession()
+        registration = sdk.build_tool_registration(
+            {"tools": [{"type": "function", "name": "lookup", "parameters": {"type": "object", "properties": {}}}]}
+        )
+
+        async def dispatch():
+            session.emit(
+                "assistant.message_delta",
+                AssistantMessageDeltaData(delta_content="Checking the inventory next.", message_id="m-1"),
+            )
+            session.emit(
+                "external_tool.requested",
+                ExternalToolRequestedData(
+                    request_id="request-1",
+                    session_id="session-1",
+                    tool_call_id="runtime-call-1",
+                    tool_name="lookup",
+                    arguments={},
+                ),
+            )
+            session.emit("session.idle", SessionIdleData())
+
+        chunks = [
+            chunk.decode()
+            async for chunk in sdk._stream_turn(
+                _ConnectedRequest(), {"model": "gpt-test"}, session, dispatch, registration,
+            )
+        ]
+        done = [
+            json.loads(c.split("data: ", 1)[1])["item"]
+            for c in chunks
+            if c.startswith("event: response.output_item.done")
+        ]
+        messages = [item for item in done if item["type"] == "message"]
+        self.assertEqual([item["phase"] for item in messages], ["commentary"])
+        completed = next(c for c in chunks if c.startswith("event: response.completed"))
+        output = json.loads(completed.split("data: ", 1)[1])["response"]["output"]
+        self.assertEqual(
+            [item.get("phase") for item in output if item["type"] == "message"],
+            ["commentary"],
+        )
+
+    async def test_stream_forwards_sdk_message_phase_on_the_added_item(self):
+        session = _FakeSession()
+
+        async def dispatch():
+            session.emit(
+                "assistant.message_start",
+                SimpleNamespace(message_id="m-1", phase="final_answer"),
+            )
+            session.emit(
+                "assistant.message_delta",
+                AssistantMessageDeltaData(delta_content="done", message_id="m-1"),
+            )
+            session.emit("session.idle", SessionIdleData())
+
+        chunks = [
+            chunk.decode()
+            async for chunk in sdk._stream_turn(
+                _ConnectedRequest(), {"model": "gpt-test"}, session, dispatch, sdk.ToolRegistration(),
+            )
+        ]
+        added = [
+            json.loads(c.split("data: ", 1)[1])["item"]
+            for c in chunks
+            if c.startswith("event: response.output_item.added")
+        ]
+        self.assertEqual([item.get("phase") for item in added if item["type"] == "message"], ["final_answer"])
+
     async def test_wait_for_outcome_collects_reasoning_without_duplication(self):
         session = _FakeSession()
 
