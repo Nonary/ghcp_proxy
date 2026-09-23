@@ -777,7 +777,15 @@ async def _get_client():
 def _reasoning_effort(body: dict) -> str | None:
     reasoning = body.get("reasoning")
     effort = reasoning.get("effort") if isinstance(reasoning, dict) else None
-    return effort if effort in {"low", "medium", "high", "xhigh", "max"} else None
+    if effort in {"low", "medium", "high", "xhigh", "max"}:
+        return effort
+    if isinstance(reasoning, dict) and (effort == "none" or reasoning.get("summary") == "none"):
+        return None
+    # Some ChatGPT clients omit the effort even when the catalog advertises
+    # Luna reasoning. Without one the SDK commonly emits no heading at all.
+    if _model_id_for_lookup(body.get("model")) == "gpt-5.6-luna":
+        return "medium"
+    return None
 
 
 def _model_id_for_lookup(model: Any) -> str | None:
@@ -854,15 +862,15 @@ async def _reasoning_effort_for_client(body: dict, client: Any) -> str | None:
 
 
 def _reasoning_summary(body: dict) -> str:
-    """Request short app-facing summaries unless the caller selects a mode."""
+    """Request early SDK headings unless the caller selects a mode."""
     reasoning = body.get("reasoning")
     summary = reasoning.get("summary") if isinstance(reasoning, dict) else None
     if summary in {"none", "concise", "detailed"}:
         return summary
-    # Responses clients normally send "auto" or omit this setting. The SDK's
-    # detailed mode turns those requests into extended reasoning prose. Concise
-    # produces the short summary headings used by the app's thinking display.
-    return "concise"
+    # Concise headings usually arrive with the completed SDK message, so the
+    # app shows only its spinner while the model works. Detailed mode streams
+    # the heading early; the output translator emits only that short heading.
+    return "detailed"
 
 
 def _session_options(
@@ -1886,6 +1894,22 @@ def _sse(event_type: str, **payload: Any) -> bytes:
     return f"event: {event_type}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n".encode()
 
 
+_SDK_SUMMARY_HEADING = re.compile(r"^\s*(\*\*[^*\n]{1,100}\*\*|#{1,3} [^\n]{1,100})")
+
+
+def _sdk_display_summary(text: str, *, complete: bool) -> str:
+    """Expose a finished, short heading as soon as the SDK has streamed it."""
+    match = _SDK_SUMMARY_HEADING.match(text)
+    if match:
+        return match.group(1)
+    if not complete:
+        return ""
+    # Older runtimes sometimes omit Markdown headings. Use the first line of
+    # their completed summary, rather than exposing the full reasoning prose.
+    first_line = text.strip().splitlines()[0] if text.strip() else ""
+    return first_line[:100].rstrip() + ("…" if len(first_line) > 100 else "")
+
+
 @dataclass
 class _SdkOutputItem:
     kind: str
@@ -1939,6 +1963,21 @@ class _SdkOutputTranslator:
         if key in self.state.finished:
             return []
         previous = self.state.raw_text.get(key, "")
+        if kind == "reasoning":
+            # The SDK's detailed mode streams many fragments of one reasoning
+            # block. The app needs a completed summary item while that block is
+            # still running, rather than a long series of hidden text deltas.
+            suffix = text[len(previous):] if complete and text.startswith(previous) else text
+            accumulated = previous + suffix
+            summary = _sdk_display_summary(accumulated, complete=complete)
+            if not summary:
+                self.state.raw_text[key] = accumulated
+                if complete:
+                    self.state.finished.add(key)
+                return []
+            text = summary
+            previous = ""
+            complete = True
         # Completed SDK events repeat the accumulated deltas. Reconcile only
         # their missing suffix, independently for each source message/reasoning ID.
         delta = text

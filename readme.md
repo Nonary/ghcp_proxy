@@ -84,9 +84,13 @@ SDK feedback is collected for the lifetime of the connected session, including
 between tool handoffs. Each Responses request emits its own ordered thought and
 message items, while deduplication follows the SDK's source IDs across handoffs.
 Thoughts use the Responses reasoning-summary channel with live display headers.
-Omitted or `auto` summary settings request the SDK's concise summaries, producing
-short app-facing headings. Explicit `none`, `concise`, and `detailed` settings are
-preserved. Completed summary items use the same normalization as the Excel path.
+Omitted or `auto` summary settings request the SDK's early detailed stream. The
+proxy completes a short heading as soon as it appears, so the app can show
+progress while Luna is still working. The full reasoning prose stays out of the
+display. Explicit `none`, `concise`, and `detailed` settings are preserved.
+Completed summary items use the same normalization as the Excel path.
+Luna uses medium reasoning effort when a client omits its effort setting, so
+its progress headings remain available in that case.
 Models that expose thoughts only in a completed message's `reasoningText` use
 that as a fallback. Message phases and separate follow-up messages are preserved,
 and SDK intent updates are emitted as commentary.

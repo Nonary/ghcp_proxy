@@ -57,13 +57,19 @@ class _ConnectedRequest:
 
 
 class CopilotSdkTranslationTests(unittest.TestCase):
-    def test_sdk_defaults_to_concise_app_summaries(self):
+    def test_luna_has_reasoning_without_an_explicit_effort(self):
+        self.assertEqual(sdk._reasoning_effort({"model": "gpt-5.6-luna"}), "medium")
+        self.assertEqual(sdk._reasoning_effort({"model": "gpt-5.6-luna", "reasoning": {"summary": "auto"}}), "medium")
+        self.assertIsNone(sdk._reasoning_effort({"model": "gpt-5.6-luna", "reasoning": {"summary": "none"}}))
+        self.assertEqual(sdk._reasoning_effort({"model": "gpt-5.6-luna", "reasoning": {"effort": "high"}}), "high")
+
+    def test_sdk_streams_early_headings_by_default(self):
         for reasoning in (None, {}, {"effort": "high"}, {"summary": "auto"}):
             with self.subTest(reasoning=reasoning):
                 options = sdk._session_options(
                     {"model": "gpt-5.6-luna", "reasoning": reasoning}, sdk.ToolRegistration(),
                 )
-                self.assertEqual(options["reasoning_summary"], "concise")
+                self.assertEqual(options["reasoning_summary"], "detailed")
         for summary in ("none", "concise", "detailed"):
             self.assertEqual(sdk._reasoning_summary({"reasoning": {"summary": summary}}), summary)
 
@@ -1187,7 +1193,7 @@ class CopilotSdkEventTests(unittest.IsolatedAsyncioTestCase):
         outcome = await sdk._wait_for_outcome(session, dispatch, sdk.ToolRegistration())
         self.assertEqual(outcome.text, "final answer")
         self.assertIn("Code Reviewer", outcome.reasoning)
-        self.assertIn("internal check", outcome.reasoning)
+        self.assertNotIn("internal check", outcome.reasoning)
         self.assertIn("completed", outcome.reasoning)
 
     async def test_stream_turn_routes_subagent_delta_to_reasoning_stream(self):
@@ -1221,9 +1227,9 @@ class CopilotSdkEventTests(unittest.IsolatedAsyncioTestCase):
                 data = json.loads(lines[1].replace("data: ", ""))
                 events.append((ev_name, data))
 
-        # Check that subagent delta was emitted as reasoning summary delta
+        # An unfinished subagent message is not a completed summary heading.
         reasoning_deltas = [d.get("delta") for name, d in events if name == "response.reasoning_summary_text.delta"]
-        self.assertIn("subagent thought", "".join(reasoning_deltas))
+        self.assertNotIn("subagent thought", "".join(reasoning_deltas))
 
         # Check that main delta was emitted as output text delta
         text_deltas = [d.get("delta") for name, d in events if name == "response.output_text.delta"]
@@ -1515,6 +1521,50 @@ class CopilotSdkEventTests(unittest.IsolatedAsyncioTestCase):
 
 
 class CopilotSdkFeedbackTests(unittest.IsolatedAsyncioTestCase):
+    async def test_heading_completes_while_sdk_is_still_working(self):
+        session = _FakeSession()
+        continue_sdk = asyncio.Event()
+
+        async def dispatch():
+            session.emit("assistant.reasoning_delta", AssistantReasoningDeltaData(
+                reasoning_id="r1", delta_content="**Checking",
+            ))
+            session.emit("assistant.reasoning_delta", AssistantReasoningDeltaData(
+                reasoning_id="r1", delta_content=" inventory**\n\n",
+            ))
+            await continue_sdk.wait()
+            session.emit("assistant.reasoning_delta", AssistantReasoningDeltaData(
+                reasoning_id="r1", delta_content="Private working detail that should stay hidden.",
+            ))
+            session.emit("assistant.reasoning", AssistantReasoningData(
+                reasoning_id="r1", content="**Checking inventory**\n\nPrivate working detail that should stay hidden.",
+            ))
+            session.emit("assistant.message", AssistantMessageData(
+                message_id="m1", content="Done.", phase="final_answer",
+            ))
+            session.emit("session.idle", SessionIdleData())
+
+        events = []
+        with patch.object(sdk, "_remember_session"), patch.object(sdk, "_commit_alias_watermark"), patch.object(sdk, "_release_session", new=AsyncMock()):
+            async def collect():
+                async for chunk in sdk._stream_turn(
+                    _ConnectedRequest(), {"model": "gpt-5.6-luna"}, session,
+                    dispatch, sdk.ToolRegistration(),
+                ):
+                    event = json.loads(chunk.decode().split("data: ", 1)[1])
+                    events.append(event)
+                    if (event["type"] == "response.output_item.done"
+                            and event["item"]["type"] == "reasoning"):
+                        continue_sdk.set()
+
+            await asyncio.wait_for(collect(), timeout=5)
+
+        self.assert_lifecycles(events)
+        summaries = [i for i in events[-1]["response"]["output"] if i["type"] == "reasoning"]
+        self.assertEqual(len(summaries), 1)
+        self.assertEqual(summaries[0]["summary"][0]["text"], "**Checking inventory**")
+        self.assertNotIn("Private working detail", json.dumps(events))
+
     async def replay(self, sequence, *, compact=False, session=None, idle=True):
         session = session or _FakeSession()
 
@@ -1602,7 +1652,7 @@ class CopilotSdkFeedbackTests(unittest.IsolatedAsyncioTestCase):
         output = events[-1]["response"]["output"]
         self.assertEqual([i["type"] for i in output], ["reasoning", "message", "reasoning"])
         deltas = [e["delta"] for e in events if e["type"] == "response.reasoning_summary_text.delta"]
-        self.assertEqual(deltas, ["**Thinking**\n\nChecking", " inputs.", "**Thinking**\n\nAnother step."])
+        self.assertEqual(deltas, ["**Thinking**\n\nChecking inputs.", "**Thinking**\n\nAnother step."])
 
     async def test_interleaved_sources_do_not_write_to_closed_items_or_drop_completions(self):
         sequence = [
@@ -1672,7 +1722,7 @@ class CopilotSdkFeedbackTests(unittest.IsolatedAsyncioTestCase):
             self.assert_lifecycles(second)
             output = second[-1]["response"]["output"]
             self.assertEqual([i["type"] for i in output], ["reasoning", "message"])
-            self.assertEqual(output[0]["summary"][0]["text"], "**Thinking**\n\n inputs.")
+            self.assertEqual(output[0]["summary"][0]["text"], "**Thinking**\n\nChecking inputs.")
             self.assertEqual(output[1]["content"][0]["text"], "Done.")
             self.assertNotEqual(output[0]["id"], first[-1]["response"]["output"][0]["id"])
         finally:
