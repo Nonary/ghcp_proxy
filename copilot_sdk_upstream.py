@@ -937,11 +937,10 @@ _LIVE_COMPACTION_WAIT_SECONDS = 600.0
 class _SdkFeedbackState:
     raw_text: dict[tuple, str] = field(default_factory=dict)
     finished: set[tuple] = field(default_factory=set)
+    summary_emitted: set[tuple] = field(default_factory=set)
     phases: dict[str, str] = field(default_factory=dict)
     native_reasoning: bool = False
     last_intent: str | None = None
-    progress_count: int = 0
-    progress_texts: set[str] = field(default_factory=set)
     interaction_id: str | None = None
 
 
@@ -1835,7 +1834,7 @@ def _reasoning_item(text: str, *, item_id: str | None = None, completed: bool = 
         "type": "reasoning",
         "id": item_id or _new_id("rs"),
         "status": "completed" if completed else "in_progress",
-        "summary": ([{"type": "summary_text", "text": text}] if (completed and text) else []),
+        "summary": [{"type": "summary_text", "text": text if completed else ""}],
         "content": [],
         "encrypted_content": None,
     }
@@ -1901,7 +1900,7 @@ _SDK_SUMMARY_HEADING = re.compile(r"^\s*(\*\*[^*\n]{1,100}\*\*|#{1,3} [^\n]{1,10
 
 
 def _sdk_display_summary(text: str, *, complete: bool) -> str:
-    """Return one short, substantive update from an SDK summary block."""
+    """Select one short thought summary once it contains an actual sentence."""
     match = _SDK_SUMMARY_HEADING.match(text)
     heading = match.group(1) if match else ""
     body = (text[match.end():] if match else text).strip()
@@ -1928,6 +1927,7 @@ class _SdkOutputItem:
     text: str = ""
     phase: str | None = None
     closed: bool = False
+    summary_done_sent: bool = False
 
     def payload(self, *, completed: bool) -> dict:
         if self.kind == "reasoning":
@@ -1955,11 +1955,12 @@ class _SdkOutputTranslator:
         self.outcome.output_items[item.index] = payload
         common = {"item_id": item.item_id, "output_index": item.index}
         if item.kind == "reasoning":
-            events = [
-                _sse("response.reasoning_summary_text.done", **common, summary_index=0, text=item.text),
-                _sse("response.reasoning_summary_part.done", **common, summary_index=0,
-                     part=payload["summary"][0]),
-            ]
+            events = []
+            if not item.summary_done_sent:
+                events.append(_sse("response.reasoning_summary_text.done", **common,
+                                   summary_index=0, text=item.text))
+            events.append(_sse("response.reasoning_summary_part.done", **common,
+                               summary_index=0, part=payload["summary"][0]))
         else:
             events = [
                 _sse("response.output_text.done", **common, content_index=0, text=item.text),
@@ -1974,27 +1975,39 @@ class _SdkOutputTranslator:
             return []
         previous = self.state.raw_text.get(key, "")
         if kind == "reasoning":
-            # The app receives reasoning items but keeps them in its thinking
-            # UI. Commentary messages use its visible progress path.
+            # Codex's concurrent summary mode consumes summary_text.done, not
+            # summary_text.delta. Emit both forms once a short sentence is
+            # ready, while the reasoning item is still active.
             suffix = text[len(previous):] if complete and text.startswith(previous) else text
             accumulated = previous + suffix
+            self.state.raw_text[key] = accumulated
             summary = _sdk_display_summary(accumulated, complete=complete)
-            fingerprint = re.sub(r"\W+", "", summary).casefold()
-            if (not summary or self.state.progress_count >= 3
-                    or fingerprint in self.state.progress_texts):
-                self.state.raw_text[key] = accumulated
-                if complete:
-                    self.state.finished.add(key)
-                return []
-            text = summary
-            previous = ""
-            complete = True
-            self.state.progress_count += 1
-            self.state.progress_texts.add(fingerprint)
-            self.outcome.reasoning += summary
-            kind = "message"
-            phase = "commentary"
-            record_text = False
+            events: list[bytes] = []
+            if summary and key not in self.state.summary_emitted:
+                self.state.summary_emitted.add(key)
+                events.extend(self.close())
+                item = _SdkOutputItem("reasoning", _new_id("rs"), len(self.items))
+                self.items.append(item)
+                self.active = item
+                self.active_key = key
+                self.outcome.output_items.append(item.payload(completed=False))
+                common = {"item_id": item.item_id, "output_index": item.index}
+                events.append(_sse("response.output_item.added", output_index=item.index,
+                                   item=item.payload(completed=False)))
+                events.append(_sse("response.reasoning_summary_part.added", **common,
+                                   summary_index=0, part={"type": "summary_text", "text": ""}))
+                item.text = format_translation.ensure_codex_reasoning_header(summary)
+                events.append(_sse("response.reasoning_summary_text.delta", **common,
+                                   summary_index=0, delta=item.text))
+                events.append(_sse("response.reasoning_summary_text.done", **common,
+                                   summary_index=0, text=item.text))
+                item.summary_done_sent = True
+            if complete:
+                self.state.finished.add(key)
+                self.outcome.reasoning += accumulated
+                if self.active_key == key:
+                    events.extend(self.close())
+            return events
         # Completed SDK events repeat the accumulated deltas. Reconcile only
         # their missing suffix, independently for each source message/reasoning ID.
         delta = text
@@ -2042,17 +2055,15 @@ class _SdkOutputTranslator:
         data = getattr(event, "data", None)
         name = _event_name(event)
         if name == "assistant.turn_start":
-            # The SDK starts another turn after each tool call, but retains
-            # interaction_id for the entire user request. Keep its progress
-            # budget across those internal turns.
+            # Each tool continuation starts another SDK turn with the same
+            # interaction_id. Preserve deduplication until a new user request.
             interaction_id = getattr(data, "interaction_id", None)
             if not interaction_id or interaction_id != self.state.interaction_id:
-                self.state.progress_count = 0
-                self.state.progress_texts.clear()
+                self.state.raw_text.clear()
+                self.state.finished.clear()
+                self.state.summary_emitted.clear()
+                self.state.phases.clear()
             self.state.interaction_id = interaction_id
-            self.state.raw_text.clear()
-            self.state.finished.clear()
-            self.state.phases.clear()
             self.state.native_reasoning = False
             self.state.last_intent = None
             return []
@@ -2075,8 +2086,18 @@ class _SdkOutputTranslator:
             # Some SDK models provide thoughts only on the completed message,
             # including empty messages that carry tool requests.
             reasoning = getattr(data, "reasoning_text", None)
-            if complete and reasoning and not self.state.native_reasoning and key not in self.state.finished:
-                events.extend(self.append(("message_reasoning", parent, data.message_id), "reasoning", reasoning, complete=True))
+            if complete and reasoning and key not in self.state.finished:
+                pending_reasoning = [source for source in self.state.raw_text
+                                     if source[0] == "reasoning" and source not in self.state.finished]
+                if pending_reasoning:
+                    # The SDK can send assistant.message before the matching
+                    # assistant.reasoning completion. Finish the active thought
+                    # before the final answer so it cannot appear below it.
+                    events.extend(self.append(pending_reasoning[-1], "reasoning", reasoning,
+                                              complete=True))
+                elif not self.state.native_reasoning:
+                    events.extend(self.append(("message_reasoning", parent, data.message_id),
+                                              "reasoning", reasoning, complete=True))
             events.extend(self.append(key, "reasoning" if parent else "message",
                                       (data.content if complete else data.delta_content) or "",
                                       complete=complete, phase=phase if not parent else None))
@@ -2084,14 +2105,9 @@ class _SdkOutputTranslator:
                 self.state.native_reasoning = False
             return events
         if isinstance(data, AssistantIntentData):
-            fingerprint = re.sub(r"\W+", "", data.intent or "").casefold()
-            if (not fingerprint or data.intent == self.state.last_intent
-                    or fingerprint in self.state.progress_texts
-                    or self.state.progress_count >= 3):
+            if not data.intent or data.intent == self.state.last_intent:
                 return []
             self.state.last_intent = data.intent
-            self.state.progress_count += 1
-            self.state.progress_texts.add(fingerprint)
             # Intent describes user-facing progress, like Excel commentary.
             return self.append(("intent", _new_id("intent")), "message", data.intent,
                                complete=True, phase="commentary", record_text=False)
