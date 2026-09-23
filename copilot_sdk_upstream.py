@@ -205,17 +205,20 @@ def _session_alias(body: dict) -> str | None:
     resuming a subagent into its parent's session would splice the two
     histories together.  ``thread_id`` distinguishes them.
     """
-    value = body.get("session_id") or body.get("sessionId")
-    if isinstance(value, str) and value.strip():
-        return value.strip()
     # Codex keeps this in client metadata.  Importing lazily avoids making the
     # SDK adapter depend on the rest of the request routing path at import time.
-    try:
-        import codex_agent_compat
-        value = codex_agent_compat.codex_thread_id(body) or codex_agent_compat.codex_session_id(body)
-    except Exception:
-        value = None
-    return value.strip() if isinstance(value, str) and value.strip() else None
+    import codex_agent_compat
+
+    thread_id = codex_agent_compat.codex_thread_id(body)
+    if thread_id:
+        return thread_id
+    for value in (
+        body.get("session_id"), body.get("sessionId"),
+        codex_agent_compat.codex_session_id(body),
+    ):
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
 
 
 def _remember_session_alias(alias: str, session_id: str, fingerprints: list[str]) -> None:
@@ -336,9 +339,13 @@ def _encode_call_id(
     *,
     tool_name: str,
     tool_type: str,
+    caller_alias: str | None = None,
 ) -> str:
+    identity = {"s": session_id, "r": request_id, "n": tool_name, "t": tool_type}
+    if caller_alias:
+        identity["a"] = caller_alias
     raw = json.dumps(
-        {"s": session_id, "r": request_id, "n": tool_name, "t": tool_type},
+        identity,
         separators=(",", ":"),
     ).encode("utf-8")
     encoded = base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
@@ -362,6 +369,8 @@ def _decode_call_id(call_id: Any) -> dict[str, str] | None:
     if not all(isinstance(value.get(key), str) and value[key] for key in ("s", "r", "n", "t")):
         return None
     if value["t"] not in {"function", "custom"}:
+        return None
+    if "a" in value and (not isinstance(value["a"], str) or not value["a"].strip()):
         return None
     return value
 
@@ -656,6 +665,7 @@ class PendingToolResult:
     request_id: str
     output: str
     tool_name: str = ""
+    caller_alias: str | None = None
 
 
 def _is_caller_message(item: Any) -> bool:
@@ -688,6 +698,7 @@ def resolve_tool_continuation(value: Any) -> tuple[str, list[PendingToolResult]]
                 request_id=decoded["r"],
                 output=_text_from_content(item.get("output")),
                 tool_name=decoded.get("n", ""),
+                caller_alias=decoded.get("a"),
             )
         )
     if not trailing:
@@ -697,6 +708,35 @@ def resolve_tool_continuation(value: Any) -> tuple[str, list[PendingToolResult]]
     if any(result.session_id != session_id for result in trailing):
         return None
     return session_id, trailing
+
+
+def _continuation_matches_caller(
+    body: dict, session_id: str, results: list[PendingToolResult],
+) -> bool:
+    """A fork may replay tool IDs without owning their pending SDK turn."""
+    alias = _session_alias(body)
+    if alias is None:
+        # Legacy clients can return only tool results, without an identity.
+        return True
+    if any(result.caller_alias is not None and result.caller_alias != alias for result in results):
+        return False
+    # Older tool IDs have no caller field. Check durable aliases as well as
+    # in-flight watermarks, including after a proxy restart. A superseded
+    # alias must not reconnect the caller to its retired SDK session either.
+    with _SESSION_LEDGER_LOCK:
+        aliases = _read_session_aliases_unlocked()
+    known = aliases.get(alias)
+    if known is not None and known["session_id"] != session_id:
+        return False
+    if any(owner != alias and entry["session_id"] == session_id for owner, entry in aliases.items()):
+        return False
+    pending = _pending_alias_watermark.get(session_id)
+    if pending is not None:
+        return pending[0] == alias
+    # With an explicit caller identity, an old ID whose owner is no longer
+    # known is not enough evidence to resume a mutable session. Replay into
+    # a fresh session instead; new IDs carry ownership across alias changes.
+    return known is not None or all(result.caller_alias == alias for result in results)
 
 
 async def _get_client():
@@ -883,6 +923,23 @@ _LIVE_COMPACTION_WAIT_SECONDS = 600.0
 
 
 @dataclass
+class _SdkFeedbackState:
+    raw_text: dict[tuple, str] = field(default_factory=dict)
+    finished: set[tuple] = field(default_factory=set)
+    phases: dict[str, str] = field(default_factory=dict)
+    native_reasoning: bool = False
+    last_intent: str | None = None
+
+
+def _is_feedback_event(event: Any) -> bool:
+    return _event_name(event) in {
+        "assistant.turn_start", "assistant.message_start", "assistant.message_delta",
+        "assistant.message", "assistant.reasoning_delta", "assistant.reasoning",
+        "assistant.intent", "subagent.started", "subagent.completed", "subagent.failed",
+    }
+
+
+@dataclass
 class _LiveSession:
     session: Any
     options: dict[str, Any] | None = None
@@ -893,6 +950,9 @@ class _LiveSession:
     compaction_settled: asyncio.Event = field(default_factory=asyncio.Event)
     unsubscribe: Callable[[], None] | None = None
     reaper: asyncio.Task | None = None
+    feedback_events: list[Any] = field(default_factory=list)
+    feedback_state: _SdkFeedbackState = field(default_factory=_SdkFeedbackState)
+    event_queue: asyncio.Queue | None = None
 
 
 _live_sessions: dict[str, _LiveSession] = {}
@@ -949,11 +1009,20 @@ async def _track_live_session(
     )
     loop = asyncio.get_running_loop()
 
-    def handler(event: Any) -> None:
+    def deliver(event: Any) -> None:
         if _is_compaction_event(event, started=True):
-            loop.call_soon_threadsafe(_set_compaction_state, entry, True)
+            _set_compaction_state(entry, True)
         elif _is_compaction_event(event, started=False):
-            loop.call_soon_threadsafe(_set_compaction_state, entry, False)
+            _set_compaction_state(entry, False)
+        if entry.event_queue is not None:
+            entry.event_queue.put_nowait(event)
+        elif _is_feedback_event(event):
+            # Tool execution can outlive the HTTP response. Keep only feedback
+            # here: old idle/shutdown markers must not finish the next request.
+            entry.feedback_events.append(event)
+
+    def handler(event: Any) -> None:
+        loop.call_soon_threadsafe(deliver, event)
 
     try:
         entry.unsubscribe = session.on(handler)
@@ -1147,10 +1216,17 @@ async def _open_session(body: dict, registration: ToolRegistration):
 
     session_id, results = continuation
     # Read the old watermark before reconfiguration can evict the live entry.
-    steering_prompt = _continuation_prompt(body, session_id, segments, fingerprints)
+    matches_caller = _continuation_matches_caller(body, session_id, results)
+    steering_prompt = (
+        _continuation_prompt(body, session_id, segments, fingerprints)
+        if matches_caller else ""
+    )
     pending_work = True
-    session = await _reuse_live_session(session_id, allow_pending=True, options=options)
-    if session is None and _owns_session(session_id):
+    session = (
+        await _reuse_live_session(session_id, allow_pending=True, options=options)
+        if matches_caller else None
+    )
+    if session is None and matches_caller and _owns_session(session_id):
         try:
             session = await client.resume_session(
                 session_id,
@@ -1169,9 +1245,9 @@ async def _open_session(body: dict, registration: ToolRegistration):
                 session = None
 
     if session is None:
-        # If the SDK session could not be resumed (e.g. proxy was reset and session
-        # was pruned or state file lost), fall back to creating a fresh session
-        # carrying the transcript up to and including the tool output.
+        # A fork must get its own history without consuming the parent's
+        # pending call. Also use this full-transcript fallback if the SDK
+        # session was pruned or its state was lost.
         session = await client.create_session(**options)
         prompt = "\n\n".join(text for _, text in segments)
         await _track_live_session(session, options=options, fingerprints=fingerprints)
@@ -1266,6 +1342,7 @@ class TurnOutcome:
     # Two independent usage sources; ``_finalize_usage`` picks between them.
     shutdown_usage: dict[str, int] = field(default_factory=dict)
     event_usage: dict[str, int] = field(default_factory=dict)
+    output_items: list[dict] = field(default_factory=list)
 
 
 def _event_name(event: Any) -> str:
@@ -1568,6 +1645,22 @@ def _tool_call(data: Any, registration: ToolRegistration) -> ToolCall:
 def _event_queue(session: Any) -> tuple[asyncio.Queue, Callable[[], None]]:
     loop = asyncio.get_running_loop()
     queue: asyncio.Queue = asyncio.Queue()
+    entry = _live_sessions.get(session.session_id)
+    if entry is not None and entry.session is session and entry.unsubscribe is not None:
+        for event in entry.feedback_events:
+            queue.put_nowait(event)
+        entry.feedback_events.clear()
+        entry.event_queue = queue
+
+        def detach() -> None:
+            if entry.event_queue is queue:
+                entry.event_queue = None
+            while not queue.empty():
+                event = queue.get_nowait()
+                if _is_feedback_event(event):
+                    entry.feedback_events.append(event)
+
+        return queue, detach
 
     def handler(event: Any) -> None:
         loop.call_soon_threadsafe(queue.put_nowait, event)
@@ -1582,8 +1675,7 @@ async def _wait_for_outcome(
 ) -> TurnOutcome:
     queue, unsubscribe = _event_queue(session)
     outcome = TurnOutcome()
-    saw_delta = False
-    saw_reasoning_delta = False
+    output = _SdkOutputTranslator(outcome, session)
     dispatch_task = asyncio.create_task(dispatch())
     try:
         # ``send`` is asynchronous and may fail before the SDK emits any
@@ -1609,29 +1701,8 @@ async def _wait_for_outcome(
                     raise TimeoutError(f"Timed out waiting for the Copilot SDK turn after {_TURN_TIMEOUT_SECONDS}s")
                 continue
             data = getattr(event, "data", None)
-            if isinstance(data, AssistantMessageDeltaData):
-                if getattr(data, "parent_tool_call_id", None):
-                    outcome.reasoning += data.delta_content
-                    saw_reasoning_delta = True
-                else:
-                    outcome.text += data.delta_content
-                    saw_delta = True
-            elif isinstance(data, AssistantReasoningDeltaData):
-                outcome.reasoning += data.delta_content
-                saw_reasoning_delta = True
-            elif isinstance(data, AssistantReasoningData):
-                if not saw_reasoning_delta and data.content:
-                    outcome.reasoning = data.content
-            elif isinstance(data, AssistantIntentData):
-                if not saw_reasoning_delta and not outcome.reasoning and data.intent:
-                    outcome.reasoning = data.intent
-            elif isinstance(data, AssistantMessageData):
-                if getattr(data, "parent_tool_call_id", None):
-                    if not saw_reasoning_delta and data.content:
-                        outcome.reasoning = data.content
-                else:
-                    if not saw_delta:
-                        outcome.text = data.content or outcome.text
+            if output.consume(event) is not None:
+                pass
             elif (
                 (SessionShutdownData is not None and isinstance(data, SessionShutdownData))
                 or _event_name(event) == "session.shutdown"
@@ -1644,19 +1715,6 @@ async def _wait_for_outcome(
                 _add_usage(outcome.event_usage, _usage_from_event(data))
             elif isinstance(data, ExternalToolRequestedData):
                 outcome.calls.append(_tool_call(data, registration))
-            elif (SubagentStartedData is not None and isinstance(data, SubagentStartedData)) or _event_name(event) == "subagent.started":
-                agent_name = getattr(data, "agent_display_name", None) or getattr(data, "agent_name", "subagent")
-                outcome.reasoning += f"[Subagent '{agent_name}' started]\n"
-                saw_reasoning_delta = True
-            elif (SubagentCompletedData is not None and isinstance(data, SubagentCompletedData)) or _event_name(event) == "subagent.completed":
-                agent_name = getattr(data, "agent_display_name", None) or getattr(data, "agent_name", "subagent")
-                outcome.reasoning += f"[Subagent '{agent_name}' completed]\n"
-                saw_reasoning_delta = True
-            elif (SubagentFailedData is not None and isinstance(data, SubagentFailedData)) or _event_name(event) == "subagent.failed":
-                agent_name = getattr(data, "agent_display_name", None) or getattr(data, "agent_name", "subagent")
-                err_msg = getattr(data, "error", "error")
-                outcome.reasoning += f"[Subagent '{agent_name}' failed: {err_msg}]\n"
-                saw_reasoning_delta = True
             elif (
                 (SessionCompactionCompleteData is not None and isinstance(data, SessionCompactionCompleteData))
                 or _event_name(event) in {"session.compaction_start", "session.compaction_complete"}
@@ -1677,6 +1735,7 @@ async def _wait_for_outcome(
                 if error is not None:
                     raise error
     finally:
+        output.close()
         unsubscribe()
         if not dispatch_task.done():
             dispatch_task.cancel()
@@ -1719,12 +1778,16 @@ def _arguments_json(call: ToolCall) -> str:
     return json.dumps(call.arguments or {}, ensure_ascii=False, separators=(",", ":"))
 
 
-def _tool_item(session_id: str, call: ToolCall, *, completed: bool = True) -> dict:
+def _tool_item(
+    session_id: str, call: ToolCall, *, completed: bool = True,
+    caller_alias: str | None = None,
+) -> dict:
     call_id = _encode_call_id(
         session_id,
         call.request_id,
         tool_name=call.name,
         tool_type=call.tool_type,
+        caller_alias=caller_alias,
     )
     item = {
         "type": "custom_tool_call" if call.tool_type == "custom" else "function_call",
@@ -1737,14 +1800,20 @@ def _tool_item(session_id: str, call: ToolCall, *, completed: bool = True) -> di
     return item
 
 
-def _message_item(text: str, *, item_id: str | None = None, completed: bool = True) -> dict:
-    return {
+def _message_item(
+    text: str, *, item_id: str | None = None, completed: bool = True,
+    phase: str | None = None,
+) -> dict:
+    item = {
         "type": "message",
         "id": item_id or _new_id("msg"),
         "role": "assistant",
         "status": "completed" if completed else "in_progress",
         "content": ([{"type": "output_text", "text": text, "annotations": []}] if completed else []),
     }
+    if phase in {"commentary", "final_answer"}:
+        item["phase"] = phase
+    return item
 
 
 def _reasoning_item(text: str, *, item_id: str | None = None, completed: bool = True) -> dict:
@@ -1760,12 +1829,15 @@ def _reasoning_item(text: str, *, item_id: str | None = None, completed: bool = 
 
 
 def _response_payload(body: dict, session_id: str, outcome: TurnOutcome, response_id: str) -> dict:
-    output: list[dict] = []
-    if outcome.reasoning:
+    output: list[dict] = list(outcome.output_items)
+    if not output and outcome.reasoning:
         output.append(_reasoning_item(outcome.reasoning, item_id=outcome.reasoning_id, completed=True))
-    if outcome.text:
+    if not outcome.output_items and outcome.text:
         output.append(_message_item(outcome.text, item_id=outcome.message_id, completed=True))
-    output.extend(_tool_item(session_id, call, completed=True) for call in outcome.calls)
+    output.extend(
+        _tool_item(session_id, call, completed=True, caller_alias=_session_alias(body))
+        for call in outcome.calls
+    )
     return {
         "id": response_id,
         "object": "response",
@@ -1810,6 +1882,158 @@ def _sse(event_type: str, **payload: Any) -> bytes:
     return f"event: {event_type}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n".encode()
 
 
+@dataclass
+class _SdkOutputItem:
+    kind: str
+    item_id: str
+    index: int
+    text: str = ""
+    phase: str | None = None
+    closed: bool = False
+
+    def payload(self, *, completed: bool) -> dict:
+        if self.kind == "reasoning":
+            return _reasoning_item(self.text, item_id=self.item_id, completed=completed)
+        return _message_item(self.text, item_id=self.item_id, completed=completed, phase=self.phase)
+
+
+class _SdkOutputTranslator:
+    """Preserve SDK item boundaries and use one lifecycle for stream and JSON output."""
+
+    def __init__(self, outcome: TurnOutcome, session: Any):
+        self.outcome = outcome
+        self.items: list[_SdkOutputItem] = []
+        self.active: _SdkOutputItem | None = None
+        self.active_key: tuple | None = None
+        entry = _live_sessions.get(session.session_id)
+        self.state = entry.feedback_state if entry is not None and entry.session is session else _SdkFeedbackState()
+
+    def close(self) -> list[bytes]:
+        item = self.active
+        if item is None or item.closed:
+            return []
+        item.closed = True
+        payload = item.payload(completed=True)
+        self.outcome.output_items[item.index] = payload
+        common = {"item_id": item.item_id, "output_index": item.index}
+        if item.kind == "reasoning":
+            events = [
+                _sse("response.reasoning_summary_text.done", **common, summary_index=0, text=item.text),
+                _sse("response.reasoning_summary_part.done", **common, summary_index=0,
+                     part=payload["summary"][0]),
+            ]
+        else:
+            events = [
+                _sse("response.output_text.done", **common, content_index=0, text=item.text),
+                _sse("response.content_part.done", **common, content_index=0, part=payload["content"][0]),
+            ]
+        events.append(_sse("response.output_item.done", output_index=item.index, item=payload))
+        return events
+
+    def append(self, key: tuple, kind: str, text: str, *, complete: bool = False,
+               phase: str | None = None, record_text: bool = True) -> list[bytes]:
+        if key in self.state.finished:
+            return []
+        previous = self.state.raw_text.get(key, "")
+        # Completed SDK events repeat the accumulated deltas. Reconcile only
+        # their missing suffix, independently for each source message/reasoning ID.
+        delta = text
+        if complete:
+            delta = text[len(previous):] if text.startswith(previous) else (text if not previous else "")
+            self.state.finished.add(key)
+        self.state.raw_text[key] = previous + delta
+        events: list[bytes] = []
+        if phase and self.active_key == key and self.active is not None and not self.active.closed:
+            self.active.phase = phase
+        if delta:
+            if self.active_key != key or self.active is None or self.active.closed:
+                events.extend(self.close())
+                item = _SdkOutputItem(kind, _new_id("rs" if kind == "reasoning" else "msg"), len(self.items), phase=phase)
+                self.items.append(item)
+                self.active = item
+                self.active_key = key
+                self.outcome.output_items.append(item.payload(completed=False))
+                events.append(_sse("response.output_item.added", output_index=item.index, item=item.payload(completed=False)))
+                common = {"item_id": item.item_id, "output_index": item.index}
+                if kind == "reasoning":
+                    events.append(_sse("response.reasoning_summary_part.added", **common, summary_index=0,
+                                       part={"type": "summary_text", "text": ""}))
+                else:
+                    events.append(_sse("response.content_part.added", **common, content_index=0,
+                                       part={"type": "output_text", "text": "", "annotations": []}))
+            item = self.active
+            if kind == "reasoning":
+                self.outcome.reasoning += delta
+                # The live summary must have the same renderable header as
+                # its done event; adding it only at completion hides feedback.
+                if not item.text.strip():
+                    delta = format_translation.ensure_codex_reasoning_header(delta)
+            elif record_text:
+                self.outcome.text += delta
+            item.text += delta
+            event = "response.reasoning_summary_text.delta" if kind == "reasoning" else "response.output_text.delta"
+            index = {"summary_index": 0} if kind == "reasoning" else {"content_index": 0}
+            events.append(_sse(event, item_id=item.item_id, output_index=item.index, delta=delta, **index))
+        if complete and self.active_key == key:
+            events.extend(self.close())
+        return events
+
+    def consume(self, event: Any) -> list[bytes] | None:
+        data = getattr(event, "data", None)
+        name = _event_name(event)
+        if name == "assistant.turn_start":
+            # A real SDK turn boundary, unlike an HTTP tool handoff, retires
+            # the deduplication state so long-lived sessions stay bounded.
+            self.state.raw_text.clear()
+            self.state.finished.clear()
+            self.state.phases.clear()
+            self.state.native_reasoning = False
+            self.state.last_intent = None
+            return []
+        if name == "assistant.message_start":
+            phase = getattr(data, "phase", None)
+            if phase in {"commentary", "final_answer"}:
+                self.state.phases[data.message_id] = phase
+            return []
+        if isinstance(data, (AssistantReasoningDeltaData, AssistantReasoningData)):
+            text = getattr(data, "delta_content", None) if isinstance(data, AssistantReasoningDeltaData) else data.content
+            self.state.native_reasoning = self.state.native_reasoning or bool(text)
+            return self.append(("reasoning", data.reasoning_id), "reasoning", text or "",
+                               complete=isinstance(data, AssistantReasoningData))
+        if isinstance(data, (AssistantMessageDeltaData, AssistantMessageData)):
+            complete = isinstance(data, AssistantMessageData)
+            parent = getattr(data, "parent_tool_call_id", None)
+            key = ("message", parent, data.message_id)
+            phase = getattr(data, "phase", None) or self.state.phases.get(data.message_id)
+            events = []
+            # Some SDK models provide thoughts only on the completed message,
+            # including empty messages that carry tool requests.
+            reasoning = getattr(data, "reasoning_text", None)
+            if complete and reasoning and not self.state.native_reasoning and key not in self.state.finished:
+                events.extend(self.append(("message_reasoning", parent, data.message_id), "reasoning", reasoning, complete=True))
+            events.extend(self.append(key, "reasoning" if parent else "message",
+                                      (data.content if complete else data.delta_content) or "",
+                                      complete=complete, phase=phase if not parent else None))
+            if complete and not parent:
+                self.state.native_reasoning = False
+            return events
+        if isinstance(data, AssistantIntentData):
+            if not data.intent or data.intent == self.state.last_intent:
+                return []
+            self.state.last_intent = data.intent
+            # Intent describes user-facing progress, like Excel commentary.
+            return self.append(("intent", _new_id("intent")), "message", data.intent,
+                               complete=True, phase="commentary", record_text=False)
+        if name in {"subagent.started", "subagent.completed", "subagent.failed"}:
+            agent_name = getattr(data, "agent_display_name", None) or getattr(data, "agent_name", "subagent")
+            status = name.rsplit(".", 1)[1]
+            if status == "failed":
+                status += f": {getattr(data, 'error', 'error')}"
+            notice = f"[Subagent '{agent_name}' {status}]\n"
+            return self.append(("notice", _new_id("notice")), "reasoning", notice, complete=True)
+        return None
+
+
 async def _stream_turn(
     request: Request,
     body: dict,
@@ -1840,15 +2064,7 @@ async def _stream_turn(
     final_payload: dict | None = None
     usage_finished = False
 
-    reasoning_started = False
-    reasoning_closed = False
-    reasoning_output_index = 0
-    saw_reasoning_delta = False
-
-    message_started = False
-    message_closed = False
-    message_output_index = 0
-    saw_delta = False
+    output = _SdkOutputTranslator(outcome, session)
 
     first_output_marked = False
 
@@ -1880,109 +2096,6 @@ async def _stream_turn(
                 except Exception:
                     pass
 
-    def emit_reasoning_start() -> list[bytes]:
-        nonlocal reasoning_started, reasoning_output_index, output_index
-        if reasoning_started:
-            return []
-        mark_first()
-        reasoning_started = True
-        reasoning_output_index = output_index
-        output_index += 1
-        return [
-            _sse(
-                "response.output_item.added",
-                output_index=reasoning_output_index,
-                item=_reasoning_item("", item_id=outcome.reasoning_id, completed=False),
-            ),
-            _sse(
-                "response.reasoning_summary_part.added",
-                item_id=outcome.reasoning_id,
-                output_index=reasoning_output_index,
-                summary_index=0,
-                part={"type": "summary_text", "text": ""},
-            ),
-        ]
-
-    def emit_reasoning_done() -> list[bytes]:
-        nonlocal reasoning_closed
-        if not reasoning_started or reasoning_closed:
-            return []
-        reasoning_closed = True
-        return [
-            _sse(
-                "response.reasoning_summary_text.done",
-                item_id=outcome.reasoning_id,
-                output_index=reasoning_output_index,
-                summary_index=0,
-                text=outcome.reasoning,
-            ),
-            _sse(
-                "response.reasoning_summary_part.done",
-                item_id=outcome.reasoning_id,
-                output_index=reasoning_output_index,
-                summary_index=0,
-                part={"type": "summary_text", "text": outcome.reasoning},
-            ),
-            _sse(
-                "response.output_item.done",
-                output_index=reasoning_output_index,
-                item=_reasoning_item(outcome.reasoning, item_id=outcome.reasoning_id, completed=True),
-            ),
-        ]
-
-    def emit_text_start() -> list[bytes]:
-        nonlocal message_started, message_output_index, output_index
-        if message_started:
-            return []
-        mark_first()
-        chunks = list(emit_reasoning_done())
-        message_started = True
-        message_output_index = output_index
-        output_index += 1
-        chunks.extend([
-            _sse(
-                "response.output_item.added",
-                output_index=message_output_index,
-                item=_message_item("", item_id=outcome.message_id, completed=False),
-            ),
-            _sse(
-                "response.content_part.added",
-                item_id=outcome.message_id,
-                output_index=message_output_index,
-                content_index=0,
-                part={"type": "output_text", "text": "", "annotations": []},
-            ),
-        ])
-        return chunks
-
-    def emit_text_done() -> list[bytes]:
-        nonlocal message_closed
-        if not message_started or message_closed:
-            return []
-        message_closed = True
-        completed_message = _message_item(outcome.text, item_id=outcome.message_id, completed=True)
-        return [
-            _sse(
-                "response.output_text.done",
-                item_id=outcome.message_id,
-                output_index=message_output_index,
-                content_index=0,
-                text=outcome.text,
-            ),
-            _sse(
-                "response.content_part.done",
-                item_id=outcome.message_id,
-                output_index=message_output_index,
-                content_index=0,
-                part=completed_message["content"][0],
-            ),
-            _sse(
-                "response.output_item.done",
-                output_index=message_output_index,
-                item=completed_message,
-            ),
-        ]
-
     try:
         await asyncio.sleep(0)
         if dispatch_task.done():
@@ -2006,163 +2119,12 @@ async def _stream_turn(
                 yield b": keep-alive\n\n"
                 continue
             data = getattr(event, "data", None)
-            # A compact response is a different Responses item type.  Do not
-            # leak the SDK's ordinary assistant/tool items into that stream:
-            # remote compaction v2 validates the streamed output and requires
-            # exactly one compaction item.  Still collect assistant text so it
-            # can be placed in the encrypted compaction payload below.
-            if is_compact and isinstance(data, AssistantReasoningDeltaData):
-                outcome.reasoning += data.delta_content
-                saw_reasoning_delta = True
-                continue
-            if is_compact and isinstance(data, AssistantReasoningData):
-                if not saw_reasoning_delta and data.content:
-                    outcome.reasoning = data.content
-                continue
-            if is_compact and isinstance(data, AssistantMessageDeltaData):
-                if not getattr(data, "parent_tool_call_id", None):
-                    outcome.text += data.delta_content
-                    saw_delta = True
-                continue
-            if is_compact and isinstance(data, AssistantMessageData):
-                if not getattr(data, "parent_tool_call_id", None) and not saw_delta:
-                    outcome.text = data.content or outcome.text
-                continue
-            if isinstance(data, AssistantReasoningDeltaData):
-                for chunk in emit_reasoning_start():
-                    yield chunk
-                outcome.reasoning += data.delta_content
-                saw_reasoning_delta = True
-                yield _sse(
-                    "response.reasoning_summary_text.delta",
-                    item_id=outcome.reasoning_id,
-                    output_index=reasoning_output_index,
-                    summary_index=0,
-                    delta=data.delta_content,
-                )
-            elif isinstance(data, AssistantReasoningData):
-                if not saw_reasoning_delta and data.content:
-                    for chunk in emit_reasoning_start():
+            chunks = output.consume(event)
+            if chunks is not None:
+                if chunks and not is_compact:
+                    mark_first()
+                    for chunk in chunks:
                         yield chunk
-                    outcome.reasoning = data.content
-                    yield _sse(
-                        "response.reasoning_summary_text.delta",
-                        item_id=outcome.reasoning_id,
-                        output_index=reasoning_output_index,
-                        summary_index=0,
-                        delta=data.content,
-                    )
-            elif isinstance(data, AssistantIntentData):
-                if not saw_reasoning_delta and not outcome.reasoning and data.intent:
-                    for chunk in emit_reasoning_start():
-                        yield chunk
-                    outcome.reasoning = data.intent
-                    yield _sse(
-                        "response.reasoning_summary_text.delta",
-                        item_id=outcome.reasoning_id,
-                        output_index=reasoning_output_index,
-                        summary_index=0,
-                        delta=data.intent,
-                    )
-            elif (SubagentStartedData is not None and isinstance(data, SubagentStartedData)) or _event_name(event) == "subagent.started":
-                agent_name = getattr(data, "agent_display_name", None) or getattr(data, "agent_name", "subagent")
-                notice = f"[Subagent '{agent_name}' started]\n"
-                for chunk in emit_reasoning_start():
-                    yield chunk
-                outcome.reasoning += notice
-                saw_reasoning_delta = True
-                yield _sse(
-                    "response.reasoning_summary_text.delta",
-                    item_id=outcome.reasoning_id,
-                    output_index=reasoning_output_index,
-                    summary_index=0,
-                    delta=notice,
-                )
-            elif (SubagentCompletedData is not None and isinstance(data, SubagentCompletedData)) or _event_name(event) == "subagent.completed":
-                agent_name = getattr(data, "agent_display_name", None) or getattr(data, "agent_name", "subagent")
-                notice = f"[Subagent '{agent_name}' completed]\n"
-                for chunk in emit_reasoning_start():
-                    yield chunk
-                outcome.reasoning += notice
-                saw_reasoning_delta = True
-                yield _sse(
-                    "response.reasoning_summary_text.delta",
-                    item_id=outcome.reasoning_id,
-                    output_index=reasoning_output_index,
-                    summary_index=0,
-                    delta=notice,
-                )
-            elif (SubagentFailedData is not None and isinstance(data, SubagentFailedData)) or _event_name(event) == "subagent.failed":
-                agent_name = getattr(data, "agent_display_name", None) or getattr(data, "agent_name", "subagent")
-                err_msg = getattr(data, "error", "error")
-                notice = f"[Subagent '{agent_name}' failed: {err_msg}]\n"
-                for chunk in emit_reasoning_start():
-                    yield chunk
-                outcome.reasoning += notice
-                saw_reasoning_delta = True
-                yield _sse(
-                    "response.reasoning_summary_text.delta",
-                    item_id=outcome.reasoning_id,
-                    output_index=reasoning_output_index,
-                    summary_index=0,
-                    delta=notice,
-                )
-            elif (
-                (SessionCompactionCompleteData is not None and isinstance(data, SessionCompactionCompleteData))
-                or _event_name(event) in {"session.compaction_start", "session.compaction_complete"}
-            ):
-                # Internal bookkeeping, not downstream response text.
-                pass
-            elif isinstance(data, AssistantMessageDeltaData):
-                if getattr(data, "parent_tool_call_id", None):
-                    for chunk in emit_reasoning_start():
-                        yield chunk
-                    outcome.reasoning += data.delta_content
-                    saw_reasoning_delta = True
-                    yield _sse(
-                        "response.reasoning_summary_text.delta",
-                        item_id=outcome.reasoning_id,
-                        output_index=reasoning_output_index,
-                        summary_index=0,
-                        delta=data.delta_content,
-                    )
-                else:
-                    for chunk in emit_text_start():
-                        yield chunk
-                    outcome.text += data.delta_content
-                    saw_delta = True
-                    yield _sse(
-                        "response.output_text.delta",
-                        item_id=outcome.message_id,
-                        output_index=message_output_index,
-                        content_index=0,
-                        delta=data.delta_content,
-                    )
-            elif isinstance(data, AssistantMessageData):
-                if getattr(data, "parent_tool_call_id", None):
-                    if not saw_reasoning_delta and data.content:
-                        for chunk in emit_reasoning_start():
-                            yield chunk
-                        outcome.reasoning += data.content
-                        yield _sse(
-                            "response.reasoning_summary_text.delta",
-                            item_id=outcome.reasoning_id,
-                            output_index=reasoning_output_index,
-                            summary_index=0,
-                            delta=data.content,
-                        )
-                else:
-                    if not saw_delta and data.content:
-                        for chunk in emit_text_start():
-                            yield chunk
-                        outcome.text = data.content
-                        yield _sse(
-                            "response.output_text.delta",
-                            item_id=outcome.message_id,
-                            output_index=message_output_index,
-                            content_index=0,
-                            delta=data.content,
-                        )
             elif (
                 (SessionShutdownData is not None and isinstance(data, SessionShutdownData))
                 or _event_name(event) == "session.shutdown"
@@ -2183,16 +2145,18 @@ async def _stream_turn(
                 if error is not None:
                     raise error
 
+        closing_chunks = output.close()
         if not is_compact:
-            for chunk in emit_reasoning_done():
+            for chunk in closing_chunks:
                 yield chunk
-            for chunk in emit_text_done():
-                yield chunk
+        output_index = len(output.items) if not is_compact else 0
 
         for call in outcome.calls if not is_compact else []:
             call_output_index = output_index
             output_index += 1
-            completed_item = _tool_item(session.session_id, call, completed=True)
+            completed_item = _tool_item(
+                session.session_id, call, completed=True, caller_alias=_session_alias(body),
+            )
             started_item = dict(completed_item)
             started_item["status"] = "in_progress"
             field = "input" if call.tool_type == "custom" else "arguments"

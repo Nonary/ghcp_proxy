@@ -71,10 +71,22 @@ call one, the SDK suspends its turn; GHCP Proxy returns the call to Codex and
 encodes the SDK session and request IDs in `call_id`. Codex executes the tool,
 then its next Responses request resumes that exact SDK turn. Parallel calls are
 batched and the encoded continuation survives proxy restarts.
+Tool IDs also retain the originating caller thread. A fork that replays its
+parent's tool IDs gets a separate SDK session with its own transcript; it does
+not deliver results into the parent's pending turn. Codex thread metadata takes
+precedence over a shared outer session ID when choosing the caller identity.
 
 Reasoning effort, including `max` for supported models, is forwarded to the SDK.
 New caller instructions accompanying tool results are delivered as immediate
 steering before those results release the next model call.
+
+SDK feedback is collected for the lifetime of the connected session, including
+between tool handoffs. Each Responses request emits its own ordered thought and
+message items, while deduplication follows the SDK's source IDs across handoffs.
+Thoughts use the Responses reasoning-summary channel with live display headers;
+models that expose thoughts only in a completed message's `reasoningText` use
+that as a fallback. Message phases and separate follow-up messages are preserved,
+and SDK intent updates are emitted as commentary.
 
 The SDK session stays connected across that tool round-trip instead of being
 destroyed after every response, so the runtime's own background compaction
@@ -96,6 +108,9 @@ GHCP_RESPONSES_UPSTREAM=rest python proxy.py
 
 This switch applies to Codex Responses and model discovery. The legacy chat and
 Anthropic compatibility routes continue to use their existing implementation.
+The REST Responses adapter folds only the initial instruction block into
+`instructions`. Later developer or system messages stay in conversation order
+so appending instructions does not rewrite the previously cached prompt prefix.
 
 ## Token Pricing And Billing
 

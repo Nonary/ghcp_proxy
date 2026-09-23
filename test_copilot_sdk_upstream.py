@@ -6,6 +6,8 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from copilot.session_events import (
+    AssistantIntentData,
+    AssistantMessageStartData,
     AssistantMessageData,
     AssistantMessageDeltaData,
     AssistantReasoningData,
@@ -570,6 +572,7 @@ class CopilotSdkEventTests(unittest.IsolatedAsyncioTestCase):
             "session_id": "thread-C",
         }
         sdk._remember_session("sdk-sess-1")
+        sdk._remember_session_alias("thread-C", "sdk-sess-1", [])
         with patch.object(sdk, "_get_client", return_value=_Client()):
             session, dispatch = await sdk._open_session(body, sdk.ToolRegistration())
             await dispatch()
@@ -611,6 +614,7 @@ class CopilotSdkEventTests(unittest.IsolatedAsyncioTestCase):
             "session_id": "thread-D",
         }
         sdk._remember_session("lost-sess-1")
+        sdk._remember_session_alias("thread-D", "lost-sess-1", [])
         with patch.object(sdk, "_get_client", return_value=_Client()):
             session, dispatch = await sdk._open_session(body, sdk.ToolRegistration())
             await dispatch()
@@ -749,7 +753,7 @@ class CopilotSdkEventTests(unittest.IsolatedAsyncioTestCase):
             chunk.decode()
             async for chunk in sdk._stream_turn(
                 _ConnectedRequest(),
-                {"model": "gpt-test"},
+                {"model": "gpt-test", "session_id": "stream-owner"},
                 session,
                 dispatch,
                 registration,
@@ -758,6 +762,12 @@ class CopilotSdkEventTests(unittest.IsolatedAsyncioTestCase):
         completed = [c for c in chunks if "response.completed" in c]
         self.assertEqual(len(completed), 1)
         data = json.loads(completed[0].replace("event: response.completed\ndata: ", "").strip())
+        final_call_id = data["response"]["output"][0]["call_id"]
+        self.assertEqual(sdk._decode_call_id(final_call_id)["a"], "stream-owner")
+        for chunk in chunks:
+            if chunk.startswith(("event: response.output_item.added\n", "event: response.output_item.done\n")):
+                item = json.loads(chunk.split("\ndata: ", 1)[1])["item"]
+                self.assertEqual(item["call_id"], final_call_id)
         usage = data["response"]["usage"]
         self.assertEqual(usage["input_tokens"], 600)
         self.assertEqual(usage["input_tokens_details"]["cached_tokens"], 450)
@@ -1192,7 +1202,7 @@ class CopilotSdkEventTests(unittest.IsolatedAsyncioTestCase):
 
         # Check that subagent delta was emitted as reasoning summary delta
         reasoning_deltas = [d.get("delta") for name, d in events if name == "response.reasoning_summary_text.delta"]
-        self.assertIn("subagent thought", reasoning_deltas)
+        self.assertIn("subagent thought", "".join(reasoning_deltas))
 
         # Check that main delta was emitted as output text delta
         text_deltas = [d.get("delta") for name, d in events if name == "response.output_text.delta"]
@@ -1483,6 +1493,171 @@ class CopilotSdkEventTests(unittest.IsolatedAsyncioTestCase):
 
 
 
+class CopilotSdkFeedbackTests(unittest.IsolatedAsyncioTestCase):
+    async def replay(self, sequence, *, compact=False, session=None, idle=True):
+        session = session or _FakeSession()
+
+        async def dispatch():
+            for name, data in sequence:
+                session.emit(name, data)
+            if idle:
+                session.emit("session.idle", SessionIdleData())
+
+        # Avoid writing runtime session ledgers during these isolated replays.
+        with patch.object(sdk, "_remember_session"), patch.object(sdk, "_commit_alias_watermark"), patch.object(sdk, "_release_session", new=AsyncMock()):
+            events = [json.loads(chunk.decode().split("data: ", 1)[1])
+                      async for chunk in sdk._stream_turn(
+                          _ConnectedRequest(), {"model": "test"}, session, dispatch,
+                          sdk.ToolRegistration(), is_compact=compact)]
+        self.assertEqual(events[-1]["type"], "response.completed")
+        return events
+
+    def assert_lifecycles(self, events):
+        opened = {}
+        closed = {}
+        deltas = {}
+        for event in events:
+            kind = event["type"]
+            if kind == "response.output_item.added":
+                index = event["output_index"]
+                self.assertEqual(index, len(opened))
+                opened[index] = event["item"]["id"]
+            if "item_id" in event:
+                index = event["output_index"]
+                self.assertNotIn(index, closed, "event written after item completion")
+                self.assertEqual(event["item_id"], opened[index])
+                if kind.endswith(".delta"):
+                    deltas[index] = deltas.get(index, "") + event["delta"]
+                elif kind.endswith("text.done"):
+                    self.assertEqual(event["text"], deltas[index])
+            if kind == "response.output_item.done":
+                index = event["output_index"]
+                self.assertNotIn(index, closed)
+                closed[index] = event["item"]
+                self.assertEqual(closed[index]["id"], opened[index])
+                item = closed[index]
+                if item["type"] == "reasoning":
+                    self.assertEqual(item["summary"][0]["text"], deltas[index])
+                    self.assertEqual(item["content"][0]["text"], deltas[index])
+        self.assertEqual(events[-1]["response"]["output"], list(closed.values()))
+        self.assertEqual(len(opened), len(closed))
+
+    async def test_commentary_followup_and_final_preserve_phase_and_boundaries(self):
+        sequence = []
+        for mid, phase, text in [("m1", "commentary", "Inspecting."),
+                                 ("m2", "commentary", "Following up."),
+                                 ("m3", "final_answer", "Done.")]:
+            sequence.extend([
+                ("assistant.message_start", AssistantMessageStartData(message_id=mid, phase=phase)),
+                ("assistant.message_delta", AssistantMessageDeltaData(message_id=mid, delta_content=text)),
+                ("assistant.message", AssistantMessageData(message_id=mid, content=text, phase=phase)),
+            ])
+        events = await self.replay(sequence)
+        self.assert_lifecycles(events)
+        added = [e["item"] for e in events if e["type"] == "response.output_item.added"]
+        self.assertEqual([i["phase"] for i in added], ["commentary", "commentary", "final_answer"])
+        output = events[-1]["response"]["output"]
+        self.assertEqual([i["content"][0]["text"] for i in output], ["Inspecting.", "Following up.", "Done."])
+
+    async def test_embedded_tool_turn_thoughts_are_not_lost_or_repeated(self):
+        message = AssistantMessageData(message_id="tool", content="", reasoning_text="Checking inputs.")
+        events = await self.replay([
+            ("assistant.message", message), ("assistant.message", message),
+            ("assistant.message", AssistantMessageData(message_id="next", content="", reasoning_text="Checking results.")),
+        ])
+        self.assert_lifecycles(events)
+        output = events[-1]["response"]["output"]
+        self.assertEqual([i["summary"][0]["text"] for i in output],
+                         ["**Thinking**\n\nChecking inputs.", "**Thinking**\n\nChecking results."])
+
+    async def test_live_reasoning_and_completed_suffix_are_consistent(self):
+        events = await self.replay([
+            ("assistant.reasoning_delta", AssistantReasoningDeltaData(reasoning_id="r1", delta_content="Checking")),
+            ("assistant.reasoning", AssistantReasoningData(reasoning_id="r1", content="Checking inputs.")),
+            ("assistant.message", AssistantMessageData(message_id="m1", content="Done.", reasoning_text="Checking inputs.", phase="final_answer")),
+            ("assistant.reasoning", AssistantReasoningData(reasoning_id="r2", content="Another step.")),
+        ])
+        self.assert_lifecycles(events)
+        output = events[-1]["response"]["output"]
+        self.assertEqual([i["type"] for i in output], ["reasoning", "message", "reasoning"])
+        deltas = [e["delta"] for e in events if e["type"] == "response.reasoning_summary_text.delta"]
+        self.assertEqual(deltas, ["**Thinking**\n\nChecking", " inputs.", "**Thinking**\n\nAnother step."])
+
+    async def test_interleaved_sources_do_not_write_to_closed_items_or_drop_completions(self):
+        sequence = [
+            ("assistant.reasoning_delta", AssistantReasoningDeltaData(reasoning_id="r1", delta_content="First.")),
+            ("assistant.message_delta", AssistantMessageDeltaData(message_id="m1", delta_content="Working.")),
+            ("assistant.reasoning_delta", AssistantReasoningDeltaData(reasoning_id="r1", delta_content=" More.")),
+            ("assistant.reasoning", AssistantReasoningData(reasoning_id="r1", content="First. More.")),
+            ("assistant.message", AssistantMessageData(message_id="sub", parent_tool_call_id="tool", content="Subagent result.")),
+            ("assistant.message", AssistantMessageData(message_id="m1", content="Working.")),
+            ("assistant.message", AssistantMessageData(message_id="m2", content="Finished.", phase="final_answer")),
+        ]
+        events = await self.replay(sequence)
+        self.assert_lifecycles(events)
+        session = _FakeSession()
+
+        async def dispatch():
+            for name, data in sequence:
+                session.emit(name, data)
+            session.emit("session.idle", SessionIdleData())
+
+        outcome = await sdk._wait_for_outcome(session, dispatch, sdk.ToolRegistration())
+        self.assertEqual(outcome.text, "Working.Finished.")
+        self.assertEqual(outcome.reasoning, "First. More.Subagent result.")
+        payload = sdk._response_payload({}, session.session_id, outcome, "test")
+        def without_ids(items):
+            return [{k: v for k, v in item.items() if k != "id"} for item in items]
+        self.assertEqual(without_ids(payload["output"]), without_ids(events[-1]["response"]["output"]))
+
+    async def test_intent_is_commentary_and_does_not_contaminate_compaction(self):
+        sequence = [
+            ("assistant.intent", AssistantIntentData(intent="Reviewing.")),
+            ("assistant.intent", AssistantIntentData(intent="Reviewing.")),
+            ("assistant.message", AssistantMessageData(message_id="m1", content="Summary.", phase="final_answer")),
+        ]
+        events = await self.replay(sequence)
+        self.assert_lifecycles(events)
+        self.assertEqual([i["phase"] for i in events[-1]["response"]["output"]], ["commentary", "final_answer"])
+        compact = await self.replay(sequence, compact=True)
+        output = compact[-1]["response"]["output"]
+        self.assertEqual(len(output), 1)
+        self.assertEqual(output[0]["type"], "compaction")
+        self.assertEqual(format_translation.decode_fake_compaction(output[0]["encrypted_content"]), "Summary.")
+        self.assertFalse(any(e["type"].endswith("text.delta") for e in compact))
+
+    async def test_background_feedback_survives_tool_handoff_without_replay(self):
+        session = _FakeSession()
+        session.session_id = "feedback-handoff"
+        await sdk._track_live_session(session)
+        try:
+            first = await self.replay([
+                ("assistant.reasoning_delta", AssistantReasoningDeltaData(reasoning_id="r1", delta_content="Checking")),
+                ("external_tool.requested", ExternalToolRequestedData(
+                    request_id="request-1", session_id=session.session_id,
+                    tool_call_id="call-1", tool_name="lookup", arguments={},
+                )),
+            ], session=session, idle=False)
+            self.assert_lifecycles(first)
+            # These arrive with no HTTP request listening, while the SDK
+            # session is still alive. Idle must not terminate the next stream.
+            session.emit("assistant.reasoning", AssistantReasoningData(reasoning_id="r1", content="Checking inputs."))
+            session.emit("session.idle", SessionIdleData())
+            await asyncio.sleep(0)
+            second = await self.replay([
+                ("assistant.reasoning", AssistantReasoningData(reasoning_id="r1", content="Checking inputs.")),
+                ("assistant.message", AssistantMessageData(message_id="m1", content="Done.", phase="final_answer", reasoning_text="Checking inputs.")),
+            ], session=session)
+            self.assert_lifecycles(second)
+            output = second[-1]["response"]["output"]
+            self.assertEqual([i["type"] for i in output], ["reasoning", "message"])
+            self.assertEqual(output[0]["summary"][0]["text"], "**Thinking**\n\n inputs.")
+            self.assertEqual(output[1]["content"][0]["text"], "Done.")
+            self.assertNotEqual(output[0]["id"], first[-1]["response"]["output"][0]["id"])
+        finally:
+            await sdk._evict_live_session(session.session_id)
+
+
 class CopilotSdkCompactionContinuityTests(unittest.IsolatedAsyncioTestCase):
     """A client-side compaction must not cost the thread its SDK session."""
 
@@ -1736,6 +1911,13 @@ class CopilotSdkCompactionContinuityTests(unittest.IsolatedAsyncioTestCase):
 
 
 class CopilotSdkRequestContinuityTests(unittest.IsolatedAsyncioTestCase):
+    def test_codex_thread_identity_wins_over_shared_outer_session(self):
+        body = {"session_id": "root", "client_metadata": {
+            "thread_id": "stale-thread",
+            "x-codex-turn-metadata": json.dumps({"session_id": "root", "thread_id": "child"}),
+        }}
+        self.assertEqual(sdk._session_alias(body), "child")
+
     def setUp(self):
         self.state = _IsolatedSdkState()
         self.state.__enter__()
@@ -1813,6 +1995,92 @@ class CopilotSdkRequestContinuityTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(session, original)
         self.client.resume_session.assert_not_awaited()
         self.assertEqual(self.actions, [("result", "pending-1", "Inspection done")])
+
+    async def test_fork_does_not_consume_parents_legacy_tool_call(self):
+        original = await self.begin()
+        child = self.new_session()
+        child.session_id = "sdk-child"
+        self.client.create_session.side_effect = None
+        self.client.create_session.return_value = child
+        body = {**self.continuation(), "client_metadata": {
+            "x-codex-turn-metadata": json.dumps({
+                "session_id": "review-thread", "thread_id": "child-thread",
+            }),
+        }}
+        session, dispatch = await self.open(body)
+        await dispatch()
+        self.assertIs(session, child)
+        self.client.resume_session.assert_not_awaited()
+        original.rpc.tools.handle_pending_tool_call.assert_not_awaited()
+        self.assertFalse(original.disconnected)
+        self.assertTrue(sdk._live_sessions[original.session_id].pending_calls)
+        self.assertIn("User: Original task", self.actions[0][1])
+        self.assertIn("Tool result: Inspection done", self.actions[0][1])
+        sdk._commit_alias_watermark(child.session_id, success=True)
+        self.assertEqual(sdk._session_for_alias("review-thread")[0], original.session_id)
+        self.assertEqual(sdk._session_for_alias("child-thread")[0], child.session_id)
+        self.actions.clear()
+        resumed, dispatch = await self.open(self.continuation())
+        await dispatch()
+        self.assertIs(resumed, original)
+        self.assertEqual(self.actions, [("result", "pending-1", "Inspection done")])
+
+    async def test_fork_is_isolated_after_restart_with_legacy_tool_id(self):
+        await self.begin()
+        await sdk._evict_all_live_sessions()
+        child = self.new_session()
+        child.session_id = "sdk-child"
+        self.client.create_session.side_effect = None
+        self.client.create_session.return_value = child
+        session, dispatch = await self.open({**self.continuation(), "session_id": "child"})
+        await dispatch()
+        self.assertIs(session, child)
+        self.client.resume_session.assert_not_awaited()
+        self.assertEqual(self.actions[0][0], "send")
+
+    async def test_encoded_owner_survives_alias_retirement(self):
+        original = await self.begin()
+        payload = sdk._response_payload(self.body, original.session_id, sdk.TurnOutcome(
+            calls=[sdk.ToolCall("pending-1", "inspect", "function", {})],
+        ), "resp-parent")
+        self.call_id = payload["output"][0]["call_id"]
+        self.assertEqual(sdk._decode_call_id(self.call_id)["a"], "review-thread")
+        # Replacing the parent's alias removes the reverse lookup for its old
+        # session. The tool ID must still keep a fork out of that old session.
+        sdk._remember_session_alias("review-thread", "replacement", [])
+        child = self.new_session()
+        child.session_id = "sdk-child"
+        self.client.create_session.side_effect = None
+        self.client.create_session.return_value = child
+        session, dispatch = await self.open({**self.continuation(), "session_id": "child"})
+        await dispatch()
+        self.assertIs(session, child)
+        original.rpc.tools.handle_pending_tool_call.assert_not_awaited()
+        self.client.resume_session.assert_not_awaited()
+
+    async def test_matching_encoded_owner_keeps_live_continuation(self):
+        original = await self.begin()
+        self.call_id = sdk._encode_call_id(
+            original.session_id, "pending-1", tool_name="inspect", tool_type="function",
+            caller_alias="review-thread",
+        )
+        session, dispatch = await self.open(self.continuation())
+        await dispatch()
+        self.assertIs(session, original)
+        self.assertEqual(self.actions, [("result", "pending-1", "Inspection done")])
+
+    async def test_unknown_legacy_owner_does_not_resume_another_session(self):
+        original = await self.begin()
+        sdk._forget_session_aliases({original.session_id})
+        child = self.new_session()
+        child.session_id = "sdk-child"
+        self.client.create_session.side_effect = None
+        self.client.create_session.return_value = child
+        session, dispatch = await self.open({**self.continuation(), "session_id": "child"})
+        await dispatch()
+        self.assertIs(session, child)
+        original.rpc.tools.handle_pending_tool_call.assert_not_awaited()
+        self.client.resume_session.assert_not_awaited()
 
     async def test_changed_model_effort_instructions_and_tools_reconfigure_pending_session(self):
         changes = [

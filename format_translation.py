@@ -2213,6 +2213,12 @@ def _message_with_merged_text(item: dict, text: str) -> dict:
 
 
 def normalize_responses_instructions_for_copilot(body: dict, *, diagnostics: list[dict] | None = None) -> dict:
+    """Fold only the initial instruction block; preserve later updates in place.
+
+    Hoisting a developer message appended during a turn rewrites the prefix
+    of every prior message, invalidating prompt-cache reuse and changing the
+    chronological scope of those instructions.
+    """
     if not isinstance(body, dict):
         return body
     input_items = body.get("input")
@@ -2226,8 +2232,9 @@ def normalize_responses_instructions_for_copilot(body: dict, *, diagnostics: lis
 
     retained_items = []
     removed_roles: list[str] = []
+    in_preamble = True
     for item in input_items:
-        if _is_instruction_input_message(item):
+        if in_preamble and _is_instruction_input_message(item):
             text = _message_text(item).strip()
             if text:
                 instruction_parts.append(text)
@@ -2235,6 +2242,7 @@ def normalize_responses_instructions_for_copilot(body: dict, *, diagnostics: lis
             if role:
                 removed_roles.append(role)
             continue
+        in_preamble = False
         retained_items.append(item)
 
     if not removed_roles:

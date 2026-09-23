@@ -6,6 +6,40 @@ import format_translation
 import proxy
 
 
+class ResponsesInstructionPrefixTests(unittest.TestCase):
+    def test_appended_instructions_preserve_existing_upstream_prefix(self):
+        for role in ("developer", "system"):
+            with self.subTest(role=role):
+                body = {"instructions": "Base policy", "input": [
+                    {"role": "developer", "content": "Initial environment"},
+                    {"role": "user", "content": "Task"},
+                    {"role": "assistant", "content": "Working"},
+                ]}
+                update = {"type": "message", "role": role, "content": [
+                    {"type": "input_text", "text": "New runtime instruction"},
+                ], "id": "update-1"}
+                extended = {**body, "input": [*body["input"], update,
+                    {"role": "user", "content": "Continue"},
+                ]}
+                previous = format_translation.normalize_responses_instructions_for_copilot(body)
+                current = format_translation.normalize_responses_instructions_for_copilot(extended)
+                self.assertEqual(previous["instructions"], "Base policy\n\nInitial environment")
+                self.assertEqual(current["instructions"], previous["instructions"])
+                self.assertEqual(current["input"][:len(previous["input"])], previous["input"])
+                self.assertEqual(current["input"][-2], update)
+                self.assertEqual(len(extended["input"]), 5)
+                self.assertEqual(
+                    format_translation.normalize_responses_instructions_for_copilot(current), current,
+                )
+
+    def test_late_instruction_without_initial_preamble_stays_in_place(self):
+        body = {"input": [
+            {"role": "user", "content": "Task"},
+            {"role": "developer", "content": "Update"},
+        ]}
+        self.assertIs(format_translation.normalize_responses_instructions_for_copilot(body), body)
+
+
 class ReasoningTranslationTests(unittest.IsolatedAsyncioTestCase):
     def test_ensure_codex_reasoning_header(self):
         self.assertEqual(
