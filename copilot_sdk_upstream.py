@@ -940,6 +940,8 @@ class _SdkFeedbackState:
     phases: dict[str, str] = field(default_factory=dict)
     native_reasoning: bool = False
     last_intent: str | None = None
+    progress_count: int = 0
+    progress_texts: set[str] = field(default_factory=set)
 
 
 def _is_feedback_event(event: Any) -> bool:
@@ -1898,16 +1900,23 @@ _SDK_SUMMARY_HEADING = re.compile(r"^\s*(\*\*[^*\n]{1,100}\*\*|#{1,3} [^\n]{1,10
 
 
 def _sdk_display_summary(text: str, *, complete: bool) -> str:
-    """Expose a finished, short heading as soon as the SDK has streamed it."""
+    """Return one short, substantive update from an SDK summary block."""
     match = _SDK_SUMMARY_HEADING.match(text)
-    if match:
-        return match.group(1)
-    if not complete:
+    heading = match.group(1) if match else ""
+    body = (text[match.end():] if match else text).strip()
+    if not body:
         return ""
-    # Older runtimes sometimes omit Markdown headings. Use the first line of
-    # their completed summary, rather than exposing the full reasoning prose.
-    first_line = text.strip().splitlines()[0] if text.strip() else ""
-    return first_line[:100].rstrip() + ("…" if len(first_line) > 100 else "")
+    sentence_end = re.search(r"[.!?](?=\s|$)", body)
+    if sentence_end:
+        body = body[:sentence_end.end()]
+    elif not complete:
+        return ""
+    else:
+        body = body.splitlines()[0]
+    body = body[:180].rstrip()
+    if len(body) == 180:
+        body = body.rstrip(" ,;:") + "…"
+    return f"{heading}\n\n{body}" if heading else body
 
 
 @dataclass
@@ -1964,13 +1973,14 @@ class _SdkOutputTranslator:
             return []
         previous = self.state.raw_text.get(key, "")
         if kind == "reasoning":
-            # The SDK's detailed mode streams many fragments of one reasoning
-            # block. The app needs a completed summary item while that block is
-            # still running, rather than a long series of hidden text deltas.
+            # The app receives reasoning items but keeps them in its thinking
+            # UI. Commentary messages use its visible progress path.
             suffix = text[len(previous):] if complete and text.startswith(previous) else text
             accumulated = previous + suffix
             summary = _sdk_display_summary(accumulated, complete=complete)
-            if not summary:
+            fingerprint = re.sub(r"\W+", "", summary).casefold()
+            if (not summary or self.state.progress_count >= 3
+                    or fingerprint in self.state.progress_texts):
                 self.state.raw_text[key] = accumulated
                 if complete:
                     self.state.finished.add(key)
@@ -1978,6 +1988,12 @@ class _SdkOutputTranslator:
             text = summary
             previous = ""
             complete = True
+            self.state.progress_count += 1
+            self.state.progress_texts.add(fingerprint)
+            self.outcome.reasoning += summary
+            kind = "message"
+            phase = "commentary"
+            record_text = False
         # Completed SDK events repeat the accumulated deltas. Reconcile only
         # their missing suffix, independently for each source message/reasoning ID.
         delta = text
@@ -2032,6 +2048,8 @@ class _SdkOutputTranslator:
             self.state.phases.clear()
             self.state.native_reasoning = False
             self.state.last_intent = None
+            self.state.progress_count = 0
+            self.state.progress_texts.clear()
             return []
         if name == "assistant.message_start":
             phase = getattr(data, "phase", None)
@@ -2061,9 +2079,14 @@ class _SdkOutputTranslator:
                 self.state.native_reasoning = False
             return events
         if isinstance(data, AssistantIntentData):
-            if not data.intent or data.intent == self.state.last_intent:
+            fingerprint = re.sub(r"\W+", "", data.intent or "").casefold()
+            if (not fingerprint or data.intent == self.state.last_intent
+                    or fingerprint in self.state.progress_texts
+                    or self.state.progress_count >= 3):
                 return []
             self.state.last_intent = data.intent
+            self.state.progress_count += 1
+            self.state.progress_texts.add(fingerprint)
             # Intent describes user-facing progress, like Excel commentary.
             return self.append(("intent", _new_id("intent")), "message", data.intent,
                                complete=True, phase="commentary", record_text=False)

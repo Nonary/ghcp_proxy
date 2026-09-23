@@ -876,7 +876,7 @@ class CopilotSdkEventTests(unittest.IsolatedAsyncioTestCase):
         outcome = await sdk._wait_for_outcome(session, dispatch, sdk.ToolRegistration())
         self.assertEqual(outcome.text, "visible answer")
 
-    async def test_stream_emits_reasoning_and_message_with_stable_ids_and_indices(self):
+    async def test_stream_emits_progress_and_reply_with_stable_ids_and_indices(self):
         session = _FakeSession()
 
         async def dispatch():
@@ -916,10 +916,10 @@ class CopilotSdkEventTests(unittest.IsolatedAsyncioTestCase):
             "response.created",
             "response.in_progress",
             "response.output_item.added",
-            "response.reasoning_summary_part.added",
-            "response.reasoning_summary_text.delta",
-            "response.reasoning_summary_text.done",
-            "response.reasoning_summary_part.done",
+            "response.content_part.added",
+            "response.output_text.delta",
+            "response.output_text.done",
+            "response.content_part.done",
             "response.output_item.done",
             "response.output_item.added",
             "response.content_part.added",
@@ -931,18 +931,16 @@ class CopilotSdkEventTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertEqual(event_names, expected_names)
 
-        # Verify reasoning item has output_index 0 and message has output_index 1
-        reasoning_added = next(d for name, d in events if name == "response.output_item.added" and d["item"]["type"] == "reasoning")
-        message_added = next(d for name, d in events if name == "response.output_item.added" and d["item"]["type"] == "message")
-        self.assertEqual(reasoning_added["output_index"], 0)
-        self.assertEqual(message_added["output_index"], 1)
+        added = [d for name, d in events if name == "response.output_item.added"]
+        self.assertEqual([d["output_index"] for d in added], [0, 1])
+        self.assertEqual([d["item"].get("phase") for d in added], ["commentary", None])
 
         # Verify response.completed matches item IDs and ordering
         completed = events[-1][1]["response"]
         self.assertEqual(len(completed["output"]), 2)
-        self.assertEqual(completed["output"][0]["id"], reasoning_added["item"]["id"])
-        self.assertEqual(completed["output"][0]["type"], "reasoning")
-        self.assertEqual(completed["output"][1]["id"], message_added["item"]["id"])
+        self.assertEqual(completed["output"][0]["id"], added[0]["item"]["id"])
+        self.assertEqual(completed["output"][0]["phase"], "commentary")
+        self.assertEqual(completed["output"][1]["id"], added[1]["item"]["id"])
         self.assertEqual(completed["output"][1]["type"], "message")
 
     def test_extract_shutdown_usage_prefers_token_details_over_model_metrics(self):
@@ -1521,7 +1519,7 @@ class CopilotSdkEventTests(unittest.IsolatedAsyncioTestCase):
 
 
 class CopilotSdkFeedbackTests(unittest.IsolatedAsyncioTestCase):
-    async def test_heading_completes_while_sdk_is_still_working(self):
+    async def test_commentary_summary_completes_while_sdk_is_still_working(self):
         session = _FakeSession()
         continue_sdk = asyncio.Event()
 
@@ -1530,14 +1528,14 @@ class CopilotSdkFeedbackTests(unittest.IsolatedAsyncioTestCase):
                 reasoning_id="r1", delta_content="**Checking",
             ))
             session.emit("assistant.reasoning_delta", AssistantReasoningDeltaData(
-                reasoning_id="r1", delta_content=" inventory**\n\n",
+                reasoning_id="r1", delta_content=" inventory**\n\nI am checking item counts.",
             ))
             await continue_sdk.wait()
             session.emit("assistant.reasoning_delta", AssistantReasoningDeltaData(
                 reasoning_id="r1", delta_content="Private working detail that should stay hidden.",
             ))
             session.emit("assistant.reasoning", AssistantReasoningData(
-                reasoning_id="r1", content="**Checking inventory**\n\nPrivate working detail that should stay hidden.",
+                reasoning_id="r1", content="**Checking inventory**\n\nI am checking item counts. Private working detail that should stay hidden.",
             ))
             session.emit("assistant.message", AssistantMessageData(
                 message_id="m1", content="Done.", phase="final_answer",
@@ -1554,15 +1552,15 @@ class CopilotSdkFeedbackTests(unittest.IsolatedAsyncioTestCase):
                     event = json.loads(chunk.decode().split("data: ", 1)[1])
                     events.append(event)
                     if (event["type"] == "response.output_item.done"
-                            and event["item"]["type"] == "reasoning"):
+                            and event["item"].get("phase") == "commentary"):
                         continue_sdk.set()
 
             await asyncio.wait_for(collect(), timeout=5)
 
         self.assert_lifecycles(events)
-        summaries = [i for i in events[-1]["response"]["output"] if i["type"] == "reasoning"]
+        summaries = [i for i in events[-1]["response"]["output"] if i.get("phase") == "commentary"]
         self.assertEqual(len(summaries), 1)
-        self.assertEqual(summaries[0]["summary"][0]["text"], "**Checking inventory**")
+        self.assertEqual(summaries[0]["content"][0]["text"], "**Checking inventory**\n\nI am checking item counts.")
         self.assertNotIn("Private working detail", json.dumps(events))
 
     async def replay(self, sequence, *, compact=False, session=None, idle=True):
@@ -1638,8 +1636,9 @@ class CopilotSdkFeedbackTests(unittest.IsolatedAsyncioTestCase):
         ])
         self.assert_lifecycles(events)
         output = events[-1]["response"]["output"]
-        self.assertEqual([i["summary"][0]["text"] for i in output],
-                         ["**Thinking**\n\nChecking inputs.", "**Thinking**\n\nChecking results."])
+        self.assertEqual([i.get("phase") for i in output], ["commentary", "commentary"])
+        self.assertEqual([i["content"][0]["text"] for i in output],
+                         ["Checking inputs.", "Checking results."])
 
     async def test_live_reasoning_and_completed_suffix_are_consistent(self):
         events = await self.replay([
@@ -1650,9 +1649,9 @@ class CopilotSdkFeedbackTests(unittest.IsolatedAsyncioTestCase):
         ])
         self.assert_lifecycles(events)
         output = events[-1]["response"]["output"]
-        self.assertEqual([i["type"] for i in output], ["reasoning", "message", "reasoning"])
-        deltas = [e["delta"] for e in events if e["type"] == "response.reasoning_summary_text.delta"]
-        self.assertEqual(deltas, ["**Thinking**\n\nChecking inputs.", "**Thinking**\n\nAnother step."])
+        self.assertEqual([i.get("phase") for i in output], ["commentary", "final_answer", "commentary"])
+        deltas = [e["delta"] for e in events if e["type"] == "response.output_text.delta"]
+        self.assertEqual(deltas, ["Checking inputs.", "Done.", "Another step."])
 
     async def test_interleaved_sources_do_not_write_to_closed_items_or_drop_completions(self):
         sequence = [
@@ -1675,7 +1674,7 @@ class CopilotSdkFeedbackTests(unittest.IsolatedAsyncioTestCase):
 
         outcome = await sdk._wait_for_outcome(session, dispatch, sdk.ToolRegistration())
         self.assertEqual(outcome.text, "Working.Finished.")
-        self.assertEqual(outcome.reasoning, "First. More.Subagent result.")
+        self.assertEqual(outcome.reasoning, "First.Subagent result.")
         payload = sdk._response_payload({}, session.session_id, outcome, "test")
         def without_ids(items):
             return [{k: v for k, v in item.items() if k != "id"} for item in items]
@@ -1696,6 +1695,24 @@ class CopilotSdkFeedbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(output[0]["type"], "compaction")
         self.assertEqual(format_translation.decode_fake_compaction(output[0]["encrypted_content"]), "Summary.")
         self.assertFalse(any(e["type"].endswith("text.delta") for e in compact))
+
+    async def test_progress_is_limited_across_reasoning_and_intents(self):
+        events = await self.replay([
+            ("assistant.reasoning", AssistantReasoningData(reasoning_id="r1", content="**Checking files**\n\nI am locating the relevant code. More internal detail.")),
+            ("assistant.reasoning", AssistantReasoningData(reasoning_id="r2", content="**Checking files**\n\nI am locating the relevant code. Repeated detail.")),
+            ("assistant.intent", AssistantIntentData(intent="Reviewing the event path.")),
+            ("assistant.reasoning", AssistantReasoningData(reasoning_id="r3", content="**Tracing events**\n\nI am checking the app notifications.")),
+            ("assistant.intent", AssistantIntentData(intent="One more update that should be suppressed.")),
+            ("assistant.message", AssistantMessageData(message_id="m1", content="Done.", phase="final_answer")),
+        ])
+        output = events[-1]["response"]["output"]
+        self.assertEqual([item.get("phase") for item in output],
+                         ["commentary", "commentary", "commentary", "final_answer"])
+        self.assertEqual([item["content"][0]["text"] for item in output[:3]], [
+            "**Checking files**\n\nI am locating the relevant code.",
+            "Reviewing the event path.",
+            "**Tracing events**\n\nI am checking the app notifications.",
+        ])
 
     async def test_background_feedback_survives_tool_handoff_without_replay(self):
         session = _FakeSession()
@@ -1721,8 +1738,8 @@ class CopilotSdkFeedbackTests(unittest.IsolatedAsyncioTestCase):
             ], session=session)
             self.assert_lifecycles(second)
             output = second[-1]["response"]["output"]
-            self.assertEqual([i["type"] for i in output], ["reasoning", "message"])
-            self.assertEqual(output[0]["summary"][0]["text"], "**Thinking**\n\nChecking inputs.")
+            self.assertEqual([i.get("phase") for i in output], ["commentary", "final_answer"])
+            self.assertEqual(output[0]["content"][0]["text"], "Checking inputs.")
             self.assertEqual(output[1]["content"][0]["text"], "Done.")
             self.assertNotEqual(output[0]["id"], first[-1]["response"]["output"][0]["id"])
         finally:
