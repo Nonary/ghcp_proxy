@@ -861,6 +861,22 @@ async def _reasoning_effort_for_client(body: dict, client: Any) -> str | None:
     return requested
 
 
+# Codex sends Luna a one-line system prompt and relies on the model to write
+# its own commentary-phase progress updates, which the app shows between tool
+# calls (the Excel upstream's models do this natively).  Through the SDK, Luna
+# writes none unless asked, so the app shows only "Thinking" until the final
+# answer.  With this instruction it sends a commentary message beside its tool
+# calls, which the output translator already forwards as a separate item.
+_PROGRESS_UPDATE_INSTRUCTIONS = (
+    "Intermediary updates: while you work, keep the user informed with short "
+    "commentary messages. Before a tool call or group of related tool calls, and "
+    "whenever you learn something that changes your plan, write one or two plain "
+    "sentences saying what you found and what you will do next. Send these "
+    "alongside the tool call; do not wait for the final answer. Do not repeat an "
+    "update you already gave."
+)
+
+
 def _reasoning_summary(body: dict) -> str:
     """Request early SDK headings unless the caller selects a mode."""
     reasoning = body.get("reasoning")
@@ -909,7 +925,10 @@ def _session_options(
         "enable_host_git_operations": False,
     }
     if isinstance(instructions, str) and instructions:
-        options["system_message"] = {"mode": "replace", "content": instructions}
+        options["system_message"] = {
+            "mode": "replace",
+            "content": f"{instructions}\n\n{_PROGRESS_UPDATE_INSTRUCTIONS}",
+        }
     return {key: value for key, value in options.items() if value is not None}
 
 
