@@ -57,6 +57,27 @@ class _ConnectedRequest:
 
 
 class CopilotSdkTranslationTests(unittest.TestCase):
+    def test_sdk_defaults_to_concise_app_summaries(self):
+        for reasoning in (None, {}, {"effort": "high"}, {"summary": "auto"}):
+            with self.subTest(reasoning=reasoning):
+                options = sdk._session_options(
+                    {"model": "gpt-5.6-luna", "reasoning": reasoning}, sdk.ToolRegistration(),
+                )
+                self.assertEqual(options["reasoning_summary"], "concise")
+        for summary in ("none", "concise", "detailed"):
+            self.assertEqual(sdk._reasoning_summary({"reasoning": {"summary": summary}}), summary)
+
+    def test_sdk_completed_summary_matches_excel_normalization(self):
+        for text in ("Checking inventory", "**Checking inventory**"):
+            with self.subTest(text=text):
+                excel_item = format_translation.normalize_reasoning_item_for_client({
+                    "id": "rs-test", "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": text}],
+                })
+                sdk_item = sdk._reasoning_item(text, item_id="rs-test")
+                self.assertEqual(sdk_item["summary"], excel_item["summary"])
+                self.assertEqual(sdk_item["content"], excel_item["content"])
+
     def test_sdk_is_default_and_rest_is_explicit_fallback(self):
         with patch.dict(os.environ, {}, clear=True):
             self.assertEqual(sdk.responses_upstream(), "sdk")

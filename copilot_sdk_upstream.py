@@ -854,12 +854,15 @@ async def _reasoning_effort_for_client(body: dict, client: Any) -> str | None:
 
 
 def _reasoning_summary(body: dict) -> str:
-    """Map Responses reasoning settings to the SDK's summary modes."""
+    """Request short app-facing summaries unless the caller selects a mode."""
     reasoning = body.get("reasoning")
     summary = reasoning.get("summary") if isinstance(reasoning, dict) else None
     if summary in {"none", "concise", "detailed"}:
         return summary
-    return "detailed"
+    # Responses clients normally send "auto" or omit this setting. The SDK's
+    # detailed mode turns those requests into extended reasoning prose. Concise
+    # produces the short summary headings used by the app's thinking display.
+    return "concise"
 
 
 def _session_options(
@@ -1817,15 +1820,16 @@ def _message_item(
 
 
 def _reasoning_item(text: str, *, item_id: str | None = None, completed: bool = True) -> dict:
-    formatted_text = format_translation.ensure_codex_reasoning_header(text) if (completed and text) else text
-    return {
+    item = {
         "type": "reasoning",
         "id": item_id or _new_id("rs"),
         "status": "completed" if completed else "in_progress",
-        "summary": ([{"type": "summary_text", "text": formatted_text}] if (completed and formatted_text) else []),
-        "content": ([{"type": "reasoning_text", "text": formatted_text}] if (completed and formatted_text) else []),
+        "summary": ([{"type": "summary_text", "text": text}] if (completed and text) else []),
+        "content": [],
         "encrypted_content": None,
     }
+    # Excel uses this same normalizer for its native Responses reasoning items.
+    return format_translation.normalize_reasoning_item_for_client(item)
 
 
 def _response_payload(body: dict, session_id: str, outcome: TurnOutcome, response_id: str) -> dict:

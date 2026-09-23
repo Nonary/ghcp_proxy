@@ -83,8 +83,11 @@ steering before those results release the next model call.
 SDK feedback is collected for the lifetime of the connected session, including
 between tool handoffs. Each Responses request emits its own ordered thought and
 message items, while deduplication follows the SDK's source IDs across handoffs.
-Thoughts use the Responses reasoning-summary channel with live display headers;
-models that expose thoughts only in a completed message's `reasoningText` use
+Thoughts use the Responses reasoning-summary channel with live display headers.
+Omitted or `auto` summary settings request the SDK's concise summaries, producing
+short app-facing headings. Explicit `none`, `concise`, and `detailed` settings are
+preserved. Completed summary items use the same normalization as the Excel path.
+Models that expose thoughts only in a completed message's `reasoningText` use
 that as a fallback. Message phases and separate follow-up messages are preserved,
 and SDK intent updates are emitted as commentary.
 
