@@ -1714,6 +1714,26 @@ class CopilotSdkFeedbackTests(unittest.IsolatedAsyncioTestCase):
             "**Tracing events**\n\nI am checking the app notifications.",
         ])
 
+    async def test_tool_turns_share_one_interaction_progress_budget(self):
+        sequence = [("assistant.turn_start", SimpleNamespace(interaction_id="request-1"))]
+        for index in range(5):
+            sequence.extend([
+                ("assistant.reasoning", AssistantReasoningData(
+                    reasoning_id=f"reason-{index}", content=f"Progress update {index}.")),
+                ("assistant.turn_start", SimpleNamespace(interaction_id="request-1")),
+            ])
+        sequence.extend([
+            ("assistant.turn_start", SimpleNamespace(interaction_id="request-2")),
+            ("assistant.reasoning", AssistantReasoningData(
+                reasoning_id="next-request", content="Progress for the next request.")),
+        ])
+        events = await self.replay(sequence)
+        output = events[-1]["response"]["output"]
+        self.assertEqual([item["content"][0]["text"] for item in output], [
+            "Progress update 0.", "Progress update 1.", "Progress update 2.",
+            "Progress for the next request.",
+        ])
+
     async def test_background_feedback_survives_tool_handoff_without_replay(self):
         session = _FakeSession()
         session.session_id = "feedback-handoff"

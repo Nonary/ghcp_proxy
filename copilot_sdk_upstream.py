@@ -942,6 +942,7 @@ class _SdkFeedbackState:
     last_intent: str | None = None
     progress_count: int = 0
     progress_texts: set[str] = field(default_factory=set)
+    interaction_id: str | None = None
 
 
 def _is_feedback_event(event: Any) -> bool:
@@ -2041,15 +2042,19 @@ class _SdkOutputTranslator:
         data = getattr(event, "data", None)
         name = _event_name(event)
         if name == "assistant.turn_start":
-            # A real SDK turn boundary, unlike an HTTP tool handoff, retires
-            # the deduplication state so long-lived sessions stay bounded.
+            # The SDK starts another turn after each tool call, but retains
+            # interaction_id for the entire user request. Keep its progress
+            # budget across those internal turns.
+            interaction_id = getattr(data, "interaction_id", None)
+            if not interaction_id or interaction_id != self.state.interaction_id:
+                self.state.progress_count = 0
+                self.state.progress_texts.clear()
+            self.state.interaction_id = interaction_id
             self.state.raw_text.clear()
             self.state.finished.clear()
             self.state.phases.clear()
             self.state.native_reasoning = False
             self.state.last_intent = None
-            self.state.progress_count = 0
-            self.state.progress_texts.clear()
             return []
         if name == "assistant.message_start":
             phase = getattr(data, "phase", None)
