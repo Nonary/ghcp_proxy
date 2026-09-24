@@ -1,538 +1,278 @@
 # GHCP Proxy
 
-Local compatibility proxy for Codex and Claude Code using GitHub Copilot.
+GHCP Proxy provides an OpenAI-compatible local endpoint for using GitHub Copilot with Codex and the ChatGPT app. Claude Code is also supported through a compatibility integration.
 
-## Read This First
+For organizations that provide the official ChatGPT Excel add-in but do not enable ChatGPT for Work or direct Codex access, GHCP Proxy can alternatively route Codex through the backend available to the authenticated Excel add-in session.
 
-The v2 Codex path uses GitHub's official Copilot SDK and bundled runtime. The
-OpenAI Responses compatibility layer in this project is unofficial, as are the
-legacy REST, Claude Code, and GPT Excel paths. You should still assume that
-misuse can violate GitHub's terms or acceptable-use rules. GitHub's API terms
-say abusive or excessive requests can lead to temporary or permanent suspension
-of API access, and GitHub's acceptable-use rules include service usage limits.
+The dashboard handles authentication, integrations, usage, cost estimates, and optional startup management.
 
-Use your own account, respect GitHub's limits, and do not use this project to
-evade billing or quotas. Rate limits make runaway usage less likely than it used
-to be, but they are not permission to abuse the service. If you mark every
-ordinary request as free/agent traffic or try to bypass billing accounting, you
-are taking on account risk, including possible suspension or a permanent ban.
+## Supported Backends
 
-GitHub remains the source of truth for billing and enforcement:
+| Client                | Backend                        | Use                                                              |
+| --------------------- | ------------------------------ | ---------------------------------------------------------------- |
+| Codex and ChatGPT app | GitHub Copilot                 | Default                                                          |
+| Codex                 | ChatGPT Excel backend          | Alternative when organizational access is provided through Excel |
+| Claude Code           | GHCP Proxy compatibility route | Optional                                                         |
 
-- [GitHub Copilot models and token pricing](https://docs.github.com/en/copilot/reference/copilot-billing/models-and-pricing)
-- [GitHub Copilot usage limits](https://docs.github.com/en/copilot/concepts/rate-limits)
-- [GitHub API terms](https://docs.github.com/github/site-policy/github-terms-of-service#h-api-terms)
-- [GitHub Acceptable Use Policies](https://docs.github.com/site-policy/acceptable-use-policies/github-acceptable-use-policies)
-
-## Setup
-
-You need Python 3.11 or newer, a GitHub account with Copilot access, and Codex
-or Claude Code installed if you want GHCP Proxy to configure those clients.
-
-From this folder, start the proxy:
-
-```bash
-python3 proxy.py
-```
-
-On Windows PowerShell:
-
-```powershell
-py -3 .\proxy.py
-```
-
-Then open the dashboard:
+GHCP Proxy listens on loopback only.
 
 ```text
-http://localhost:8000/
+API:       http://127.0.0.1:8000/v1
+Dashboard: http://127.0.0.1:8000/
 ```
 
-In the dashboard:
+## Quick Start
 
-1. Sign in to GitHub if prompted.
-2. Open **Integrations**.
-3. Enable Codex, Claude Code, or both.
-4. Install the shell commands.
-5. Optionally enable startup so GHCP Proxy starts at login.
-6. Restart any already-open Codex or Claude Code sessions.
+### Prerequisites
 
-That is the normal setup. You do not need Node.js, `npx`, or hand-edited
-`~/.codex` / `~/.claude` config files.
+* Python 3.11 or newer
+* GitHub Copilot access when using the Copilot backend
+* Codex, the ChatGPT app, or Claude Code for the client you want to configure
+* Excel desktop with the official ChatGPT add-in signed in when using the Excel backend
 
-## Codex v2 Upstream
+### macOS and Linux
 
-Codex Responses requests use the official `github-copilot-sdk` package by
-default. The SDK downloads and manages its matching Copilot runtime, owns the
-GitHub-supported authentication/model transport, and persists its session state.
-GHCP Proxy translates between OpenAI Responses items and SDK session events.
-
-Client tools are registered as SDK declaration-only tools. When Copilot asks to
-call one, the SDK suspends its turn; GHCP Proxy returns the call to Codex and
-encodes the SDK session and request IDs in `call_id`. Codex executes the tool,
-then its next Responses request resumes that exact SDK turn. Parallel calls are
-batched and the encoded continuation survives proxy restarts.
-
-Reasoning effort, including `max` for supported models, is forwarded to the SDK.
-New caller instructions accompanying tool results are delivered as immediate
-steering before those results release the next model call.
-
-The SDK session stays connected across tool round-trips **and completed user
-turns**. Destroying and resuming a session removes encrypted reasoning from
-the SDK's persisted history, breaking the cached prefix on the next user turn.
-Keeping the runtime alive also lets background compaction finish. Idle sessions
-expire after `GHCP_SDK_SESSION_IDLE_SECONDS` (default 1800); at most 32 completed
-idle sessions are retained, with the oldest evicted first. Pending tools and
-active compaction are excluded from that capacity limit. When Codex compacts its
-own transcript, the proxy keeps
-the same SDK session -- the one that wrote the summary -- and only sends what
-follows the summary, rather than replaying the summary into a fresh session.
-If the model, effort, instructions, or tool configuration changes, the proxy
-reconnects to the same SDK session with the updated options. Unchanged requests
-continue using the existing connection.
-
-An interrupted turn keeps its session too, once the runtime confirms the abort.
-
-The runtime reaches Copilot over a WebSocket that chains `previous_response_id`
-(Sol, and tool-using sessions generally), and Copilot caches along that chain:
-a full-history request only reuses earlier *full* requests. The proxy's request
-handler therefore keeps an idle upstream WebSocket when the runtime drops it and
-hands it to the session's next connection; the full history a disk-resumed
-session opens with is sent as a continuation of that chain when it matches it
-item for item (`GHCP_SDK_WEBSOCKET_POOL_SECONDS`, default 600). If Copilot rejects
-the continuation, the full request is sent instead. The handler also records
-each session's encrypted reasoning (under `copilot-sdk/reasoning/`, pruned with
-the session) and restores it into full-history requests that lost it, and gives
-each session its own `prompt_cache_key` (disable with
-`GHCP_SDK_PROMPT_CACHE_KEY=0`).
-
-Request-finished traces include `copilot_sdk_session.operation` to distinguish
-live reuse from disk resume, and `copilot_sdk_session.model_calls` for the
-runtime's actual model calls: transport, whether each was a chained
-continuation, restored reasoning, resumed chains, and (WebSocket) per-call
-cached tokens. SDK request bodies in traces are adapter inputs, not the
-model-wire requests. See
-[the 2026-09-22 cache investigation](docs/prompt-cache-investigation-2026-09-22.md)
-and [the 2026-09-21 investigation](docs/prompt-cache-investigation-2026-09-21.md)
-for the evidence.
-
-To temporarily restore the old direct REST implementation while diagnosing a
-regression, start the proxy with:
-
-```bash
-GHCP_RESPONSES_UPSTREAM=rest python proxy.py
-```
-
-This switch applies to Codex Responses and model discovery. The legacy chat and
-Anthropic compatibility routes continue to use their existing implementation.
-
-## Token Pricing And Billing
-
-GitHub Copilot usage-based billing prices input, cached-input, cache-write, and
-output tokens according to the selected model, then converts the cost to GitHub
-AI Credits (1 credit = $0.01 USD). GHCP Proxy applies the published per-token
-rates to locally observed usage, but the dashboard remains an estimate. Your
-GitHub account and billing pages are the source of truth.
-
-For responsible use, leave prompts unprefixed most of the time and let the proxy
-classify traffic. Use `_` only when you are deliberately continuing a tool-driven
-agent workflow. Use `+` only when you are starting a fresh user request
-immediately after prior proxy activity and want it counted as user traffic.
-
-The dashboard shows recent requests, token counts, and estimated cost by token
-type and provider. Treat that display as guidance, not a guarantee.
-
-## First-Time Python Setup
-
-If `python3 proxy.py` fails because packages are missing, create a local Python
-environment once and install the dependencies:
-
-macOS/Linux:
+From the repository directory:
 
 ```bash
 python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-python proxy.py
+./.venv/bin/python -m pip install --upgrade pip
+./.venv/bin/python -m pip install -r requirements.txt
+./.venv/bin/python proxy.py
 ```
 
-Windows PowerShell:
+### Windows PowerShell
+
+From the repository directory:
 
 ```powershell
 py -3 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install --upgrade pip
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-.\.venv\Scripts\python.exe .\proxy.py
+./.venv/Scripts/python.exe -m pip install --upgrade pip
+./.venv/Scripts/python.exe -m pip install -r requirements.txt
+./.venv/Scripts/python.exe ./proxy.py
 ```
 
-After the dashboard is working, use **Integrations** to install the convenient
-start/stop commands:
+Then open `http://127.0.0.1:8000/`.
 
-- macOS zsh: `start-ghproxy` and `stop-ghproxy`
-- Windows PowerShell: `Start-GHProxy` and `Stop-GHProxy`
+On the first run:
+
+1. Sign in to GitHub if prompted.
+2. Open **Integrations**.
+3. Enable the clients you want to use.
+4. Optionally install the start and stop commands.
+5. Optionally enable startup at login.
+6. Restart any clients that were already running.
+
+Node.js, `npx`, and manually edited client configuration files are not required for normal setup.
 
 ## Daily Use
 
-If startup is enabled, GHCP Proxy starts automatically when you sign in.
+Start the proxy with the repository virtual environment:
 
-If you prefer manual control, use the installed command:
+```bash
+./.venv/bin/python proxy.py
+```
 
-macOS:
+If you installed the helper commands:
 
 ```bash
 start-ghproxy
 ```
 
-Windows PowerShell:
+On Windows PowerShell:
 
 ```powershell
 Start-GHProxy
 ```
 
-The proxy listens only on your local machine:
+After changing an integration, restart the affected client so it reloads its provider configuration.
+
+## Backends
+
+### GitHub Copilot
+
+GitHub Copilot is the default backend. Use it when your GitHub account has Copilot access.
+
+### ChatGPT Excel
+
+Some organizations enable the official ChatGPT add-in for Excel without enabling ChatGPT for Work or direct Codex access.
+
+Because the Excel add-in already provides an authenticated OpenAI backend and can support code-execution workflows, similar coding tasks can be performed from Excel. However, reproducing an agent such as Codex inside Excel requires additional prompting and orchestration.
+
+GHCP Proxy removes that indirection by connecting Codex directly to the backend available through the authenticated Excel add-in session. This lets Codex handle the coding workflow while the model requests use the organization's existing Excel access.
+
+In current testing, this has used substantially fewer tokens than recreating a comparable Codex workflow through a large orchestration prompt inside Excel. This is an observed result, not a guaranteed token-reduction ratio.
+
+Use one of the Excel model aliases to select this route:
 
 ```text
-http://localhost:8000/v1
+gpt-5.6-luna-excel
+gpt-5.6-terra-excel
+gpt-5.6-sol-excel
 ```
 
-The dashboard is:
+The aliases support `low`, `medium`, `high`, and `xhigh` reasoning effort. `x-high` is accepted as an alias for `xhigh`.
 
-```text
-http://localhost:8000/
-```
+Models without an `-excel` alias continue to use GitHub Copilot.
 
-## GPT Excel Upstream
+No Excel-specific prompt prefix or additional prompting syntax is required.
 
-`gpt-5.6-luna-excel`, `gpt-5.6-terra-excel`, and `gpt-5.6-sol-excel` are
-Responses-only models that send requests to the matching official ChatGPT
-Excel add-in backend model instead of GitHub Copilot. They are experimental and
-unofficial. The backend may change without notice, and using an add-in session
-outside the add-in may be unsupported by OpenAI. Use only your own account and
-session.
+## Excel Setup
 
-The Excel credential is deliberately separate from GitHub authentication. On
-Windows it is encrypted with the current user's DPAPI key. On both Windows and
-macOS it is read automatically from the Excel add-in cache at startup and
-before Excel-routed requests when a fresh session is needed. The bearer token
-and account ID are never returned to the dashboard.
+The Excel backend uses the authenticated session created by the official ChatGPT add-in.
 
-Windows prerequisites:
+It does not require network capture, DevTools, a debugging port, custom certificates, or operating-system proxy changes.
 
-- Excel desktop with the official ChatGPT add-in signed in at least once.
+### Windows
 
-The Windows reader automatically reads the add-in's cached `bps_auth_tokens`
-session from Office's WebView2 Local Storage database. It works while Excel is
-closed; it never monitors network traffic, needs no DevTools port, and has no
-dashboard toggle. If the session is missing, malformed, incomplete, or
-expired, the dashboard reports that condition; open the signed-in add-in once
-to refresh its cache, then retry the GPT Excel request.
+Excel desktop must have the ChatGPT add-in signed in at least once. GHCP Proxy discovers the session from Office WebView2 local storage.
 
-Check non-secret status with:
+Check the detected session status with:
 
 ```powershell
 Invoke-RestMethod http://127.0.0.1:8000/api/config/excel-session
 ```
 
-### Reading from Excel for Mac
+### macOS
 
-Excel for macOS stores the signed-in ChatGPT add-in session in WebKit
-LocalStorage. GHCP Proxy reads that SQLite database directly; it does not
-install a certificate or change macOS proxy settings.
+Excel desktop must have the ChatGPT add-in open and signed in. GHCP Proxy discovers the session from the local WebKit storage used by Excel.
 
-Mac prerequisites:
+If the session is missing or expired, reopen or refresh the signed-in Excel task pane and retry the request.
 
-- Excel desktop with the official ChatGPT add-in open and signed in.
+### Clear the Excel Session
 
-GHCP Proxy loads the session automatically at startup and again whenever a
-Excel-routed request finds no session or an expired token. There is no macOS
-capture button or certificate/proxy setup.
-
-The reader searches Excel's WebKit `WebsiteData/Default` profiles for the
-`bps_auth_tokens` LocalStorage key. It extracts only the bearer token and
-account identifiers required by GHCP Proxy and submits them to the loopback
-session API. Token values are not printed or written to logs. The macOS session
-remains memory-only, but GHCP Proxy reloads it after restarts. If the token
-expires, refresh the ChatGPT Excel task pane so Excel writes a current token.
-After priming, select `gpt-5.6-luna-excel`, `gpt-5.6-terra-excel`, or
-`gpt-5.6-sol-excel` in Codex. Requests for all other models still use GitHub
-Copilot. Each Excel alias sends its matching base model on the wire and exposes
-`low`, `medium`, `high`, and `xhigh` reasoning efforts (`x-high` is accepted as
-an input alias).
-
-Basispoints rejects client-supplied tool schemas and injects its own
-Excel-specific tools. GHCP Proxy therefore removes client tool declarations and
-describes the caller's function and custom tools in a constrained catalog. To
-make tool selection an actual function call instead of advisory text, the
-bridge uses Basispoints' declared `run_officejs` function as a transport. The
-proxy intercepts that call before execution, extracts the catalog tool request
-from its `code` field, and never runs Office code or touches the workbook. Codex
-receives a standard Responses `function_call` or `custom_tool_call` and executes
-it locally under its normal approval policy. The result is replayed under the
-original native call identity on the next request. The bridge intentionally
-requests one client tool at a time; parallel client tool calls are not exposed
-for Excel-routed models.
-
-Replayed history keeps its native Responses shape: Basispoints accepts
-`function_call` / `function_call_output` items for tools it never declared
-(verified by live replays), and the model only maintains its tool state
-machine when it sees the standard item shapes. Actual Basispoints calls,
-including `update_plan` and the intercepted transport, retain the complete
-native item across the client round trip. This includes the server item ID,
-which Codex omits when it submits a tool result; a bounded in-memory call cache
-restores that item exactly. The adapter also restores the native plan argument
-schema after Codex consumes its normalized version and maps Codex's display-only
-`Plan updated` result to the native executor's actual `{"status":"ok"}` result.
-Finally, one `turn_id` is held constant throughout all tool iterations for a
-user message, while only `agent_iteration` advances, matching the Excel
-add-in's agent loop. Older versions changed `turn_id` after every tool result,
-so Basispoints treated a completed plan as a new turn and planned again.
-Preserving the native item and real turn boundary removes the loop without
-steering text or a fabricated assistant turn. Text markers and their
-`codex_client__` history namespace are accepted only to finish requests already
-in flight during an upgrade.
-Reasoning items with `encrypted_content` are replayed unchanged (GPT-5 models
-repeat their previous action without that continuity); bare reasoning items
-(which the stateless upstream would reject) are dropped.
-
-The rewrite is deterministic and the prompt is laid out for the upstream
-prompt cache: the instructions and the tool catalog lead, conversation history
-follows, and only a short protocol reminder trails. The catalog originally sat
-last, because A/B replays showed the model ignores the marker protocol when
-nothing restates it near generation — but a trailing ~3.5k-token catalog caps
-the cache prefix at its first byte and re-bills it on every single turn. Wire
-captures showed a floor of roughly 3.8k fresh input tokens per request from
-that alone; replaying those same captures through the current layout cuts
-fresh input by about 60%. The compact trailing reminder keeps the recency the
-model needs at a fraction of the cost. Set
-`GHCP_EXCEL_CATALOG_AT_PROMPT_END=1` to restore the old suffix layout if the
-reminder ever stops holding the model to the protocol.
-
-Byte-for-byte determinism is the other half of the cache story: the same
-client request must produce the same outbound bytes, or a retry looks like new
-work. Two things used to break that. The proxy stamps Copilot's per-request
-affinity headers (`x-request-id`, `x-github-request-id`, `x-agent-task-id`) on
-outbound requests and strips them for Responses upstreams — but that check
-matched the path `/responses` exactly, so the Excel gateway's
-`/basispoints/api/responses` fell through to the Copilot branch and got a fresh
-identifier on every request. The check now matches by suffix. Separately,
-`task_id` is derived from the conversation identity and `turn_id` from the
-conversation history through the latest user message. Tool results advance
-`agent_iteration` without changing that turn identity, and a retried iteration
-serializes identically.
-
-Codex's `prompt_cache_key` is forwarded for cache routing (disable with
-`GHCP_EXCEL_FORWARD_PROMPT_CACHE_KEY=0`), and the `task_id` metadata is derived
-from it so one conversation keeps one task identity across turns.
-
-Cost tracking prices each Excel alias at its matching GPT-5.6 token rates,
-including applicable long-context tiers. The dashboard shows that spend in
-OpenAI Credits ($0.04 = 1 Credit) instead of Copilot AIC; aggregate totals that
-mix providers remain in AIC.
-
-Clear the active session and, on Windows, its encrypted copy without stopping
-the proxy:
+Clear the cached session without stopping the proxy:
 
 ```powershell
 Invoke-RestMethod -Method Delete http://127.0.0.1:8000/api/config/excel-session
 ```
 
+Then reopen or refresh the ChatGPT add-in before retrying.
+
+## Usage and Billing
+
+The dashboard tracks usage and provides local cost estimates by backend and token type.
+
+GitHub Copilot and Excel-backed usage are tracked separately. Provider-side usage and billing records remain authoritative.
+
+The Excel route uses access already available through the authenticated Excel add-in session. GHCP Proxy does not create or modify organizational entitlements.
+
+For current GitHub Copilot pricing and limits, see:
+
+* [Models and pricing](https://docs.github.com/en/copilot/reference/copilot-billing/models-and-pricing)
+* [Usage limits](https://docs.github.com/en/copilot/concepts/rate-limits)
+
+## Integrations
+
+The dashboard's **Integrations** page manages local client configuration. It can:
+
+* connect Codex to GHCP Proxy
+* connect the ChatGPT app to GHCP Proxy
+* connect Claude Code to GHCP Proxy
+* install start and stop commands
+* enable or disable startup at login
+* restore previous client configuration when an integration is disabled
+
+Existing client configuration is backed up before replacement. Most users should manage integrations through the dashboard rather than editing configuration files manually.
+
+## Configuration
+
+Set environment variables before starting the proxy.
+
+| Variable                        | Purpose                                     | Default or notes               |
+| ------------------------------- | ------------------------------------------- | ------------------------------ |
+| `GHCP_UPSTREAM_TIMEOUT_SECONDS` | Timeout for upstream non-streaming requests | `300` seconds                  |
+| `GHCP_UPSTREAM_PROXY`           | Proxy for HTTP and HTTPS upstream traffic   | Can be overridden per protocol |
+| `GHCP_HTTP_PROXY`               | HTTP upstream proxy                         | Optional                       |
+| `GHCP_HTTPS_PROXY`              | HTTPS upstream proxy                        | Optional                       |
+| `GHCP_NO_PROXY`                 | Hosts excluded from proxying                | Optional                       |
+| `GHCP_UPSTREAM_TLS_VERIFY`      | Upstream TLS certificate verification       | Configure as required          |
+| `GHCP_UPSTREAM_HTTP2`           | HTTP/2 for upstream requests                | Configure as required          |
+
+Standard `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY` variables are also honored.
+
+### Enterprise Proxy Example
+
+```bash
+export GHCP_UPSTREAM_PROXY=http://proxy.example.com:8080
+export GHCP_UPSTREAM_TLS_VERIFY=1
+export GHCP_UPSTREAM_HTTP2=0
+
+./.venv/bin/python proxy.py
+```
+
 ## Troubleshooting
 
-Start here if setup does not work.
+### Missing Python packages
 
-### Python Command Not Found
-
-If `python3 --version` or `py -3 --version` fails, Python is not available in
-that terminal. Install Python 3.11 or newer, then close and reopen the terminal.
-
-On Windows, keep the Python launcher enabled during install. If `python` opens
-the Microsoft Store instead of Python, use `py -3` commands.
-
-### `venv` Creation Fails
-
-Make sure you are using Python 3.11 or newer:
+Install dependencies and launch the proxy using the same virtual environment:
 
 ```bash
-python3 --version
-```
-
-Some Linux distributions package virtual environment support separately. If
-`python3 -m venv .venv` says `venv` is missing, install your distribution's
-Python venv package, then run the command again.
-
-### `No module named fastapi` Or `No module named uvicorn`
-
-The dependencies were installed into a different Python than the one running
-`proxy.py`. Use the local virtual environment for install and launch:
-
-```bash
-source .venv/bin/activate
-python -m pip install -r requirements.txt
-python proxy.py
-```
-
-### GitHub Auth Cannot Reach GitHub
-
-If sign-in fails with a name-lookup, DNS, timeout, VPN, or firewall message,
-first prove the terminal can reach GitHub:
-
-```bash
-curl -I https://github.com
-```
-
-If that fails, reconnect Wi-Fi or VPN and try again. If it works, start the
-proxy again with `start-ghproxy` or `python3 proxy.py`.
-
-Windows PowerShell without activation:
-
-```powershell
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-.\.venv\Scripts\python.exe .\proxy.py
-```
-
-### Dashboard Does Not Open
-
-Check the terminal running `proxy.py`.
-
-- If it is still running, open `http://localhost:8000/`.
-- If it exited with an error, fix the error and start `proxy.py` again.
-- If the browser says it cannot connect, the proxy is not running or another
-  program is blocking port `8000`.
-
-### Port 8000 Is Already In Use
-
-GHCP Proxy uses `127.0.0.1:8000`. If startup says the address is already in use,
-another copy is probably already running.
-
-Close any old GHCP Proxy terminal windows, or use the dashboard/background
-helper to stop the background copy if one was installed. Then start `proxy.py`
-again.
-
-### GitHub Sign-In Does Not Complete
-
-Keep the dashboard open and follow the device-code flow exactly. Make sure you
-sign in with the GitHub account that has Copilot access. After GitHub approves
-the device code, return to the dashboard and wait for it to refresh.
-
-### Codex Or Claude Code Still Uses Its Old Provider
-
-After enabling a client from **Integrations**, fully restart any open Codex or
-Claude Code sessions. These tools usually read their config only when a new
-session starts.
-
-If it still does not work, return to **Integrations**, disable the client,
-enable it again, then start a fresh client session.
-
-### Upstream Requests Time Out
-
-Raise the upstream timeout before starting the proxy:
-
-```bash
-export GHCP_UPSTREAM_TIMEOUT_SECONDS=300
-python proxy.py
+./.venv/bin/python -m pip install -r requirements.txt
+./.venv/bin/python proxy.py
 ```
 
 Windows PowerShell:
 
 ```powershell
-$env:GHCP_UPSTREAM_TIMEOUT_SECONDS = "300"
-python .\proxy.py
+./.venv/Scripts/python.exe -m pip install -r requirements.txt
+./.venv/Scripts/python.exe ./proxy.py
 ```
 
-`GHCP_UPSTREAM_TIMEOUT_SECONDS` applies to upstream non-streaming requests,
-including `/v1/responses/compact`. The default is `300` seconds.
+### Dashboard does not open
 
-### Upstream Proxy Environment Variables
+Check the terminal running `proxy.py`.
 
-GHCP Proxy uses standard proxy variables (`HTTPS_PROXY`, `HTTP_PROXY`,
-`NO_PROXY`) via `httpx` environment handling. It also accepts GHCP-specific
-aliases and maps them to standard names at startup when needed:
+If it exited, resolve the reported error and restart it. If another process is using port `8000`, stop the old GHCP Proxy instance or conflicting process first.
 
-- `GHCP_UPSTREAM_PROXY` (applies to both HTTP and HTTPS unless overridden)
-- `GHCP_HTTPS_PROXY`
-- `GHCP_HTTP_PROXY`
-- `GHCP_NO_PROXY`
+### GitHub sign-in does not complete
 
-When a proxy is configured, GHCP Proxy now defaults to:
+Keep the dashboard open while completing the GitHub device-code flow with the account that has Copilot access.
 
-- `GHCP_UPSTREAM_TLS_VERIFY=0` (to tolerate enterprise TLS interception certs
-  that are not in certifi by default)
-- `GHCP_UPSTREAM_HTTP2=0` (to avoid proxy-specific HTTP/2 stream resets)
+After approval, return to the dashboard and wait for the status to refresh.
 
-You can override either default explicitly:
+### Client still uses its old provider
 
-- `GHCP_UPSTREAM_TLS_VERIFY=1` to require certificate validation
-- `GHCP_UPSTREAM_HTTP2=1` to force HTTP/2 upstream requests
+Completely restart the client after changing its integration.
 
-When background startup is enabled on macOS, the launch agent now records these
-proxy-related environment variables so the background process can use the same
-proxy route as interactive shell launches.
+If necessary, disable and re-enable the integration from the dashboard and start a new client session.
 
-### Background Startup Gets Confusing
+### Upstream requests time out
 
-The first setup is easiest with a visible terminal running `proxy.py`. Install
-startup only after the dashboard is working. If a background copy is already
-installed, use **Integrations** or the installed helper commands to stop it
-before starting a manual copy.
-
-## What It Does
-
-- Serves a local OpenAI-compatible endpoint at `http://localhost:8000/v1`
-- Proxies Codex Responses API traffic to GitHub Copilot
-- Also works with Claude Code
-- Installs Codex and Claude Code integrations from the local dashboard
-- Supports GitHub Copilot auth from the local dashboard on first run
-- Shows input, cached-input, cache-write, output-token, and estimated AI-credit cost data
-- Tracks session, token, and estimated cost data from the proxy's own request log
-- Saves recent request prompt transcripts for dashboard drill-downs; set
-  `GHCP_REQUEST_PROMPT_ARCHIVE_DIR` to override that local archive location
-
-## Auto Update
-
-When GHCP Proxy is started from a git checkout, it checks the configured
-upstream branch and updates itself when a safe upgrade is available. The proxy
-restarts itself after a successful update.
-
-After startup, the proxy keeps checking for safe updates every 15 minutes. If an
-update is applied while upstream requests are active, the proxy
-lets those requests finish before restarting. The dashboard shows when a restart
-is pending or scheduled.
-
-The updater is conservative:
-
-- uses the checkout's existing upstream branch, such as `origin/main`
-- runs `git fetch` and applies fast-forward updates when possible
-- rebases committed local changes onto upstream when the checkout has diverged
-- skips updates when the checkout is only ahead of upstream
-- defaults to **user mode**, which stashes pending GHCP Proxy folder edits,
-  updates, then reapplies those edits
-- blocks the upgrade if pending changes cannot be safely reapplied, and the
-  dashboard offers an explicit "Apply upgrade anyway" override that discards
-  pending local changes before upgrading
-- supports **developer mode**, which never stashes or discards local code
-  changes during upgrades and instead blocks until you commit or remove them
-- records the most recent result in the user state directory
-
-Environment knobs:
+Increase the timeout before starting the proxy:
 
 ```bash
-export GHCP_AUTO_UPDATE=0                     # disable
-export GHCP_AUTO_UPDATE_MODE=developer        # default: user
-export GHCP_AUTO_UPDATE_INTERVAL_SECONDS=900  # default: 15 minutes
-export GHCP_AUTO_UPDATE_GIT_TIMEOUT_SECONDS=60 # default git command timeout
+export GHCP_UPSTREAM_TIMEOUT_SECONDS=600
+./.venv/bin/python proxy.py
 ```
 
-## Integrations
+Windows PowerShell:
 
-Use the dashboard's **Integrations** page as the source of truth for local
-setup. It can:
+```powershell
+$env:GHCP_UPSTREAM_TIMEOUT_SECONDS = "600"
+./.venv/Scripts/python.exe ./proxy.py
+```
 
-- connect Codex to GHCP Proxy
-- connect Claude Code to GHCP Proxy
-- install start/stop shell commands
-- enable or disable startup at login
-- restore the previous client configuration when an integration is disabled
+### Excel session is missing or expired
 
-The dashboard writes the required local config files and keeps backups before
-replacing anything. Most users should not edit `~/.codex` or `~/.claude` by
-hand.
+Open the official ChatGPT add-in in Excel and confirm that it is signed in.
+
+Refresh or reopen the task pane, then check:
+
+```text
+http://127.0.0.1:8000/api/config/excel-session
+```
+
+If necessary, clear the cached session and retry.
+
+### Excel requests use the wrong backend
+
+Make sure the selected model uses an `-excel` alias:
+
+```text
+gpt-5.6-luna-excel
+gpt-5.6-terra-excel
+gpt-5.6-sol-excel
+```
+
+Models without an Excel alias use GitHub Copilot.
