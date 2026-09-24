@@ -27,6 +27,7 @@ import responses_replay_ids
 
 
 EXCEL_MODEL_UPSTREAMS = {
+    "gpt-6-astra-excel": "gpt-6-astra",
     "gpt-5.6-luna-excel": "gpt-5.6-luna",
     "gpt-5.6-terra-excel": "gpt-5.6-terra",
     "gpt-5.6-sol-excel": "gpt-5.6-sol",
@@ -36,6 +37,9 @@ MODEL_ID = "gpt-5.6-sol-excel"
 _UPSTREAM_MODEL_OVERRIDE = os.environ.get("GHCP_EXCEL_UPSTREAM_MODEL", "").strip()
 UPSTREAM_MODEL = _UPSTREAM_MODEL_OVERRIDE or EXCEL_MODEL_UPSTREAMS[MODEL_ID]
 EXCEL_REASONING_EFFORTS = ("low", "medium", "high", "xhigh")
+EXCEL_MODEL_REASONING_EFFORTS = {
+    "gpt-6-astra-excel": ("medium", "high", "xhigh"),
+}
 _REASONING_EFFORT_ALIASES = {
     "x-high": "xhigh",
     "extra-high": "xhigh",
@@ -153,6 +157,7 @@ LOCAL_MODEL_CAPABILITIES = {
         "auto_compact_token_limit": 180_000,
         "context_window": 200_000 if "luna" in model_id else 272_000,
         "display_name": {
+            "gpt-6-astra-excel": "6-Astra Excel",
             "gpt-5.6-luna-excel": "5.6-Luna Excel",
             "gpt-5.6-terra-excel": "5.6-Terra Excel",
             "gpt-5.6-sol-excel": "5.6-Sol Excel",
@@ -163,7 +168,9 @@ LOCAL_MODEL_CAPABILITIES = {
         "model_picker_enabled": True,
         "parallel_tool_calls": False,
         "provider": "OpenAI Excel",
-        "reasoning_efforts": list(EXCEL_REASONING_EFFORTS),
+        "reasoning_efforts": list(
+            EXCEL_MODEL_REASONING_EFFORTS.get(model_id, EXCEL_REASONING_EFFORTS)
+        ),
         "supported_endpoints": ["/responses"],
         "vision": False,
     }
@@ -187,12 +194,17 @@ def upstream_model_for(model: object) -> str:
     return _UPSTREAM_MODEL_OVERRIDE or EXCEL_MODEL_UPSTREAMS[model_id]
 
 
-def _normalize_reasoning_effort(value: object) -> str | None:
+def _normalize_reasoning_effort(
+    value: object, model: object = None
+) -> str | None:
     if not isinstance(value, str):
         return None
     normalized = value.strip().lower()
     normalized = _REASONING_EFFORT_ALIASES.get(normalized, normalized)
-    return normalized if normalized in EXCEL_REASONING_EFFORTS else None
+    allowed = EXCEL_MODEL_REASONING_EFFORTS.get(
+        excel_model_id(model), EXCEL_REASONING_EFFORTS
+    )
+    return normalized if normalized in allowed else None
 
 
 def local_model_payload(model_id: str) -> dict[str, object]:
@@ -1608,7 +1620,9 @@ def prepare_responses_body(
     )
     # Keep the public picker and the Basispoints wire value aligned. Unknown
     # or stale catalog values fall back to medium rather than producing a 422.
-    output["reasoning_effort"] = _normalize_reasoning_effort(requested_effort) or "medium"
+    output["reasoning_effort"] = (
+        _normalize_reasoning_effort(requested_effort, source.get("model")) or "medium"
+    )
 
     context_management = source.get("context_management")
     output["context_management"] = (

@@ -106,6 +106,7 @@ In current testing, this has used substantially fewer tokens than recreating a c
 Use one of the Excel model aliases to select this route:
 
 ```text
+gpt-6-astra-excel
 gpt-5.6-luna-excel
 gpt-5.6-terra-excel
 gpt-5.6-sol-excel
@@ -270,6 +271,7 @@ If necessary, clear the cached session and retry.
 Make sure the selected model uses an `-excel` alias:
 
 ```text
+gpt-6-astra-excel
 gpt-5.6-luna-excel
 gpt-5.6-terra-excel
 gpt-5.6-sol-excel

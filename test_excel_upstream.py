@@ -134,11 +134,23 @@ class ExcelUpstreamTests(unittest.TestCase):
             with self.subTest(model_id=model_id):
                 self.assertEqual(
                     excel_upstream.LOCAL_MODEL_CAPABILITIES[model_id]["reasoning_efforts"],
-                    ["low", "medium", "high", "xhigh"],
+                    ["medium", "high", "xhigh"]
+                    if model_id == "gpt-6-astra-excel"
+                    else ["low", "medium", "high", "xhigh"],
                 )
+
+        astra_low = excel_upstream.prepare_responses_body(
+            {
+                "model": "gpt-6-astra-excel",
+                "input": "Hello",
+                "reasoning": {"effort": "low"},
+            }
+        )
+        self.assertEqual(astra_low["reasoning_effort"], "medium")
 
     def test_each_excel_alias_routes_to_matching_upstream_model(self):
         expected = {
+            "gpt-6-astra-excel": "gpt-6-astra",
             "gpt-5.6-luna-excel": "gpt-5.6-luna",
             "gpt-5.6-terra-excel": "gpt-5.6-terra",
             "gpt-5.6-sol-excel": "gpt-5.6-sol",

@@ -49,6 +49,7 @@ def _format_token_rate(value: object) -> str:
 
 def _model_token_pricing_description(model_name: str) -> str:
     if model_name.endswith("-excel") and model_name in {
+        "gpt-6-astra-excel",
         "gpt-5.6-luna-excel",
         "gpt-5.6-terra-excel",
         "gpt-5.6-sol-excel",
@@ -1170,6 +1171,7 @@ class ProxyClientConfigService:
     ) -> list[str]:
         family_order = {"gpt": 0, "claude": 1, "gemini": 2, "grok": 3}
         preferred_order = {
+            "gpt-6-astra-excel": -27,
             "gpt-5.6-sol-excel": -26,
             "gpt-5.6-terra-excel": -25,
             "gpt-5.6-luna-excel": -24,
