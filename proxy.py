@@ -6334,11 +6334,10 @@ async def _handle_copilot_sdk_responses(
             if isinstance(reasoning, dict)
             else {"effort": "high"}
         )
-    if is_compact:
-        # Compaction is a pure summarization turn.  The generic fake compact
-        # request intentionally retains tool declarations for cache affinity,
-        # but the SDK executes declared tools unless explicitly disabled.
-        sdk_body["tool_choice"] = "none"
+    # A compaction turn keeps the caller's tool_choice.  tool_choice "none"
+    # here would unregister the session's tools, which changes the start of
+    # the prompt and misses the cache for the whole context; the SDK adapter
+    # sets tool_choice "none" on the turn's model calls instead.
 
     raw_input = sdk_body.get("input")
     has_compaction_input = format_translation.input_contains_compaction(raw_input)

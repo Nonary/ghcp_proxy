@@ -1063,8 +1063,14 @@ class _LiveSession:
     # The current caller's reasoning summary delivery, for model calls the
     # SDK issues on this session (see _UpstreamRequestHandler).
     summary_delivery: str | None = None
+    # tool_choice for the current turn's model calls; "none" while compacting.
+    tool_choice: str | None = None
     # The current request's trace diagnostics; model calls are added to it.
     diagnostics: dict | None = None
+    # Model calls made while no request was attached, for the next trace.
+    background_calls: list = field(default_factory=list)
+    # Aborts an interrupted turn and releases the session (_stream_turn).
+    settling: asyncio.Task | None = None
 
 
 _live_sessions: dict[str, _LiveSession] = {}
@@ -1150,6 +1156,14 @@ async def _reuse_live_session(
     stay connected so ordinary tool round-trips preserve background compaction.
     """
     entry = _live_sessions.get(session_id)
+    if entry is not None and entry.settling is not None and not entry.settling.done():
+        # The previous request was interrupted and is still waiting for the
+        # runtime to go idle; it then parks or evicts this session.
+        try:
+            await asyncio.wait_for(asyncio.shield(entry.settling), _ABORT_SETTLE_SECONDS + 1.0)
+        except Exception:
+            pass
+        entry = _live_sessions.get(session_id)
     if diagnostics is not None:
         diagnostics["reuse_miss"] = "not_connected" if entry is None else "in_use" if entry.in_use else None
     if entry is None or entry.in_use:
@@ -1266,6 +1280,8 @@ async def _release_session(
         await _evict_live_session(session.session_id)
         return
     entry.diagnostics = None
+    entry.tool_choice = None
+    entry.settling = None
     entry.in_use = False
     entry.pending_calls = pending
     entry.released_at = time.monotonic()
@@ -1319,13 +1335,88 @@ _reasoning_ledger = sdk_reasoning_ledger.ReasoningLedger(
 
 
 def _note_model_call(session_id: str | None, record: dict) -> None:
-    """Attach one runtime model call to the current request's trace."""
+    """Attach one runtime model call to the current request's trace.
+
+    Calls the runtime makes between requests (background compaction, for
+    one) are kept for the next request's trace.
+    """
     entry = _live_sessions.get(session_id) if session_id else None
-    diagnostics = entry.diagnostics if entry is not None else None
-    if isinstance(diagnostics, dict):
-        calls = diagnostics.setdefault("model_calls", [])
-        if len(calls) < _MAX_TRACED_MODEL_CALLS:
-            calls.append(record)
+    if entry is None:
+        return
+    diagnostics = entry.diagnostics
+    calls = diagnostics.setdefault("model_calls", []) if isinstance(diagnostics, dict) else entry.background_calls
+    if len(calls) < _MAX_TRACED_MODEL_CALLS:
+        calls.append(record)
+
+
+def _note_usage(record: dict, usage: Any) -> None:
+    if not isinstance(usage, dict):
+        return
+    details = usage.get("input_tokens_details")
+    record["input_tokens"] = usage.get("input_tokens")
+    record["cached_tokens"] = details.get("cached_tokens") if isinstance(details, dict) else None
+
+
+def _event_error(event: dict) -> dict:
+    """The part of an upstream error event worth tracing."""
+    error = event.get("error")
+    response = event.get("response")
+    if not isinstance(error, dict) and isinstance(response, dict):
+        error = response.get("error") or response.get("incomplete_details")
+    if not isinstance(error, dict):
+        return {"event": event.get("type")}
+    return {key: str(error[key])[:300] for key in ("type", "code", "message", "reason") if error.get(key)}
+
+
+class _SseUsageTap(httpx.AsyncByteStream):
+    """Pass a Responses SSE body through unchanged, noting its final usage."""
+
+    def __init__(self, stream: httpx.AsyncByteStream, record: dict) -> None:
+        self._stream = stream
+        self._record: dict | None = record
+        self._pending = b""
+
+    async def __aiter__(self):
+        async for chunk in self._stream:
+            if self._record is not None:
+                self._observe(chunk)
+            yield chunk
+
+    def _observe(self, chunk: bytes) -> None:
+        lines = (self._pending + chunk).split(b"\n")
+        self._pending = lines.pop()
+        for line in lines:
+            if not line.startswith(b"data:") or b'"response.completed"' not in line:
+                continue
+            event = _parse_event(line[5:].decode("utf-8", "replace"))
+            response = event.get("response") if event else None
+            if isinstance(response, dict):
+                _note_usage(self._record, response.get("usage"))
+            self._record = None
+            self._pending = b""
+            return
+
+    async def aclose(self) -> None:
+        await self._stream.aclose()
+
+
+async def _observe_http_response(response: httpx.Response, record: dict) -> httpx.Response:
+    """Trace an HTTP model call's status, error body or usage."""
+    if response.status_code != 200:
+        record["status"] = response.status_code
+        try:
+            # Buffered bodies are forwarded as they are (see the SDK's
+            # _stream_response_to_exchange), so the runtime still gets it.
+            record["error"] = (await response.aread())[:300].decode("utf-8", "replace")
+        except Exception:
+            pass
+        return response
+    if (
+        response.headers.get("content-encoding", "identity").lower() in {"", "identity"}
+        and isinstance(response.stream, httpx.AsyncByteStream)
+    ):
+        response.stream = _SseUsageTap(response.stream, record)
+    return response
 
 
 class _UpstreamRequestHandler(CopilotRequestHandler):
@@ -1343,6 +1434,11 @@ class _UpstreamRequestHandler(CopilotRequestHandler):
     Responses calls that request a summary, and only for sessions whose current
     caller asked for it.
 
+    A compaction turn keeps the session's tool declarations, which sit at the
+    start of the prompt: without them the summary request missed the cache for
+    the whole context.  Its model calls carry ``tool_choice: "none"`` instead,
+    which Copilot serves from the cached prefix.
+
     An HTTP call rejected with any of these changes is retried once as the
     runtime sent it, and the changes are not applied to that model (or, for
     restored reasoning, that session) again.
@@ -1351,8 +1447,11 @@ class _UpstreamRequestHandler(CopilotRequestHandler):
     def __init__(self) -> None:
         self._rejected_models: set[Any] = set()
         self._cache_key_rejected_models: set[Any] = set()
+        self._tool_choice_rejected_models: set[Any] = set()
 
-    def _prepare(self, session_id: str | None, body: dict, transport: str) -> tuple[bool, dict]:
+    def _prepare(
+        self, session_id: str | None, body: dict, transport: str, interaction: str | None = None,
+    ) -> tuple[bool, dict]:
         """Adjust one Responses model call in place; return (changed, trace record)."""
         model = body.get("model")
         continued = bool(body.get("previous_response_id"))
@@ -1362,6 +1461,8 @@ class _UpstreamRequestHandler(CopilotRequestHandler):
             "continuation": continued,
             "input_items": len(items) if isinstance(items, list) else None,
         }
+        if interaction:
+            record["interaction"] = interaction
         changed = False
         if not continued:
             # A request without previous_response_id carries the whole history.
@@ -1401,6 +1502,16 @@ class _UpstreamRequestHandler(CopilotRequestHandler):
             }
             record["summary_delivery"] = delivery
             changed = True
+        tool_choice = entry.tool_choice if entry is not None else None
+        if (
+            tool_choice is not None
+            and body.get("tools")
+            and body.get("tool_choice") != tool_choice
+            and model not in self._tool_choice_rejected_models
+        ):
+            body["tool_choice"] = tool_choice
+            record["tool_choice"] = tool_choice
+            changed = True
         return changed, record
 
     def _reject(self, session_id: str | None, model: Any, record: dict | None) -> None:
@@ -1411,6 +1522,8 @@ class _UpstreamRequestHandler(CopilotRequestHandler):
             self._rejected_models.add(model)
         if record.get("prompt_cache_key"):
             self._cache_key_rejected_models.add(model)
+        if record.get("tool_choice"):
+            self._tool_choice_rejected_models.add(model)
         if record.get("restored_reasoning"):
             _reasoning_ledger.disable(session_id, model)
 
@@ -1424,18 +1537,18 @@ class _UpstreamRequestHandler(CopilotRequestHandler):
             body = None
         if not isinstance(body, dict) or "input" not in body:
             return await super().send_request(request, ctx)
-        changed, record = self._prepare(ctx.session_id, body, "http")
+        changed, record = self._prepare(ctx.session_id, body, "http", getattr(ctx, "interaction_type", None))
         _note_model_call(ctx.session_id, record)
         if not changed:
-            return await super().send_request(request, ctx)
+            return await _observe_http_response(await super().send_request(request, ctx), record)
         response = await super().send_request(_with_request_body(request, json.dumps(body).encode()), ctx)
         if response.status_code not in {400, 422}:
-            return response
+            return await _observe_http_response(response, record)
         await response.aclose()
         retry = await super().send_request(_with_request_body(request, original), ctx)
         if retry.status_code not in {400, 422}:
             self._reject(ctx.session_id, body.get("model"), record)
-        return retry
+        return await _observe_http_response(retry, record)
 
     async def open_websocket(self, ctx: Any) -> Any:
         return _UpstreamWebSocket(ctx, self)
@@ -1615,6 +1728,7 @@ class _UpstreamWebSocket(CopilotWebSocketForwarder):
         self._record: dict | None = None
         self._changed = False
         self._fallback: tuple[str, dict] | None = None
+        self._pooled_socket = False
 
     async def open(self) -> None:
         pooled = _take_pooled_websocket(self.context.session_id)
@@ -1625,6 +1739,7 @@ class _UpstreamWebSocket(CopilotWebSocketForwarder):
             # A websocket allows one reader; let the old loop finish cancelling.
             await asyncio.wait({pooled.reader}, timeout=1.0)
         self._upstream, self._chain = pooled.upstream, pooled.chain
+        self._pooled_socket = True
         self._receive_task = asyncio.create_task(self._receive_loop())
 
     def _keep_for_reuse(self) -> None:
@@ -1664,7 +1779,14 @@ class _UpstreamWebSocket(CopilotWebSocketForwarder):
             body = message["response"] if isinstance(message.get("response"), dict) else message
         if isinstance(body, dict) and isinstance(body.get("input"), list):
             session_id = self.context.session_id
-            self._changed, self._record = self._owner._prepare(session_id, body, "websocket")
+            self._changed, self._record = self._owner._prepare(
+                session_id, body, "websocket", getattr(self.context, "interaction_type", None),
+            )
+            # Which runtime connection carried the call, and whether its
+            # upstream socket was kept from an earlier connection.
+            self._record["connection"] = str(getattr(self.context, "request_id", "") or "")[:8] or None
+            if self._pooled_socket:
+                self._record["pooled_socket"] = True
             _note_model_call(session_id, self._record)
             items = body["input"]
             self._last_input_key = sdk_reasoning_ledger.anchor_key(items[-1]) if items else None
@@ -1693,6 +1815,7 @@ class _UpstreamWebSocket(CopilotWebSocketForwarder):
             self._fallback = None
             if self._record is not None:
                 self._record["resumed_chain_rejected"] = True
+                self._record["resumed_chain_error"] = _event_error(event)
             self._chain.broken()
             self._chain.sent(body)
             await self._upstream.send(full)
@@ -1700,6 +1823,8 @@ class _UpstreamWebSocket(CopilotWebSocketForwarder):
         elif kind == "response.completed":
             self._observe_completed(event)
         elif kind in {"error", "response.failed", "response.incomplete"}:
+            if self._record is not None:
+                self._record["error"] = _event_error(event)
             self._chain.broken()
             if self._changed and _is_invalid_request(event):
                 # A WebSocket rejection cannot be retried here; stop applying
@@ -1715,11 +1840,8 @@ class _UpstreamWebSocket(CopilotWebSocketForwarder):
         _reasoning_ledger.record_output(
             self.context.session_id, self._chain.model, self._last_input_key, response.get("output"),
         )
-        usage = response.get("usage")
-        if self._record is not None and isinstance(usage, dict):
-            details = usage.get("input_tokens_details")
-            self._record["input_tokens"] = usage.get("input_tokens")
-            self._record["cached_tokens"] = details.get("cached_tokens") if isinstance(details, dict) else None
+        if self._record is not None:
+            _note_usage(self._record, response.get("usage"))
         self._record = None
 
 
@@ -2294,6 +2416,48 @@ async def _abort_and_settle(session: Any, queue: asyncio.Queue) -> bool:
     return False
 
 
+# Interrupted turns still settling; referenced so they are not collected.
+_interrupted_turns: set[asyncio.Task] = set()
+
+
+def _settle_interrupted_turn(
+    session: Any,
+    queue: asyncio.Queue,
+    unsubscribe: Callable[[], None],
+    *,
+    parkable: bool,
+) -> asyncio.Task:
+    """Abort an interrupted turn and park its session once the runtime is idle.
+
+    Starlette cancels a streaming response through an anyio cancel scope,
+    which cancels every later await in the generator too: a settle awaited
+    there never finished, so every interrupt evicted the live session and the
+    next request resumed it from disk.  This task runs outside that scope.
+    It owns ``queue`` and ``unsubscribe``; ``_reuse_live_session`` waits for it.
+    """
+
+    async def settle() -> None:
+        settled = False
+        try:
+            if parkable:
+                settled = await _abort_and_settle(session, queue)
+            else:
+                await session.abort()
+        except Exception:
+            settled = False
+        finally:
+            unsubscribe()
+        await _release_session(session, None, completed=False, park=settled)
+
+    task = asyncio.get_running_loop().create_task(settle())
+    _interrupted_turns.add(task)
+    task.add_done_callback(_interrupted_turns.discard)
+    entry = _live_sessions.get(session.session_id)
+    if entry is not None and entry.session is session:
+        entry.settling = task
+    return task
+
+
 async def _wait_for_outcome(
     session: Any,
     dispatch: Callable[[], Awaitable[None]],
@@ -2734,6 +2898,7 @@ async def _stream_turn(
     is_compact: bool = False,
     finish_usage_callback: Any = None,
     mark_first_output_callback: Any = None,
+    diagnostics: dict | None = None,
 ) -> AsyncIterator[bytes]:
     response_id = _new_id("resp")
     base = {
@@ -2751,8 +2916,23 @@ async def _stream_turn(
     outcome = TurnOutcome()
     output_index = 0
     final_payload: dict | None = None
-    abort_settled = False
+    # Set when an interrupted turn is handed to _settle_interrupted_turn.
+    settling: asyncio.Task | None = None
     usage_finished = False
+
+    def hand_off_interrupted_turn() -> asyncio.Task:
+        if diagnostics is not None:
+            diagnostics["interrupted"] = True
+        return _settle_interrupted_turn(
+            session,
+            queue,
+            unsubscribe,
+            parkable=(
+                dispatch_task.done()
+                and not dispatch_task.cancelled()
+                and dispatch_task.exception() is None
+            ),
+        )
 
     reasoning_started = False
     reasoning_closed = False
@@ -3020,7 +3200,7 @@ async def _stream_turn(
         start_wait_time = time.time()
         while True:
             if await request.is_disconnected():
-                await session.abort()
+                settling = hand_off_interrupted_turn()
                 return
             reasoning_part_open = (
                 reasoning_parts is not None and reasoning_parts.part_open and not reasoning_closed
@@ -3248,18 +3428,15 @@ async def _stream_turn(
             "response.completed",
             response=final_payload,
         )
-    except asyncio.CancelledError:
-        try:
-            if dispatch_task.done() and not dispatch_task.cancelled() and dispatch_task.exception() is None:
-                abort_settled = await asyncio.shield(_abort_and_settle(session, queue))
-            else:
-                await asyncio.shield(session.abort())
-        except asyncio.CancelledError:
-            pass
-        except Exception:
-            pass
+    except (asyncio.CancelledError, GeneratorExit):
+        # The caller went away mid-turn.  Awaiting here does not work (see
+        # _settle_interrupted_turn), so the abort and release happen there.
+        if final_payload is None:
+            settling = hand_off_interrupted_turn()
         raise
     except Exception as exc:
+        if diagnostics is not None:
+            diagnostics["error"] = str(exc)[:500]
         yield _sse(
             "response.failed",
             response={
@@ -3269,7 +3446,8 @@ async def _stream_turn(
             },
         )
     finally:
-        unsubscribe()
+        if settling is None:
+            unsubscribe()
         if not dispatch_task.done():
             dispatch_task.cancel()
         # Record the HTTP turn before any awaited cleanup.  Starlette cancels
@@ -3280,23 +3458,17 @@ async def _stream_turn(
         _remember_session(session.session_id)
         _commit_alias_watermark(session.session_id, success=final_payload is not None)
         finish_usage()
-        try:
-            await asyncio.shield(
-                _release_session(
-                    session,
-                    outcome,
-                    completed=final_payload is not None,
-                    # An interrupted turn keeps its live session (and the
-                    # encrypted reasoning a disk resume would drop).
-                    park=final_payload is None and abort_settled,
+        if settling is None:
+            try:
+                await asyncio.shield(
+                    _release_session(session, outcome, completed=final_payload is not None)
                 )
-            )
-        except asyncio.CancelledError:
-            # The shielded release continues independently; lifecycle
-            # reporting above has already completed.
-            pass
-        except Exception:
-            pass
+            except asyncio.CancelledError:
+                # The shielded release continues independently; lifecycle
+                # reporting above has already completed.
+                pass
+            except Exception:
+                pass
 
 
 async def handle_responses(
@@ -3334,6 +3506,12 @@ async def handle_responses(
         entry.summary_delivery = (
             _requested_summary_delivery(body) if body.get("stream") and not is_compact else None
         )
+        # A summary turn must not call tools, but keeps them declared so its
+        # prompt matches the session's cached prefix (_UpstreamRequestHandler).
+        entry.tool_choice = "none" if is_compact else None
+        if entry.background_calls:
+            session_diagnostics["background_model_calls"] = entry.background_calls
+            entry.background_calls = []
         entry.diagnostics = session_diagnostics
 
     if bool(body.get("stream")):
@@ -3348,6 +3526,7 @@ async def handle_responses(
                 is_compact=is_compact,
                 finish_usage_callback=finish_usage_callback,
                 mark_first_output_callback=mark_first_output_callback,
+                diagnostics=session_diagnostics,
             ),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
@@ -3384,6 +3563,7 @@ async def handle_responses(
                 pass
         return format_translation.openai_error_response(400, str(exc))
     except Exception as exc:
+        session_diagnostics["error"] = str(exc)[:500]
         if finish_usage_callback is not None and plan is not None:
             try:
                 finish_usage_callback(plan, 502, response_text=str(exc))

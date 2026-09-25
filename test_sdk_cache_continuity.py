@@ -14,6 +14,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import anyio
 import httpx
 from copilot import copilot_request_handler
 from copilot.session_events import SessionIdleData
@@ -350,6 +351,40 @@ class CopilotSdkCacheContinuityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sent["type"], "response.create")
         self.assertEqual(self.entry.diagnostics["model_calls"][3]["restored_reasoning"], 2)
 
+    async def test_compaction_turn_calls_keep_tools_with_tool_choice_none(self):
+        tools = [{"type": "function", "name": "inspect", "parameters": {"type": "object", "properties": {}}}]
+        self.entry.tool_choice = "none"
+        socket = self.websocket()
+        sent = await self.exchange(socket, {"model": MODEL, "tools": tools, "input": [user("summarize")]},
+                                   [answer("summary")], response_id="r1")
+        self.assertEqual(sent["tools"], tools)
+        self.assertEqual(sent["tool_choice"], "none")
+        self.assertEqual(self.entry.diagnostics["model_calls"][-1]["tool_choice"], "none")
+        # Other turns keep the runtime's tool_choice.
+        self.entry.tool_choice = None
+        sent = await self.exchange(socket, {"model": MODEL, "previous_response_id": "r1", "tools": tools,
+                                            "input": [user("next")]}, [answer("ok")])
+        self.assertNotIn("tool_choice", sent)
+
+    async def test_rejected_tool_choice_is_recorded_and_not_sent_again(self):
+        tools = [{"type": "function", "name": "inspect"}]
+        self.entry.tool_choice = "none"
+        socket = self.websocket()
+        create = json.dumps({"type": "response.create", "model": MODEL, "tools": tools, "input": [user("x")]})
+        await socket.send_request_message(create)
+        await socket.send_response_message(json.dumps({"type": "error", "error": {
+            "type": "invalid_request_error", "message": "tool_choice is not supported"}}))
+        await socket.send_request_message(create)
+        self.assertNotIn("tool_choice", socket._upstream.sent[-1])
+        self.assertEqual(self.entry.diagnostics["model_calls"][0]["error"],
+                         {"type": "invalid_request_error", "message": "tool_choice is not supported"})
+
+    async def test_calls_between_requests_are_kept_for_the_next_trace(self):
+        self.entry.diagnostics = None
+        await self.post({"model": MODEL, "input": [user("background")]})
+        self.assertEqual(len(self.entry.background_calls), 1)
+        self.assertEqual(self.entry.background_calls[0]["transport"], "http")
+
     async def test_websocket_error_after_a_change_disables_it(self):
         record_turn_from_responses(self.ledger)
         socket = self.websocket()
@@ -358,6 +393,81 @@ class CopilotSdkCacheContinuityTests(unittest.IsolatedAsyncioTestCase):
             "type": "invalid_request_error", "message": "rejected"}}))
         await socket.send_request_message(json.dumps({"type": "response.create", "model": MODEL, "input": RESUMED_HISTORY}))
         self.assertEqual(socket._upstream.sent[-1], {"type": "response.create", "model": MODEL, "input": RESUMED_HISTORY})
+
+
+class _ChunkedStream(httpx.AsyncByteStream):
+    def __init__(self, chunks):
+        self.chunks = chunks
+
+    async def __aiter__(self):
+        for chunk in self.chunks:
+            yield chunk
+
+
+class CopilotSdkHttpCallTraceTests(unittest.IsolatedAsyncioTestCase):
+    """HTTP model calls record their usage and errors without altering them."""
+
+    def setUp(self):
+        self.entry = sdk._LiveSession(session=SimpleNamespace(), diagnostics={})
+        for name, value in (("_INJECT_PROMPT_CACHE_KEY", True), ("_live_sessions", {"s1": self.entry})):
+            patcher = patch.object(sdk, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.handler = sdk._UpstreamRequestHandler()
+
+    async def send(self, response):
+        client = httpx.AsyncClient(transport=httpx.MockTransport(lambda request: response))
+        self.addAsyncCleanup(client.aclose)
+        with patch.object(copilot_request_handler, "_get_shared_http_client", return_value=client):
+            request = httpx.Request("POST", "https://api.githubcopilot.com/responses",
+                                    json={"model": MODEL, "input": [user("x")]})
+            sent = await self.handler.send_request(request, SimpleNamespace(session_id="s1", interaction_type="conversation-agent"))
+            return sent, await sent.aread()
+
+    async def test_usage_is_read_from_the_stream_as_it_passes(self):
+        completed = json.dumps({"type": "response.completed", "response": {"usage": {
+            "input_tokens": 900, "input_tokens_details": {"cached_tokens": 512}}}}).encode()
+        chunks = [b"event: response.created\ndata: {}\n\nevent: response.completed\ndata: ", completed[:20],
+                  completed[20:] + b"\n\n"]
+        _, body = await self.send(httpx.Response(200, headers={"content-type": "text/event-stream"},
+                                                 stream=_ChunkedStream(chunks)))
+        self.assertEqual(body, b"".join(chunks))
+        record = self.entry.diagnostics["model_calls"][0]
+        self.assertEqual((record["input_tokens"], record["cached_tokens"]), (900, 512))
+        self.assertEqual(record["interaction"], "conversation-agent")
+
+    async def test_error_status_and_body_are_recorded_and_forwarded(self):
+        response, body = await self.send(httpx.Response(503, json={"error": {"message": "overloaded"}}))
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(json.loads(body), {"error": {"message": "overloaded"}})
+        record = self.entry.diagnostics["model_calls"][0]
+        self.assertEqual(record["status"], 503)
+        self.assertIn("overloaded", record["error"])
+
+
+class ProxyCompactionRoutingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_sdk_compaction_turn_keeps_the_callers_tools(self):
+        import format_translation
+        import proxy
+        from starlette.requests import Request
+
+        tools = [{"type": "function", "name": "inspect", "parameters": {"type": "object", "properties": {}}}]
+        body = {"model": MODEL, "tools": tools, "tool_choice": "auto",
+                "input": [user("first"), {"type": "compaction_trigger"}]}
+        captured = {}
+
+        async def handle_responses(request, sdk_body, **kwargs):
+            captured.update(body=sdk_body, **kwargs)
+
+        request = Request({"type": "http", "method": "POST", "path": "/v1/responses", "headers": []})
+        with patch.object(proxy, "_prepare_upstream_request", return_value=(None, None)), \
+                patch.object(sdk, "handle_responses", handle_responses):
+            await proxy._handle_copilot_sdk_responses(
+                request, format_translation.build_fake_compaction_request(body), source_body=body, is_compact=True,
+            )
+        self.assertTrue(captured["is_compact"])
+        self.assertEqual(captured["body"]["tool_choice"], "auto")
+        self.assertEqual([tool.name for tool in sdk.build_tool_registration(captured["body"]).tools], ["inspect"])
 
 
 class _AbortingSession:
@@ -414,6 +524,7 @@ class CopilotSdkInterruptedTurnTests(unittest.IsolatedAsyncioTestCase):
     async def test_settled_interrupt_keeps_the_live_session(self):
         session = _AbortingSession(settles=True)
         await self.interrupt(session)
+        await asyncio.gather(*sdk._interrupted_turns)
         self.assertFalse(session.disconnected)
         self.assertFalse(sdk._live_sessions["s1"].in_use)
         self.assertFalse(sdk._live_sessions["s1"].pending_calls)
@@ -421,8 +532,52 @@ class CopilotSdkInterruptedTurnTests(unittest.IsolatedAsyncioTestCase):
     async def test_unsettled_interrupt_still_disconnects(self):
         session = _AbortingSession(settles=False)
         await self.interrupt(session)
+        await asyncio.gather(*sdk._interrupted_turns)
         self.assertTrue(session.disconnected)
         self.assertNotIn("s1", sdk._live_sessions)
+
+    async def test_interrupt_through_starlettes_cancel_scope_keeps_the_live_session(self):
+        # Starlette cancels a streaming response by cancelling an anyio task
+        # group, which cancels every later await inside the generator too.
+        session = _AbortingSession(settles=True)
+        await sdk._track_live_session(session)
+
+        async def dispatch():
+            return None
+
+        async def connected():
+            return False
+
+        async def consume():
+            async for _chunk in sdk._stream_turn(
+                SimpleNamespace(is_disconnected=connected), {"model": MODEL}, session, dispatch,
+                sdk.ToolRegistration(),
+            ):
+                pass
+
+        async with anyio.create_task_group() as group:
+            group.start_soon(consume)
+            await asyncio.sleep(0.05)
+            group.cancel_scope.cancel()
+        await asyncio.gather(*sdk._interrupted_turns)
+        self.assertFalse(session.disconnected)
+        self.assertFalse(sdk._live_sessions["s1"].in_use)
+
+    async def test_next_request_waits_for_an_interrupted_turn_to_settle(self):
+        session = _AbortingSession(settles=True)
+        entry = await sdk._track_live_session(session)
+        settled = asyncio.Event()
+
+        async def settle():
+            await settled.wait()
+            await sdk._release_session(session, None, completed=False, park=True)
+
+        entry.settling = asyncio.create_task(settle())
+        reuse = asyncio.create_task(sdk._reuse_live_session("s1", allow_pending=False, options=None))
+        await asyncio.sleep(0.05)
+        self.assertFalse(reuse.done())
+        settled.set()
+        self.assertIs(await reuse, session)
 
 
 if __name__ == "__main__":

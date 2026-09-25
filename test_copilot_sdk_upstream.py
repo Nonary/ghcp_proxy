@@ -2178,6 +2178,51 @@ class CopilotSdkCompactionContinuityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(created), 1)
         self.assertEqual(sent[-1], sdk._CONTINUE_AFTER_COMPACTION_PROMPT)
 
+    async def test_compaction_turn_keeps_the_live_session_and_its_tools(self):
+        # Unregistering the tools for the summary turn used to reconfigure the
+        # session: it was evicted, resumed from disk and its summary request
+        # missed the cache for the whole context.
+        created, resumed = [], []
+
+        class _Session(_FakeSession):
+            def __init__(self):
+                super().__init__()
+                self.session_id = "sdk-session-1"
+
+            async def send(self, prompt):
+                pass
+
+        class _Client:
+            async def create_session(self, **options):
+                created.append(options)
+                return _Session()
+
+            async def resume_session(self, session_id, **options):
+                resumed.append(options)
+                return _Session()
+
+        tools = [{"type": "function", "name": "inspect", "parameters": {"type": "object", "properties": {}}}]
+        history = [
+            {"role": "user", "content": "hello"},
+            {"type": "message", "role": "assistant", "content": "hi"},
+        ]
+
+        async def turn(body):
+            with patch.object(sdk, "_get_client", return_value=_Client()):
+                session, dispatch = await sdk._open_session(body, sdk.build_tool_registration(body))
+                await dispatch()
+            sdk._commit_alias_watermark(session.session_id, success=True)
+            await sdk._release_session(session, sdk.TurnOutcome(), completed=True)
+            return session
+
+        base = {"session_id": "thread-A", "tools": tools, "tool_choice": "auto"}
+        first = await turn({**base, "input": history[:1]})
+        compact = await turn(format_translation.build_fake_compaction_request({**base, "input": history}))
+        self.assertIs(compact, first)
+        self.assertEqual(resumed, [])
+        self.assertEqual(len(created), 1)
+        self.assertEqual([tool.name for tool in created[0]["tools"]], ["inspect"])
+
     async def test_tool_call_turn_keeps_the_session_connected_for_its_continuation(self):
         handled, resumed = [], []
 
