@@ -518,6 +518,103 @@ def _text_from_content(content: Any) -> str:
     return "\n".join(part for part in parts if part)
 
 
+def _image_attachment_from_part(part: dict, index: int) -> dict | None:
+    """Convert one Responses input_image block into an SDK blob attachment."""
+    image_url = part.get("image_url")
+    if isinstance(image_url, dict):
+        image_url = image_url.get("url")
+
+    data = None
+    media_type = part.get("media_type") or part.get("mime_type")
+    if isinstance(image_url, str) and image_url.lower().startswith("data:"):
+        header, separator, encoded = image_url.partition(",")
+        if separator:
+            media_type = header[5:].split(";", 1)[0] or media_type or "image/png"
+            try:
+                data = base64.b64encode(
+                    base64.b64decode(encoded, validate=False)
+                ).decode("ascii")
+            except (ValueError, binascii.Error):
+                data = None
+    elif isinstance(part.get("image_base64"), str):
+        data = part["image_base64"]
+
+    if not isinstance(data, str) or not data or not isinstance(media_type, str) or not media_type:
+        return None
+
+    extension = media_type.partition("/")[2] or "bin"
+    return {
+        "type": "blob",
+        "data": data,
+        "mimeType": media_type,
+        "displayName": f"image-{index}.{extension}",
+    }
+
+
+def _image_attachments_from_content(content: Any, *, start_index: int = 1) -> list[dict]:
+    """Collect inline image attachments from nested Responses content."""
+    attachments: list[dict] = []
+
+    def visit(value: Any) -> None:
+        if isinstance(value, list):
+            for item in value:
+                visit(item)
+            return
+        if not isinstance(value, dict):
+            return
+        if str(value.get("type", "")).lower() in {"input_image", "image_url"}:
+            attachment = _image_attachment_from_part(
+                value, start_index + len(attachments)
+            )
+            if attachment is not None:
+                attachments.append(attachment)
+        for nested in value.values():
+            if isinstance(nested, (dict, list)):
+                visit(nested)
+
+    visit(content)
+    return attachments
+
+
+def _attachments_for_prompt(value: Any, prompt_segments: list[str]) -> list[dict]:
+    """Return image blobs belonging to the user segments sent in this turn."""
+    if not isinstance(value, list) or not prompt_segments:
+        return []
+
+    remaining = list(prompt_segments)
+    attachments: list[dict] = []
+    for item in format_translation._latest_compaction_window(value):
+        if (
+            not isinstance(item, dict)
+            or item.get("role") not in {"user", "developer", "system"}
+        ):
+            continue
+        item_user_segments = [
+            text
+            for kind, text in _render_input_segments([item])
+            if kind == _SEGMENT_USER
+        ]
+        if not item_user_segments:
+            continue
+        matched = False
+        for text in item_user_segments:
+            match_index = next(
+                (
+                    index
+                    for index, candidate in enumerate(remaining)
+                    if candidate == text
+                    or (len(prompt_segments) == 1 and text in candidate)
+                ),
+                None,
+            )
+            if match_index is not None:
+                remaining.pop(match_index)
+                matched = True
+        if matched:
+            attachments.extend(_image_attachments_from_content(item.get("content")))
+    return attachments
+
+
 # Segment kinds.  ``_SEGMENT_USER`` marks content that originates with the
 # caller; ``_SEGMENT_ECHO`` marks a transcript echo of work the SDK session
 # performed itself, which a resumed session already holds and must not be
@@ -1895,6 +1992,7 @@ async def _open_session(body: dict, registration: ToolRegistration, *, diagnosti
         # conversations used to stall out early.
         session = None
         prompt = None
+        prompt_attachments: list[dict] = []
         if alias:
             known = _session_for_alias(alias)
             if known is not None:
@@ -1922,9 +2020,13 @@ async def _open_session(body: dict, registration: ToolRegistration, *, diagnosti
                             session = None
                     if session is not None:
                         prompt = "\n\n".join(new_text)
+                        prompt_attachments = _attachments_for_prompt(body.get("input"), new_text)
         if session is None:
             session = await client.create_session(**options)
             prompt = "\n\n".join(text for _, text in segments)
+            prompt_attachments = _attachments_for_prompt(
+                body.get("input"), [text for _, text in segments]
+            )
             if diagnostics is not None:
                 diagnostics["operation"] = "create"
 
@@ -1936,7 +2038,10 @@ async def _open_session(body: dict, registration: ToolRegistration, *, diagnosti
         async def dispatch() -> None:
             if not prompt:
                 raise ValueError("input must contain at least one text message")
-            await session.send(prompt)
+            if prompt_attachments:
+                await session.send(prompt, attachments=prompt_attachments)
+            else:
+                await session.send(prompt)
 
         return session, dispatch
 
@@ -1975,6 +2080,9 @@ async def _open_session(body: dict, registration: ToolRegistration, *, diagnosti
         if diagnostics is not None:
             diagnostics["operation"] = "create_after_lost_continuation"
         prompt = "\n\n".join(text for _, text in segments)
+        prompt_attachments = _attachments_for_prompt(
+            body.get("input"), [text for _, text in segments]
+        )
         await _track_live_session(session, options=options, fingerprints=fingerprints)
         _remember_session(session.session_id)
         alias = _session_alias(body)
@@ -1987,7 +2095,10 @@ async def _open_session(body: dict, registration: ToolRegistration, *, diagnosti
         async def dispatch_fresh() -> None:
             if not prompt:
                 raise ValueError("input must contain at least one text message")
-            await session.send(prompt)
+            if prompt_attachments:
+                await session.send(prompt, attachments=prompt_attachments)
+            else:
+                await session.send(prompt)
 
         return session, dispatch_fresh
 
@@ -2004,7 +2115,17 @@ async def _open_session(body: dict, registration: ToolRegistration, *, diagnosti
         if steering_prompt and pending_work:
             # Enqueue would wait for the agent to finish. Immediate steering
             # must precede the result that releases its next model call.
-            await session.send(steering_prompt, mode="immediate")
+            steering_attachments = _attachments_for_prompt(
+                body.get("input"), [steering_prompt]
+            )
+            if steering_attachments:
+                await session.send(
+                    steering_prompt,
+                    mode="immediate",
+                    attachments=steering_attachments,
+                )
+            else:
+                await session.send(steering_prompt, mode="immediate")
         failed = not pending_work
         for result in results if pending_work else []:
             try:

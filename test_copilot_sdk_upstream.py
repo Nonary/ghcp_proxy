@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import os
 import tempfile
@@ -357,6 +358,33 @@ class CopilotSdkTranslationTests(unittest.TestCase):
         )
         self.assertEqual(prompt, "User: hello\n\nAssistant: hi")
 
+    def test_input_image_becomes_native_sdk_blob_attachment(self):
+        image = base64.b64encode(b"fake-png").decode("ascii")
+        input_items = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "What is shown?"},
+                    {
+                        "type": "input_image",
+                        "image_url": f"data:image/png;base64,{image}",
+                    },
+                ],
+            }
+        ]
+        segments = sdk._render_input_segments(input_items)
+
+        attachments = sdk._attachments_for_prompt(
+            input_items, [segments[0][1]]
+        )
+
+        self.assertEqual(attachments, [{
+            "type": "blob",
+            "data": image,
+            "mimeType": "image/png",
+            "displayName": "image-1.png",
+        }])
+
     def test_response_payload_preserves_custom_tool_shape(self):
         outcome = sdk.TurnOutcome(
             calls=[sdk.ToolCall("request-1", "apply_patch", "custom", {"input": "*** patch"})],
@@ -660,6 +688,45 @@ class CopilotSdkEventTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resumed, ["sdk-session-1"])
         self.assertEqual(len(created), 1)
         self.assertEqual(sent[1], "User: next question")
+
+    async def test_open_session_sends_input_image_as_sdk_attachment(self):
+        sent = []
+
+        class _Session(_FakeSession):
+            async def send(self, prompt, **kwargs):
+                sent.append((prompt, kwargs))
+
+        class _Client:
+            async def create_session(self, **options):
+                return _Session()
+
+        image = base64.b64encode(b"fake-png").decode("ascii")
+        body = {
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "Describe this image."},
+                        {
+                            "type": "input_image",
+                            "image_url": f"data:image/png;base64,{image}",
+                        },
+                    ],
+                }
+            ]
+        }
+
+        with patch.object(sdk, "_get_client", return_value=_Client()):
+            _, dispatch = await sdk._open_session(body, sdk.ToolRegistration())
+            await dispatch()
+
+        self.assertEqual(sent[0][0], "User: Describe this image.\n[image supplied by client]")
+        self.assertEqual(sent[0][1]["attachments"], [{
+            "type": "blob",
+            "data": image,
+            "mimeType": "image/png",
+            "displayName": "image-1.png",
+        }])
 
     async def test_open_session_does_not_commit_watermark_for_a_failed_turn(self):
         sdk._pending_alias_watermark["sdk-session-9"] = ("thread-B", ["abc"])
