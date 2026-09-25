@@ -379,6 +379,18 @@ class CopilotSdkCacheContinuityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.entry.diagnostics["model_calls"][0]["error"],
                          {"type": "invalid_request_error", "message": "tool_choice is not supported"})
 
+    async def test_websocket_calls_record_copilots_request_ids(self):
+        socket = self.websocket()
+        await socket.send_request_message(json.dumps({"type": "response.create", "model": MODEL, "input": [user("x")]}))
+        await socket.send_response_message(json.dumps({
+            "type": "response.completed",
+            "headers": {"X-Copilot-Service-Request-Id": "svc-1", "X-Copilot-WebSocket-Session-Id": "0123456789abcdef"},
+            "response": {"id": "r1", "output": [answer("y")], "usage": {}},
+        }))
+        record = self.entry.diagnostics["model_calls"][-1]
+        self.assertEqual(record["service_request_id"], "svc-1")
+        self.assertEqual(record["copilot_websocket_session"], "01234567")
+
     async def test_calls_between_requests_are_kept_for_the_next_trace(self):
         self.entry.diagnostics = None
         await self.post({"model": MODEL, "input": [user("background")]})

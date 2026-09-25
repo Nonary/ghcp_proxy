@@ -1357,6 +1357,19 @@ def _note_usage(record: dict, usage: Any) -> None:
     record["cached_tokens"] = details.get("cached_tokens") if isinstance(details, dict) else None
 
 
+def _note_copilot_ids(record: dict, headers: Any) -> None:
+    """Copilot's ids for one model call, to find it on GitHub's side."""
+    if not headers or not hasattr(headers, "get"):
+        return
+    lowered = {str(key).lower(): value for key, value in headers.items()}
+    service_request_id = lowered.get("x-copilot-service-request-id")
+    websocket_session = lowered.get("x-copilot-websocket-session-id")
+    if service_request_id:
+        record["service_request_id"] = str(service_request_id)
+    if websocket_session:
+        record["copilot_websocket_session"] = str(websocket_session)[:8]
+
+
 def _event_error(event: dict) -> dict:
     """The part of an upstream error event worth tracing."""
     error = event.get("error")
@@ -1402,6 +1415,7 @@ class _SseUsageTap(httpx.AsyncByteStream):
 
 async def _observe_http_response(response: httpx.Response, record: dict) -> httpx.Response:
     """Trace an HTTP model call's status, error body or usage."""
+    _note_copilot_ids(record, response.headers)
     if response.status_code != 200:
         record["status"] = response.status_code
         try:
@@ -1825,6 +1839,7 @@ class _UpstreamWebSocket(CopilotWebSocketForwarder):
         elif kind in {"error", "response.failed", "response.incomplete"}:
             if self._record is not None:
                 self._record["error"] = _event_error(event)
+                _note_copilot_ids(self._record, event.get("headers"))
             self._chain.broken()
             if self._changed and _is_invalid_request(event):
                 # A WebSocket rejection cannot be retried here; stop applying
@@ -1842,6 +1857,7 @@ class _UpstreamWebSocket(CopilotWebSocketForwarder):
         )
         if self._record is not None:
             _note_usage(self._record, response.get("usage"))
+            _note_copilot_ids(self._record, event.get("headers"))
         self._record = None
 
 
