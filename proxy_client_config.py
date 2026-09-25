@@ -581,7 +581,14 @@ class ProxyClientConfigService:
                 "clients": {},
             }
 
-        pending_targets = self._configured_proxy_targets()
+        # Keep targets that are still waiting to be restored (e.g. a failed
+        # startup restore) so a shutdown can never drop them to [].
+        pending_targets = self._normalize_restore_targets(
+            [
+                *self._normalize_restore_targets(settings.get("pending_restore_targets")),
+                *self._configured_proxy_targets(),
+            ]
+        )
         self._write_client_proxy_settings(
             {
                 **settings,

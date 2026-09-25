@@ -894,6 +894,16 @@ def _shutdown_upstream_client() -> None:
         pass
 
 
+def _proxy_port_in_use(host: str = "127.0.0.1", port: int = 8000) -> bool:
+    import socket
+
+    try:
+        with socket.create_connection((host, port), timeout=0.5):
+            return True
+    except OSError:
+        return False
+
+
 def _write_proxy_pid_file() -> None:
     try:
         os.makedirs(os.path.dirname(PROXY_PID_FILE), exist_ok=True)
@@ -6939,6 +6949,13 @@ if __name__ == "__main__":
         name="dashboard-prewarm",
         daemon=True,
     ).start()
+
+    # uvicorn runs the lifespan startup/shutdown hooks even when the bind
+    # fails, so a duplicate launch would revert the client configs that the
+    # already-running instance owns. Bail out before touching any of that.
+    if _proxy_port_in_use():
+        print("GHCP proxy is already running on http://127.0.0.1:8000; exiting.", flush=True)
+        sys.exit(0)
 
     # Start the server immediately so first-run setup can complete from the
     # browser dashboard instead of blocking on a terminal prompt.
