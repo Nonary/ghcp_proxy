@@ -13,6 +13,8 @@ Configure Codex:
   export OPENAI_API_KEY=anything
 """
 
+import base64
+import copy
 import os
 import sys
 
@@ -6235,6 +6237,115 @@ async def _post_excel_non_streaming_request(
     return proxy_non_streaming_response(upstream)
 
 
+class ExcelInlineImageUploadError(RuntimeError):
+    pass
+
+
+def _decode_excel_inline_image(image_url: str) -> tuple[str, bytes]:
+    if not isinstance(image_url, str) or not image_url.startswith("data:"):
+        raise ExcelInlineImageUploadError("Excel image input must use a data URL or HTTPS URL")
+    try:
+        header, encoded = image_url.split(",", 1)
+        media_type = header[5:].split(";", 1)[0] or "application/octet-stream"
+        raw = base64.b64decode(encoded, validate=True)
+    except (ValueError, UnicodeError, base64.binascii.Error) as exc:
+        raise ExcelInlineImageUploadError("Excel image data URL is not valid base64") from exc
+    if not raw:
+        raise ExcelInlineImageUploadError("Excel image data URL is empty")
+    return media_type, raw
+
+
+async def _upload_excel_inline_image(
+    image_url: str,
+    excel_headers: dict[str, str],
+) -> str:
+    media_type, raw = _decode_excel_inline_image(image_url)
+    extension = media_type.partition("/")[2] or "bin"
+    upload_headers = {
+        key: value
+        for key, value in excel_headers.items()
+        if key.lower() not in {"accept", "content-type", "content-length"}
+    }
+    upload_headers["accept"] = "application/json"
+    upload_url = os.environ.get(
+        "GHCP_EXCEL_FILES_URL",
+        "https://bps.openai.com/basispoints/api/attachments",
+    ).strip()
+    try:
+        tls_verify, _tls_source = _configured_upstream_tls_verify(
+            _upstream_proxy_configured()
+        )
+        async with httpx.AsyncClient(
+            http2=False,
+            timeout=httpx.Timeout(120),
+            verify=tls_verify,
+            trust_env=True,
+        ) as upload_client:
+            response = await upload_client.post(
+                upload_url,
+                headers=upload_headers,
+                data={"purpose": "vision"},
+                files={"file": (f"codex-image.{extension}", raw, media_type)},
+            )
+    except Exception as exc:
+        raise ExcelInlineImageUploadError(
+            f"ChatGPT image upload transport failed: {exc}"
+        ) from exc
+    if response.status_code >= 400:
+        detail = response.text[:500].replace("\n", " ")
+        raise ExcelInlineImageUploadError(
+            f"ChatGPT image upload failed ({response.status_code}): {detail}"
+        )
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise ExcelInlineImageUploadError("ChatGPT image upload returned invalid JSON") from exc
+    file_id = (
+        payload.get("openai_file_id")
+        or payload.get("file_id")
+        or payload.get("id")
+        if isinstance(payload, dict)
+        else None
+    )
+    if not isinstance(file_id, str) or not file_id.strip():
+        raise ExcelInlineImageUploadError("ChatGPT image upload did not return a file ID")
+    return file_id.strip()
+
+
+async def _materialize_excel_inline_images(
+    body: dict,
+    excel_headers: dict[str, str],
+) -> dict:
+    if not _request_headers_module.has_vision_input(body.get("input")):
+        return body
+
+    rewritten = copy.deepcopy(body)
+    uploaded: dict[str, str] = {}
+
+    async def visit(value):
+        if isinstance(value, list):
+            for index, item in enumerate(value):
+                value[index] = await visit(item)
+            return value
+        if not isinstance(value, dict):
+            return value
+        if str(value.get("type", "")).lower() == "input_image":
+            image_url = value.get("image_url")
+            if isinstance(image_url, str) and image_url.startswith("data:"):
+                file_id = uploaded.get(image_url)
+                if file_id is None:
+                    file_id = await _upload_excel_inline_image(image_url, excel_headers)
+                    uploaded[image_url] = file_id
+                value.pop("image_url", None)
+                value["file_id"] = file_id
+            return value
+        for key, child in list(value.items()):
+            value[key] = await visit(child)
+        return value
+
+    return await visit(rewritten)
+
+
 async def _handle_excel_responses(
     request: Request,
     body: dict,
@@ -6256,10 +6367,24 @@ async def _handle_excel_responses(
         excel_headers = excel_upstream.excel_session_store.request_headers(
             stream=bool(body.get("stream")),
         )
+        # The Basispoints Excel Responses route requires the vision feature
+        # header for input_image content. Codex sends images as standard
+        # Responses input_image blocks, so opt the session request into the
+        # vision path when the request actually contains one.
+        if _request_headers_module.has_vision_input(body.get("input")):
+            excel_headers["Copilot-Vision-Request"] = "true"
     except RuntimeError as exc:
         return format_translation.openai_error_response(401, str(exc))
+    try:
+        body_for_upstream = await _materialize_excel_inline_images(
+            body,
+            excel_headers,
+        )
+    except ExcelInlineImageUploadError as exc:
+        return format_translation.openai_error_response(502, str(exc))
+
     upstream_body = excel_upstream.prepare_responses_body(
-        body,
+        body_for_upstream,
         tools_version_id=excel_upstream.excel_session_store.tools_version_id(),
     )
 

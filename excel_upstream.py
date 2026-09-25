@@ -162,7 +162,7 @@ LOCAL_MODEL_CAPABILITIES = {
             "gpt-5.6-terra-excel": "5.6-Terra Excel",
             "gpt-5.6-sol-excel": "5.6-Sol Excel",
         }.get(model_id, model_id.removesuffix("-excel").upper().replace("GPT-", "GPT ")),
-        "input_modalities": ["text"],
+        "input_modalities": ["text", "image"],
         "max_context_window": 200_000 if "luna" in model_id else 272_000,
         "messages_endpoint_supported": False,
         "model_picker_enabled": True,
@@ -172,7 +172,7 @@ LOCAL_MODEL_CAPABILITIES = {
             EXCEL_MODEL_REASONING_EFFORTS.get(model_id, EXCEL_REASONING_EFFORTS)
         ),
         "supported_endpoints": ["/responses"],
-        "vision": False,
+        "vision": True,
     }
     for model_id in MODEL_IDS
 }

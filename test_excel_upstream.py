@@ -19,6 +19,16 @@ def _jwt_with_exp(expiration: float) -> str:
 
 
 class ExcelUpstreamTests(unittest.TestCase):
+    def test_excel_models_advertise_image_input_support(self):
+        for model_id in excel_upstream.MODEL_IDS:
+            with self.subTest(model_id=model_id):
+                capabilities = excel_upstream.LOCAL_MODEL_CAPABILITIES[model_id]
+                self.assertTrue(capabilities["vision"])
+                self.assertEqual(
+                    capabilities["input_modalities"],
+                    ["text", "image"],
+                )
+
     def test_session_store_keeps_only_allowlisted_headers(self):
         store = excel_upstream.ExcelSessionStore()
         status = store.configure(
