@@ -126,6 +126,7 @@ from constants import (
     CLAUDE_MAX_CONTEXT_TOKENS,
     CLAUDE_MAX_OUTPUT_TOKENS,
     DEFAULT_UPSTREAM_TIMEOUT_SECONDS,
+    EXCEL_IMAGE_FILE_ID_CACHE_FILE,
     LEGACY_BILLING_TOKEN_FILE,
     LEGACY_PREMIUM_PLAN_CONFIG_FILE,
     PROXY_PID_FILE,
@@ -6312,6 +6313,94 @@ async def _upload_excel_inline_image(
     return file_id.strip()
 
 
+# Basispoints issues a new file ID for every upload, even of identical bytes.
+# Codex replays pasted images on every turn, so without this map each turn
+# would carry fresh file IDs and break the upstream prompt-cache prefix at the
+# first image. Entries are keyed by account and image content, persisted so a
+# proxy restart keeps the same IDs, and bounded in count and age.
+EXCEL_IMAGE_FILE_ID_CACHE_LIMIT = 512
+EXCEL_IMAGE_FILE_ID_TTL_SECONDS = 24 * 60 * 60
+_excel_image_file_ids: OrderedDict[str, tuple[str, float]] | None = None
+_excel_image_file_ids_lock = asyncio.Lock()
+
+
+def _excel_image_cache_key(image_url: str, excel_headers: dict[str, str]) -> str:
+    lowered = {key.lower(): value for key, value in excel_headers.items()}
+    account = "|".join(
+        str(lowered.get(name) or "")
+        for name in ("chatgpt-account-id", "x-openai-account-user-id")
+    )
+    digest = hashlib.sha256()
+    digest.update(account.encode("utf-8"))
+    digest.update(b"\0")
+    digest.update(image_url.encode("utf-8"))
+    return digest.hexdigest()
+
+
+def _load_excel_image_file_ids() -> OrderedDict[str, tuple[str, float]]:
+    global _excel_image_file_ids
+    if _excel_image_file_ids is not None:
+        return _excel_image_file_ids
+    entries: OrderedDict[str, tuple[str, float]] = OrderedDict()
+    try:
+        with open(EXCEL_IMAGE_FILE_ID_CACHE_FILE, encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, ValueError):
+        payload = None
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            if (
+                isinstance(value, list)
+                and len(value) == 2
+                and isinstance(value[0], str)
+                and isinstance(value[1], (int, float))
+            ):
+                entries[key] = (value[0], float(value[1]))
+    _excel_image_file_ids = entries
+    return entries
+
+
+def _save_excel_image_file_ids(entries: OrderedDict[str, tuple[str, float]]) -> None:
+    try:
+        os.makedirs(os.path.dirname(EXCEL_IMAGE_FILE_ID_CACHE_FILE), exist_ok=True)
+        fd, temp_path = tempfile.mkstemp(
+            dir=os.path.dirname(EXCEL_IMAGE_FILE_ID_CACHE_FILE),
+            prefix=".excel-image-file-ids.",
+        )
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump({key: list(value) for key, value in entries.items()}, handle)
+        os.replace(temp_path, EXCEL_IMAGE_FILE_ID_CACHE_FILE)
+    except OSError as exc:
+        print(f"Warning: could not persist Excel image file IDs: {exc}", flush=True)
+
+
+async def _excel_file_id_for_image(
+    image_url: str,
+    excel_headers: dict[str, str],
+) -> str:
+    key = _excel_image_cache_key(image_url, excel_headers)
+    async with _excel_image_file_ids_lock:
+        entries = _load_excel_image_file_ids()
+        now = time.time()
+        cached = entries.get(key)
+        if cached is not None and now - cached[1] < EXCEL_IMAGE_FILE_ID_TTL_SECONDS:
+            entries.move_to_end(key)
+            return cached[0]
+        file_id = await _upload_excel_inline_image(image_url, excel_headers)
+        entries[key] = (file_id, now)
+        entries.move_to_end(key)
+        for stale_key in [
+            stale_key
+            for stale_key, (_file_id, uploaded_at) in entries.items()
+            if now - uploaded_at >= EXCEL_IMAGE_FILE_ID_TTL_SECONDS
+        ]:
+            del entries[stale_key]
+        while len(entries) > EXCEL_IMAGE_FILE_ID_CACHE_LIMIT:
+            entries.popitem(last=False)
+        _save_excel_image_file_ids(entries)
+        return file_id
+
+
 async def _materialize_excel_inline_images(
     body: dict,
     excel_headers: dict[str, str],
@@ -6320,7 +6409,6 @@ async def _materialize_excel_inline_images(
         return body
 
     rewritten = copy.deepcopy(body)
-    uploaded: dict[str, str] = {}
 
     async def visit(value):
         if isinstance(value, list):
@@ -6332,12 +6420,11 @@ async def _materialize_excel_inline_images(
         if str(value.get("type", "")).lower() == "input_image":
             image_url = value.get("image_url")
             if isinstance(image_url, str) and image_url.startswith("data:"):
-                file_id = uploaded.get(image_url)
-                if file_id is None:
-                    file_id = await _upload_excel_inline_image(image_url, excel_headers)
-                    uploaded[image_url] = file_id
                 value.pop("image_url", None)
-                value["file_id"] = file_id
+                value["file_id"] = await _excel_file_id_for_image(
+                    image_url,
+                    excel_headers,
+                )
             return value
         for key, child in list(value.items()):
             value[key] = await visit(child)
