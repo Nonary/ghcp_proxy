@@ -51,7 +51,6 @@
       grid-template-columns: 232px 1fr;
       min-height: 100vh;
     }
-    .app.setup-mode { grid-template-columns: 1fr; place-items: center; padding: 32px; }
 
     /* ─── Sidebar ──────────────────────────────────────────────── */
     .sidebar {
@@ -1652,44 +1651,228 @@
       color: #051b12;
     }
 
+    /* ─── Layout and formatting fixes ──────────────────────────── */
+    /* Sign-in screen: centre the setup card. Bindings on the #app mount
+       element are not compiled by Vue, so key off the panel instead. */
+    .app:has(> .auth-panel) {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr);
+      place-items: center;
+      min-height: 100vh;
+      padding: 32px 16px;
+    }
+    .auth-panel .toolbar { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0; }
+    .auth-steps { display: grid; gap: 6px; color: var(--muted); font-size: 0.9rem; }
+    .auth-panel.setup-panel { width: min(1040px, 100%); }
+    .setup-grid {
+      display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 16px; margin-top: 22px;
+    }
+    .setup-option {
+      display: flex; flex-direction: column; gap: 12px;
+      padding: 18px; border-radius: 18px;
+      border: 1px solid rgba(171, 196, 220, 0.14);
+      background: rgba(10, 23, 36, 0.52);
+    }
+    .setup-option.done { border-color: rgba(139, 240, 199, 0.3); }
+    .setup-option-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+    .setup-option-head h3 { margin: 4px 0 0; font-size: 1.1rem; letter-spacing: -0.02em; }
+    .setup-badge {
+      flex: 0 0 auto; padding: 4px 10px; border-radius: 999px;
+      font-size: 0.72rem; font-weight: 600; color: var(--muted);
+      border: 1px solid rgba(171, 196, 220, 0.18);
+    }
+    .setup-badge.good { color: var(--success); border-color: rgba(121, 232, 184, 0.3); background: rgba(121, 232, 184, 0.08); }
+    .setup-option .auth-code-card { padding: 14px; text-align: center; }
+    .setup-option .auth-code { font-size: 1.8rem; margin: 6px 0; }
+    .setup-option .toolbar { margin: 0; }
+    ol.auth-steps { margin: 0; padding-left: 20px; }
+    @media (max-width: 760px) {
+      .setup-grid { grid-template-columns: 1fr; }
+    }
+    .auth-skip {
+      display: flex; align-items: center; justify-content: space-between; gap: 16px;
+      margin-top: 24px; padding-top: 18px;
+      border-top: 1px solid rgba(171, 196, 220, 0.12);
+    }
+    .auth-skip .subtle { margin-top: 4px; max-width: 560px; line-height: 1.45; }
+    .auth-skip button { flex: 0 0 auto; }
+    @media (max-width: 640px) {
+      .auth-skip { flex-direction: column; align-items: stretch; }
+    }
+
+        /* Sidebar scrolls on short windows so the status footer stays reachable. */
+    .sidebar { overflow-y: auto; }
+
+    /* Compact select pills: drop the global input chrome and the native
+       arrow so only the custom chevron shows. */
+    .select-btn { position: relative; gap: 6px; }
+    .select-btn select {
+      appearance: none;
+      -webkit-appearance: none;
+      background: transparent !important;
+      border: 0 !important;
+      border-radius: 0 !important;
+      padding: 0 16px 0 0 !important;
+      min-height: 0;
+    }
+    .select-btn svg {
+      position: absolute;
+      right: 10px;
+      pointer-events: none;
+      color: var(--muted);
+    }
+
+    /* Overview: the activity table spans the full width under the KPI
+       column and the right rail instead of being squeezed beside the rail. */
+    .work-grid > .activity-card { grid-column: 1 / -1; min-width: 0; }
+    /* Wide screens: the rail runs beside both the KPIs and the activity
+       table, so no dead space opens up under the short KPI column. */
+    @media (min-width: 1801px) {
+      .work-grid > .rail { grid-column: 2; grid-row: 1 / span 2; }
+      .work-grid > .activity-card { grid-column: 1; grid-row: 2; }
+    }
+    /* Laptop and mid-size widths: the rail becomes a row of cards under the KPIs. */
+    @media (max-width: 1800px) {
+      .work-grid { grid-template-columns: minmax(0, 1fr); }
+      .rail {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        align-items: stretch;
+      }
+    }
+    @media (max-width: 760px) {
+      .rail { grid-template-columns: 1fr; }
+    }
+
+    /* Four spend cards in one row; 2×2 on narrow screens. */
+    .spark-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+    @media (max-width: 1100px) {
+      .spark-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+    @media (max-width: 640px) {
+      .spark-grid { grid-template-columns: 1fr; }
+    }
+    .req-table .cost-stack { min-width: 190px; }
+    .spark .value { overflow: hidden; text-overflow: ellipsis; }
+    .spark .value-sub { color: var(--muted); font-size: 0.78rem; font-weight: 600; }
+    .spark .desc { min-height: 0; }
+
+    /* Tables: keep short values on one line and let IDs wrap cleanly. */
+    .req-table td.nowrap, .req-table th { white-space: nowrap; }
+    .session-id-cell { min-width: 200px; }
+    .req-table .session-id-full { white-space: nowrap; }
+    .session-id-full { word-break: normal; overflow-wrap: anywhere; }
+    .session-id-full.short { white-space: nowrap; }
+
+    /* Donut centre label: one compact value that fits inside the ring. */
+    .donut-label .big { white-space: nowrap; font-size: 0.82rem !important; }
+
+    /* AIC usage tiles are too narrow for four across in the rail. */
+    .credit-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+
+    .routing-callout { border-color: rgba(255, 196, 107, 0.28) !important; }
+    .routing-callout h3 { margin-top: 4px; }
+    .routing-callout .subtle { max-width: 720px; line-height: 1.45; margin-top: 4px; }
+    .routing-rows { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+    .routing-row {
+      display: flex; align-items: center; justify-content: space-between; gap: 12px;
+      padding: 12px 14px; border-radius: 14px;
+      border: 1px solid rgba(171, 196, 220, 0.12); background: rgba(10, 23, 36, 0.52);
+    }
+    .routing-state { font-size: 0.78rem; margin-top: 2px; color: var(--muted); }
+    .routing-state.good { color: var(--success); }
+    .routing-state.warn { color: var(--warn); }
+    .routing-state.error { color: var(--danger); }
+    @media (max-width: 760px) { .routing-rows { grid-template-columns: 1fr; } }
+    .view-section-title { margin: 6px 0 12px; }
+    .view-section-title h2 { margin: 0; font-size: 1.05rem; letter-spacing: -0.02em; }
+    .settings-stack { display: flex; flex-direction: column; gap: 12px; }
+    .settings-stack > .mini-card, .settings-stack > .update-panel { margin-top: 0 !important; }
+
   </style>
 </head>
 <body>
   <div id="boot-placeholder" class="boot-placeholder"><div class="spinner"></div>Loading dashboard…</div>
-  <div id="app" class="app" :class="{ 'setup-mode': showAuthPanel }" v-cloak>
+  <div id="app" class="app" v-cloak>
 
     <!-- ─── Auth setup card (kept) ─────────────────────────────── -->
-    <section v-if="showAuthPanel" class="auth-panel">
+    <section v-if="showAuthPanel" class="auth-panel setup-panel">
       <div>
-        <div class="eyebrow" style="color: var(--accent);">Required · Setup</div>
-        <h2 style="margin: 6px 0 4px;">GitHub Copilot Sign-In</h2>
-        <div class="subtle">{{ authStatus.message || 'A local GHCP token is required before the dashboard can serve traffic.' }}</div>
+        <div class="eyebrow" style="color: var(--accent);">Setup</div>
+        <h2 style="margin: 6px 0 4px;">Connect an upstream</h2>
+        <div class="subtle">GHCP Proxy can send requests to GitHub Copilot, to GPT Excel, or to both. Each one is optional: set up either, both, or skip for now.</div>
       </div>
-      <div class="auth-grid">
-        <div class="auth-code-card">
-          <div class="subtle">Device code</div>
-          <div class="auth-code">{{ authStatus.user_code || '——' }}</div>
-          <div class="subtle" v-if="authStatus.expires_at">Expires {{ stamp(authStatus.expires_at) }}</div>
-          <div class="subtle" v-else>Code appears here after sign-in starts.</div>
-        </div>
-        <div class="auth-copy">
-          <div class="subtle">Start sign-in here, open GitHub, enter the code, and the page will detect completion automatically.</div>
-          <div class="toolbar">
-            <button class="primary" @click="startAuthFlow" :disabled="startingAuthFlow || authStatus.state === 'starting' || authStatus.state === 'pending'">
-              {{ authPrimaryButtonLabel }}
-            </button>
-            <a v-if="authVerificationUri" class="button-link" :href="authVerificationUri" target="_blank" rel="noreferrer">Open GitHub</a>
-            <button v-if="authStatus.user_code" @click="copyAuthCode">Copy code</button>
-            <button @click="loadAuthStatus" :disabled="loadingAuthStatus">Refresh</button>
+
+      <div class="setup-grid">
+        <!-- GitHub Copilot -->
+        <article class="setup-option" :class="{ done: authStatus.authenticated }">
+          <div class="setup-option-head">
+            <div>
+              <div class="eyebrow">Optional</div>
+              <h3>GitHub Copilot</h3>
+            </div>
+            <span :class="['setup-badge', authStatus.authenticated ? 'good' : '']">{{ authStatus.authenticated ? 'Signed in' : 'Not signed in' }}</span>
           </div>
-          <div class="auth-steps">
-            <div>1. Click Start sign-in to request a GitHub device code.</div>
-            <div>2. Click Open GitHub and paste the code shown on this page.</div>
-            <div>3. Return here after approval.</div>
+          <div class="subtle">For Copilot models used by Codex and Claude Code.</div>
+
+          <template v-if="!authStatus.authenticated">
+            <div class="auth-code-card">
+              <div class="subtle">Device code</div>
+              <div class="auth-code">{{ authStatus.user_code || '——' }}</div>
+              <div class="subtle" v-if="authStatus.expires_at">Expires {{ stamp(authStatus.expires_at) }}</div>
+              <div class="subtle" v-else>The code appears here after you start sign-in.</div>
+            </div>
+            <div class="toolbar">
+              <button class="primary" @click="startAuthFlow" :disabled="startingAuthFlow || authStatus.state === 'starting' || authStatus.state === 'pending'">
+                {{ authPrimaryButtonLabel }}
+              </button>
+              <a v-if="authVerificationUri" class="button-link" :href="authVerificationUri" target="_blank" rel="noreferrer">Open GitHub</a>
+              <button v-if="authStatus.user_code" @click="copyAuthCode">Copy code</button>
+            </div>
+            <ol class="auth-steps">
+              <li>Start sign-in to get a device code.</li>
+              <li>Open GitHub and enter the code.</li>
+              <li>This page updates once you approve.</li>
+            </ol>
+            <div v-if="authStatus.error" class="status error">{{ authStatus.error }}</div>
+            <div v-else-if="authStatus.warning" class="status warn">{{ authStatus.warning }}</div>
+          </template>
+          <div v-else class="status good">GitHub Copilot is connected.</div>
+        </article>
+
+        <!-- GPT Excel -->
+        <article class="setup-option" :class="{ done: excelSessionReady }">
+          <div class="setup-option-head">
+            <div>
+              <div class="eyebrow">Optional</div>
+              <h3>GPT Excel</h3>
+            </div>
+            <span :class="['setup-badge', excelSessionReady ? 'good' : '']">{{ excelSessionReady ? 'Connected' : 'Not connected' }}</span>
           </div>
-          <div v-if="authStatus.error" class="status error">{{ authStatus.error }}</div>
-          <div v-else-if="authStatus.warning" class="status warn">{{ authStatus.warning }}</div>
-        </div>
+          <div class="subtle">For GPT Excel models, using the ChatGPT add-in's sign-in.</div>
+
+          <template v-if="!excelSessionReady">
+            <ol class="auth-steps">
+              <li>Open Microsoft Excel.</li>
+              <li>Open the ChatGPT add-in and sign in to your ChatGPT account.</li>
+              <li>The proxy reads the add-in's session automatically. This page checks every few seconds.</li>
+            </ol>
+            <div class="toolbar">
+              <button @click="loadExcelSessionStatus">Check again</button>
+            </div>
+            <div :class="['status', excelSessionStatusClass()]">{{ excelSessionStatusLabel() }}</div>
+          </template>
+          <div v-else class="status good">{{ excelSessionStatusLabel() }}</div>
+        </article>
+      </div>
+
+      <div class="auth-skip">
+        <div class="subtle" v-if="!authStatus.authenticated">Codex and Claude Code requests on Copilot models will fail until you sign in. You can sign in later under Integrations.</div>
+        <div class="subtle" v-else>You can change either connection later under Integrations.</div>
+        <button type="button" :class="{ primary: authStatus.authenticated }" @click="finishSetup" :disabled="savingSignInSkip">
+          {{ savingSignInSkip ? 'Saving…' : (authStatus.authenticated ? 'Continue to dashboard' : 'Continue without Copilot') }}
+        </button>
       </div>
     </section>
 
@@ -1745,17 +1928,9 @@
         <div class="header-tools">
           <span class="live-pill"><span class="pulse"></span> Live</span>
           <span class="updated-text">Updated {{ stamp(data.generated_at) }}</span>
-          <button class="icon-btn" @click="load(true)" title="Refresh">
+          <button class="icon-btn" @click="load(true)" title="Refresh" aria-label="Refresh">
             <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-3-6.7"/><path d="M21 4v5h-5"/></svg>
           </button>
-          <label class="select-btn">
-            <select v-model="overviewRange">
-              <option value="7d">Last 7 Days</option>
-              <option value="30d">Last 30 Days</option>
-              <option value="all">All Time</option>
-            </select>
-            <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 9l6 6 6-6"/></svg>
-          </label>
         </div>
       </header>
       <div v-if="dashboardError" class="status error" role="alert" style="margin-bottom: 14px;">
@@ -1822,6 +1997,37 @@
             <div v-if="autoUpdateStatus.statusMessage" class="status good">{{ autoUpdateStatus.statusMessage }}</div>
           </article>
 
+          <!-- Client routing: prompt to point Codex / Claude Code at the proxy -->
+          <article v-if="clientRoutingNeedsAttention" class="card routing-callout">
+            <div class="card-head">
+              <div>
+                <div class="eyebrow">Client routing</div>
+                <h3>{{ clientRoutingTitle }}</h3>
+                <div class="subtle">Until you enable it, their requests go straight to their own services, so the proxy can't route or track them. Enabling updates the client's config file; you can turn it off anytime in Integrations.</div>
+              </div>
+            </div>
+            <div class="routing-rows">
+              <div v-for="client in clientRoutingRows" :key="client.key" class="routing-row">
+                <div>
+                  <strong>{{ client.label }}</strong>
+                  <div :class="['routing-state', client.tone]">{{ client.state }}</div>
+                </div>
+                <button v-if="!client.configured"
+                        :class="{ primary: !clientRoutingBothMissing }"
+                        @click="configureClientProxy(client.key, 'enable')"
+                        :disabled="savingProxyConfig || Boolean(client.error)">
+                  Enable for {{ client.label }}
+                </button>
+              </div>
+            </div>
+            <div class="toolbar" style="margin-top: 12px;" v-if="clientRoutingBothMissing">
+              <button class="primary" @click="enableAllClientProxy" :disabled="savingProxyConfig || anyClientProxyError">
+                {{ savingProxyConfig ? 'Enabling…' : 'Enable both' }}
+              </button>
+            </div>
+            <div v-if="proxyConfigError" class="status error" style="margin-top: 10px;">{{ proxyConfigError }}</div>
+          </article>
+
           <!-- KPI strip -->
           <div class="kpi-grid">
             <article class="kpi">
@@ -1834,9 +2040,9 @@
               <div class="value" :title="costLabel(todayUsage.cost_usd)">{{ headlineAicLabel(todayUsage.cost_usd) }}</div>
               <div class="cost-secondary">{{ money(todayUsage.cost_usd) }}</div>
               <div class="kpi-meta">
-                <div class="row"><span class="k">Today</span><span class="v">{{ costLabel(todayUsage.cost_usd) }}</span></div>
-                <div class="row"><span class="k">Month</span><span class="v">{{ costLabel(currentMonth.cost_usd) }}</span></div>
-                <div class="row"><span class="k">All-Time</span><span class="v">{{ costLabel(allTime.cost_usd) }}</span></div>
+                <div class="row" :title="costLabel(todayUsage.cost_usd)"><span class="k">Today</span><span class="v">{{ headlineAicLabel(todayUsage.cost_usd) }}</span></div>
+                <div class="row" :title="costLabel(currentMonth.cost_usd)"><span class="k">Month</span><span class="v">{{ headlineAicLabel(currentMonth.cost_usd) }}</span></div>
+                <div class="row" :title="costLabel(allTime.cost_usd)"><span class="k">All-Time</span><span class="v">{{ headlineAicLabel(allTime.cost_usd) }}</span></div>
               </div>
             </article>
 
@@ -1876,7 +2082,8 @@
           <div class="spark-grid">
             <div v-for="card in sparkCards" :key="card.key" class="spark">
               <div class="eyebrow">{{ card.title }}</div>
-              <div class="value">{{ card.value }}</div>
+              <div class="value" :title="card.title + ': ' + card.value + ' · ' + card.valueSub">{{ card.value }}</div>
+              <div class="value-sub">{{ card.valueSub }}</div>
               <div class="desc">{{ card.desc }}</div>
               <div class="sparkline">
                 <svg :viewBox="'0 0 ' + card.width + ' ' + card.height" preserveAspectRatio="none" :width="card.width" :height="card.height" style="width:100%; height:60px; display:block;">
@@ -1898,144 +2105,6 @@
             </div>
           </div>
 
-          <!-- Recent Activity (sessions + requests) -->
-          <article class="card">
-            <div class="card-head">
-              <div style="display:flex; gap:6px; align-items:center;">
-                <button class="tabbtn" :class="{ active: overviewActivityTab === 'sessions' }" @click="overviewActivityTab = 'sessions'">Sessions</button>
-                <button class="tabbtn" :class="{ active: overviewActivityTab === 'requests' }" @click="overviewActivityTab = 'requests'">Requests</button>
-              </div>
-              <a href="#" class="card-link" @click.prevent="activeView = (overviewActivityTab === 'sessions' ? 'sessions' : 'requests')">Open full view →</a>
-            </div>
-
-            <div class="req-toolbar">
-              <input v-model.trim="search" type="search" :placeholder="overviewActivityTab === 'sessions' ? 'Search by model, source, or session id' : 'Search by model, path, request id, session…'">
-              <select v-model="sourceFilter">
-                <option value="all">All Sources</option>
-                <option value="claude">Claude</option>
-                <option value="codex">Codex (proxied)</option>
-                <option value="codex_native">Codex (native)</option>
-                <option value="proxy">Proxy</option>
-              </select>
-              <select v-model="sortMode">
-                <option value="recent">Newest First</option>
-                <option value="cost">Highest Cost</option>
-                <option value="tokens">Most Tokens</option>
-              </select>
-            </div>
-            <!-- Sessions tab -->
-            <div v-if="overviewActivityTab === 'sessions'" style="overflow-x: auto;">
-              <table class="req-table">
-                <thead>
-                  <tr>
-                    <th>Source</th>
-                    <th>Session</th>
-                    <th>Model</th>
-                    <th>Last Activity</th>
-                    <th>Duration</th>
-                    <th>Activity</th>
-                    <th>Tokens</th>
-                    <th>Cost</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  <tr v-for="row in pagedSessions" :key="row.session_key"
-                      tabindex="0"
-                      @click="openSessionRequests(row)"
-                      @keydown.enter="openSessionRequests(row)"
-                      @keydown.space.prevent="openSessionRequests(row)"
-                      style="cursor: pointer;">
-                    <td><span class="pill">{{ sourceLabel(row.source) }}</span></td>
-                    <td class="session-id-cell"><span class="session-id-full"><span>{{ row.session_display_id || row.session_id || '-' }}</span><button class="copy-btn" @click.stop="copyText(row.session_display_id || row.session_id)" title="Copy full session ID"><svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button></span></td>
-                    <td>{{ modelLabel(row.models) }}</td>
-                    <td>{{ shortStamp(row.last_activity) }}</td>
-                    <td>{{ sessionDurationLabel(row) }}</td>
-                    <td>{{ integer(row.session_request_count || row.request_count) }} {{ sessionActivityUnit(row) }}</td>
-                    <td>{{ compact(row.total_tokens) }}</td>
-                    <td>
-                      <div class="cost-stack" :title="rowCostTitle(row)">
-                        <strong>{{ rowCostLabel(row) }}</strong>
-                        <span class="cost-secondary">{{ money(row.cost_usd) }} · {{ costBreakdownLabel(row, true) }}</span>
-                      </div>
-                    </td>
-                  </tr>
-                  <tr v-if="!filteredSessions.length"><td colspan="8" class="empty">No sessions match the current filter.</td></tr>
-                </tbody>
-              </table>
-            </div>
-
-            <!-- Requests tab -->
-            <div v-else style="overflow-x: auto;">
-              <table class="req-table">
-                <thead>
-                  <tr>
-                    <th>Time</th>
-                    <th>Status</th>
-                    <th>Model</th>
-                    <th>Path</th>
-                    <th>Timing</th>
-                    <th>Tokens (in/out)</th>
-                    <th>Cost</th>
-                    <th>Request ID</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  <tr v-for="row in pagedRequests" :key="requestKey(row)"
-                      tabindex="0"
-                      @click="selectedRequestKey = requestKey(row); activeView = 'requests'"
-                      @keydown.enter="selectedRequestKey = requestKey(row); activeView = 'requests'"
-                      @keydown.space.prevent="selectedRequestKey = requestKey(row); activeView = 'requests'"
-                      style="cursor: pointer;">
-                    <td>{{ shortStamp(row.finished_at || row.started_at) }}</td>
-                    <td>
-                      <span class="pill" :class="row.success === false ? 'pill-error' : 'pill-success'">
-                        {{ row.success === false ? 'ERROR' : 'SUCCESS' }}
-                      </span>
-                    </td>
-                    <td>
-                      <div>{{ row.resolved_model || row.requested_model || '—' }}</div>
-                      <span v-if="requestEffortLabel(row)" :class="['badge', requestEffortBadgeClass(row)]">{{ requestEffortLabel(row) }}</span>
-                    </td>
-                    <td><code>{{ row.path || '—' }}</code></td>
-                    <td>{{ requestDurationLabel(row) }}</td>
-                    <td>{{ shortTokens(row) }}</td>
-                    <td>
-                      <div class="cost-stack" :title="rowCostTitle(row)">
-                        <strong>{{ rowCostLabel(row) }}</strong>
-                        <span class="cost-secondary">{{ money(row.cost_usd) }} · {{ costBreakdownLabel(row, true) }}</span>
-                      </div>
-                    </td>
-                    <td>
-                      <span class="req-id">
-                        <span>{{ shortHash(row.request_id || row.client_request_id) }}</span>
-                        <button class="copy-btn" @click.stop="copyText(row.request_id || row.client_request_id)" title="Copy">
-                          <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
-                        </button>
-                      </span>
-                    </td>
-                  </tr>
-                  <tr v-if="!pagedRequests.length"><td colspan="8" class="empty">No requests match the current filter.</td></tr>
-                </tbody>
-              </table>
-            </div>
-
-            <div class="pager">
-              <div v-if="overviewActivityTab === 'sessions'">
-                Showing {{ pagedSessions.length }} of {{ filteredSessions.length }} sessions
-              </div>
-              <div v-else>
-                Showing {{ requestPageStart }}–{{ requestPageEnd }} of {{ filteredRequests.length }} recent requests
-              </div>
-              <div class="pages" v-if="overviewActivityTab === 'requests'">
-                <button class="pgbtn" @click="changeRequestPage(-1)" :disabled="normalizedRequestPage <= 1">‹</button>
-                <button v-for="p in pagerPages" :key="p.key" class="pgbtn"
-                        :class="{ active: p.value === normalizedRequestPage }"
-                        :disabled="p.value === '...'"
-                        @click="goToRequestPage(p.value)">{{ p.label }}</button>
-                <button class="pgbtn" @click="changeRequestPage(1)" :disabled="normalizedRequestPage >= requestPageCount">›</button>
-              </div>
-            </div>
-          </article>
         </div>
 
         <!-- ─── Right rail ─────────────────────────────────────── -->
@@ -2124,12 +2193,13 @@
               <div>
                 <h3>Spend By Provider</h3>
               </div>
-              <label class="select-btn" style="font-size: 0.78rem; padding: 4px 8px;">
-                <select v-model="overviewRange">
+              <label class="select-btn" style="font-size: 0.78rem; padding: 6px 10px;">
+                <select v-model="overviewRange" aria-label="Time range">
                   <option value="7d">Last 7 Days</option>
-                  <option value="30d">Last 30 Days</option>
+                  <option value="30d">This Month</option>
                   <option value="all">All Time</option>
                 </select>
+                <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 9l6 6 6-6"/></svg>
               </label>
             </div>
             <div class="donut-wrap legend-donut">
@@ -2143,8 +2213,8 @@
                 </svg>
                 <div class="donut-label">
                   <div>
-                    <div class="big" style="font-size: 0.95rem;">{{ costLabel(providerTotalCost) }}</div>
-                    <div class="tiny">Total</div>
+                    <div class="big" style="font-size: 0.95rem;" :title="costLabel(providerTotalCost)">{{ headlineAicLabel(providerTotalCost) }}</div>
+                    <div class="tiny">{{ money(providerTotalCost) }}</div>
                   </div>
                 </div>
               </div>
@@ -2158,19 +2228,20 @@
                 <div v-if="!providerRows.length" class="subtle">No spend recorded yet.</div>
               </div>
             </div>
-            <a href="#" class="card-link" @click.prevent="activeView = 'storage'">View detailed breakdown →</a>
+            <a href="#" class="card-link" @click.prevent="activeView = 'usage'">View detailed breakdown →</a>
           </article>
 
           <!-- Source Mix -->
           <article class="card">
             <div class="card-head">
               <div><h3>Source Mix</h3></div>
-              <label class="select-btn" style="font-size: 0.78rem; padding: 4px 8px;">
-                <select v-model="overviewRange">
+              <label class="select-btn" style="font-size: 0.78rem; padding: 6px 10px;">
+                <select v-model="overviewRange" aria-label="Time range">
                   <option value="7d">Last 7 Days</option>
-                  <option value="30d">Last 30 Days</option>
+                  <option value="30d">This Month</option>
                   <option value="all">All Time</option>
                 </select>
+                <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 9l6 6 6-6"/></svg>
               </label>
             </div>
             <div class="donut-wrap legend-donut">
@@ -2203,6 +2274,145 @@
           </article>
 
         </aside>
+
+        <!-- Recent Activity (sessions + requests) -->
+        <article class="card activity-card">
+          <div class="card-head">
+            <div style="display:flex; gap:6px; align-items:center;">
+              <button class="tabbtn" :class="{ active: overviewActivityTab === 'sessions' }" @click="overviewActivityTab = 'sessions'">Sessions</button>
+              <button class="tabbtn" :class="{ active: overviewActivityTab === 'requests' }" @click="overviewActivityTab = 'requests'">Requests</button>
+            </div>
+            <a href="#" class="card-link" @click.prevent="activeView = (overviewActivityTab === 'sessions' ? 'sessions' : 'requests')">Open full view →</a>
+          </div>
+
+          <div class="req-toolbar">
+            <input v-model.trim="search" type="search" :placeholder="overviewActivityTab === 'sessions' ? 'Search by model, source, or session id' : 'Search by model, path, request id, session…'">
+            <select v-model="sourceFilter">
+              <option value="all">All Sources</option>
+              <option value="claude">Claude</option>
+              <option value="codex">Codex (proxied)</option>
+              <option value="codex_native">Codex (native)</option>
+              <option value="proxy">Proxy</option>
+            </select>
+            <select v-model="sortMode">
+              <option value="recent">Newest First</option>
+              <option value="cost">Highest Cost</option>
+              <option value="tokens">Most Tokens</option>
+            </select>
+          </div>
+          <!-- Sessions tab -->
+          <div v-if="overviewActivityTab === 'sessions'" style="overflow-x: auto;">
+            <table class="req-table">
+              <thead>
+                <tr>
+                  <th>Source</th>
+                  <th>Session</th>
+                  <th>Model</th>
+                  <th>Last Activity</th>
+                  <th>Duration</th>
+                  <th>Activity</th>
+                  <th>Peak Context</th>
+                  <th>Cost</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="row in pagedSessions" :key="row.session_key"
+                    tabindex="0"
+                    @click="openSessionRequests(row)"
+                    @keydown.enter="openSessionRequests(row)"
+                    @keydown.space.prevent="openSessionRequests(row)"
+                    style="cursor: pointer;">
+                  <td><span class="pill">{{ sourceLabel(row.source) }}</span></td>
+                  <td class="session-id-cell"><span class="session-id-full short" :title="row.session_display_id || row.session_id"><span>{{ shortHash(row.session_display_id || row.session_id) }}</span><button class="copy-btn" @click.stop="copyText(row.session_display_id || row.session_id)" title="Copy full session ID"><svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button></span></td>
+                  <td class="nowrap">{{ modelLabel(row.models) }}</td>
+                  <td class="nowrap">{{ shortStamp(row.last_activity) }}</td>
+                  <td class="nowrap">{{ sessionDurationLabel(row) }}</td>
+                  <td class="nowrap">{{ integer(row.session_request_count || row.request_count) }} {{ sessionActivityUnit(row) }}</td>
+                  <td class="nowrap">{{ compact(row.total_tokens) }}</td>
+                  <td>
+                    <div class="cost-stack" :title="rowCostTitle(row)">
+                      <strong>{{ rowCostLabel(row) }}</strong>
+                      <span class="cost-secondary">{{ money(row.cost_usd) }} · {{ costBreakdownLabel(row, true) }}</span>
+                    </div>
+                  </td>
+                </tr>
+                <tr v-if="!filteredSessions.length"><td colspan="8" class="empty">No sessions match the current filter.</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <!-- Requests tab -->
+          <div v-else style="overflow-x: auto;">
+            <table class="req-table">
+              <thead>
+                <tr>
+                  <th>Time</th>
+                  <th>Status</th>
+                  <th>Model</th>
+                  <th>Path</th>
+                  <th>Timing</th>
+                  <th>Tokens (in/out)</th>
+                  <th>Cost</th>
+                  <th>Request ID</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="row in pagedRequests" :key="requestKey(row)"
+                    tabindex="0"
+                    @click="selectedRequestKey = requestKey(row); activeView = 'requests'"
+                    @keydown.enter="selectedRequestKey = requestKey(row); activeView = 'requests'"
+                    @keydown.space.prevent="selectedRequestKey = requestKey(row); activeView = 'requests'"
+                    style="cursor: pointer;">
+                  <td>{{ shortStamp(row.finished_at || row.started_at) }}</td>
+                  <td>
+                    <span class="pill" :class="row.success === false ? 'pill-error' : 'pill-success'">
+                      {{ row.success === false ? 'ERROR' : 'SUCCESS' }}
+                    </span>
+                  </td>
+                  <td>
+                    <div>{{ row.resolved_model || row.requested_model || '—' }}</div>
+                    <span v-if="requestEffortLabel(row)" :class="['badge', requestEffortBadgeClass(row)]">{{ requestEffortLabel(row) }}</span>
+                  </td>
+                  <td><code>{{ row.path || '—' }}</code></td>
+                  <td>{{ requestDurationLabel(row) }}</td>
+                  <td>{{ shortTokens(row) }}</td>
+                  <td>
+                    <div class="cost-stack" :title="rowCostTitle(row)">
+                      <strong>{{ rowCostLabel(row) }}</strong>
+                      <span class="cost-secondary">{{ money(row.cost_usd) }} · {{ costBreakdownLabel(row, true) }}</span>
+                    </div>
+                  </td>
+                  <td>
+                    <span class="req-id">
+                      <span>{{ shortHash(row.request_id || row.client_request_id) }}</span>
+                      <button class="copy-btn" @click.stop="copyText(row.request_id || row.client_request_id)" title="Copy">
+                        <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+                      </button>
+                    </span>
+                  </td>
+                </tr>
+                <tr v-if="!pagedRequests.length"><td colspan="8" class="empty">No requests match the current filter.</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="pager">
+            <div v-if="overviewActivityTab === 'sessions'">
+              Showing {{ pagedSessions.length }} of {{ filteredSessions.length }} sessions
+            </div>
+            <div v-else>
+              Showing {{ requestPageStart }}–{{ requestPageEnd }} of {{ filteredRequests.length }} recent requests
+            </div>
+            <div class="pages" v-if="overviewActivityTab === 'requests'">
+              <button class="pgbtn" @click="changeRequestPage(-1)" :disabled="normalizedRequestPage <= 1">‹</button>
+              <button v-for="p in pagerPages" :key="p.key" class="pgbtn"
+                      :class="{ active: p.value === normalizedRequestPage }"
+                      :disabled="p.value === '...'"
+                      @click="goToRequestPage(p.value)">{{ p.label }}</button>
+              <button class="pgbtn" @click="changeRequestPage(1)" :disabled="normalizedRequestPage >= requestPageCount">›</button>
+            </div>
+          </div>
+        </article>
       </div>
 
       <!-- ─── Other views (legacy panels accessed via sidebar) ── -->
@@ -2302,11 +2512,11 @@
                     style="cursor:pointer;">
                   <td><span class="pill">{{ sourceLabel(row.source) }}</span></td>
                   <td class="session-id-cell"><span class="session-id-full"><span>{{ row.session_display_id || row.session_id || '-' }}</span><button class="copy-btn" @click.stop="copyText(row.session_display_id || row.session_id)" title="Copy full session ID"><svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button></span></td>
-                  <td>{{ modelLabel(row.models) }}</td>
-                  <td>{{ shortStamp(row.last_activity) }}</td>
-                  <td>{{ sessionDurationLabel(row) }}</td>
-                  <td>{{ integer(row.session_request_count || row.request_count) }} {{ sessionActivityUnit(row) }}</td>
-                  <td>{{ compact(row.total_tokens) }}</td>
+                  <td class="nowrap">{{ modelLabel(row.models) }}</td>
+                  <td class="nowrap">{{ shortStamp(row.last_activity) }}</td>
+                  <td class="nowrap">{{ sessionDurationLabel(row) }}</td>
+                  <td class="nowrap">{{ integer(row.session_request_count || row.request_count) }} {{ sessionActivityUnit(row) }}</td>
+                  <td class="nowrap">{{ compact(row.total_tokens) }}</td>
                     <td>
                       <div class="cost-stack" :title="rowCostTitle(row)">
                         <strong>{{ rowCostLabel(row) }}</strong>
@@ -2623,20 +2833,18 @@
         </section>
       </div>
 
-      <div v-show="activeView === 'storage'" class="legacy-section">
-        <article class="card">
-          <div class="card-head"><div><h3>Storage & Costs</h3><div class="subtle">Token cost breakdown and historical analysis.</div></div></div>
-          <token-breakdown-card
-            :daily-history="dailyHistory"
-            :current-usage="currentMonth"
-            :all-time-usage="allTime"
-            :scope="analysisScope"
-            @update:scope="analysisScope = $event"
-          ></token-breakdown-card>
+      <div v-show="activeView === 'integrations'" class="legacy-section">
+        <article class="card" style="margin-bottom: 18px;">
+          <div class="card-head">
+            <div><div class="eyebrow">Upstream</div><h3>GitHub Copilot</h3><div class="subtle">Needed for Copilot models. GPT Excel models work without it.</div></div>
+          </div>
+          <div :class="['status', authStatus.authenticated ? 'good' : 'warn']">
+            {{ authStatus.authenticated ? 'Signed in' : 'Not signed in: Copilot model requests will fail' }}
+          </div>
+          <div class="toolbar" style="margin-top: 10px;" v-if="!authStatus.authenticated">
+            <button class="primary" @click="openSetupScreen">Sign in to GitHub Copilot</button>
+          </div>
         </article>
-      </div>
-
-      <div v-show="activeView === 'settings' || activeView === 'integrations'" class="legacy-section">
         <article class="card">
           <div class="card-head">
             <div><div class="eyebrow">Local Clients</div><h3>Client Proxy Configuration</h3><div class="subtle">Install or verify local proxy settings for Codex and Claude Code.</div></div>
@@ -2700,6 +2908,47 @@
             <div v-else-if="excelSessionStatus.statusMessage" class="status good" style="margin-top: 10px;">{{ excelSessionStatus.statusMessage }}</div>
           </article>
           <article class="mini-card" style="margin-top: 12px;">
+            <div class="eyebrow">Background Proxy</div>
+            <div :class="['status', backgroundProxyStatus.startup_enabled ? 'good' : 'warn']">
+              {{ backgroundProxyStartupLabel }}
+            </div>
+            <label style="display:flex; align-items:center; gap:10px; margin-top:6px;">
+              <input type="checkbox"
+                     :checked="backgroundProxyStatus.startup_enabled"
+                     :disabled="savingBackgroundProxy || !backgroundProxyStatus.startup_supported"
+                     @change="toggleBackgroundStartup($event.target.checked)">
+              <span>Start GHCP Proxy in the background when this user logs in</span>
+            </label>
+            <div class="subtle" style="margin-top: 8px;">{{ backgroundProxyStatus.startup_path || 'Startup integration is not supported on this OS.' }}</div>
+            <div class="toolbar" style="margin-top: 10px;">
+              <button :class="backgroundProxyStatus.shell_commands_installed ? '' : 'primary'"
+                      @click="toggleShellCommands"
+                      :disabled="savingBackgroundProxy || !backgroundProxyStatus.shell_commands_supported">
+                {{ backgroundProxyStatus.shell_commands_installed ? 'Remove shell commands' : 'Install shell commands' }}
+              </button>
+              <button @click="loadBackgroundProxyStatus" :disabled="savingBackgroundProxy">Refresh</button>
+            </div>
+            <div class="command-list" v-if="backgroundProxyCommandNames.length">
+              <div class="command-row" v-for="name in backgroundProxyCommandNames" :key="name">
+                <span>{{ name.includes('Stop') || name.startsWith('stop-') ? 'Stop' : 'Start' }}</span>
+                <code>{{ name }}</code>
+              </div>
+            </div>
+            <div class="subtle" style="margin-top: 4px;" v-if="backgroundProxyProfilePaths.length">
+              <div v-for="path in backgroundProxyProfilePaths" :key="path">{{ path }}</div>
+            </div>
+            <div class="subtle" style="margin-top: 4px;" v-else>{{ backgroundProxyStatus.shell_profile_path }}</div>
+            <div v-if="backgroundProxyStatus.error" class="status error" style="margin-top: 10px;">{{ backgroundProxyStatus.error }}</div>
+            <div v-else-if="backgroundProxyStatus.statusMessage" class="status good" style="margin-top: 10px;">{{ backgroundProxyStatus.statusMessage }}</div>
+          </article>
+          <div v-if="proxyConfigError" class="status error" style="margin-top: 10px;">{{ proxyConfigError }}</div>
+          <div v-else-if="proxyConfigStatusMessage" class="status good" style="margin-top: 10px;">{{ proxyConfigStatusMessage }}</div>
+        </article>
+      </div>
+
+      <div v-show="activeView === 'settings'" class="legacy-section">
+        <div class="settings-stack">
+          <article class="mini-card" style="margin-top: 12px;">
             <div class="eyebrow">Shutdown Behavior</div>
             <label style="display:flex; align-items:center; gap:10px; margin-top:6px;">
               <input type="checkbox" v-model="clientProxySettings.revert_on_shutdown" :disabled="savingClientProxySettings">
@@ -2739,40 +2988,6 @@
                 {{ autoUpdateAction === 'restart_proxy' ? 'Restarting…' : 'Restart proxy' }}
               </button>
             </div>
-          </article>
-          <article class="mini-card" style="margin-top: 12px;">
-            <div class="eyebrow">Background Proxy</div>
-            <div :class="['status', backgroundProxyStatus.startup_enabled ? 'good' : 'warn']">
-              {{ backgroundProxyStartupLabel }}
-            </div>
-            <label style="display:flex; align-items:center; gap:10px; margin-top:6px;">
-              <input type="checkbox"
-                     :checked="backgroundProxyStatus.startup_enabled"
-                     :disabled="savingBackgroundProxy || !backgroundProxyStatus.startup_supported"
-                     @change="toggleBackgroundStartup($event.target.checked)">
-              <span>Start GHCP Proxy in the background when this user logs in</span>
-            </label>
-            <div class="subtle" style="margin-top: 8px;">{{ backgroundProxyStatus.startup_path || 'Startup integration is not supported on this OS.' }}</div>
-            <div class="toolbar" style="margin-top: 10px;">
-              <button :class="backgroundProxyStatus.shell_commands_installed ? '' : 'primary'"
-                      @click="toggleShellCommands"
-                      :disabled="savingBackgroundProxy || !backgroundProxyStatus.shell_commands_supported">
-                {{ backgroundProxyStatus.shell_commands_installed ? 'Remove shell commands' : 'Install shell commands' }}
-              </button>
-              <button @click="loadBackgroundProxyStatus" :disabled="savingBackgroundProxy">Refresh</button>
-            </div>
-            <div class="command-list" v-if="backgroundProxyCommandNames.length">
-              <div class="command-row" v-for="name in backgroundProxyCommandNames" :key="name">
-                <span>{{ name.includes('Stop') || name.startsWith('stop-') ? 'Stop' : 'Start' }}</span>
-                <code>{{ name }}</code>
-              </div>
-            </div>
-            <div class="subtle" style="margin-top: 4px;" v-if="backgroundProxyProfilePaths.length">
-              <div v-for="path in backgroundProxyProfilePaths" :key="path">{{ path }}</div>
-            </div>
-            <div class="subtle" style="margin-top: 4px;" v-else>{{ backgroundProxyStatus.shell_profile_path }}</div>
-            <div v-if="backgroundProxyStatus.error" class="status error" style="margin-top: 10px;">{{ backgroundProxyStatus.error }}</div>
-            <div v-else-if="backgroundProxyStatus.statusMessage" class="status good" style="margin-top: 10px;">{{ backgroundProxyStatus.statusMessage }}</div>
           </article>
           <article :class="['update-panel', { prominent: autoUpdateNeedsAttention }]" style="margin-top: 12px;">
             <div class="update-panel-head">
@@ -2846,9 +3061,7 @@
             <div class="subtle" style="margin-top: 4px;">{{ autoUpdateStatus.repo_dir }}</div>
             <div v-if="autoUpdateStatus.statusMessage" class="status good" style="margin-top: 10px;">{{ autoUpdateStatus.statusMessage }}</div>
           </article>
-          <div v-if="proxyConfigError" class="status error" style="margin-top: 10px;">{{ proxyConfigError }}</div>
-          <div v-else-if="proxyConfigStatusMessage" class="status good" style="margin-top: 10px;">{{ proxyConfigStatusMessage }}</div>
-        </article>
+        </div>
       </div>
 
     </main>
@@ -3015,7 +3228,7 @@
               {{ row.label }}
             </span>
             <span class="breakdown-values">
-              <span class="mono">{{ compact(row.tokens) }}</span>
+              <strong>{{ compact(row.tokens) }} tokens</strong>
               <span class="subtle" style="margin-left: 8px;">{{ costLabel(row.cost) }} · {{ row.costShareLabel }}</span>
             </span>
           </div>
@@ -3891,7 +4104,7 @@
       methods: {
         ...sharedFormatters,
         formatPercent(value) {
-          return new Intl.NumberFormat('en-US', { maximumFractionDigits: 1 }).format(value);
+          return new Intl.NumberFormat('en-US', { minimumFractionDigits: 1, maximumFractionDigits: 1 }).format(value);
         },
         updateScope(value) {
           if (value === 'today') {
@@ -4075,8 +4288,12 @@
           savingModelRoutingConfig: false,
           proxyConfigError: '',
           proxyConfigStatusMessage: '',
+          setupScreenOpen: false,
+          setupExcelPollTimer: null,
+          savingSignInSkip: false,
           authStatus: {
             authenticated: false,
+            setup_skipped: false,
             state: 'unauthenticated',
             message: '',
             error: '',
@@ -4088,6 +4305,7 @@
             expires_at: '',
             poll_interval_seconds: null,
           },
+          clientProxyStatusLoaded: false,
           clientProxyStatus: {
             codex: {
               client: 'codex',
@@ -4239,7 +4457,10 @@
         };
       },
       computed: {
-        showAuthPanel() { return !this.authStatus.authenticated; },
+        showAuthPanel() { return this.setupScreenOpen; },
+        excelSessionReady() {
+          return Boolean(this.excelSessionStatus.configured && !this.excelSessionStatus.expired);
+        },
         authVerificationUri() {
           return this.authStatus.verification_uri_complete || this.authStatus.verification_uri || '';
         },
@@ -4632,6 +4853,30 @@
         anyClientProxyError() {
           return Boolean(this.clientProxyStatus.codex?.error || this.clientProxyStatus.claude?.error);
         },
+        clientRoutingNeedsAttention() {
+          return this.clientProxyStatusLoaded && !this.allClientProxyConfigured;
+        },
+        clientRoutingBothMissing() {
+          return this.noClientProxyConfigured;
+        },
+        clientRoutingTitle() {
+          if (this.clientRoutingBothMissing) return "Codex and Claude Code aren't using the proxy yet";
+          return this.clientProxyStatus.codex?.configured
+            ? "Claude Code isn't using the proxy yet"
+            : "Codex isn't using the proxy yet";
+        },
+        clientRoutingRows() {
+          const describe = (key, label) => {
+            const state = this.clientProxyStatus[key] || {};
+            let text = 'Not using the proxy';
+            let tone = 'warn';
+            if (state.error) { text = state.error; tone = 'error'; }
+            else if (state.configured) { text = 'Using the proxy'; tone = 'good'; }
+            else if (!state.exists) { text = 'Not set up for the proxy'; }
+            return { key, label, configured: Boolean(state.configured), error: state.error || '', state: text, tone };
+          };
+          return [describe('codex', 'Codex'), describe('claude', 'Claude Code')];
+        },
         allClientProxyConfigured() {
           return Boolean(this.clientProxyStatus.codex?.configured && this.clientProxyStatus.claude?.configured);
         },
@@ -4750,7 +4995,6 @@
             { key: 'sessions', label: 'Sessions', icon: ico('<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/></svg>') },
             { key: 'routing', label: 'Model Routing', icon: ico('<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="6" r="2.5"/><circle cx="18" cy="6" r="2.5"/><circle cx="12" cy="18" r="2.5"/><path d="M8 7l3 9M16 7l-3 9"/></svg>') },
             { key: 'approvals', label: 'Approvals', icon: ico('<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12l4 4 10-10"/></svg>') },
-            { key: 'storage', label: 'Storage & Costs', icon: ico('<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.7 4 3 9 3s9-1.3 9-3V5"/></svg>') },
             { key: 'settings', label: 'Settings', icon: ico('<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1-1.5 1.7 1.7 0 0 0-1.9.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.9 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1 1.7 1.7 0 0 0-.3-1.9l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.9.3h0a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.9-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.9v0a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>') },
             { key: 'integrations', label: 'Integrations', icon: ico('<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7 0l3-3a5 5 0 0 0-7-7l-1 1"/><path d="M14 11a5 5 0 0 0-7 0l-3 3a5 5 0 0 0 7 7l1-1"/></svg>') },
           ];
@@ -4758,14 +5002,13 @@
         activeViewMeta() {
           const map = {
             overview: { title: 'Overview', subtitle: 'Live spend, token usage, and request activity at a glance.' },
-            usage: { title: 'Usage Analytics', subtitle: 'Spend, tokens, and source breakdowns.' },
-            requests: { title: 'Request Explorer', subtitle: 'Inspect any recent request in full detail.' },
+            usage: { title: 'Usage Explorer', subtitle: 'Spend, tokens, and source breakdowns.' },
+            requests: { title: 'Requests', subtitle: 'Inspect any recent request in full detail.' },
             sessions: { title: 'Sessions', subtitle: 'Recent sessions across all upstream sources.' },
             routing: { title: 'Model Routing', subtitle: 'Map requested models to provider models.' },
-            approvals: { title: 'Approval Routing', subtitle: 'Routes for approval prompts and fallbacks.' },
-            storage: { title: 'Storage & Data', subtitle: 'Spend by provider and storage activity.' },
-            settings: { title: 'Settings', subtitle: 'Client integrations and proxy configuration.' },
-            integrations: { title: 'Integrations', subtitle: 'Client integrations and proxy configuration.' },
+            approvals: { title: 'Approvals', subtitle: 'Route approval-agent requests to a model of your choice.' },
+            settings: { title: 'Settings', subtitle: 'Proxy runtime, logging, and update behavior.' },
+            integrations: { title: 'Integrations', subtitle: 'Connect Codex, Claude Code, and GPT Excel to the proxy.' },
           };
           return map[this.activeView] || map.overview;
         },
@@ -4823,19 +5066,19 @@
           const allEnd      = all.length ? (all[all.length-1].label || all[all.length-1].month_label || '') : '';
 
           return [
-            { key: 'today', title: 'Today', value: this.costLabel(todayVal),
-              desc: 'Same local day shown in the expanded view',
+            { key: 'today', title: 'Today', value: this.aicLabel(todayVal), valueSub: this.money(todayVal),
+              desc: 'Trend shows daily spend over the last 14 days',
               ...buildSpark(todaySeries),
-              xStart: '12 AM', xMid: '12 PM', xEnd: '12 AM' },
-            { key: 'week', title: '7 Days', value: this.costLabel(weekTotal),
+              xStart: last14Start, xMid: last14Mid, xEnd: last14End },
+            { key: 'week', title: '7 Days', value: this.aicLabel(weekTotal), valueSub: this.money(weekTotal),
               desc: 'Rolling seven-day total',
               ...buildSpark(week),
               xStart: last7Start, xMid: (days7.length > 2 ? labelDate(dayKeyToDate(days7[Math.floor(days7.length/2)].day_key)) : ''), xEnd: last7End },
-            { key: 'month', title: 'Month', value: this.costLabel(monthTotal),
+            { key: 'month', title: 'Month', value: this.aicLabel(monthTotal), valueSub: this.money(monthTotal),
               desc: 'Current month so far',
               ...buildSpark(month),
               xStart: monthStart, xMid: (monthRows.length > 2 ? labelDate(dayKeyToDate(monthRows[Math.floor(monthRows.length/2)].day_key)) : ''), xEnd: monthEnd },
-            { key: 'all', title: 'All-Time', value: this.costLabel(allTotal),
+            { key: 'all', title: 'All-Time', value: this.aicLabel(allTotal), valueSub: this.money(allTotal),
               desc: 'All recorded token cost',
               ...buildSpark(allTime),
               xStart: allStart, xMid: (all.length > 2 ? (all[Math.floor(all.length/2)].label || all[Math.floor(all.length/2)].month_label || '') : ''), xEnd: allEnd },
@@ -4953,6 +5196,7 @@
           }
           return {
             authenticated: Boolean(payload.authenticated),
+            setup_skipped: Boolean(payload.setup_skipped ?? this.authStatus?.setup_skipped),
             state: payload.state || 'unauthenticated',
             message: payload.message || '',
             error: payload.error || '',
@@ -5013,6 +5257,55 @@
           } finally {
             this.loadingAuthStatus = false;
           }
+        },
+        // The setup screen offers GitHub Copilot and GPT Excel side by side.
+        // It opens whenever Copilot is not signed in, until the user opts out,
+        // even if GPT Excel is already connected.
+        async decideSetupScreen() {
+          await Promise.all([this.loadAuthStatus(), this.loadExcelSessionStatus()]);
+          if (!this.authStatus.authenticated && !this.authStatus.setup_skipped) {
+            this.openSetupScreen();
+          }
+        },
+        openSetupScreen() {
+          this.setupScreenOpen = true;
+          window.scrollTo(0, 0);
+          if (!this.setupExcelPollTimer) {
+            this.setupExcelPollTimer = window.setInterval(() => {
+              if (!this.excelSessionReady) this.loadExcelSessionStatus();
+            }, 5000);
+          }
+        },
+        closeSetupScreen() {
+          this.setupScreenOpen = false;
+          if (this.setupExcelPollTimer) {
+            window.clearInterval(this.setupExcelPollTimer);
+            this.setupExcelPollTimer = null;
+          }
+        },
+        async finishSetup() {
+          if (this.savingSignInSkip) return;
+          // Leaving without Copilot is an explicit opt-out; remember it so the
+          // screen doesn't return on every visit.
+          if (!this.authStatus.authenticated && !this.authStatus.setup_skipped) {
+            this.savingSignInSkip = true;
+            try {
+              const response = await fetch('/api/config/client-proxy/settings', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ setup_skipped: true }),
+              });
+              if (!response.ok) throw new Error(`setup preference request failed: ${response.status}`);
+              this.authStatus = { ...this.authStatus, setup_skipped: true };
+            } catch (error) {
+              this.authStatus = { ...this.authStatus, error: error?.message || 'Failed to save setup preference.' };
+              return;
+            } finally {
+              this.savingSignInSkip = false;
+            }
+          }
+          this.closeSetupScreen();
+          this.load(true);
         },
         async startAuthFlow() {
           if (this.startingAuthFlow || this.authStatus.state === 'pending') return;
@@ -5227,6 +5520,12 @@
           if (!Number.isFinite(startedAt)) return null;
           return Math.max(0, this.nowMs - startedAt);
         },
+        // A native turn with no new observation for this long never reported
+        // completion; showing it as "in progress" forever is misleading.
+        nativeTurnLooksAbandoned(row) {
+          const lastSeen = Date.parse(row?.finished_at || row?.started_at || '');
+          return Number.isFinite(lastSeen) && this.nowMs - lastSeen > 30 * 60 * 1000;
+        },
         nativeTurnSnapshotElapsedMs(row) {
           if (!row || !this.isNativeRequest(row)) return null;
           const turnKey = this.nativeTurnKey(row);
@@ -5273,8 +5572,9 @@
                 ? `At +${this.shortDuration(snapshotElapsed)}`
                 : 'Not available';
             }
+            if (this.nativeTurnLooksAbandoned(row)) return 'No completion recorded';
             const elapsed = this.nativeTurnElapsedMs(row);
-             return elapsed != null ? `In progress - ${this.shortDuration(elapsed)} elapsed` : 'In progress';
+            return elapsed != null ? `In progress · ${this.shortDuration(elapsed)} elapsed` : 'In progress';
           }
           return '—';
         },
@@ -5288,14 +5588,15 @@
           if (duration != null) return `${duration} ms`;
           if (this.isNativeRequest(row)) {
             if (this.nativeTurnSummaryRow(row)) {
+              if (this.nativeTurnLooksAbandoned(row)) return 'No completion recorded';
               const elapsed = this.nativeTurnElapsedMs(row);
               return elapsed != null
-                 ? `In progress - ${elapsed} ms elapsed`
+                ? `In progress · ${this.shortDuration(elapsed)} elapsed`
                 : 'In progress';
             }
             const snapshotElapsed = this.nativeTurnSnapshotElapsedMs(row);
             return snapshotElapsed != null
-              ? `At +${snapshotElapsed} ms`
+              ? `At +${this.shortDuration(snapshotElapsed)}`
               : 'Not available';
           }
           return '-';
@@ -5638,6 +5939,7 @@
                 error: '',
               };
             }
+            this.clientProxyStatusLoaded = true;
           } catch (error) {
             this.proxyConfigError = error.message;
           } finally {
@@ -6397,13 +6699,15 @@
           const wall = row.wall_duration_ms;
           const api = row.api_duration_ms;
           const metric = this.sessionDurationMetricLabel(row);
-          if (wall == null && api == null) return '—';
-          if (wall == null) return `${this.shortDuration(api)} ${metric}`;
+          const hasWall = wall != null && Number(wall) > 0;
+          if (!hasWall && api == null) return '—';
+          if (!hasWall) return `${this.shortDuration(api)} ${metric}`;
           if (api == null) return `${this.shortDuration(wall)} wall`;
           return `${this.shortDuration(wall)} wall · ${this.shortDuration(api)} ${metric}`;
         },
         sessionActivityUnit(row) {
-          return 'requests';
+          const count = Number(row?.session_request_count || row?.request_count || 0);
+          return count === 1 ? 'request' : 'requests';
         },
         sessionDurationMetricLabel(row) {
           return 'api';
@@ -6436,7 +6740,11 @@
           if (!Number.isFinite(v)) return '—';
           if (v < 1000) return `${Math.round(v)}ms`;
           if (v < 60000) return `${(v / 1000).toFixed(1)}s`;
-          return `${(v / 60000).toFixed(1)}m`;
+          if (v < 3600000) return `${(v / 60000).toFixed(1)}m`;
+          const totalMinutes = Math.round(v / 60000);
+          if (totalMinutes < 1440) return `${Math.floor(totalMinutes / 60)}h ${totalMinutes % 60}m`;
+          const totalHours = Math.round(totalMinutes / 60);
+          return `${Math.floor(totalHours / 24)}d ${totalHours % 24}h`;
         },
         shortTokens(row) {
           const usage = row?.usage || {};
@@ -6531,10 +6839,15 @@
         },
         activeView: {
           immediate: true,
-          handler(view) {
+          handler(view, previous) {
+            if (view === 'storage') {
+              this.activeView = 'usage';
+              return;
+            }
             if (view === 'overview') {
               this.search = '';
             }
+            if (previous !== undefined) window.scrollTo(0, 0);
             this.ensureViewData(view);
           },
         },
@@ -6544,7 +6857,8 @@
         // app shell so the user sees the dashboard, not a stale "Loading…".
         const bootPlaceholder = document.getElementById('boot-placeholder');
         if (bootPlaceholder) bootPlaceholder.remove();
-        this.loadAuthStatus();
+        this.decideSetupScreen();
+        this.loadClientProxyStatus();
         this.load(true);
         // Eager: auto-update status feeds the update banner that surfaces on
         // every view, so we still need it on mount.
@@ -6585,6 +6899,7 @@
           window.clearTimeout(this.excelSessionPollTimer);
           this.excelSessionPollTimer = null;
         }
+        this.closeSetupScreen();
         this.stopDashboardStream();
         if (this._debugModalKeyHandler) {
           window.removeEventListener('keydown', this._debugModalKeyHandler);

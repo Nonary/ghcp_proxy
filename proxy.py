@@ -516,9 +516,12 @@ def _client_proxy_settings_with_trace_status(payload: dict[str, object]) -> dict
 def _save_client_proxy_settings(payload: dict) -> dict[str, object]:
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="Request body must be an object")
+    # Forward only the keys the caller sent; the service merges them with the
+    # saved settings so a partial update leaves the other settings unchanged.
     result = client_proxy_config_service.save_client_proxy_settings({
-        "revert_on_shutdown": bool(payload.get("revert_on_shutdown", True)),
-        "debug_prompt_logging_enabled": bool(payload.get("debug_prompt_logging_enabled", False)),
+        key: payload[key]
+        for key in ("revert_on_shutdown", "debug_prompt_logging_enabled", "setup_skipped")
+        if key in payload
     })
     try:
         dashboard_service.notify_dashboard_stream_listeners()
@@ -5499,8 +5502,15 @@ async def request_prompt_api(request_id: str):
 
 @app.get("/api/auth/status")
 async def auth_status_api():
+    status = auth.auth_status()
+    # GPT Excel works without Copilot, so users may skip the setup screen.
+    try:
+        settings = client_proxy_config_service.load_client_proxy_settings()
+        status["setup_skipped"] = bool(settings.get("setup_skipped"))
+    except HTTPException:
+        status["setup_skipped"] = False
     return JSONResponse(
-        content=auth.auth_status(),
+        content=status,
         headers={"Cache-Control": "no-store"},
     )
 

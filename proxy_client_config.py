@@ -282,6 +282,7 @@ class ProxyClientConfigService:
         return {
             "revert_on_shutdown": True,
             "debug_prompt_logging_enabled": False,
+            "setup_skipped": False,
             "pending_restore_targets": [],
         }
 
@@ -293,6 +294,9 @@ class ProxyClientConfigService:
             "debug_prompt_logging_enabled": bool(
                 payload.get("debug_prompt_logging_enabled", defaults["debug_prompt_logging_enabled"])
             ),
+            "setup_skipped": bool(
+                payload.get("setup_skipped", defaults["setup_skipped"])
+            ),
             "pending_restore_targets": self._normalize_restore_targets(
                 payload.get("pending_restore_targets"),
             ),
@@ -303,6 +307,7 @@ class ProxyClientConfigService:
         return {
             "revert_on_shutdown": settings["revert_on_shutdown"],
             "debug_prompt_logging_enabled": settings["debug_prompt_logging_enabled"],
+            "setup_skipped": settings["setup_skipped"],
             "pending_restore_targets": settings["pending_restore_targets"],
             "path": self._config.client_proxy_settings_file,
         }
@@ -313,6 +318,7 @@ class ProxyClientConfigService:
         known_keys = {
             "revert_on_shutdown",
             "debug_prompt_logging_enabled",
+            "setup_skipped",
         }
         if not any(key in payload for key in known_keys):
             raise HTTPException(
@@ -323,6 +329,8 @@ class ProxyClientConfigService:
             raise HTTPException(status_code=400, detail="revert_on_shutdown must be true or false.")
         if "debug_prompt_logging_enabled" in payload and not isinstance(payload.get("debug_prompt_logging_enabled"), bool):
             raise HTTPException(status_code=400, detail="debug_prompt_logging_enabled must be true or false.")
+        if "setup_skipped" in payload and not isinstance(payload.get("setup_skipped"), bool):
+            raise HTTPException(status_code=400, detail="setup_skipped must be true or false.")
 
         existing = self.load_client_proxy_settings()
         settings = {
@@ -330,6 +338,10 @@ class ProxyClientConfigService:
             "debug_prompt_logging_enabled": payload.get(
                 "debug_prompt_logging_enabled",
                 existing.get("debug_prompt_logging_enabled", False),
+            ),
+            "setup_skipped": payload.get(
+                "setup_skipped",
+                existing.get("setup_skipped", False),
             ),
             "pending_restore_targets": existing.get("pending_restore_targets", []),
         }
@@ -653,6 +665,7 @@ class ProxyClientConfigService:
         normalized = {
             "revert_on_shutdown": bool(payload.get("revert_on_shutdown", True)),
             "debug_prompt_logging_enabled": bool(payload.get("debug_prompt_logging_enabled", False)),
+            "setup_skipped": bool(payload.get("setup_skipped", False)),
             "pending_restore_targets": self._normalize_restore_targets(payload.get("pending_restore_targets")),
         }
         self._write_json_atomic(self._config.client_proxy_settings_file, normalized)
