@@ -9,6 +9,9 @@ the runtime's model calls are summarized from ``copilot_sdk_session.model_calls`
 output_tokens.  Near zero, the upstream saw the previous prompt and output
 intact, so a cache miss is upstream routing or expiry.  Clearly negative, the
 history was rewritten (typically encrypted reasoning dropped by a disk resume).
+
+Items are compared without ``item_hash``, which also covers caller metadata
+the SDK adapter does not forward; the content fingerprints still must match.
 """
 
 from __future__ import annotations
@@ -46,18 +49,39 @@ def _shortfall(usage, previous_usage):
         return ""
 
 
+def _call_cached(calls):
+    return ";".join(
+        f"{call.get('transport', '')[:2]}:{call['cached_tokens']}/{call['input_tokens']}" for call in calls
+        if call.get("input_tokens") is not None
+    )
+
+
+def _call_error(call):
+    error = call.get("error")
+    if isinstance(error, dict):
+        return error.get("code") or error.get("type") or error.get("event") or "error"
+    return str(call.get("status") or "error")
+
+
 def _model_calls(finished_event):
-    calls = (finished_event.get("copilot_sdk_session") or {}).get("model_calls") or []
+    session = finished_event.get("copilot_sdk_session") or {}
+    calls = session.get("model_calls") or []
+    background = session.get("background_model_calls") or []
     return {
         "sdk_model_calls": len(calls) if calls else "",
         "sdk_full_resends": sum(1 for call in calls if not call.get("continuation")) if calls else "",
         "sdk_resumed_chain": sum(1 for call in calls if call.get("resumed_chain_items")) if calls else "",
         "sdk_restored_reasoning": sum(call.get("restored_reasoning") or 0 for call in calls) if calls else "",
-        "sdk_call_cached": ";".join(
-            f"{call['cached_tokens']}/{call['input_tokens']}" for call in calls
-            if call.get("input_tokens") is not None
-        ),
+        "sdk_call_cached": _call_cached(calls),
+        "sdk_call_errors": ";".join(_call_error(call) for call in calls if call.get("error") or call.get("status")),
+        "sdk_background_calls": _call_cached(background) or (len(background) if background else ""),
+        "sdk_interrupted": bool(session.get("interrupted")) or "",
+        "sdk_error": (session.get("error") or "")[:120],
     }
+
+
+def _same_item(left, right):
+    return {k: v for k, v in left.items() if k != "item_hash"} == {k: v for k, v in right.items() if k != "item_hash"}
 
 
 def compare(events):
@@ -75,7 +99,7 @@ def compare(events):
         old_sequence = old.get("input", {}).get("sequence", []) if old else []
         shared = 0
         for left, right in zip(old_sequence, sequence):
-            if left != right:
+            if not _same_item(left, right):
                 break
             shared += 1
         difference = ""
