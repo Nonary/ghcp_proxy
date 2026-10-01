@@ -216,29 +216,12 @@ def local_model_payload(model_id: str) -> dict[str, object]:
     }
 
 
-def _enabled_local_model_ids(records: dict[str, dict] | None) -> tuple[str, ...]:
-    """Return local aliases allowed by the upstream model records.
-
-    Every Excel alias requires a matching upstream model record. This prevents
-    the proxy from advertising an Excel route when the account has not unlocked
-    its corresponding upstream model.
-    """
-    source = records if isinstance(records, dict) else {}
-    enabled: list[str] = []
-    for model_id in MODEL_IDS:
-        upstream_id = EXCEL_MODEL_UPSTREAMS[model_id]
-        upstream_record = source.get(upstream_id)
-        if isinstance(upstream_record, dict) and upstream_record.get("model_picker_enabled") is not False:
-            enabled.append(model_id)
-    return tuple(enabled)
-
-
 def merge_local_model_capabilities(capabilities: dict[str, dict] | None) -> dict[str, dict]:
     merged = dict(capabilities or {})
     merged.update(
         {
             key: dict(LOCAL_MODEL_CAPABILITIES[key])
-            for key in _enabled_local_model_ids(merged)
+            for key in MODEL_IDS
         }
     )
     return merged
@@ -249,23 +232,10 @@ def merge_local_models_payload(payload: dict | None) -> dict:
     raw_data = result.get("data")
     data = [dict(item) for item in raw_data if isinstance(item, dict)] if isinstance(raw_data, list) else []
     data = [item for item in data if item.get("id") != "gpt-excel"]
-    upstream_records = {
-        item.get("id"): item
-        for item in data
-        if isinstance(item.get("id"), str)
-    }
-    enabled_local_ids = _enabled_local_model_ids(upstream_records)
-    enabled_local_id_set = set(enabled_local_ids)
-    data = [
-        item
-        for item in data
-        if item.get("id") not in MODEL_IDS
-        or item.get("id") in enabled_local_id_set
-    ]
     existing_ids = {item.get("id") for item in data}
     data.extend(
         local_model_payload(model_id)
-        for model_id in enabled_local_ids
+        for model_id in MODEL_IDS
         if model_id not in existing_ids
     )
     result["object"] = result.get("object") or "list"

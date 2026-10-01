@@ -406,6 +406,13 @@ MODEL_PRICING = {
         "long_context_cache_write_per_million": 5.00,
         "long_context_output_per_million": 15.00,
     },
+    "gpt-6.1-sol": {
+        "provider": "OpenAI",
+        "input_per_million": 2.00,
+        "cached_input_per_million": 0.10,
+        "cache_write_per_million": 2.50,
+        "output_per_million": 10.00,
+    },
     "gpt-6-luna": {
         "provider": "OpenAI",
         "input_per_million": 0.10,
@@ -576,6 +583,7 @@ MODEL_PRICING_ALIASES = {
     "gpt-6 astra": "gpt-6-astra",
     "gpt-6 astra excel": "gpt-6-astra-excel",
     "gpt-6 sol": "gpt-6-sol",
+    "gpt-6.1 sol": "gpt-6.1-sol",
     "gpt-6 luna": "gpt-6-luna",
     "gpt-5.6 luna": "gpt-5.6-luna",
     "gpt-5.6 luna excel": "gpt-5.6-luna-excel",
