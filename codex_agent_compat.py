@@ -9,7 +9,9 @@ from collections.abc import Mapping
 _SPAWN_AGENT_COMPAT_MARKER = "ghcp_proxy multi-agent compatibility"
 _SPAWN_AGENT_COMPAT_NOTE = (
     "\n\n[ghcp_proxy multi-agent compatibility]\n"
-    "`gpt-5.4-mini` is a valid model override. When `agent_type`, `model`, "
+    "For `model`, use any model id offered in the active GHCP Proxy/Codex model "
+    "catalog; do not limit overrides to a hard-coded example list. "
+    "When `agent_type`, `model`, "
     "`reasoning_effort`, or `service_tier` is overridden, `fork_context` must "
     "be false or omitted. A full-history fork inherits those settings from "
     "the parent. Use only the agent id returned by a successful spawn when "
@@ -298,7 +300,8 @@ def _patched_spawn_agent_tool(tool: dict) -> tuple[dict, bool]:
         patched_model = dict(model)
         existing = _non_empty_string(model.get("description")) or ""
         patched_model["description"] = (
-            existing.rstrip() + " `gpt-5.4-mini` is a valid override."
+            existing.rstrip()
+            + " Any model id offered in the active GHCP Proxy/Codex model catalog is a valid override."
         ).strip()
         patched_properties["model"] = patched_model
 

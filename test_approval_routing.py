@@ -1,11 +1,39 @@
 import json
 import unittest
 
-from codex_agent_compat import codex_subagent_identity, codex_subagent_role
+from codex_agent_compat import (
+    codex_subagent_identity,
+    codex_subagent_role,
+    normalize_codex_agent_tools,
+)
 from initiator_policy import is_approval_agent_request
 
 
 class ApprovalRoutingTests(unittest.TestCase):
+    def test_spawn_agent_compat_uses_active_model_catalog_for_overrides(self):
+        body = {
+            "tools": [
+                {
+                    "name": "spawn_agent",
+                    "description": "Spawn a worker.",
+                    "parameters": {
+                        "properties": {
+                            "fork_context": {"type": "boolean"},
+                            "model": {"type": "string", "description": "Model id."},
+                        }
+                    },
+                }
+            ]
+        }
+
+        normalized = normalize_codex_agent_tools(body)
+        tool = normalized["tools"][0]
+
+        self.assertIn("active GHCP Proxy/Codex model catalog", tool["description"])
+        model_description = tool["parameters"]["properties"]["model"]["description"]
+        self.assertIn("active GHCP Proxy/Codex model catalog", model_description)
+        self.assertNotIn("gpt-6-luna", model_description)
+
     def test_current_codex_guardian_metadata_is_detected(self):
         body = {
             "client_metadata": {
