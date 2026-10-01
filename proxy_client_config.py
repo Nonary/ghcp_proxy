@@ -37,6 +37,7 @@ _GPT_56_REASONING_EFFORTS = ["low", "medium", "high", "xhigh", "max"]
 _REASONING_EFFORT_RANK = {"minimal": 0, "low": 1, "medium": 2, "high": 3, "xhigh": 4, "max": 5}
 _DEFAULT_PREFERRED_REASONING = ("medium", "low", "high", "xhigh", "max", "minimal")
 _GPT_56_MODEL_PREFIX = "gpt-5.6-"
+_GPT_6_MAX_REASONING_MODELS = frozenset({"gpt-6-luna", "gpt-6.1-sol"})
 
 
 def _format_token_rate(value: object) -> str:
@@ -1137,7 +1138,11 @@ class ProxyClientConfigService:
         normalized_model_name = self._normalize_model_name(model_name)
         is_gpt_56 = normalized_model_name.startswith(_GPT_56_MODEL_PREFIX)
         is_excel_model = normalized_model_name.endswith("-excel")
-        supports_max = (is_gpt_56 and not is_excel_model) or family == "claude"
+        supports_max = (
+            (is_gpt_56 and not is_excel_model)
+            or normalized_model_name in _GPT_6_MAX_REASONING_MODELS
+            or family == "claude"
+        )
         efforts: list[str] = []
         if isinstance(raw_efforts, (list, tuple)):
             for item in raw_efforts:

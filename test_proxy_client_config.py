@@ -34,6 +34,21 @@ class ReasoningLevelTests(unittest.TestCase):
             ["low", "medium", "high", "xhigh", "max"],
         )
 
+    def test_gpt_6_luna_and_gpt_61_sol_expose_upstream_max_effort(self):
+        raw_efforts = ["low", "medium", "high", "max"]
+        for model_name in ("gpt-6-luna", "gpt-6.1-sol"):
+            with self.subTest(model_name=model_name):
+                self.assertEqual(
+                    self._effort_names(model_name, raw_efforts),
+                    raw_efforts,
+                )
+
+    def test_gpt_6_models_without_max_support_do_not_expose_max(self):
+        self.assertEqual(
+            self._effort_names("gpt-6-sol", ["low", "medium", "high", "max"]),
+            ["low", "medium", "high"],
+        )
+
     def test_empty_capability_fallback_does_not_expose_excel_aliases(self):
         model_names = self.service._sorted_catalog_model_names(set(), {})
 
