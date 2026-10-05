@@ -13,10 +13,10 @@ records each reasoning run together with the items on either side of it and
 puts the run back into a full-history request that is missing it, so a
 resumed session sends the same prefix a live session would.
 
-Sol reaches Copilot over a WebSocket that chains ``previous_response_id``;
-its requests carry only new items, so its reasoning is recorded from response
-output.  HTTP models (Luna) replay reasoning inside every request, so their
-runs are recorded from request input.  Runs are keyed by model because
+WebSocket calls can chain ``previous_response_id`` and carry only new items;
+HTTP calls usually replay the full history. Both transports record reasoning
+from response output so the newest run survives a resume before the next
+request. Replayed request input is recorded too. Runs are keyed by model because
 encrypted reasoning is only valid for the model that produced it.
 """
 

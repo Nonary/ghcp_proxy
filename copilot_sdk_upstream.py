@@ -1361,11 +1361,10 @@ async def _reuse_live_session(
 ) -> Any | None:
     """Hand back a connected session for ``session_id`` if one is idle.
 
-    A session parked on a pending tool call is only reusable by the request
-    that delivers the result.  Any other request (a new user message while
-    a tool was still running) needs ``continue_pending_work=False``, which
-    is a resume-time option, so the live object is discarded first. Changed
-    configuration also needs a resume: the SDK's live options API cannot
+    A new user message cancels pending tool work in place and waits for idle.
+    Disconnecting just to set ``continue_pending_work=False`` on a disk resume
+    loses the live reasoning prefix. Changed configuration still needs a
+    resume: the SDK's live options API cannot
     replace tool declarations or the system message. Unchanged configurations
     stay connected so ordinary tool round-trips preserve background compaction.
     """
@@ -1382,17 +1381,34 @@ async def _reuse_live_session(
         diagnostics["reuse_miss"] = "not_connected" if entry is None else "in_use" if entry.in_use else None
     if entry is None or entry.in_use:
         return None
-    if (entry.pending_calls and not allow_pending) or entry.options != options:
+    if entry.options != options:
         if diagnostics is not None:
-            diagnostics["reuse_miss"] = "pending_work" if entry.pending_calls and not allow_pending else "configuration_changed"
+            diagnostics["reuse_miss"] = "configuration_changed"
             diagnostics["changed_options"] = sorted(
                 key for key in set(entry.options or {}) | set(options)
                 if (entry.options or {}).get(key) != options.get(key)
             )
         await _evict_live_session(session_id)
         return None
+    aborted_pending = entry.pending_calls and not allow_pending
+    if aborted_pending:
+        # Claim the session before awaiting: another request/reaper must not
+        # take it while the old turn's final events are still arriving. The
+        # settle task owns cleanup even if this request is cancelled.
+        entry.in_use = True
+        if entry.reaper is not None:
+            entry.reaper.cancel()
+            entry.reaper = None
+        queue, unsubscribe = _event_queue(entry.session)
+        task = _settle_interrupted_turn(entry.session, queue, unsubscribe, parkable=True)
+        await asyncio.shield(task)
+        settled_entry = _live_sessions.get(session_id)
+        if settled_entry is not entry or entry.in_use or entry.pending_calls:
+            if diagnostics is not None:
+                diagnostics["reuse_miss"] = "pending_abort_failed"
+            return None
     if diagnostics is not None:
-        diagnostics["operation"] = "reuse_live"
+        diagnostics["operation"] = "reuse_live_after_abort" if aborted_pending else "reuse_live"
     entry.in_use = True
     if entry.reaper is not None:
         entry.reaper.cancel()
@@ -1596,12 +1612,18 @@ def _event_error(event: dict) -> dict:
 
 
 class _SseUsageTap(httpx.AsyncByteStream):
-    """Pass a Responses SSE body through unchanged, noting its final usage."""
+    """Pass SSE through unchanged, recording usage and final reasoning output."""
 
-    def __init__(self, stream: httpx.AsyncByteStream, record: dict) -> None:
+    def __init__(
+        self, stream: httpx.AsyncByteStream, record: dict,
+        session_id: str | None = None, model: Any = None, before: str | None = None,
+    ) -> None:
         self._stream = stream
         self._record: dict | None = record
         self._pending = b""
+        self._session_id = session_id
+        self._model = model
+        self._before = before
 
     async def __aiter__(self):
         async for chunk in self._stream:
@@ -1619,6 +1641,9 @@ class _SseUsageTap(httpx.AsyncByteStream):
             response = event.get("response") if event else None
             if isinstance(response, dict):
                 _note_usage(self._record, response.get("usage"))
+                _reasoning_ledger.record_output(
+                    self._session_id, self._model, self._before, response.get("output"),
+                )
             self._record = None
             self._pending = b""
             return
@@ -1627,7 +1652,10 @@ class _SseUsageTap(httpx.AsyncByteStream):
         await self._stream.aclose()
 
 
-async def _observe_http_response(response: httpx.Response, record: dict) -> httpx.Response:
+async def _observe_http_response(
+    response: httpx.Response, record: dict,
+    session_id: str | None = None, model: Any = None, before: str | None = None,
+) -> httpx.Response:
     """Trace an HTTP model call's status, error body or usage."""
     _note_copilot_ids(record, response.headers)
     if response.status_code != 200:
@@ -1643,7 +1671,7 @@ async def _observe_http_response(response: httpx.Response, record: dict) -> http
         response.headers.get("content-encoding", "identity").lower() in {"", "identity"}
         and isinstance(response.stream, httpx.AsyncByteStream)
     ):
-        response.stream = _SseUsageTap(response.stream, record)
+        response.stream = _SseUsageTap(response.stream, record, session_id, model, before)
     return response
 
 
@@ -1754,6 +1782,7 @@ class _UpstreamRequestHandler(CopilotRequestHandler):
             self._tool_choice_rejected_models.add(model)
         if record.get("restored_reasoning"):
             _reasoning_ledger.disable(session_id, model)
+            record["restoration_disabled"] = True
 
     async def _send_upstream(self, request: httpx.Request) -> httpx.Response:
         return await _get_sdk_http_client().send(request, stream=True)
@@ -1770,16 +1799,28 @@ class _UpstreamRequestHandler(CopilotRequestHandler):
             return await self._send_upstream(request)
         changed, record = self._prepare(ctx.session_id, body, "http", getattr(ctx, "interaction_type", None))
         _note_model_call(ctx.session_id, record)
+        items = body.get("input")
+        before = sdk_reasoning_ledger.anchor_key(items[-1]) if isinstance(items, list) and items else None
+        observe_options = {"session_id": ctx.session_id, "model": body.get("model"), "before": before}
         if not changed:
-            return await _observe_http_response(await self._send_upstream(request), record)
+            return await _observe_http_response(await self._send_upstream(request), record, **observe_options)
         response = await self._send_upstream(_with_request_body(request, json.dumps(body).encode()))
         if response.status_code not in {400, 422}:
-            return await _observe_http_response(response, record)
+            return await _observe_http_response(response, record, **observe_options)
+        # The original 400/422 used to be closed unread. The successful retry
+        # then hid both the upstream error and the cache-destroying fallback.
+        record["rejected_attempt"] = {}
+        await _observe_http_response(response, record["rejected_attempt"])
         await response.aclose()
+        record["fallback"] = "runtime_original"
+        original_items = json.loads(original).get("input")
+        record["fallback_reasoning_items"] = sum(
+            1 for item in original_items if isinstance(item, dict) and item.get("type") == "reasoning"
+        ) if isinstance(original_items, list) else 0
         retry = await self._send_upstream(_with_request_body(request, original))
-        if retry.status_code not in {400, 422}:
+        if 200 <= retry.status_code < 300:
             self._reject(ctx.session_id, body.get("model"), record)
-        return await _observe_http_response(retry, record)
+        return await _observe_http_response(retry, record, **observe_options)
 
     async def open_websocket(self, ctx: Any) -> Any:
         return _UpstreamWebSocket(ctx, self)

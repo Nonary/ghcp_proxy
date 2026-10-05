@@ -16,7 +16,6 @@ from unittest.mock import patch
 
 import anyio
 import httpx
-from copilot import copilot_request_handler
 from copilot.session_events import SessionIdleData
 
 import copilot_sdk_upstream as sdk
@@ -207,7 +206,7 @@ class CopilotSdkCacheContinuityTests(unittest.IsolatedAsyncioTestCase):
 
         client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
         self.addAsyncCleanup(client.aclose)
-        patcher = patch.object(copilot_request_handler, "_get_shared_http_client", return_value=client)
+        patcher = patch.object(sdk, "_get_sdk_http_client", return_value=client)
         patcher.start()
         self.addCleanup(patcher.stop)
         self.handler = sdk._UpstreamRequestHandler()
@@ -319,10 +318,55 @@ class CopilotSdkCacheContinuityTests(unittest.IsolatedAsyncioTestCase):
         response = await self.post({"model": MODEL, "input": RESUMED_HISTORY})
         self.assertEqual(response.status_code, 200)
         self.assertEqual(self.sent[1], {"model": MODEL, "input": RESUMED_HISTORY})
+        record = self.entry.diagnostics["model_calls"][0]
+        self.assertEqual(record["rejected_attempt"]["status"], 400)
+        self.assertIn("bad request", record["rejected_attempt"]["error"])
+        self.assertEqual(record["fallback"], "runtime_original")
+        self.assertEqual(record["fallback_reasoning_items"], 0)
+        self.assertTrue(record["restoration_disabled"])
         self.reject = False
         self.sent.clear()
         await self.post({"model": MODEL, "input": RESUMED_HISTORY})
         self.assertEqual(self.sent, [{"model": MODEL, "input": RESUMED_HISTORY}])
+
+    async def test_http_output_reasoning_is_saved_before_the_next_request(self):
+        """A pending tool call can be interrupted before HTTP input replays it."""
+        event = {"type": "response.completed", "response": {
+            "output": [reasoning("latest"), call("pending")],
+            "usage": {"input_tokens": 2000, "input_tokens_details": {"cached_tokens": 1800}},
+        }}
+        wire = ("data: " + json.dumps(event) + "\n\n").encode()
+
+        class Chunked(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                for boundary in range(0, len(wire), 17):
+                    yield wire[boundary:boundary + 17]
+
+        client = httpx.AsyncClient(transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=Chunked()),
+        ))
+        self.addAsyncCleanup(client.aclose)
+        with patch.object(sdk, "_get_sdk_http_client", return_value=client):
+            response = await self.post({"model": MODEL, "input": [user("first")]})
+        self.assertEqual(response.content, wire)
+        resumed = [user("first"), call("pending"), output("pending"), user("interrupt")]
+        restored, count = self.ledger.restore("s1", MODEL, resumed)
+        self.assertEqual(count, 1)
+        self.assertEqual(restored, [user("first"), reasoning("latest"), *resumed[1:]])
+        self.assertEqual(self.entry.diagnostics["model_calls"][0]["cached_tokens"], 1800)
+
+    async def test_unsuccessful_http_fallback_does_not_disable_restoration(self):
+        self.ledger.record_input("s1", MODEL, LIVE_HISTORY)
+        statuses = iter((400, 503))
+        client = httpx.AsyncClient(transport=httpx.MockTransport(
+            lambda request: httpx.Response(next(statuses), json={"error": {"message": "failed"}}),
+        ))
+        self.addAsyncCleanup(client.aclose)
+        with patch.object(sdk, "_get_sdk_http_client", return_value=client):
+            response = await self.post({"model": MODEL, "input": RESUMED_HISTORY})
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(self.ledger.restore("s1", MODEL, RESUMED_HISTORY)[1], 2)
+        self.assertNotIn("restoration_disabled", self.entry.diagnostics["model_calls"][0])
 
     async def test_requests_without_a_session_are_forwarded_unchanged(self):
         body = {"model": MODEL, "input": RESUMED_HISTORY}
@@ -430,7 +474,7 @@ class CopilotSdkHttpCallTraceTests(unittest.IsolatedAsyncioTestCase):
     async def send(self, response):
         client = httpx.AsyncClient(transport=httpx.MockTransport(lambda request: response))
         self.addAsyncCleanup(client.aclose)
-        with patch.object(copilot_request_handler, "_get_shared_http_client", return_value=client):
+        with patch.object(sdk, "_get_sdk_http_client", return_value=client):
             request = httpx.Request("POST", "https://api.githubcopilot.com/responses",
                                     json={"model": MODEL, "input": [user("x")]})
             sent = await self.handler.send_request(request, SimpleNamespace(session_id="s1", interaction_type="conversation-agent"))

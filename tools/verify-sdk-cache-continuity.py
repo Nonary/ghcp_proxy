@@ -29,9 +29,10 @@ import format_translation
 
 
 class SyntheticUpstream(CopilotRequestHandler):
-    def __init__(self, reasoning: bool):
+    def __init__(self, reasoning: bool, *, interrupt_pending: bool = False):
         self.bodies: list[dict] = []
         self.reasoning = reasoning
+        self.interrupt_pending = interrupt_pending
 
     async def send_request(self, request, ctx):
         # Never forward a request, including unexpected discovery/telemetry.
@@ -47,9 +48,9 @@ class SyntheticUpstream(CopilotRequestHandler):
                 "summary": [{"type": "summary_text", "text": "Synthetic summary."}],
                 "encrypted_content": f"opaque-synthetic-reasoning-{turn}",
             })
-        if turn == 1:
+        if turn == 1 or (self.interrupt_pending and turn == 2):
             output.append({
-                "type": "function_call", "id": "fc_first", "call_id": "call_first",
+                "type": "function_call", "id": f"fc_{turn}", "call_id": f"call_{turn}",
                 "name": "inspect", "arguments": "{}", "status": "completed",
             })
         else:
@@ -116,8 +117,8 @@ def prefix_length(previous, current):
     return count
 
 
-async def replay(model, reasoning, destroy_after_answer, root):
-    capture = SyntheticUpstream(reasoning)
+async def replay(model, reasoning, destroy_after_answer, root, *, interrupt_pending=False):
+    capture = SyntheticUpstream(reasoning, interrupt_pending=interrupt_pending)
     client = CopilotClient(mode="empty", use_logged_in_user=False,
                            base_directory=str(root / "runtime"), request_handler=capture)
     body = {
@@ -147,12 +148,17 @@ async def replay(model, reasoning, destroy_after_answer, root):
                     await sdk._evict_live_session(session.session_id)
                 else:
                     await sdk._release_session(session, outcome, completed=True)
-                body["input"].extend(payload["output"])
-                if outcome.calls:
+                if interrupt_pending and turn == 1:
+                    # A subagent notification can arrive before the caller
+                    # consumes the pending call: no tool result is delivered.
+                    body["input"].append({"type": "agent_message", "content": "Another agent completed its review."})
+                elif outcome.calls:
+                    body["input"].extend(payload["output"])
                     call = next(item for item in payload["output"] if item["type"] == "function_call")
                     body["input"].append({"type": "function_call_output",
                                           "call_id": call["call_id"], "output": "Inspection result."})
                 else:
+                    body["input"].extend(payload["output"])
                     body["input"].append({"type": "message", "role": "user", "content": "Next question."})
         finally:
             await sdk._evict_all_live_sessions()
@@ -167,9 +173,12 @@ async def replay(model, reasoning, destroy_after_answer, root):
         assert shared < len(before["input"]) and reasoning_count == 0
     else:
         assert shared == len(before["input"]), (shared, before, after)
-        assert reasoning_count == (2 if reasoning else 0)
+        assert reasoning_count == ((1 if interrupt_pending else 2) if reasoning else 0)
+    if interrupt_pending:
+        assert diagnostics[-1]["operation"] == "reuse_live_after_abort", diagnostics
+        assert before.get("prompt_cache_key") == after.get("prompt_cache_key")
     (root / "wire.json").write_text(json.dumps(capture.bodies, indent=2), encoding="utf-8")
-    return {"model": model, "old_lifecycle": destroy_after_answer,
+    return {"model": model, "old_lifecycle": destroy_after_answer, "interrupt_pending": interrupt_pending,
             "previous_input_items": len(before["input"]), "reused_prefix_items": shared,
             "reasoning_items_retained": reasoning_count,
             "session_operations": [item["operation"] for item in diagnostics]}
@@ -227,6 +236,10 @@ async def main(root):
             directory = root / f"{model}-{'before' if old else 'after'}"
             directory.mkdir(parents=True, exist_ok=True)
             results.append(await replay(model, reasoning, old, directory))
+    for model in ("gpt-6.1-sol", "gpt-5.6-luna"):
+        directory = root / f"{model}-pending-interrupt"
+        directory.mkdir(parents=True, exist_ok=True)
+        results.append(await replay(model, True, False, directory, interrupt_pending=True))
     verify_excel_and_rest()
     await verify_chat_passthrough()
     print(json.dumps({"replays": results, "excel_and_rest_prefix_checks": "passed",

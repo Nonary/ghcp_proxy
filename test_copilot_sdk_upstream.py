@@ -2407,7 +2407,7 @@ class CopilotSdkCompactionContinuityTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(session.disconnected)
         self.assertIn("sdk-sess-live", sdk._live_sessions)
 
-    async def test_new_user_message_discards_a_session_parked_on_a_tool_call(self):
+    async def test_new_user_message_aborts_pending_work_without_disk_resume(self):
         resumed = []
 
         class _Session(_FakeSession):
@@ -2417,6 +2417,10 @@ class CopilotSdkCompactionContinuityTests(unittest.IsolatedAsyncioTestCase):
 
             async def send(self, prompt):
                 pass
+
+            async def abort(self):
+                self.aborted = True
+                self.emit("session.idle", SessionIdleData())
 
         class _Client:
             async def create_session(self, **options):
@@ -2443,10 +2447,66 @@ class CopilotSdkCompactionContinuityTests(unittest.IsolatedAsyncioTestCase):
                 ],
                 "session_id": "thread-P",
             }
-            replacement, _ = await sdk._open_session(follow_up, sdk.ToolRegistration())
+            diagnostics = {}
+            replacement, _ = await sdk._open_session(
+                follow_up, sdk.ToolRegistration(), diagnostics=diagnostics,
+            )
+        self.assertTrue(session.aborted)
+        self.assertFalse(session.disconnected)
+        self.assertIs(replacement, session)
+        self.assertEqual(resumed, [])
+        self.assertEqual(diagnostics["operation"], "reuse_live_after_abort")
+        self.assertFalse(sdk._live_sessions[session.session_id].pending_calls)
+
+    async def test_pending_abort_without_idle_falls_back_to_disk_resume(self):
+        session = _FakeSession()
+        options = {"model": "gpt-6.1-sol"}
+        entry = await sdk._track_live_session(session, options=options)
+        outcome = sdk.TurnOutcome()
+        outcome.calls.append(sdk.ToolCall("req-1", "inspect", "function", {}))
+        await sdk._release_session(session, outcome, completed=True)
+        diagnostics = {}
+        with patch.object(sdk, "_ABORT_SETTLE_SECONDS", 0.01):
+            reused = await sdk._reuse_live_session(
+                session.session_id, allow_pending=False, options=options, diagnostics=diagnostics,
+            )
+        self.assertIsNone(reused)
+        self.assertTrue(session.aborted)
         self.assertTrue(session.disconnected)
-        self.assertIsNot(replacement, session)
-        self.assertEqual(resumed, [False])
+        self.assertNotIn(session.session_id, sdk._live_sessions)
+        self.assertTrue(entry.settling.done())
+        self.assertEqual(diagnostics["reuse_miss"], "pending_abort_failed")
+
+    async def test_cancelled_follow_up_leaves_pending_abort_cleanup_running(self):
+        started, finish_abort = asyncio.Event(), asyncio.Event()
+
+        class _Session(_FakeSession):
+            async def abort(self):
+                self.aborted = True
+                started.set()
+                await finish_abort.wait()
+                self.emit("session.idle", SessionIdleData())
+
+        session = _Session()
+        options = {"model": "gpt-6.1-sol"}
+        entry = await sdk._track_live_session(session, options=options)
+        outcome = sdk.TurnOutcome()
+        outcome.calls.append(sdk.ToolCall("req-1", "inspect", "function", {}))
+        await sdk._release_session(session, outcome, completed=True)
+        follow_up = asyncio.create_task(sdk._reuse_live_session(
+            session.session_id, allow_pending=False, options=options,
+        ))
+        await asyncio.wait_for(started.wait(), 1)
+        settling = entry.settling
+        follow_up.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await follow_up
+        self.assertFalse(settling.cancelled())
+        finish_abort.set()
+        await asyncio.wait_for(settling, 1)
+        self.assertFalse(entry.in_use)
+        self.assertFalse(entry.pending_calls)
+        self.assertFalse(session.disconnected)
 
     async def test_release_keeps_completed_compaction_alive_until_idle_timeout(self):
         session = _FakeSession()
