@@ -2946,5 +2946,48 @@ class CopilotSdkRequestContinuityTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Tool result: Inspection done", self.actions[0][1])
 
 
+class CopilotSdkModelCatalogTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        patcher = patch.object(sdk.excel_model_catalog, "fetch_model_capabilities", return_value={})
+        self.excel_catalog = patcher.start()
+        self.addCleanup(patcher.stop)
+
+    async def test_excel_catalog_survives_sdk_discovery_failure(self):
+        self.excel_catalog.return_value = {"gpt-6-sol": {}}
+        with patch.object(sdk, "_get_client", AsyncMock(side_effect=RuntimeError("not signed in"))):
+            response = await sdk.models_response()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([item["id"] for item in json.loads(response.body)["data"]], ["gpt-6-sol-excel"])
+    async def test_only_available_models_enable_excel_aliases(self):
+        self.excel_catalog.return_value = {"gpt-5.6-sol": {}, "gpt-6-luna": {}}
+        client = SimpleNamespace(list_models=AsyncMock(return_value=[
+            SimpleNamespace(id="gpt-5.6-sol"),
+            SimpleNamespace(id="gpt-6-luna", policy=SimpleNamespace(state="enabled")),
+            SimpleNamespace(id="gpt-6-astra", policy=SimpleNamespace(state="disabled")),
+            SimpleNamespace(id="gpt-5.6-terra", policy={"state": "unconfigured"}),
+            SimpleNamespace(id="gpt-6-sol", model_picker_enabled=False),
+        ]))
+        with patch.object(sdk, "_get_client", AsyncMock(return_value=client)):
+            response = await sdk.models_response()
+        self.assertEqual(response.status_code, 200)
+        ids = {item["id"] for item in json.loads(response.body)["data"]}
+        self.assertEqual(
+            ids & set(sdk.excel_upstream.MODEL_IDS),
+            {"gpt-5.6-sol-excel", "gpt-6-luna-excel"},
+        )
+
+    async def test_empty_sdk_catalog_does_not_enable_excel_aliases(self):
+        client = SimpleNamespace(list_models=AsyncMock(return_value=[]))
+        with patch.object(sdk, "_get_client", AsyncMock(return_value=client)):
+            response = await sdk.models_response()
+        self.assertEqual(json.loads(response.body)["data"], [])
+
+    async def test_failed_sdk_discovery_does_not_enable_excel_aliases(self):
+        with patch.object(sdk, "_get_client", AsyncMock(side_effect=RuntimeError("not signed in"))):
+            response = await sdk.models_response()
+        self.assertEqual(response.status_code, 502)
+        self.assertNotIn("data", json.loads(response.body))
+
+
 if __name__ == "__main__":
     unittest.main()

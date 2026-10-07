@@ -7,6 +7,9 @@ from util import _usage_event_model_name
 class UsageModelIdentityTests(unittest.TestCase):
     def test_excel_alias_wins_over_base_response_model(self):
         for base_model in (
+            "gpt-6-luna",
+            "gpt-6-sol",
+            "gpt-7-new-model",
             "gpt-5.6-luna",
             "gpt-5.6-terra",
             "gpt-5.6-sol",

@@ -28,6 +28,8 @@ import responses_replay_ids
 
 EXCEL_MODEL_UPSTREAMS = {
     "gpt-6-astra-excel": "gpt-6-astra",
+    "gpt-6-sol-excel": "gpt-6-sol",
+    "gpt-6-luna-excel": "gpt-6-luna",
     "gpt-5.6-luna-excel": "gpt-5.6-luna",
     "gpt-5.6-terra-excel": "gpt-5.6-terra",
     "gpt-5.6-sol-excel": "gpt-5.6-sol",
@@ -158,6 +160,8 @@ LOCAL_MODEL_CAPABILITIES = {
         "context_window": 200_000 if "luna" in model_id else 272_000,
         "display_name": {
             "gpt-6-astra-excel": "6-Astra Excel",
+            "gpt-6-sol-excel": "6-Sol Excel",
+            "gpt-6-luna-excel": "6-Luna Excel",
             "gpt-5.6-luna-excel": "5.6-Luna Excel",
             "gpt-5.6-terra-excel": "5.6-Terra Excel",
             "gpt-5.6-sol-excel": "5.6-Sol Excel",
@@ -186,12 +190,16 @@ def excel_model_id(model: object) -> str | None:
     if not isinstance(model, str):
         return None
     normalized = model.strip().lower()
-    return normalized if normalized in EXCEL_MODEL_UPSTREAMS else None
+    if normalized == "gpt-excel-excel":
+        return None
+    # Model catalogs vary independently between Excel and Copilot. Routing is
+    # suffix-based; discovery, not this legacy metadata table, controls exposure.
+    return normalized if re.fullmatch(r"gpt-[a-z0-9]+(?:[.-][a-z0-9]+)*-excel", normalized) else None
 
 
 def upstream_model_for(model: object) -> str:
     model_id = excel_model_id(model) or MODEL_ID
-    return _UPSTREAM_MODEL_OVERRIDE or EXCEL_MODEL_UPSTREAMS[model_id]
+    return _UPSTREAM_MODEL_OVERRIDE or model_id.removesuffix("-excel")
 
 
 def _normalize_reasoning_effort(
@@ -216,26 +224,74 @@ def local_model_payload(model_id: str) -> dict[str, object]:
     }
 
 
-def merge_local_model_capabilities(capabilities: dict[str, dict] | None) -> dict[str, dict]:
-    merged = dict(capabilities or {})
+def _enabled_local_model_ids(records: dict[str, dict] | None) -> tuple[str, ...]:
+    """Select supported aliases using positive upstream availability evidence.
+
+    These records must come from Excel discovery, never the Copilot catalog.
+    """
+    source = records if isinstance(records, dict) else {}
+    enabled: list[str] = []
+    for upstream_id, record in source.items():
+        model_id = excel_model_id(f"{upstream_id}-excel")
+        if model_id is None or excel_model_id(upstream_id):
+            continue
+        if not model_record_available(record):
+            continue
+        enabled.append(model_id)
+    return tuple(enabled)
+
+
+def model_record_available(record: object) -> bool:
+    if not isinstance(record, dict) or record.get("model_picker_enabled") is False:
+        return False
+    policy = record.get("policy")
+    return not (isinstance(policy, dict) and policy.get("state") in ("disabled", "unconfigured"))
+
+
+def merge_local_model_capabilities(
+    capabilities: dict[str, dict] | None, *, excel_models: dict[str, dict] | None = None,
+) -> dict[str, dict]:
+    source = dict(capabilities or {})
+    # Discard previously injected aliases before applying the current catalog.
+    merged = {
+        key: value for key, value in source.items()
+        if key != "gpt-excel" and excel_model_id(key) is None and model_record_available(value)
+    }
     merged.update(
         {
-            key: dict(LOCAL_MODEL_CAPABILITIES[key])
-            for key in MODEL_IDS
+            key: _discovered_model_capabilities(key, excel_models[key.removesuffix("-excel")])
+            for key in _enabled_local_model_ids(excel_models)
         }
     )
     return merged
 
 
-def merge_local_models_payload(payload: dict | None) -> dict:
+def _discovered_model_capabilities(model_id: str, record: dict) -> dict:
+    caps = copy.deepcopy(LOCAL_MODEL_CAPABILITIES.get(model_id, LOCAL_MODEL_CAPABILITIES[MODEL_ID]))
+    caps.update(copy.deepcopy(record))
+    label = record.get("display_name") or model_id.removesuffix("-excel")
+    caps.update(display_name=f"{label} Excel", provider="OpenAI Excel", model_picker_enabled=True)
+    return caps
+
+
+def merge_local_models_payload(payload: dict | None, *, excel_models: dict[str, dict] | None = None) -> dict:
     result = dict(payload or {})
     raw_data = result.get("data")
-    data = [dict(item) for item in raw_data if isinstance(item, dict)] if isinstance(raw_data, list) else []
-    data = [item for item in data if item.get("id") != "gpt-excel"]
+    data = [
+        dict(item) for item in raw_data
+        if isinstance(item, dict) and isinstance(item.get("id"), str) and item["id"]
+    ] if isinstance(raw_data, list) else []
+    data = [
+        item for item in data
+        if item.get("id") != "gpt-excel"
+        and excel_model_id(item.get("id")) is None
+        and model_record_available(item)
+    ]
+    enabled_ids = _enabled_local_model_ids(excel_models)
     existing_ids = {item.get("id") for item in data}
     data.extend(
         local_model_payload(model_id)
-        for model_id in MODEL_IDS
+        for model_id in enabled_ids
         if model_id not in existing_ids
     )
     result["object"] = result.get("object") or "list"

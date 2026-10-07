@@ -107,12 +107,16 @@ Use one of the Excel model aliases to select this route:
 
 ```text
 gpt-6-astra-excel
+gpt-6-luna-excel
+gpt-6-sol-excel
 gpt-5.6-luna-excel
 gpt-5.6-terra-excel
 gpt-5.6-sol-excel
 ```
 
-The aliases support `low`, `medium`, `high`, and `xhigh` reasoning effort. `x-high` is accepted as an alias for `xhigh`.
+These are examples, not a hard-coded availability list. The proxy discovers Excel models from the signed-in add-in's `/basispoints/api/responses/access?include_models=true` catalog and Copilot models separately from Copilot. It offers their union: Copilot models use their normal IDs, while available Excel models get an `-excel` suffix that is removed when routing to Excel. A model does not need to exist in both backends. Restricted Excel models and failed discovery do not create Excel options; failure of one backend does not hide models discovered from the other. For example, Excel can offer `gpt-6-sol-excel` while Copilot offers `gpt-6.1-sol`.
+
+Reasoning effort options come from the Excel catalog; the current Sol, Luna, and Terra entries support `low`, `medium`, `high`, and `xhigh`. `x-high` is accepted as an alias for `xhigh`.
 
 Models without an `-excel` alias continue to use GitHub Copilot.
 
@@ -280,6 +284,8 @@ Make sure the selected model uses an `-excel` alias:
 
 ```text
 gpt-6-astra-excel
+gpt-6-luna-excel
+gpt-6-sol-excel
 gpt-5.6-luna-excel
 gpt-5.6-terra-excel
 gpt-5.6-sol-excel

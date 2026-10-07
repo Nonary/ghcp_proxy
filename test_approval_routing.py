@@ -26,13 +26,36 @@ class ApprovalRoutingTests(unittest.TestCase):
             ]
         }
 
-        normalized = normalize_codex_agent_tools(body)
+        normalized = normalize_codex_agent_tools(
+            body,
+            model_slugs=["gpt-6-luna", "gpt-5.6-sol", "invalid\nmodel", "gpt-6-luna"],
+        )
         tool = normalized["tools"][0]
 
         self.assertIn("active GHCP Proxy/Codex model catalog", tool["description"])
         model_description = tool["parameters"]["properties"]["model"]["description"]
         self.assertIn("active GHCP Proxy/Codex model catalog", model_description)
-        self.assertNotIn("gpt-6-luna", model_description)
+        self.assertIn("Available model slugs in the active catalog", model_description)
+        self.assertIn("`gpt-6-luna`", model_description)
+        self.assertIn("`gpt-5.6-sol`", model_description)
+        self.assertEqual(model_description.count("`gpt-6-luna`"), 1)
+        self.assertNotIn("invalid", model_description)
+
+        normalized_again = normalize_codex_agent_tools(
+            normalized,
+            model_slugs=["gpt-6-astra"],
+        )
+        self.assertEqual(normalized_again, normalized)
+
+    def test_model_catalog_provider_is_not_called_without_spawn_agent(self):
+        body = {"tools": [{"name": "lookup", "parameters": {}}]}
+
+        normalized = normalize_codex_agent_tools(
+            body,
+            model_slugs_provider=lambda: self.fail("catalog should not be loaded"),
+        )
+
+        self.assertIs(normalized, body)
 
     def test_current_codex_guardian_metadata_is_detected(self):
         body = {

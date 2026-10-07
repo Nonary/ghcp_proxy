@@ -5,10 +5,12 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass
+from typing import Callable, Mapping
 
 from fastapi import HTTPException
 
 import format_translation
+import excel_upstream
 from constants import DEFAULT_COMPACT_FALLBACK_MODEL, MODEL_PRICING, MODEL_ROUTING_CONFIG_FILE, TOKEN_DIR
 from util import _normalize_model_name
 
@@ -62,8 +64,14 @@ class ModelRoutingConfig:
 
 
 class ModelRoutingConfigService:
-    def __init__(self, config: ModelRoutingConfig):
+    def __init__(
+        self,
+        config: ModelRoutingConfig,
+        *,
+        model_capabilities_provider: Callable[[], Mapping[str, Mapping[str, object]]] | None = None,
+    ):
         self._config = config
+        self._model_capabilities_provider = model_capabilities_provider
         self._available_models = _available_model_payloads()
         self._known_models = {row["model"] for row in self._available_models}
         self._claude_code_default_slots = ("opus_model", "sonnet_model", "haiku_model")
@@ -76,9 +84,28 @@ class ModelRoutingConfigService:
             "approval_enabled": current["approval_enabled"],
             "approval_mappings": current["approval_mappings"],
             "claude_code_defaults": current["claude_code_defaults"],
-            "available_models": self._available_models,
+            "available_models": self._visible_available_models(),
             "path": self._config.config_file,
         }
+
+    def _visible_available_models(self) -> list[dict[str, str]]:
+        # Keep legacy pricing names for validating saved mappings, but expose
+        # only the independently discovered union as new routing choices.
+        capabilities = {}
+        if self._model_capabilities_provider is not None:
+            try:
+                data = self._model_capabilities_provider()
+                if isinstance(data, Mapping):
+                    capabilities = data
+            except Exception:
+                pass
+        rows = []
+        for model_name, caps in sorted(capabilities.items()):
+            provider = model_provider_family(model_name)
+            if provider and isinstance(caps, Mapping) and caps.get("model_picker_enabled") is not False:
+                rows.append({"model": model_name, "provider": provider})
+        self._known_models.update(row["model"] for row in rows)
+        return rows
 
     def load_settings(self) -> dict[str, object]:
         try:
@@ -230,9 +257,9 @@ class ModelRoutingConfigService:
                 raise HTTPException(status_code=400, detail=f"{label} #{index} must include a valid source_model.")
             if not target_model:
                 raise HTTPException(status_code=400, detail=f"{label} #{index} must include a valid target_model.")
-            if source_model not in self._known_models:
+            if source_model not in self._known_models and not excel_upstream.is_excel_model(source_model):
                 raise HTTPException(status_code=400, detail=f"{label} #{index} source model is unsupported: {source_model}")
-            if target_model not in self._known_models:
+            if target_model not in self._known_models and not excel_upstream.is_excel_model(target_model):
                 raise HTTPException(status_code=400, detail=f"{label} #{index} target model is unsupported: {target_model}")
             if source_model in seen_sources:
                 raise HTTPException(status_code=400, detail=f"Duplicate {label.lower()} source_model: {source_model}")
@@ -252,7 +279,7 @@ class ModelRoutingConfigService:
                         status_code=400,
                         detail=f"{label} #{index} compact_fallback_model is not a recognized model.",
                     )
-                if compact_fallback not in self._known_models:
+                if compact_fallback not in self._known_models and not excel_upstream.is_excel_model(compact_fallback):
                     raise HTTPException(
                         status_code=400,
                         detail=f"{label} #{index} compact_fallback_model is unsupported: {compact_fallback}",
@@ -284,7 +311,7 @@ class ModelRoutingConfigService:
                     status_code=400,
                     detail=f'claude_code_defaults.{slot_key} must be a recognized model.',
                 )
-            if model_name not in self._known_models:
+            if model_name not in self._known_models and not excel_upstream.is_excel_model(model_name):
                 raise HTTPException(
                     status_code=400,
                     detail=f"claude_code_defaults.{slot_key} is unsupported: {model_name}",

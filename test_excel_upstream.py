@@ -19,6 +19,17 @@ def _jwt_with_exp(expiration: float) -> str:
 
 
 class ExcelUpstreamTests(unittest.TestCase):
+    def _merge_models(self, payload):
+        data = payload.get("data") if isinstance(payload, dict) else None
+        records = {
+            entry["id"]: entry for entry in data
+            if isinstance(entry, dict) and isinstance(entry.get("id"), str)
+        } if isinstance(data, list) else {}
+        return excel_upstream.merge_local_models_payload(payload, excel_models=records)
+
+    def _merge_capabilities(self, capabilities):
+        return excel_upstream.merge_local_model_capabilities(capabilities, excel_models=capabilities)
+
     def test_excel_models_advertise_image_input_support(self):
         for model_id in excel_upstream.MODEL_IDS:
             with self.subTest(model_id=model_id):
@@ -161,6 +172,8 @@ class ExcelUpstreamTests(unittest.TestCase):
     def test_each_excel_alias_routes_to_matching_upstream_model(self):
         expected = {
             "gpt-6-astra-excel": "gpt-6-astra",
+            "gpt-6-sol-excel": "gpt-6-sol",
+            "gpt-6-luna-excel": "gpt-6-luna",
             "gpt-5.6-luna-excel": "gpt-5.6-luna",
             "gpt-5.6-terra-excel": "gpt-5.6-terra",
             "gpt-5.6-sol-excel": "gpt-5.6-sol",
@@ -1495,6 +1508,7 @@ class ExcelUpstreamTests(unittest.TestCase):
         )
 
     def test_entitled_local_models_are_merged_once(self):
+        excel_models = {model_id: {} for model_id in excel_upstream.EXCEL_MODEL_UPSTREAMS.values()}
         payload = excel_upstream.merge_local_models_payload(
             {
                 "object": "list",
@@ -1505,29 +1519,33 @@ class ExcelUpstreamTests(unittest.TestCase):
                         for upstream_id in excel_upstream.EXCEL_MODEL_UPSTREAMS.values()
                     ],
                 ],
-            }
+            }, excel_models=excel_models,
         )
-        payload = excel_upstream.merge_local_models_payload(payload)
+        payload = excel_upstream.merge_local_models_payload(payload, excel_models=excel_models)
         self.assertEqual(
             [item["id"] for item in payload["data"]],
             [
                 "gpt-5.5",
                 "gpt-6-astra",
+                "gpt-6-sol",
+                "gpt-6-luna",
                 "gpt-5.6-luna",
                 "gpt-5.6-terra",
                 "gpt-5.6-sol",
                 "gpt-6-astra-excel",
+                "gpt-6-sol-excel",
+                "gpt-6-luna-excel",
                 "gpt-5.6-luna-excel",
                 "gpt-5.6-terra-excel",
                 "gpt-5.6-sol-excel",
             ],
         )
 
-    def test_local_models_are_merged_even_when_upstream_models_are_missing(self):
-        payload = excel_upstream.merge_local_models_payload(
+    def test_only_matching_local_models_are_merged(self):
+        payload = self._merge_models(
             {
                 "object": "list",
-                "data": [{"id": "gpt-6-luna"}, {"id": "gpt-6.1-sol"}],
+                "data": [{"id": "gpt-6-luna"}, {"id": "gpt-6-sol"}],
             }
         )
 
@@ -1535,13 +1553,14 @@ class ExcelUpstreamTests(unittest.TestCase):
             [item["id"] for item in payload["data"]],
             [
                 "gpt-6-luna",
-                "gpt-6.1-sol",
-                *excel_upstream.MODEL_IDS,
+                "gpt-6-sol",
+                "gpt-6-luna-excel",
+                "gpt-6-sol-excel",
             ],
         )
 
-    def test_upstream_picker_flags_do_not_hide_excel_models(self):
-        payload = excel_upstream.merge_local_models_payload(
+    def test_upstream_picker_flags_hide_excel_models(self):
+        payload = self._merge_models(
             {
                 "object": "list",
                 "data": [
@@ -1554,23 +1573,145 @@ class ExcelUpstreamTests(unittest.TestCase):
         model_ids = [item["id"] for item in payload["data"]]
         for model_id in excel_upstream.MODEL_IDS:
             with self.subTest(model_id=model_id):
-                self.assertIn(model_id, model_ids)
+                self.assertNotIn(model_id, model_ids)
 
-    def test_all_local_models_are_added_to_capabilities(self):
-        capabilities = excel_upstream.merge_local_model_capabilities({})
+    def test_independent_sol_catalogs_do_not_confuse_backend_ids(self):
+        source = {"data": [{"id": "gpt-6.1-sol"}, {"id": "gpt-6.1-sol-excel"}]}
+        payload = excel_upstream.merge_local_models_payload(source, excel_models={"gpt-6-sol": {}})
+        self.assertEqual([item["id"] for item in payload["data"]], ["gpt-6.1-sol", "gpt-6-sol-excel"])
+        capabilities = excel_upstream.merge_local_model_capabilities(
+            {"gpt-6.1-sol": {}, "gpt-6.1-sol-excel": {"model_picker_enabled": True}},
+            excel_models={"gpt-6-sol": {}},
+        )
+        self.assertEqual(set(capabilities), {"gpt-6.1-sol", "gpt-6-sol-excel"})
+
+    def test_excel_models_are_not_inferred_from_copilot(self):
+        payload = excel_upstream.merge_local_models_payload({"data": [{"id": "gpt-6-sol"}]})
+        self.assertEqual([item["id"] for item in payload["data"]], ["gpt-6-sol"])
+        self.assertEqual(
+            set(excel_upstream.merge_local_model_capabilities({"gpt-6-sol": {}})),
+            {"gpt-6-sol"},
+        )
+
+    def test_backend_restrictions_are_independent(self):
+        for copilot_enabled, excel_enabled in ((True, False), (False, True), (True, True)):
+            with self.subTest(copilot_enabled=copilot_enabled, excel_enabled=excel_enabled):
+                capabilities = excel_upstream.merge_local_model_capabilities(
+                    {"gpt-6-sol": {"model_picker_enabled": copilot_enabled}},
+                    excel_models={"gpt-6-sol": {"model_picker_enabled": excel_enabled}},
+                )
+                self.assertEqual("gpt-6-sol" in capabilities, copilot_enabled)
+                self.assertEqual("gpt-6-sol-excel" in capabilities, excel_enabled)
+
+    def test_excel_only_and_future_models_are_offered_and_routed(self):
+        records = {"gpt-6-sol": {}, "gpt-7-new-model": {"display_name": "New Model"}}
+        payload = excel_upstream.merge_local_models_payload({}, excel_models=records)
+        self.assertEqual(
+            [item["id"] for item in payload["data"]],
+            ["gpt-6-sol-excel", "gpt-7-new-model-excel"],
+        )
+        capabilities = excel_upstream.merge_local_model_capabilities({}, excel_models=records)
+        self.assertEqual(capabilities["gpt-7-new-model-excel"]["display_name"], "New Model Excel")
+        body = excel_upstream.prepare_responses_body({"model": "gpt-7-new-model-excel", "input": "Hello"})
+        self.assertEqual(body["model"], "gpt-7-new-model")
+
+    def test_gpt_6_sol_enables_the_correct_excel_alias(self):
+        payload = self._merge_models({"data": [{"id": "gpt-6-sol"}]})
+        self.assertEqual([item["id"] for item in payload["data"]], ["gpt-6-sol", "gpt-6-sol-excel"])
+        body = excel_upstream.prepare_responses_body({"model": "gpt-6-sol-excel", "input": "Hello"})
+        self.assertEqual(body["model"], "gpt-6-sol")
+
+    def test_no_local_models_are_added_without_upstream_capabilities(self):
+        capabilities = self._merge_capabilities({})
 
         for model_id in excel_upstream.MODEL_IDS:
             with self.subTest(model_id=model_id):
-                self.assertIn(model_id, capabilities)
+                self.assertNotIn(model_id, capabilities)
 
-    def test_upstream_picker_flags_do_not_hide_excel_capabilities(self):
-        capabilities = excel_upstream.merge_local_model_capabilities(
+    def test_upstream_picker_flags_hide_excel_capabilities(self):
+        capabilities = self._merge_capabilities(
             {"gpt-6-astra": {"model_picker_enabled": False}}
         )
 
         for model_id in excel_upstream.MODEL_IDS:
             with self.subTest(model_id=model_id):
-                self.assertIn(model_id, capabilities)
+                self.assertNotIn(model_id, capabilities)
+
+    def test_each_alias_requires_its_matching_upstream_record(self):
+        for alias, upstream_id in excel_upstream.EXCEL_MODEL_UPSTREAMS.items():
+            for picker_enabled in (None, True, False):
+                with self.subTest(alias=alias, picker_enabled=picker_enabled):
+                    record = {"id": upstream_id}
+                    if picker_enabled is not None:
+                        record["model_picker_enabled"] = picker_enabled
+                    payload = self._merge_models({"data": [record]})
+                    capabilities = self._merge_capabilities(
+                        {upstream_id: record}
+                    )
+                    expected = {alias} if picker_enabled is not False else set()
+                    self.assertEqual(
+                        {item["id"] for item in payload["data"]} & set(excel_upstream.MODEL_IDS),
+                        expected,
+                    )
+                    self.assertEqual(set(capabilities) & set(excel_upstream.MODEL_IDS), expected)
+                    if picker_enabled is not False:
+                        self.assertEqual(record, payload["data"][0])
+                    else:
+                        self.assertEqual(payload["data"], [])
+
+    def test_stale_aliases_do_not_prove_availability(self):
+        stale = [excel_upstream.local_model_payload(alias) for alias in excel_upstream.MODEL_IDS]
+        stale.append({"id": "gpt-excel"})
+        payload = self._merge_models({"data": stale})
+        self.assertEqual(payload["data"], [])
+        capabilities = self._merge_capabilities(
+            {item["id"]: {"model_picker_enabled": True} for item in stale}
+        )
+        self.assertEqual(capabilities, {})
+        self.assertEqual(len(stale), len(excel_upstream.MODEL_IDS) + 1)
+
+    def test_stale_aliases_are_removed_when_upstream_becomes_disabled(self):
+        source = {"gpt-6-astra": {}, "gpt-5.6-sol": {}}
+        capabilities = self._merge_capabilities(source)
+        capabilities["gpt-6-astra"]["model_picker_enabled"] = False
+        refreshed = self._merge_capabilities(capabilities)
+        self.assertNotIn("gpt-6-astra-excel", refreshed)
+        self.assertIn("gpt-5.6-sol-excel", refreshed)
+
+        payload = self._merge_models(
+            {"data": [{"id": model_id} for model_id in source]}
+        )
+        payload["data"][0]["model_picker_enabled"] = False
+        refreshed_payload = self._merge_models(payload)
+        ids = [item["id"] for item in refreshed_payload["data"]]
+        self.assertNotIn("gpt-6-astra-excel", ids)
+        self.assertIn("gpt-5.6-sol-excel", ids)
+
+    def test_policy_disabled_models_do_not_enable_excel_aliases(self):
+        for state in ("enabled", "disabled", "unconfigured"):
+            with self.subTest(state=state):
+                record = {"id": "gpt-6-astra", "policy": {"state": state}}
+                capabilities = self._merge_capabilities({"gpt-6-astra": record})
+                payload = self._merge_models({"data": [record]})
+                self.assertEqual("gpt-6-astra-excel" in capabilities, state == "enabled")
+                self.assertEqual(
+                    "gpt-6-astra-excel" in [item["id"] for item in payload["data"]],
+                    state == "enabled",
+                )
+
+    def test_empty_or_malformed_models_payload_does_not_enable_excel_aliases(self):
+        for payload in (
+            None, {}, {"data": []}, {"data": None}, {"data": {}},
+            {"data": [None, "gpt-6-astra", {}, {"id": []}, {"id": ""}]},
+        ):
+            with self.subTest(payload=payload):
+                self.assertEqual(self._merge_models(payload)["data"], [])
+
+    def test_malformed_upstream_capability_record_does_not_enable_alias(self):
+        for record in (None, False, "enabled", []):
+            with self.subTest(record=record):
+                capabilities = self._merge_capabilities({"gpt-6-astra": record})
+                self.assertNotIn("gpt-6-astra-excel", capabilities)
 
 class ExcelStreamTransformTests(unittest.TestCase):
     SOURCE_BODY = {

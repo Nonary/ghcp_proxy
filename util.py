@@ -454,6 +454,8 @@ def _usage_event_model_name(event: dict | None) -> str | None:
     # the base GPT-5.6 model and rendered as Copilot AIC instead of OpenAI Credits.
     for key in ("resolved_model", "requested_model"):
         normalized = _normalize_model_name(event.get(key))
+        if normalized and normalized.startswith("gpt-") and normalized.endswith("-excel"):
+            return normalized
         pricing = MODEL_PRICING.get(normalized) if normalized else None
         if isinstance(pricing, dict) and pricing.get("credit_unit_usd") is not None:
             return normalized
@@ -599,7 +601,12 @@ def _pricing_entry_for_model(model_name: str | None) -> dict | None:
     normalized = _normalize_model_name(model_name)
     if not normalized:
         return None
-    return MODEL_PRICING.get(normalized)
+    entry = MODEL_PRICING.get(normalized)
+    if entry is None and normalized.startswith("gpt-") and normalized.endswith("-excel"):
+        base_entry = MODEL_PRICING.get(normalized.removesuffix("-excel"))
+        if isinstance(base_entry, dict):
+            return {**base_entry, "provider": "OpenAI Excel", "credit_unit_usd": 0.04}
+    return entry
 
 
 def _anthropic_cache_creation_rate_per_million(entry: dict) -> float:

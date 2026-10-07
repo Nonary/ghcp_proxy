@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+import re
+from collections.abc import Callable, Mapping, Sequence
 
 
 _SPAWN_AGENT_COMPAT_MARKER = "ghcp_proxy multi-agent compatibility"
+_MODEL_SLUG_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,199}\Z")
 _SPAWN_AGENT_COMPAT_NOTE = (
     "\n\n[ghcp_proxy multi-agent compatibility]\n"
     "For `model`, use any model id offered in the active GHCP Proxy/Codex model "
@@ -17,6 +19,26 @@ _SPAWN_AGENT_COMPAT_NOTE = (
     "the parent. Use only the agent id returned by a successful spawn when "
     "calling `wait_agent`."
 )
+
+
+def _catalog_model_slugs_sentence(model_slugs) -> str:
+    if not isinstance(model_slugs, (list, tuple)):
+        return ""
+    slugs = []
+    seen = set()
+    for value in model_slugs:
+        if (
+            isinstance(value, str)
+            and _MODEL_SLUG_PATTERN.fullmatch(value)
+            and value not in seen
+        ):
+            slugs.append(value)
+            seen.add(value)
+    if not slugs:
+        return ""
+    return " Available model slugs in the active catalog: " + ", ".join(
+        f"`{slug}`" for slug in slugs
+    ) + "."
 
 
 def _non_empty_string(value) -> str | None:
@@ -260,7 +282,7 @@ def codex_thread_source(body: dict | None) -> str | None:
     return value.lower() if value else None
 
 
-def _patched_spawn_agent_tool(tool: dict) -> tuple[dict, bool]:
+def _patched_spawn_agent_tool(tool: dict, model_slugs=None) -> tuple[dict, bool]:
     if tool.get("name") != "spawn_agent":
         return tool, False
     description = tool.get("description")
@@ -302,6 +324,7 @@ def _patched_spawn_agent_tool(tool: dict) -> tuple[dict, bool]:
         patched_model["description"] = (
             existing.rstrip()
             + " Any model id offered in the active GHCP Proxy/Codex model catalog is a valid override."
+            + _catalog_model_slugs_sentence(model_slugs)
         ).strip()
         patched_properties["model"] = patched_model
 
@@ -310,11 +333,11 @@ def _patched_spawn_agent_tool(tool: dict) -> tuple[dict, bool]:
     return patched, True
 
 
-def _patched_tool_node(node):
+def _patched_tool_node(node, model_slugs=None):
     if not isinstance(node, dict):
         return node, False
 
-    patched, changed = _patched_spawn_agent_tool(node)
+    patched, changed = _patched_spawn_agent_tool(node, model_slugs)
     nested_tools = patched.get("tools")
     if not isinstance(nested_tools, list):
         return patched, changed
@@ -322,7 +345,7 @@ def _patched_tool_node(node):
     patched_nested = []
     nested_changed = False
     for nested in nested_tools:
-        patched_child, child_changed = _patched_tool_node(nested)
+        patched_child, child_changed = _patched_tool_node(nested, model_slugs)
         patched_nested.append(patched_child)
         nested_changed = nested_changed or child_changed
     if not nested_changed:
@@ -333,19 +356,42 @@ def _patched_tool_node(node):
     return patched, True
 
 
+def _contains_spawn_agent_tool(node) -> bool:
+    if not isinstance(node, dict):
+        return False
+    if node.get("name") == "spawn_agent":
+        return True
+    nested_tools = node.get("tools")
+    return isinstance(nested_tools, list) and any(
+        _contains_spawn_agent_tool(nested) for nested in nested_tools
+    )
+
+
 def normalize_codex_agent_tools(
     body: dict,
     *,
+    model_slugs=None,
+    model_slugs_provider: Callable[[], Sequence[str]] | None = None,
     diagnostics: list[dict] | None = None,
 ) -> dict:
     """Clarify current multi-agent constraints without mutating the input."""
     if not isinstance(body, dict) or not isinstance(body.get("tools"), list):
         return body
 
+    if model_slugs is None and model_slugs_provider is not None and any(
+        _contains_spawn_agent_tool(tool) for tool in body["tools"]
+    ):
+        try:
+            model_slugs = model_slugs_provider()
+        except Exception:
+            # Tool compatibility guidance is best-effort; don't fail Responses
+            # requests if the optional model catalog cannot be loaded.
+            model_slugs = None
+
     patched_tools = []
     changed = False
     for tool in body["tools"]:
-        patched_tool, tool_changed = _patched_tool_node(tool)
+        patched_tool, tool_changed = _patched_tool_node(tool, model_slugs)
         patched_tools.append(patched_tool)
         changed = changed or tool_changed
     if not changed:

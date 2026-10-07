@@ -35,6 +35,7 @@ import httpx
 
 import auth
 import excel_upstream
+import excel_model_catalog
 import format_translation
 import sdk_reasoning_ledger
 import util
@@ -3875,22 +3876,35 @@ async def handle_responses(
 
 
 async def models_response() -> Response:
+    excel_models = await asyncio.to_thread(
+        excel_model_catalog.fetch_model_capabilities, verify=_runtime_ssl_context(),
+    )
     try:
         client = await _get_client()
         models = await client.list_models()
     except Exception as exc:
+        excel_only = excel_upstream.merge_local_models_payload({}, excel_models=excel_models)
+        if excel_only["data"]:
+            return JSONResponse(content=excel_only)
         return format_translation.openai_error_response(502, f"Copilot SDK: {exc}")
-    data = [
-        {
+    data = []
+    for model in models:
+        entry = {
             "id": model.id,
             "object": "model",
             "created": 0,
             "owned_by": "github-copilot",
         }
-        for model in models
-    ]
+        picker_enabled = getattr(model, "model_picker_enabled", None)
+        if isinstance(picker_enabled, bool):
+            entry["model_picker_enabled"] = picker_enabled
+        policy = getattr(model, "policy", None)
+        policy_state = policy.get("state") if isinstance(policy, dict) else getattr(policy, "state", None)
+        if isinstance(policy_state, str):
+            entry["policy"] = {"state": policy_state}
+        data.append(entry)
     return JSONResponse(
-        excel_upstream.merge_local_models_payload({"object": "list", "data": data})
+        excel_upstream.merge_local_models_payload({"object": "list", "data": data}, excel_models=excel_models)
     )
 
 

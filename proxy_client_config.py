@@ -5,6 +5,7 @@ from __future__ import annotations
 import glob
 import json
 import os
+import re
 import shutil
 import tempfile
 import tomllib
@@ -49,12 +50,7 @@ def _format_token_rate(value: object) -> str:
 
 
 def _model_token_pricing_description(model_name: str) -> str:
-    if model_name.endswith("-excel") and model_name in {
-        "gpt-6-astra-excel",
-        "gpt-5.6-luna-excel",
-        "gpt-5.6-terra-excel",
-        "gpt-5.6-sol-excel",
-    }:
+    if model_name.endswith("-excel"):
         return "ChatGPT subscription usage; not API-token billing"
     pricing = MODEL_PRICING.get(model_name)
     if not isinstance(pricing, Mapping):
@@ -182,6 +178,30 @@ class ProxyClientConfigService:
         except Exception:
             return {}
         return data if isinstance(data, Mapping) else {}
+
+    def codex_model_catalog_model_names(self) -> list[str]:
+        """Return the model slugs advertised in the generated Codex catalog."""
+        return self._codex_model_catalog_model_names(
+            self._model_capabilities(),
+            self._model_routing_settings(),
+        )
+
+    def _codex_model_catalog_model_names(
+        self,
+        capabilities: Mapping[str, object],
+        routing_settings: Mapping[str, object],
+    ) -> list[str]:
+        remapped_targets = self._catalog_remap_targets(routing_settings)
+        available_ids = {
+            model_id
+            for model_id, model_caps in capabilities.items()
+            if isinstance(model_id, str)
+            and (
+                not isinstance(model_caps, Mapping)
+                or model_caps.get("model_picker_enabled") is not False
+            )
+        }
+        return self._sorted_catalog_model_names(available_ids, remapped_targets)
 
     def codex_proxy_status(self) -> dict[str, bool | str | None]:
         status = self.empty_proxy_status("codex")
@@ -354,6 +374,7 @@ class ProxyClientConfigService:
         if status.get("error"):
             return status
         if status.get("configured"):
+            self.refresh_codex_model_catalog()
             status["backup_path"] = self._latest_backup_path(self._config.codex_managed_config_file)
             status["status_message"] = "proxy already enabled"
             return status
@@ -371,9 +392,10 @@ class ProxyClientConfigService:
         backup_path = self._backup_config_file(self._config.codex_managed_config_file)
         primary_backup_path = self._backup_config_file(self._config.codex_primary_config_file)
         os.makedirs(self._config.codex_config_dir, exist_ok=True)
+        catalog = self._build_codex_model_catalog_payload()
         self._write_json_atomic(
             self._config.codex_model_catalog_file,
-            self._build_codex_model_catalog_payload(),
+            catalog,
         )
         if primary_config_exists:
             self._write_text_atomic(
@@ -384,6 +406,7 @@ class ProxyClientConfigService:
             self._config.codex_managed_config_file,
             self._render_codex_proxy_config(),
         )
+        self._repair_legacy_codex_excel_selection(catalog)
         status = self.codex_proxy_status()
         status["backup_path"] = primary_backup_path or backup_path
         status["status_message"] = "installed proxy config"
@@ -393,11 +416,59 @@ class ProxyClientConfigService:
         if not os.path.exists(self._config.codex_model_catalog_file):
             return False
         os.makedirs(self._config.codex_config_dir, exist_ok=True)
+        catalog = self._build_codex_model_catalog_payload()
         self._write_json_atomic(
             self._config.codex_model_catalog_file,
-            self._build_codex_model_catalog_payload(),
+            catalog,
         )
+        self._repair_legacy_codex_excel_selection(catalog)
         return True
+
+    def _repair_legacy_codex_excel_selection(self, catalog: dict[str, object]) -> bool:
+        """Migrate the mistaken Sol alias only when live discovery confirms it.
+
+        Rebuilding the picker catalog does not clear Codex's explicitly selected
+        default. Preserve valid selections, native-provider configs, and profiles.
+        """
+        legacy_model = "gpt-6.1-sol-excel"
+        replacement = "gpt-6-sol-excel"
+        models = catalog.get("models")
+        available = {
+            row.get("slug") for row in models
+            if isinstance(row, dict) and isinstance(row.get("slug"), str)
+        } if isinstance(models, list) else set()
+        if legacy_model in available or replacement not in available:
+            return False
+        path = getattr(self._config, "codex_primary_config_file", None)
+        if not path or not os.path.isfile(path):
+            return False
+        try:
+            with open(path, encoding="utf-8", newline="") as stream:
+                content = stream.read()
+            parsed = self._parse_toml_values(content)
+        except (OSError, ValueError):
+            return False
+        if (
+            parsed.get("model") != legacy_model
+            or parsed.get("model_provider") != "custom"
+            or parsed.get("model_catalog_json") != self._config.codex_model_catalog_file
+            or not _is_codex_proxy_base_url(self._codex_provider_config(parsed).get("base_url"))
+        ):
+            return False
+        lines = content.splitlines(keepends=True)
+        pattern = re.compile(r"^(\s*model\s*=\s*)(['\"])(gpt-6\.1-sol-excel)\2([\s\S]*)$")
+        for index, line in enumerate(lines):
+            if line.lstrip().startswith("["):
+                break
+            match = pattern.match(line)
+            if match:
+                lines[index] = f"{match[1]}{match[2]}{replacement}{match[2]}{match[4]}"
+                # Do not let this safety copy become the native config restored
+                # by the ordinary proxy-disable backup mechanism.
+                self._backup_config_file(path, suffix=".ghcp-proxy.model-selection.bak")
+                self._write_text_atomic(path, "".join(lines))
+                return True
+        return False
 
     def refresh_claude_proxy_settings(self) -> bool:
         if not os.path.exists(self._config.claude_settings_file):
@@ -744,17 +815,17 @@ class ProxyClientConfigService:
             return status
         return status
 
-    def _backup_config_file(self, path: str) -> str | None:
+    def _backup_config_file(self, path: str, *, suffix: str = ".ghcp-proxy.bak") -> str | None:
         if not os.path.isfile(path):
             return None
 
         os.makedirs(os.path.dirname(path), exist_ok=True)
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-        backup_path = f"{path}.ghcp-proxy.bak.{timestamp}"
+        backup_path = f"{path}{suffix}.{timestamp}"
         attempt = 1
         while os.path.exists(backup_path):
             attempt += 1
-            backup_path = f"{path}.ghcp-proxy.bak.{timestamp}.{attempt}"
+            backup_path = f"{path}{suffix}.{timestamp}.{attempt}"
 
         shutil.copy2(path, backup_path)
         return backup_path
@@ -820,7 +891,9 @@ class ProxyClientConfigService:
                 payload = json.load(f)
         except (OSError, json.JSONDecodeError):
             return False
-        return isinstance(payload, dict) and isinstance(payload.get("models"), list) and bool(payload["models"])
+        # An empty discovered catalog is valid; it must not disable the managed
+        # provider or require fabricating options from pricing metadata.
+        return isinstance(payload, dict) and isinstance(payload.get("models"), list)
 
     def _render_codex_proxy_config(self) -> str:
         top_level_lines: list[str] = []
@@ -953,18 +1026,9 @@ class ProxyClientConfigService:
         remapped_targets = self._catalog_remap_targets(routing_settings)
         default_context = self._config.codex_model_context_window
         default_compact = self._config.codex_model_auto_compact_token_limit
-        available_ids = {
-            model_id
-            for model_id, model_caps in capabilities.items()
-            if isinstance(model_id, str)
-            and (
-                not isinstance(model_caps, Mapping)
-                or model_caps.get("model_picker_enabled") is not False
-            )
-        } if isinstance(capabilities, Mapping) else set()
         models = []
         for priority, model_name in enumerate(
-            self._sorted_catalog_model_names(available_ids, remapped_targets)
+            self._codex_model_catalog_model_names(capabilities, routing_settings)
         ):
             routed_model_name = remapped_targets.get(model_name, model_name)
             family = self._model_family(routed_model_name)
@@ -1225,25 +1289,22 @@ class ProxyClientConfigService:
             if isinstance(model_name, str) and model_name
         }
         model_names = configured_model_names | live_model_names
-        # Filter by what the upstream Copilot plan actually exposes via /models.
-        # If the capability fetch returned nothing (auth/network blip), fall
-        # back to the configured pricing list for non-Excel models only; Excel
-        # aliases require positive entitlement evidence before being advertised.
+        # Only independently discovered backend models (or explicit remaps to
+        # them) are offered. Pricing metadata is never availability evidence.
         if available_ids:
             filtered = {
                 name
                 for name in model_names
                 if name in available_ids
                 or (
-                    isinstance(remapped_targets, Mapping)
+                    not name.endswith("-excel")
+                    and isinstance(remapped_targets, Mapping)
                     and remapped_targets.get(name) in available_ids
                 )
             }
             model_names = filtered
         else:
-            model_names = {
-                name for name in model_names if not name.endswith("-excel")
-            }
+            model_names = set()
         return sorted(model_names, key=lambda model_name: (family_key(model_name), preferred_order.get(model_name, 0), model_name))
 
     def _catalog_remap_targets(self, routing_settings: Mapping[str, object]) -> dict[str, str]:
@@ -1264,7 +1325,6 @@ class ProxyClientConfigService:
                 and source_model
                 and isinstance(target_model, str)
                 and target_model
-                and target_model in MODEL_PRICING
             ):
                 remapped_targets[source_model] = target_model
         return remapped_targets

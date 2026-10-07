@@ -62,6 +62,7 @@ import codex_native_ingest
 import copilot_sdk_upstream
 import dashboard as dashboard_module
 import excel_session_capture
+import excel_model_catalog
 import excel_upstream
 import format_translation
 import gzip
@@ -460,7 +461,10 @@ usage_reminder_controller = usage_reminder.UsageReminderController(
     usage_tracker.snapshot_all_usage_events,
 )
 
-model_routing_config_service = ModelRoutingConfigService(ModelRoutingConfig())
+model_routing_config_service = ModelRoutingConfigService(
+    ModelRoutingConfig(),
+    model_capabilities_provider=lambda: fetch_available_model_capabilities(),
+)
 client_proxy_config_service = ProxyClientConfigService(
     ProxyClientConfig(
         codex_primary_config_file=CODEX_PRIMARY_CONFIG_FILE,
@@ -475,7 +479,7 @@ client_proxy_config_service = ProxyClientConfigService(
         claude_max_output_tokens=CLAUDE_MAX_OUTPUT_TOKENS,
         client_proxy_settings_file=CLIENT_PROXY_SETTINGS_FILE,
     ),
-    model_capabilities_provider=lambda: fetch_copilot_model_capabilities(),
+    model_capabilities_provider=lambda: fetch_available_model_capabilities(),
     model_routing_settings_provider=lambda: model_routing_config_service.load_settings(),
 )
 background_proxy_manager = background_proxy.BackgroundProxyManager()
@@ -970,6 +974,11 @@ async def _app_startup_restore_client_proxy_configs():
         force=True,
     ))
     restore_client_proxy_configs_on_startup()
+    # Refresh any persisted picker catalog as well as request-time discovery.
+    # Run in the background so two independent backends cannot stall startup.
+    asyncio.create_task(asyncio.to_thread(
+        client_proxy_config_service.refresh_codex_model_catalog,
+    ))
     auto_update_runtime_controller.start_periodic_checks()
 
 
@@ -5142,13 +5151,13 @@ def fetch_copilot_model_capabilities() -> dict[str, dict]:
 
     Returns a mapping ``{model_id: capabilities_dict}`` enriched into the
     shape consumed by ``ProxyClientConfigService``. Any failure (missing
-    auth, network error, parse error) returns an empty dict so the caller
-    falls back to defaults.
+    auth, network error, parse error) returns an empty dict. Excel discovery
+    is independent and is merged only by fetch_available_model_capabilities.
     """
     try:
         api_base = auth.get_api_base().rstrip("/")
     except Exception:
-        return excel_upstream.merge_local_model_capabilities({})
+        return {}
 
     now = time.monotonic()
     with _COPILOT_MODEL_CAPS_LOCK:
@@ -5159,12 +5168,12 @@ def fetch_copilot_model_capabilities() -> dict[str, dict]:
             and cache["data"]
             and (now - float(cache.get("ts", 0.0))) < _COPILOT_MODEL_CAPS_TTL_SECONDS
         ):
-            return excel_upstream.merge_local_model_capabilities(cache["data"])  # type: ignore[arg-type]
+            return dict(cache["data"])  # type: ignore[arg-type]
 
     try:
         api_key = auth.get_api_key()
     except Exception:
-        return excel_upstream.merge_local_model_capabilities({})
+        return {}
 
     headers = format_translation.build_copilot_headers(api_key)
     url = f"{api_base}/models"
@@ -5172,8 +5181,8 @@ def fetch_copilot_model_capabilities() -> dict[str, dict]:
         # The model catalog is fetched through the same enterprise HTTPS
         # middleman as the SDK.  httpx otherwise uses certifi alone here,
         # which rejects the middleman's Keychain-installed CA and makes the
-        # caller see an empty capability set.  That empty set then removes
-        # Excel aliases from the generated model picker catalog.
+        # caller see an empty Copilot capability set. Excel has its own
+        # independently authenticated model catalog.
         with httpx.Client(
             timeout=_COPILOT_MODEL_CAPS_FETCH_TIMEOUT_SECONDS,
             verify=copilot_sdk_upstream._runtime_ssl_context(),
@@ -5183,11 +5192,11 @@ def fetch_copilot_model_capabilities() -> dict[str, dict]:
             response.raise_for_status()
             payload = response.json()
     except Exception:
-        return excel_upstream.merge_local_model_capabilities({})
+        return {}
 
     raw_entries = payload.get("data") if isinstance(payload, dict) else None
     if not isinstance(raw_entries, list):
-        return excel_upstream.merge_local_model_capabilities({})
+        return {}
 
     result: dict[str, dict] = {}
     for entry in raw_entries:
@@ -5214,6 +5223,9 @@ def fetch_copilot_model_capabilities() -> dict[str, dict]:
         picker_enabled = entry.get("model_picker_enabled")
         if isinstance(picker_enabled, bool):
             enriched["model_picker_enabled"] = picker_enabled
+        policy = entry.get("policy")
+        if isinstance(policy, dict):
+            enriched["policy"] = dict(policy)
         display_name = entry.get("name")
         if isinstance(display_name, str) and display_name.strip():
             enriched["display_name"] = display_name.strip()
@@ -5243,7 +5255,21 @@ def fetch_copilot_model_capabilities() -> dict[str, dict]:
         _COPILOT_MODEL_CAPS_CACHE["key"] = api_base
         _COPILOT_MODEL_CAPS_CACHE["ts"] = now
         _COPILOT_MODEL_CAPS_CACHE["data"] = result
-    return excel_upstream.merge_local_model_capabilities(result)
+    return result
+
+
+def fetch_excel_model_capabilities() -> dict[str, dict]:
+    return excel_model_catalog.fetch_model_capabilities(
+        verify=copilot_sdk_upstream._runtime_ssl_context(),
+    )
+
+
+def fetch_available_model_capabilities() -> dict[str, dict]:
+    """Union of independently discovered Copilot models and Excel aliases."""
+    excel_models = fetch_excel_model_capabilities()
+    return excel_upstream.merge_local_model_capabilities(
+        fetch_copilot_model_capabilities(), excel_models=excel_models,
+    )
 
 
 # Models known to natively support Anthropic /v1/messages upstream. This is a
@@ -5288,19 +5314,22 @@ def model_supports_native_messages(model: str) -> bool:
 
 
 async def _proxy_models_request() -> Response:
+    excel_models = await asyncio.to_thread(fetch_excel_model_capabilities)
+    excel_only = excel_upstream.merge_local_models_payload({}, excel_models=excel_models)
     try:
         api_key = auth.get_api_key()
+        upstream_url = f"{auth.get_api_base().rstrip('/')}/models"
+        headers = format_translation.build_copilot_headers(api_key)
     except Exception:
-        return JSONResponse(content=excel_upstream.merge_local_models_payload({}))
-
-    upstream_url = f"{auth.get_api_base().rstrip('/')}/models"
-    headers = format_translation.build_copilot_headers(api_key)
+        return JSONResponse(content=excel_only)
 
     try:
         client = _get_upstream_client()
         request = client.build_request("GET", upstream_url, headers=headers)
         upstream = await throttled_client_send(client, request)
     except httpx.RequestError as exc:
+        if excel_only["data"]:
+            return JSONResponse(content=excel_only)
         status_code, message = format_translation.upstream_request_error_status_and_message(exc)
         return format_translation.openai_error_response(status_code, message)
 
@@ -5308,9 +5337,11 @@ async def _proxy_models_request() -> Response:
         payload = _extract_upstream_json_payload(upstream)
         if isinstance(payload, dict):
             return JSONResponse(
-                content=excel_upstream.merge_local_models_payload(payload),
+                content=excel_upstream.merge_local_models_payload(payload, excel_models=excel_models),
                 status_code=upstream.status_code,
             )
+    if excel_only["data"]:
+        return JSONResponse(content=excel_only)
     return proxy_non_streaming_response(upstream)
 
 
@@ -6640,6 +6671,7 @@ async def responses(request: Request):
     agent_compat_diagnostics: list[dict] = []
     body = codex_agent_compat.normalize_codex_agent_tools(
         body,
+        model_slugs_provider=client_proxy_config_service.codex_model_catalog_model_names,
         diagnostics=agent_compat_diagnostics,
     )
     if excel_upstream.is_excel_model(body.get("model")):

@@ -3472,7 +3472,7 @@
       // OpenAI meters Excel-routed model consumption in Credits: $0.04 = 1 Credit.
       // Copilot AIC does not apply to that upstream.
       isExcelCostRow(row) {
-        const isExcel = (name) => /^gpt-5\.6-(luna|terra|sol)-excel$/.test(
+        const isExcel = (name) => /^gpt-[a-z0-9]+(?:[.-][a-z0-9]+)*-excel$/.test(
           String(name || '').trim().toLowerCase()
         );
         if (typeof row === 'string') return isExcel(row);

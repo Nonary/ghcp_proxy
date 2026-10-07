@@ -1,7 +1,7 @@
 import unittest
 
 from constants import MODEL_PRICING
-from util import _usage_event_cost_breakdown, normalize_usage_payload
+from util import _pricing_entry_for_model, _usage_event_cost_breakdown, normalize_usage_payload
 
 
 class TerraPricingTests(unittest.TestCase):
@@ -88,6 +88,28 @@ class Gpt6PricingTests(unittest.TestCase):
         self.assertEqual(pricing["long_context_cached_input_per_million"], 0.02)
         self.assertEqual(pricing["long_context_cache_write_per_million"], 0.25)
         self.assertEqual(pricing["long_context_output_per_million"], 0.75)
+
+    def test_new_excel_aliases_use_the_matching_base_model_rates(self):
+        for model_name in ("gpt-6-luna-excel", "gpt-6-sol-excel"):
+            with self.subTest(model_name=model_name):
+                pricing = _pricing_entry_for_model(model_name)
+                base_pricing = MODEL_PRICING[model_name.removesuffix("-excel")]
+                self.assertEqual(pricing["provider"], "OpenAI Excel")
+                self.assertEqual(pricing["credit_unit_usd"], 0.04)
+                self.assertEqual(
+                    pricing["input_per_million"], base_pricing["input_per_million"]
+                )
+                self.assertEqual(
+                    {key: value for key, value in pricing.items() if key not in {"provider", "credit_unit_usd"}},
+                    {key: value for key, value in base_pricing.items() if key != "provider"},
+                )
+
+    def test_dynamic_excel_alias_reuses_known_base_pricing_without_mutating_it(self):
+        base_pricing = dict(MODEL_PRICING["gpt-5.5"])
+        self.assertNotIn("gpt-5.5-excel", MODEL_PRICING)
+        pricing = _pricing_entry_for_model("gpt-5.5-excel")
+        self.assertEqual(pricing, {**base_pricing, "provider": "OpenAI Excel", "credit_unit_usd": 0.04})
+        self.assertEqual(MODEL_PRICING["gpt-5.5"], base_pricing)
 
 
 if __name__ == "__main__":
