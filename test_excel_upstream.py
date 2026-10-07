@@ -891,7 +891,7 @@ class ExcelUpstreamTests(unittest.TestCase):
         self.assertIn("run_officejs", reminder)
         self.assertIn("functions.run_officejs", reminder)
         self.assertIn("Never set the inner name", reminder)
-        self.assertIn("demo", reminder)
+        self.assertIn("catalog above", reminder)
         self.assertEqual(body["input"][-1]["role"], "user")
         # Keep the compact cue small relative to the full catalog.
         self.assertLess(len(reminder), len(catalog) / 2)
@@ -965,11 +965,10 @@ class ExcelUpstreamTests(unittest.TestCase):
         body = excel_upstream.prepare_responses_body(source)
         catalog = body["input"][0]["content"][0]["text"]
         self.assertIn('"name":"computer_use.js"', catalog)
-        self.assertIn('"namespace":"computer_use"', catalog)
-        self.assertIn('"tool":"js"', catalog)
-        self.assertIn('"required":["code"]', catalog)
+        self.assertIn('function {"name":"computer_use.js"}', catalog)
+        self.assertIn('"code":string', catalog)
         self.assertIn("Control desktop applications.", catalog)
-        self.assertIn("computer_use.js", body["input"][1]["content"][0]["text"])
+        self.assertIn("catalog above", body["input"][1]["content"][0]["text"])
 
         tool_call = excel_upstream.extract_native_client_tool_call(
             {

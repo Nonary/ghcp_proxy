@@ -424,14 +424,22 @@ class ToolRegistration:
 _DEFAULT_TOOL_NAMESPACE = "functions"
 
 
-def _flatten_tool_specs(specs: Any, namespace: str | None = None):
+def _flatten_tool_specs(
+    specs: Any, namespace: str | None = None, *, defer_loading: bool | None = None,
+):
     for spec in specs if isinstance(specs, list) else []:
         if not isinstance(spec, dict):
             continue
         if spec.get("type") == "namespace":
             name = spec.get("name")
-            yield from _flatten_tool_specs(spec.get("tools"), name if isinstance(name, str) and name else namespace)
+            inherited = spec.get("defer_loading", defer_loading)
+            yield from _flatten_tool_specs(
+                spec.get("tools"), name if isinstance(name, str) and name else namespace,
+                defer_loading=inherited if isinstance(inherited, bool) else defer_loading,
+            )
         else:
+            if defer_loading is not None and "defer_loading" not in spec:
+                spec = {**spec, "defer_loading": defer_loading}
             yield (None if namespace == _DEFAULT_TOOL_NAMESPACE else namespace), spec
 
 
@@ -502,7 +510,15 @@ def build_tool_registration(body: dict) -> ToolRegistration:
                 parameters=parameters,
                 overrides_built_in_tool=tool_type == "function",
                 skip_permission=True,
-                defer="never",
+                # Let the hostless runtime expose plugin tools through native
+                # tool search instead of loading the full desktop catalog.
+                # Keep core tools eager and respect explicit caller preferences.
+                defer=(
+                    "auto" if spec.get("defer_loading") is True
+                    or (spec.get("defer_loading") is not False and (
+                        namespace is not None or name.startswith("mcp__")
+                    )) else "never"
+                ),
             )
         )
     return registration
@@ -1209,6 +1225,12 @@ def _session_options(
         # Resume may retain previously registered tools when the new list is
         # empty. An explicit allowlist also enforces removals/tool_choice=none.
         "available_tools": available_tools,
+        # The runtime owns tool_search; it must not become a client tool call.
+        # No declared tools (including tool_choice=none) means no search either.
+        "tool_search": {
+            "enabled": any(tool.defer == "auto" for tool in registration.tools),
+            "defer_threshold": 20,
+        },
         "include_sub_agent_streaming_events": True,
         "on_permission_request": PermissionHandler.approve_all,
         # Resumed SDK sessions own their conversation history, so they also
