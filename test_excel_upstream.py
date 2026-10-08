@@ -18,6 +18,32 @@ def _jwt_with_exp(expiration: float) -> str:
     return f"{encode({'alg': 'none'})}.{encode({'exp': expiration})}."
 
 
+def _collaboration_source() -> dict:
+    return {
+        "model": "gpt-5.6-sol-excel",
+        "tools": [
+            {
+                "type": "namespace",
+                "name": "collaboration",
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "followup_task",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "agent_id": {"type": "string"},
+                                "message": {"type": "string", "encrypted": True},
+                            },
+                            "required": ["agent_id", "message"],
+                        },
+                    }
+                ],
+            }
+        ],
+    }
+
+
 class ExcelUpstreamTests(unittest.TestCase):
     def _merge_models(self, payload):
         data = payload.get("data") if isinstance(payload, dict) else None
@@ -327,6 +353,79 @@ class ExcelUpstreamTests(unittest.TestCase):
         self.assertEqual(items[0]["type"], "reasoning")
         self.assertEqual(items[0]["encrypted_content"], "gAAA==")
         self.assertEqual(items[1]["type"], "message")
+
+    def test_plaintext_agent_messages_become_excel_user_messages(self):
+        old_encrypted_assignment = {
+            "type": "agent_message",
+            "author": "/root",
+            "recipient": "/root/worker",
+            "content": [
+                {"type": "input_text", "text": "NEW_TASK: legacy header"},
+                {"type": "encrypted_content", "data": "opaque-history"},
+            ],
+        }
+        new_assignment = {
+            "type": "agent_message",
+            "author": "/root",
+            "recipient": "/root/worker",
+            "content": [
+                {"type": "input_text", "text": "Continue with the requested fix."},
+            ],
+        }
+
+        items = excel_upstream.translate_input_items(
+            [
+                old_encrypted_assignment,
+                {"type": "function_call_output", "call_id": "call_1", "output": "done"},
+                new_assignment,
+                {"type": "tool_search_output", "tools": []},
+            ]
+        )
+
+        self.assertEqual(items[0]["type"], "function_call_output")
+        self.assertEqual(items[1]["type"], "message")
+        self.assertEqual(items[1]["role"], "user")
+        self.assertEqual(items[1]["content"][0]["text"], "Continue with the requested fix.")
+        self.assertNotIn("opaque-history", json.dumps(items))
+        self.assertNotIn("agent_message", json.dumps(items))
+
+    def test_new_encrypted_agent_assignment_fails_explicitly(self):
+        encrypted_assignment = {
+            "type": "agent_message",
+            "content": [
+                {"type": "input_text", "text": "NEW_TASK: readable header only"},
+                {"type": "encrypted_content", "data": "opaque-payload"},
+            ],
+        }
+        with self.assertRaisesRegex(
+            excel_upstream.ExcelAdapterValidationError,
+            "cannot read an encrypted agent-message payload",
+        ):
+            excel_upstream.translate_input_items([encrypted_assignment])
+
+    def test_excel_route_rejects_opaque_assignment_before_session_lookup(self):
+        import proxy as proxy_module
+
+        response = asyncio.run(
+            proxy_module._handle_excel_responses(
+                None,
+                {
+                    "model": "gpt-5.6-sol-excel",
+                    "input": [
+                        {
+                            "type": "agent_message",
+                            "content": [
+                                {"type": "input_text", "text": "NEW_TASK: header only"},
+                                {"type": "encrypted_content", "data": "opaque"},
+                            ],
+                        }
+                    ],
+                },
+            )
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("cannot read an encrypted agent-message payload", response.body.decode())
 
     def test_tool_history_is_replayed_with_relay_namespace(self):
         raw_input = [
@@ -999,6 +1098,143 @@ class ExcelUpstreamTests(unittest.TestCase):
             json.loads(tool_call["arguments"]),
             {"code": "await computer.use()"},
         )
+
+    def test_tool_search_output_catalogs_and_plaintext_collaboration_schema(self):
+        source = _collaboration_source()
+        source["tools"] = [
+            {
+                "type": "function",
+                "name": "read_file",
+                "description": "Current read declaration.",
+                "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+            }
+        ]
+        source["input"] = [
+            {
+                "type": "additional_tools",
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "read_file",
+                        "description": "Stale read declaration.",
+                    }
+                ],
+            },
+            {
+                "type": "tool_search_output",
+                "tools": _collaboration_source()["tools"],
+            },
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Continue."}],
+            },
+        ]
+        original_schema = source["input"][1]["tools"][0]["tools"][0]["parameters"]
+
+        self.assertEqual(
+            excel_upstream.client_tool_types(source),
+            {"read_file": "function", "collaboration.followup_task": "function"},
+        )
+        body = excel_upstream.prepare_responses_body(source)
+        catalog = body["input"][0]["content"][0]["text"]
+
+        self.assertIn("Current read declaration.", catalog)
+        self.assertNotIn("Stale read declaration.", catalog)
+        self.assertIn('"name":"collaboration.followup_task"', catalog)
+        self.assertIn('"message":string', catalog)
+        self.assertNotIn('"encrypted":true', catalog)
+        self.assertTrue(original_schema["properties"]["message"]["encrypted"])
+        self.assertFalse(
+            any(
+                item.get("type") in {"additional_tools", "tool_search_output"}
+                for item in body["input"]
+                if isinstance(item, dict)
+            )
+        )
+
+    def test_marker_and_native_calls_preserve_collaboration_identity_and_plaintext(self):
+        source = _collaboration_source()
+        marker_text = (
+            '<codex_tool_call>{"name":"collaboration.followup_task",'
+            '"arguments":{"agent_id":"agent-1","message":"Continue the task."}}'
+            "</codex_tool_call>"
+        )
+        marker_call = excel_upstream.extract_client_tool_call(
+            marker_text,
+            excel_upstream.client_tool_types(source),
+            source=source,
+        )
+        self.assertEqual(marker_call["name"], "followup_task")
+        self.assertEqual(marker_call["namespace"], "collaboration")
+        self.assertEqual(marker_call["encrypted_function_args"], [])
+
+        marker_history = excel_upstream.translate_input_items(
+            [
+                marker_call,
+                {
+                    "type": "function_call_output",
+                    "call_id": marker_call["call_id"],
+                    "output": "agent-1",
+                },
+            ]
+        )
+        self.assertEqual(
+            marker_history[0]["name"],
+            excel_upstream.relay_tool_name("collaboration.followup_task"),
+        )
+        self.assertNotIn("namespace", marker_history[0])
+        self.assertNotIn("encrypted_function_args", marker_history[0])
+
+        fallback_history = excel_upstream.translate_input_items(
+            [
+                {
+                    "type": "function_call",
+                    "call_id": "call_namespaced_fallback",
+                    "name": "followup_task",
+                    "namespace": "collaboration",
+                    "arguments": '{"agent_id":"agent-1","message":"Continue."}',
+                }
+            ]
+        )
+        fallback_outer = json.loads(fallback_history[0]["arguments"])
+        fallback_inner = json.loads(fallback_outer["code"])
+        self.assertEqual(fallback_inner["name"], "collaboration.followup_task")
+
+        marker_payload = excel_upstream.response_payload_with_tool_call(
+            {"output": [{"type": "message"}]}, marker_call
+        )
+        self.assertEqual(marker_payload["output"][0]["encrypted_function_args"], [])
+
+        native_call = {
+            "type": "function_call",
+            "id": "fc_transport_collab",
+            "call_id": "call_transport_collab",
+            "name": "run_officejs",
+            "arguments": json.dumps(
+                {
+                    "summary": "Send follow-up",
+                    "extended_summary": "Continue the agent assignment",
+                    "destructive": False,
+                    "references": [],
+                    "code": json.dumps(
+                        {
+                            "name": "collaboration.followup_task",
+                            "arguments": {
+                                "agent_id": "agent-1",
+                                "message": "Continue the task.",
+                            },
+                        }
+                    ),
+                }
+            ),
+        }
+        native_result = excel_upstream.extract_native_client_tool_call(
+            {"output": [native_call]}, source
+        )
+        self.assertEqual(native_result["name"], "followup_task")
+        self.assertEqual(native_result["namespace"], "collaboration")
+        self.assertEqual(native_result["encrypted_function_args"], [])
 
     def test_compaction_trigger_stays_final_after_tool_reminder(self):
         body = excel_upstream.prepare_responses_body(
@@ -1849,6 +2085,100 @@ class ExcelStreamTransformTests(unittest.TestCase):
         self.assertEqual(completed["output"][0]["name"], "shell_command")
         self.assertEqual(completed["usage"]["output_tokens"], 7)
 
+    def test_namespaced_marker_stream_emits_plaintext_collaboration_call(self):
+        source = _collaboration_source()
+        marker = (
+            '<codex_tool_call>{"name":"collaboration.followup_task",'
+            '"arguments":{"agent_id":"agent-1","message":"Continue."}}'
+            "</codex_tool_call>"
+        )
+        events = self._collect(self._stream(marker), source)
+        added = next(
+            payload["item"]
+            for name, payload in events
+            if name == "response.output_item.added"
+            and payload.get("item", {}).get("type") == "function_call"
+        )
+        done = next(
+            payload["item"]
+            for name, payload in events
+            if name == "response.output_item.done"
+            and payload.get("item", {}).get("type") == "function_call"
+        )
+        completed = next(
+            payload["response"]
+            for name, payload in events
+            if name == "response.completed"
+        )
+
+        for item in (added, done, completed["output"][0]):
+            self.assertEqual(item["name"], "followup_task")
+            self.assertEqual(item["namespace"], "collaboration")
+            self.assertEqual(item["encrypted_function_args"], [])
+
+    def test_namespaced_native_collaboration_stream_emits_plaintext_call(self):
+        source = _collaboration_source()
+        native_item = {
+            "type": "function_call",
+            "id": "fc_excel_collaboration",
+            "call_id": "call_excel_collaboration",
+            "name": "run_officejs",
+            "status": "completed",
+            "arguments": json.dumps(
+                {
+                    "summary": "Send follow-up",
+                    "extended_summary": "Continue the agent assignment",
+                    "destructive": False,
+                    "references": [],
+                    "code": json.dumps(
+                        {
+                            "name": "collaboration.followup_task",
+                            "arguments": {
+                                "agent_id": "agent-1",
+                                "message": "Continue.",
+                            },
+                        }
+                    ),
+                }
+            ),
+        }
+        chunks = [
+            self._sse(
+                "response.output_item.done",
+                {"type": "response.output_item.done", "output_index": 0, "item": native_item},
+            ),
+            self._sse(
+                "response.completed",
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_excel_collaboration",
+                        "status": "completed",
+                        "output": [native_item],
+                    },
+                },
+            ),
+        ]
+
+        events = self._collect(chunks, source)
+        added = next(
+            payload["item"]
+            for name, payload in events
+            if name == "response.output_item.added"
+            and payload.get("item", {}).get("type") == "function_call"
+        )
+        completed = next(
+            payload["response"]
+            for name, payload in events
+            if name == "response.completed"
+        )
+
+        self.assertEqual(added["namespace"], "collaboration")
+        self.assertEqual(added["encrypted_function_args"], [])
+        self.assertEqual(completed["output"][0]["name"], "followup_task")
+        self.assertEqual(completed["output"][0]["namespace"], "collaboration")
+        self.assertEqual(completed["output"][0]["encrypted_function_args"], [])
+
     def test_run_officejs_stream_is_converted_to_client_tool_events(self):
         native_item = {
             "type": "function_call",
@@ -2240,6 +2570,360 @@ class ExcelStreamTransformTests(unittest.TestCase):
         self.assertEqual("".join(deltas), marker)
         completed = dict(events)["response.completed"]["response"]
         self.assertEqual(completed["output"][0]["type"], "message")
+
+
+class ExcelStreamRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    async def _verify_stream_failure(self, error, *, transform=None):
+        from unittest import mock
+        import httpx
+        import proxy
+
+        class BrokenStream(httpx.AsyncByteStream):
+            closed = False
+
+            async def __aiter__(self):
+                yield proxy.format_translation.sse_encode(
+                    "response.created",
+                    {"type": "response.created", "response": {"id": "resp_broken"}},
+                )
+                if error is not None:
+                    raise error
+
+            async def aclose(self):
+                self.closed = True
+
+        stream = BrokenStream()
+        upstream = httpx.Response(
+            200, stream=stream,
+            request=httpx.Request("POST", "https://example.invalid/responses"),
+            extensions={"http_version": b"HTTP/1.1"},
+        )
+        with mock.patch.object(proxy, "_finish_usage_and_trace") as finish:
+            body = proxy._ManagedResponsesStreamBody(
+                upstream=upstream, body={"stream": True}, headers={},
+                usage_event=None, stream_type="responses", trace_plan=None,
+                active_stream=None, emit_response_stream_errors=True,
+                stream_transform=transform,
+            )
+            chunks = [chunk async for chunk in body]
+            await body.aclose()
+            failed = json.loads(chunks[-1].split(b"data: ", 1)[1])
+            self.assertEqual(failed["type"], "response.failed")
+            self.assertEqual(failed["response"]["id"], "resp_broken")
+            self.assertEqual(finish.call_args.args[1], 502)
+            self.assertEqual(finish.call_count, 1)
+            self.assertTrue(stream.closed)
+
+    async def test_tls_error_emits_failed_terminal(self):
+        import ssl
+        await self._verify_stream_failure(ssl.SSLError("record layer failure"))
+
+    async def test_malformed_chunk_emits_failed_terminal_through_transform(self):
+        import httpx
+
+        async def transform(source):
+            async for chunk in source:
+                yield chunk
+
+        await self._verify_stream_failure(
+            httpx.RemoteProtocolError("malformed chunk footer"), transform=transform,
+        )
+
+    async def test_eof_without_terminal_emits_failure(self):
+        await self._verify_stream_failure(None)
+
+    async def test_tls_error_before_headers_returns_bad_gateway(self):
+        from unittest import mock
+        import httpx
+        import proxy
+        import ssl
+
+        async with httpx.AsyncClient() as client:
+            with mock.patch.object(proxy, "_open_streaming_upstream", mock.AsyncMock(
+                side_effect=ssl.SSLError("record layer failure")
+            )), mock.patch.object(proxy, "_finish_usage_and_trace") as finish:
+                response = await proxy.proxy_streaming_response(
+                    "https://example.invalid/responses", {}, {"stream": True},
+                    upstream_client=client, emit_response_stream_errors=True,
+                )
+                self.assertEqual(response.status_code, 502)
+                self.assertEqual(finish.call_args.args[1], 502)
+
+    async def test_silent_stream_hits_progress_deadline(self):
+        import asyncio
+        from unittest import mock
+        import httpx
+        import proxy
+
+        class SilentStream(httpx.AsyncByteStream):
+            closed = False
+
+            async def __aiter__(self):
+                yield b"event: ping\ndata: {}\n\n"
+                await asyncio.Event().wait()
+
+            async def aclose(self):
+                self.closed = True
+
+        stream = SilentStream()
+        upstream = httpx.Response(
+            200, stream=stream,
+            request=httpx.Request("POST", "https://example.invalid/responses"),
+            extensions={"http_version": b"HTTP/1.1"},
+        )
+        with mock.patch.object(proxy, "_finish_usage_and_trace") as finish:
+            body = proxy._ManagedResponsesStreamBody(
+                upstream=upstream, body={"stream": True}, headers={},
+                usage_event=None, stream_type="responses", trace_plan=None,
+                active_stream=None, emit_response_stream_errors=True,
+                progress_idle_timeout_seconds=0.05,
+            )
+            await body.__anext__()
+            failed = await asyncio.wait_for(body.__anext__(), 1)
+            self.assertIn(b"upstream_timeout", failed)
+            self.assertEqual(finish.call_args.args[1], 504)
+            await body.aclose()
+            self.assertTrue(stream.closed)
+
+    async def test_terminal_event_does_not_wait_for_http_eof(self):
+        from unittest import mock
+        import httpx
+        import proxy
+
+        for event_type in ("response.completed", "response.failed", "response.incomplete"):
+            with self.subTest(event_type=event_type):
+                class TerminalStream(httpx.AsyncByteStream):
+                    closed = False
+
+                    async def __aiter__(self):
+                        yield proxy.format_translation.sse_encode(event_type, {
+                            "type": event_type, "response": {"id": "resp_terminal"},
+                        })
+                        raise AssertionError("terminal stream must not read again")
+
+                    async def aclose(self):
+                        self.closed = True
+
+                stream = TerminalStream()
+                upstream = httpx.Response(
+                    200, stream=stream,
+                    request=httpx.Request("POST", "https://example.invalid/responses"),
+                    extensions={"http_version": b"HTTP/1.1"},
+                )
+                with mock.patch.object(proxy, "_finish_usage_and_trace") as finish:
+                    body = proxy._ManagedResponsesStreamBody(
+                        upstream=upstream, body={"stream": True}, headers={},
+                        usage_event=None, stream_type="responses", trace_plan=None,
+                        active_stream=None, emit_response_stream_errors=True,
+                    )
+                    chunks = [chunk async for chunk in body]
+                    self.assertEqual(len(chunks), 1)
+                    self.assertEqual(finish.call_args.args[1],
+                                     502 if event_type == "response.failed" else 200)
+                    await body.aclose()
+                    self.assertTrue(stream.closed)
+
+    async def test_excel_pool_uses_short_keepalive_without_changing_shared_pool(self):
+        from unittest import mock
+        import proxy
+
+        client = object()
+        with mock.patch.object(proxy, "_EXCEL_UPSTREAM_CLIENT", None), \
+             mock.patch.object(proxy, "_build_upstream_client", return_value=client) as build, \
+             mock.patch.object(proxy, "_ensure_upstream_client_shutdown_registered"):
+            self.assertIs(proxy._get_excel_upstream_client(), client)
+            self.assertIs(proxy._get_excel_upstream_client(), client)
+            build.assert_called_once_with(http2_override=False, keepalive_expiry=5.0)
+
+    async def test_cancellation_after_upstream_completion_remains_499(self):
+        from unittest import mock
+        import httpx
+        import proxy
+
+        class CompletedStream(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                yield proxy.format_translation.sse_encode("response.completed", {
+                    "type": "response.completed", "response": {"id": "resp_completed"},
+                })
+
+            async def aclose(self):
+                pass
+
+        async def transform(source):
+            async for chunk in source:
+                yield chunk
+
+        plan = proxy.UpstreamRequestPlan(
+            request_id="cancelled", upstream_url="https://example.invalid/responses",
+            body={"stream": True}, headers={}, requested_model=None,
+            resolved_model=None, source_body={}, usage_event=None, trace_context={},
+        )
+        upstream = httpx.Response(200, stream=CompletedStream(),
+            request=httpx.Request("POST", plan.upstream_url),
+            extensions={"http_version": b"HTTP/1.1"})
+        with mock.patch.object(proxy, "_finish_usage_and_trace") as finish:
+            body = proxy._ManagedResponsesStreamBody(
+                upstream=upstream, body=plan.body, headers={}, usage_event=None,
+                stream_type="responses", trace_plan=plan, active_stream=None,
+                emit_response_stream_errors=True, stream_transform=transform,
+            )
+            await body.__anext__()
+            await body.aclose()
+            self.assertEqual(finish.call_args.args[1], 499)
+            lifecycle = plan.trace_context["responses_stream_lifecycle"]
+            self.assertTrue(lifecycle["completed_event_seen"])
+            self.assertEqual(lifecycle["failure_category"], "downstream_cancelled")
+
+    async def test_excel_stream_request_uses_scoped_idle_timeout(self):
+        import proxy
+
+        class RecordingClient:
+            timeout = None
+
+            def build_request(self, _method, _url, **kwargs):
+                self.timeout = kwargs["timeout"]
+                raise RuntimeError("request captured")
+
+        client = RecordingClient()
+        with self.assertRaisesRegex(RuntimeError, "request captured"):
+            await proxy.proxy_streaming_response(
+                "https://example.invalid/responses",
+                {},
+                {"stream": True},
+                timeout=120,
+                upstream_client=client,
+            )
+        self.assertEqual(client.timeout.read, 120)
+        self.assertEqual(client.timeout.connect, 120)
+
+    async def test_excel_stream_read_timeout_emits_failed_terminal(self):
+        from unittest import mock
+        import httpx
+        import proxy
+
+        class TimeoutStream(httpx.AsyncByteStream):
+            closed = False
+
+            async def __aiter__(self):
+                yield proxy.format_translation.sse_encode(
+                    "response.created",
+                    {"type": "response.created", "response": {"id": "resp_1"}},
+                )
+                raise httpx.ReadTimeout("idle")
+
+            async def aclose(self):
+                self.closed = True
+
+        stream = TimeoutStream()
+        upstream = httpx.Response(
+            200,
+            stream=stream,
+            request=httpx.Request("POST", "https://example.invalid/responses"),
+            extensions={"http_version": b"HTTP/1.1"},
+        )
+        with mock.patch.object(proxy, "_finish_usage_and_trace") as finish:
+            body = proxy._ManagedResponsesStreamBody(
+                upstream=upstream,
+                body={"stream": True},
+                headers={},
+                usage_event=None,
+                stream_type="responses",
+                trace_plan=None,
+                active_stream=None,
+                emit_response_stream_errors=True,
+            )
+            self.assertIn(b"response.created", await body.__anext__())
+            failed = await body.__anext__()
+            self.assertIn(b"event: response.failed", failed)
+            payload = json.loads(failed.split(b"data: ", 1)[1])
+            self.assertEqual(payload["response"]["id"], "resp_1")
+            self.assertEqual(payload["response"]["error"]["code"], "upstream_timeout")
+            with self.assertRaises(StopAsyncIteration):
+                await body.__anext__()
+            await body.aclose()
+            self.assertEqual(finish.call_args.args[1], 504)
+        self.assertTrue(stream.closed)
+
+    async def test_timeout_after_completed_does_not_emit_failure(self):
+        from unittest import mock
+        import httpx
+        import proxy
+
+        class LateTimeoutStream(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                yield proxy.format_translation.sse_encode(
+                    "response.completed",
+                    {"type": "response.completed", "response": {"id": "resp_1"}},
+                )
+                raise httpx.ReadTimeout("late EOF")
+
+            async def aclose(self):
+                pass
+
+        upstream = httpx.Response(
+            200,
+            stream=LateTimeoutStream(),
+            request=httpx.Request("POST", "https://example.invalid/responses"),
+            extensions={"http_version": b"HTTP/1.1"},
+        )
+        with mock.patch.object(proxy, "_finish_usage_and_trace") as finish:
+            body = proxy._ManagedResponsesStreamBody(
+                upstream=upstream,
+                body={"stream": True},
+                headers={},
+                usage_event=None,
+                stream_type="responses",
+                trace_plan=None,
+                active_stream=None,
+                emit_response_stream_errors=True,
+            )
+            self.assertIn(b"response.completed", await body.__anext__())
+            with self.assertRaises(StopAsyncIteration):
+                await body.__anext__()
+            await body.aclose()
+            self.assertEqual(finish.call_args.args[1], 200)
+
+
+    async def test_keepalives_do_not_extend_progress_timeout(self):
+        from unittest import mock
+        import httpx
+        import proxy
+
+        class PingStream(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                yield proxy.format_translation.sse_encode(
+                    "response.created",
+                    {"type": "response.created", "response": {"id": "resp_1"}},
+                )
+                yield b"event: ping\ndata: {}\n\n"
+
+            async def aclose(self):
+                pass
+
+        upstream = httpx.Response(
+            200,
+            stream=PingStream(),
+            request=httpx.Request("POST", "https://example.invalid/responses"),
+            extensions={"http_version": b"HTTP/1.1"},
+        )
+        with mock.patch.object(proxy, "_finish_usage_and_trace") as finish:
+            body = proxy._ManagedResponsesStreamBody(
+                upstream=upstream,
+                body={"stream": True},
+                headers={},
+                usage_event=None,
+                stream_type="responses",
+                trace_plan=None,
+                active_stream=None,
+                emit_response_stream_errors=True,
+                progress_idle_timeout_seconds=120,
+            )
+            self.assertIn(b"response.created", await body.__anext__())
+            body.capture.last_progress_at -= 121
+            failed = await body.__anext__()
+            self.assertIn(b"event: response.failed", failed)
+            self.assertEqual(finish.call_args.args[1], 504)
+            await body.aclose()
 
 
 class ExcelSessionPersistenceTests(unittest.TestCase):

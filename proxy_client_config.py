@@ -1112,6 +1112,10 @@ class ProxyClientConfigService:
                 "experimental_supported_tools": [],
                 "input_modalities": input_modalities,
                 "supports_search_tool": False,
+                # Fresh child threads resolve their backend from model metadata,
+                # not the parent's per-thread v2 selection. An omitted selector
+                # can fall back to disabled/v1 and hide collaboration tools.
+                "multi_agent_version": "v2",
             }
             if supported_levels:
                 entry["default_reasoning_level"] = default_level

@@ -71,6 +71,7 @@ import messages_preprocess
 import migrate_runtime_paths
 import json
 import sqlite3
+import ssl
 import tempfile
 import time
 import threading
@@ -678,11 +679,13 @@ _EXCEL_UPSTREAM_CLIENT: "httpx.AsyncClient | None" = None
 _UPSTREAM_CLIENT_LOCK = threading.Lock()
 _UPSTREAM_CLIENT_SHUTDOWN_REGISTERED = False
 _EXCEL_NON_STREAMING_RETRY_ATTEMPTS = 2
+_EXCEL_STREAM_IDLE_TIMEOUT_SECONDS = 120
 
 
 def _build_upstream_client(
     *,
     http2_override: bool | None = None,
+    keepalive_expiry: float = 300.0,
 ) -> "httpx.AsyncClient":
     proxy_aliases = _apply_upstream_proxy_env_aliases()
     if proxy_aliases:
@@ -716,7 +719,7 @@ def _build_upstream_client(
     limits = httpx.Limits(
         max_connections=8,
         max_keepalive_connections=4,
-        keepalive_expiry=300.0,
+        keepalive_expiry=keepalive_expiry,
     )
     try:
         return httpx.AsyncClient(
@@ -760,7 +763,11 @@ def _get_excel_upstream_client() -> "httpx.AsyncClient":
         return _EXCEL_UPSTREAM_CLIENT
     with _UPSTREAM_CLIENT_LOCK:
         if _EXCEL_UPSTREAM_CLIENT is None:
-            _EXCEL_UPSTREAM_CLIENT = _build_upstream_client(http2_override=False)
+            # Avoid retaining idle proxy-tunneled sockets for five minutes.
+            # This limits stale reuse, not failures in an already-open stream.
+            _EXCEL_UPSTREAM_CLIENT = _build_upstream_client(
+                http2_override=False, keepalive_expiry=5.0
+            )
             _ensure_upstream_client_shutdown_registered()
     return _EXCEL_UPSTREAM_CLIENT
 
@@ -1689,6 +1696,8 @@ class _ManagedResponsesStreamBody:
         stream_transform=None,
         trace_details_factory=None,
         sync_replay_ids: bool | None = None,
+        emit_response_stream_errors: bool = False,
+        progress_idle_timeout_seconds: float | None = None,
     ):
         self.upstream = upstream
         self.usage_event = usage_event
@@ -1697,6 +1706,9 @@ class _ManagedResponsesStreamBody:
         self.active_stream = active_stream
         self.trace_details_factory = trace_details_factory
         self._stream_transform_enabled = callable(stream_transform)
+        self._emit_response_stream_errors = emit_response_stream_errors
+        self._progress_idle_timeout_seconds = progress_idle_timeout_seconds
+        self._failed_terminal_sent = False
         self.capture = usage_tracker.create_sse_capture(stream_type)
         self.source_loop_completed = False
         self.presentation_loop_completed = False
@@ -1742,10 +1754,45 @@ class _ManagedResponsesStreamBody:
             )
 
         async def capture_source():
-            async for chunk in raw_source_iter:
+            raw_iter = raw_source_iter.__aiter__()
+            while True:
+                try:
+                    if self._progress_idle_timeout_seconds is None:
+                        chunk = await raw_iter.__anext__()
+                    else:
+                        remaining = self._progress_idle_timeout_seconds - (
+                            time.monotonic() - self.capture.last_progress_at
+                        )
+                        if remaining <= 0:
+                            raise httpx.ReadTimeout("Upstream stream made no progress")
+                        try:
+                            chunk = await asyncio.wait_for(raw_iter.__anext__(), remaining)
+                        except asyncio.TimeoutError as exc:
+                            raise httpx.ReadTimeout("Upstream stream made no progress") from exc
+                except StopAsyncIteration:
+                    if self._emit_response_stream_errors and self.capture.terminal_event_type not in {
+                        "response.completed", "response.failed", "response.incomplete"
+                    }:
+                        raise httpx.RemoteProtocolError(
+                            "Upstream stream ended without a terminal Responses event"
+                        )
+                    break
                 if self.capture.feed(chunk):
                     usage_tracker.mark_first_output(self.usage_event)
+                if (
+                    self._progress_idle_timeout_seconds is not None
+                    and not self.capture.terminal_event_seen
+                    and time.monotonic() - self.capture.last_progress_at
+                    > self._progress_idle_timeout_seconds
+                ):
+                    raise httpx.ReadTimeout("Upstream stream made no progress")
                 yield chunk
+                if self._emit_response_stream_errors and self.capture.terminal_event_type in {
+                    "response.completed", "response.failed", "response.incomplete"
+                }:
+                    # The Responses terminal event ends this generation. Do
+                    # not wait for a trailing HTTP EOF or a lingering socket.
+                    break
             self.source_loop_completed = True
 
         source_iter = capture_source()
@@ -1757,6 +1804,8 @@ class _ManagedResponsesStreamBody:
         return self
 
     async def __anext__(self):
+        if self._failed_terminal_sent:
+            raise StopAsyncIteration
         # Keep task cancellation from reaching httpcore before we can emit
         # RST_STREAM. httpcore otherwise closes and discards its private stream
         # state while leaving the server-side generation alive.
@@ -1781,6 +1830,34 @@ class _ManagedResponsesStreamBody:
                     pass
             await self._finalize("downstream_cancelled")
             raise
+        except (httpx.RequestError, ssl.SSLError) as exc:
+            await self._finalize("upstream_error", error=exc)
+            if self.capture.terminal_event_type in {
+                "response.completed", "response.failed", "response.incomplete"
+            }:
+                # A completed/failed Responses event is already terminal; a
+                # missing trailing EOF must not change the client's outcome.
+                self._failed_terminal_sent = True
+                raise StopAsyncIteration
+            if not self._emit_response_stream_errors:
+                raise
+            self._failed_terminal_sent = True
+            _status, message = format_translation.upstream_request_error_status_and_message(exc)
+            return format_translation.sse_encode(
+                "response.failed",
+                {
+                    "type": "response.failed",
+                    "response": {
+                        "id": self.capture.response_id or f"resp_proxy_{uuid4().hex}",
+                        "object": "response",
+                        "status": "failed",
+                        "error": {
+                            "code": "upstream_timeout" if isinstance(exc, httpx.TimeoutException) else "upstream_error",
+                            "message": message,
+                        },
+                    },
+                },
+            )
         except Exception as exc:
             await self._finalize("upstream_error", error=exc)
             raise
@@ -1989,6 +2066,12 @@ class _ManagedResponsesStreamBody:
                 "transport_cancel_confirmed": transport_cancel_confirmed,
                 "teardown_confirmed": teardown_confirmed,
                 "upstream_error_type": type(error).__name__ if error is not None else None,
+                "failure_category": (
+                    "downstream_cancelled" if trace_status == 499 else
+                    None if trace_status < 400 else
+                    "upstream_transport_error" if isinstance(error, (httpx.RequestError, ssl.SSLError)) else
+                    "stream_error"
+                ),
                 "presentation_transform": self._stream_transform_enabled,
             }
             trace_details = {}
@@ -4152,6 +4235,7 @@ async def proxy_streaming_response(
     trace_details_factory=None,
     sync_replay_ids: bool | None = None,
     upstream_client: httpx.AsyncClient | None = None,
+    emit_response_stream_errors: bool = False,
 ) -> Response:
     """
     Relay an upstream SSE response while preserving upstream error statuses.
@@ -4170,7 +4254,12 @@ async def proxy_streaming_response(
     try:
         await _supersede_active_responses_streams(trace_plan, active_stream)
         client = upstream_client or _get_upstream_client()
-        request = client.build_request("POST", upstream_url, headers=headers, json=body)
+        request_kwargs = {"headers": headers, "json": body}
+        if upstream_client is not None:
+            # Excel streams need a per-chunk idle limit rather than the long
+            # timeout of the shared upstream client.
+            request_kwargs["timeout"] = httpx.Timeout(timeout)
+        request = client.build_request("POST", upstream_url, **request_kwargs)
         try:
             upstream = await _open_streaming_upstream(
                 client,
@@ -4254,7 +4343,7 @@ async def proxy_streaming_response(
                 confirmed=teardown_confirmed,
             )
         raise
-    except httpx.RequestError as exc:
+    except (httpx.RequestError, ssl.SSLError) as exc:
         status_code, message = format_translation.upstream_request_error_status_and_message(exc)
         teardown_confirmed = isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout))
         try:
@@ -4407,6 +4496,10 @@ async def proxy_streaming_response(
             stream_transform=stream_transform,
             trace_details_factory=trace_details_factory,
             sync_replay_ids=sync_replay_ids,
+            emit_response_stream_errors=emit_response_stream_errors,
+            progress_idle_timeout_seconds=(
+                timeout if upstream_client is not None else None
+            ),
         )
     except Exception:
         transport_cancel = await _close_upstream_response(
@@ -6120,6 +6213,7 @@ def _excel_tool_stream_transform(source_body: dict):
                     tool_call = excel_upstream.extract_client_tool_call(
                         completed_text or "",
                         allowed_tools,
+                        source=source_body,
                     )
                     if tool_call is None:
                         tool_call = excel_upstream.extract_native_client_tool_call(
@@ -6262,6 +6356,7 @@ async def _post_excel_non_streaming_request(
     tool_call = excel_upstream.extract_client_tool_call(
         response_text,
         excel_upstream.client_tool_types(client_body),
+        source=client_body,
     )
     if tool_call is None:
         tool_call = excel_upstream.extract_native_client_tool_call(
@@ -6502,6 +6597,10 @@ async def _handle_excel_responses(
     excel_model_id = (
         excel_upstream.excel_model_id(body.get("model")) or excel_upstream.MODEL_ID
     )
+    try:
+        excel_upstream.validate_new_agent_message(body.get("input"))
+    except excel_upstream.ExcelAdapterValidationError as exc:
+        return format_translation.openai_error_response(400, str(exc))
     excel_session_capture.refresh_macos_excel_session(
         excel_upstream.excel_session_store,
         force=True,
@@ -6561,7 +6660,7 @@ async def _handle_excel_responses(
             plan.upstream_url,
             plan.headers,
             plan.body,
-            timeout=300,
+            timeout=_EXCEL_STREAM_IDLE_TIMEOUT_SECONDS,
             usage_event=plan.usage_event,
             stream_type="responses",
             trace_plan=plan,
@@ -6571,6 +6670,7 @@ async def _handle_excel_responses(
             stream_transform=_excel_tool_stream_transform(body),
             sync_replay_ids=False,
             upstream_client=_get_excel_upstream_client(),
+            emit_response_stream_errors=True,
         )
     return await _post_excel_non_streaming_request(plan, client_body=body)
 

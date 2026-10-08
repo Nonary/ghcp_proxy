@@ -196,6 +196,21 @@ Set environment variables before starting the proxy.
 
 Standard `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY` variables are also honored.
 
+Excel Responses streams have a 120-second read/progress idle timeout, rather
+than a 120-second total generation limit. Keepalive pings do not reset it. If
+an upstream stream stops sending model events, the proxy closes it and sends
+`response.failed`. TLS failures, malformed HTTP chunks, and EOF without a
+terminal Responses event also produce an explicit failure. The proxy does not
+automatically replay interrupted streams, since that could duplicate tool
+actions or token spend. A terminal Responses event ends the relay without
+waiting for a trailing HTTP EOF. Excel connections use a five-second idle
+keepalive expiry to limit stale connection reuse through network proxies.
+
+Request traces retain HTTP `499` for downstream cancellations (not confirmed
+delivery). Their stream lifecycle `failure_category` distinguishes
+`downstream_cancelled` from `upstream_transport_error`; do not count every
+non-success response as an upstream transport failure.
+
 ### Enterprise Proxy Example
 
 ```bash

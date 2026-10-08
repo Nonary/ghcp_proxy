@@ -542,6 +542,8 @@ class SSEUsageCapture:
         self.terminal_event_seen = False
         self.completed_event_seen = False
         self.terminal_event_type = None
+        self.response_id = None
+        self.last_progress_at = time.monotonic()
 
     def _has_text(self, value) -> bool:
         if not isinstance(value, str):
@@ -558,8 +560,10 @@ class SSEUsageCapture:
         from format_translation import extract_text_from_chat_delta
         return self._has_text(extract_text_from_chat_delta(delta))
 
-    def _consume_responses_payload(self, payload: dict) -> bool:
-        event_type = str(payload.get("type", "")).strip().lower()
+    def _consume_responses_payload(self, payload: dict, event_name: str | None = None) -> bool:
+        event_type = str(payload.get("type") or event_name or "").strip().lower()
+        if event_type not in {"ping", "heartbeat", "response.in_progress"}:
+            self.last_progress_at = time.monotonic()
         if event_type in {"response.completed", "response.failed", "response.incomplete"}:
             self.terminal_event_seen = True
             self.terminal_event_type = event_type
@@ -567,6 +571,8 @@ class SSEUsageCapture:
             self.completed_event_seen = True
         response = payload.get("response")
         if isinstance(response, dict):
+            if isinstance(response.get("id"), str):
+                self.response_id = response["id"]
             if isinstance(response.get("usage"), dict):
                 self.usage = normalize_usage_payload(response["usage"])
         elif isinstance(payload.get("usage"), dict):
@@ -619,7 +625,7 @@ class SSEUsageCapture:
             if self.stream_type == "chat":
                 saw_output = self._consume_chat_payload(payload) or saw_output
             else:
-                saw_output = self._consume_responses_payload(payload) or saw_output
+                saw_output = self._consume_responses_payload(payload, _event_name) or saw_output
 
         self.buffer = normalized
         return saw_output

@@ -81,6 +81,59 @@ class ReasoningLevelTests(unittest.TestCase):
         self.assertEqual(slugs, {"gpt-6.1-sol", "gpt-6-sol-excel"})
         self.assertEqual(slugs, set(self.service.codex_model_catalog_model_names()))
 
+    def test_generated_catalog_selects_v2_for_fresh_threads_and_children(self):
+        self.service._config = SimpleNamespace(
+            codex_model_context_window=272_000,
+            codex_model_auto_compact_token_limit=180_000,
+        )
+        self.service._model_capabilities_provider = lambda: {
+            "gpt-6.1-sol": {},
+            "gpt-6-luna": {},
+            "gpt-6-sol-excel": {},
+        }
+        self.service._model_routing_settings_provider = lambda: {
+            "enabled": True,
+            "mappings": [
+                {"source_model": "gpt-5.3-codex", "target_model": "gpt-6.1-sol"},
+            ],
+        }
+
+        models = self.service._build_codex_model_catalog_payload()["models"]
+
+        self.assertEqual(
+            {model["slug"] for model in models},
+            {"gpt-6.1-sol", "gpt-6-luna", "gpt-6-sol-excel", "gpt-5.3-codex"},
+        )
+        for model in models:
+            with self.subTest(model=model["slug"]):
+                self.assertEqual(model.get("multi_agent_version"), "v2")
+
+    def test_refresh_adds_v2_metadata_without_rewriting_agent_settings(self):
+        with tempfile.TemporaryDirectory() as directory:
+            catalog_path = os.path.join(directory, "models.json")
+            primary_path = os.path.join(directory, "config.toml")
+            primary = '[agents]\nenabled = false\nmax_threads = 3\n'
+            with open(primary_path, "w") as stream:
+                stream.write(primary)
+            with open(catalog_path, "w") as stream:
+                json.dump({"models": [{"slug": "gpt-6.1-sol"}]}, stream)
+            self.service._config = SimpleNamespace(
+                codex_model_catalog_file=catalog_path,
+                codex_primary_config_file=primary_path,
+                codex_config_dir=directory,
+                codex_model_context_window=272_000,
+                codex_model_auto_compact_token_limit=180_000,
+            )
+            self.service._model_capabilities_provider = lambda: {"gpt-6.1-sol": {}}
+            self.service._model_routing_settings_provider = lambda: {}
+
+            self.assertTrue(self.service.refresh_codex_model_catalog())
+
+            with open(catalog_path) as stream:
+                self.assertEqual(json.load(stream)["models"][0]["multi_agent_version"], "v2")
+            with open(primary_path) as stream:
+                self.assertEqual(stream.read(), primary)
+
     def test_routing_can_target_a_discovered_excel_model_without_static_pricing(self):
         self.service._model_capabilities_provider = lambda: {"gpt-7-new-model-excel": {}}
         self.service._model_routing_settings_provider = lambda: {

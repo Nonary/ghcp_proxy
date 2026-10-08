@@ -104,3 +104,7 @@ It sends only a synthetic canary assignment, captures the external tool request,
 and checks the exact plaintext plus the returned compatibility marker. It does
 not execute the follow-up or spawn Codex agents. SDK state is isolated in a
 temporary directory, and its probe session is disconnected/deleted before exit.
+
+Excel-suffixed models do not use this Copilot SDK adapter. They have a separate
+Responses wire adapter with the corresponding v2 catalog, collaboration, and
+agent-message mappings documented in [the Excel adapter notes](codex-excel-adapter.md).

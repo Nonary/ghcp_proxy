@@ -65,9 +65,27 @@ CLIENT_TOOL_TRANSPORT_NAME = "run_officejs"
 CLIENT_TOOL_TRANSPORT_ALIASES = frozenset(
     {CLIENT_TOOL_TRANSPORT_NAME, f"functions.{CLIENT_TOOL_TRANSPORT_NAME}"}
 )
+_CATALOG_ITEM_TYPES = frozenset({"additional_tools", "tool_search_output"})
+_PLAINTEXT_COLLABORATION_TOOLS = frozenset(
+    {"spawn_agent", "send_message", "followup_task"}
+)
 TOOLS_VERSION_METADATA_KEY = "bps_tools_version_id"
 _TOOLS_VERSION_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,160}$")
 _NATIVE_CALL_CACHE_LIMIT = 512
+
+
+class ExcelAdapterValidationError(ValueError):
+    """A Codex Responses item cannot be safely translated to Excel wire format."""
+
+
+def _is_plaintext_collaboration_tool(namespace: object, name: object) -> bool:
+    return (
+        namespace == "collaboration"
+        and isinstance(name, str)
+        and name in _PLAINTEXT_COLLABORATION_TOOLS
+    )
+
+
 _native_call_cache_lock = threading.Lock()
 _native_call_cache: OrderedDict[str, dict] = OrderedDict()
 _TOOL_CALL_PATTERN = re.compile(
@@ -329,17 +347,24 @@ def _iter_client_tools(tools: object, namespace: str | None = None):
 
 
 def _source_client_tools(source: dict):
-    """Read both standard Responses and the app's Responses Lite declarations.
+    """Read standard, Responses Lite, and tool-search-loaded declarations.
 
     Declarations belong in the relay catalog, not in conversation history.
-    Deduplicate replayed declarations by their callable identity.
+    Deduplicate replayed declarations by callable identity. Current top-level
+    declarations take precedence over replayed catalogs; within replayed
+    catalogs, the newest declaration wins without changing its original order.
     """
-    declarations = list(_iter_client_tools(source.get("tools")))
+    current = list(_iter_client_tools(source.get("tools")))
+    replayed = []
     items = source.get("input")
     for item in items if isinstance(items, list) else []:
-        if isinstance(item, dict) and item.get("type") == "additional_tools":
-            declarations.extend(_iter_client_tools(item.get("tools")))
-    by_name = {entry[0]: entry for entry in declarations}
+        if isinstance(item, dict) and item.get("type") in _CATALOG_ITEM_TYPES:
+            replayed.extend(_iter_client_tools(item.get("tools")))
+    current_names = {entry[0] for entry in current}
+    by_name = {entry[0]: entry for entry in current}
+    for entry in replayed:
+        if entry[0] not in current_names:
+            by_name[entry[0]] = entry
     yield from by_name.values()
 
 
@@ -405,6 +430,84 @@ def _client_tool_specs(source: dict) -> dict[str, dict]:
             "spec": tool,
         }
     return result
+
+
+def _client_tool_identity(
+    name: str,
+    tool_specs: dict[str, dict] | None = None,
+) -> tuple[str, str | None]:
+    """Restore a flat catalog key to Codex's leaf-name/namespace pair."""
+    spec = (tool_specs or {}).get(name)
+    if isinstance(spec, dict):
+        original_name = spec.get("name")
+        namespace = spec.get("namespace")
+        if isinstance(original_name, str):
+            return original_name, namespace if isinstance(namespace, str) else None
+    if "." in name:
+        namespace, _, leaf_name = name.rpartition(".")
+        if namespace and leaf_name:
+            return leaf_name, namespace
+    return name, None
+
+
+def _mark_plaintext_collaboration_call(item: dict) -> dict:
+    """Select Codex's direct-plaintext path for collaboration message tools."""
+    if item.get("type") != "function_call":
+        return item
+    name = item.get("name")
+    namespace = item.get("namespace")
+    if isinstance(name, str) and not namespace and "." in name:
+        namespace, _, name = name.rpartition(".")
+    if _is_plaintext_collaboration_tool(namespace, name):
+        item["encrypted_function_args"] = []
+    return item
+
+
+def _client_tool_prompt_parameters(
+    namespace: str | None,
+    name: str,
+    parameters: object,
+) -> dict:
+    """Hide Codex's encryption annotation from Excel's plaintext tool relay."""
+    if not isinstance(parameters, dict):
+        return {}
+    if not _is_plaintext_collaboration_tool(namespace, name):
+        return parameters
+    result = copy.deepcopy(parameters)
+    properties = result.get("properties")
+    message_schema = properties.get("message") if isinstance(properties, dict) else None
+    if isinstance(message_schema, dict):
+        message_schema.pop("encrypted", None)
+    return result
+
+
+def _agent_message_has_encrypted_payload(item: dict) -> bool:
+    if item.get("encrypted_content"):
+        return True
+    content = item.get("content")
+    return isinstance(content, list) and any(
+        isinstance(part, dict) and part.get("type") == "encrypted_content"
+        for part in content
+    )
+
+
+def validate_new_agent_message(raw_input: object) -> None:
+    """Reject an unrecoverable encrypted assignment at the end of a request."""
+    if not isinstance(raw_input, list):
+        return
+    for item in reversed(raw_input):
+        if not isinstance(item, dict):
+            break
+        item_type = str(item.get("type") or "").strip().lower()
+        if item_type in _CATALOG_ITEM_TYPES:
+            continue
+        if item_type == "agent_message" and _agent_message_has_encrypted_payload(item):
+            raise ExcelAdapterValidationError(
+                "Excel Responses cannot read an encrypted agent-message payload. "
+                "Resend the assignment using the plaintext collaboration path; "
+                "existing ciphertext cannot be recovered by this adapter."
+            )
+        break
 
 
 def _decode_transport_code(code: object) -> dict | None:
@@ -677,7 +780,7 @@ def _restore_native_function_arguments(name: str, arguments: object) -> object:
 def extract_native_client_tool_call(
     response: dict | None,
     source: dict,
-) -> dict[str, str] | None:
+) -> dict[str, object] | None:
     if not isinstance(response, dict):
         return None
     specs = _client_tool_specs(source)
@@ -761,7 +864,7 @@ def extract_native_client_tool_call(
         }
         if tool_info["namespace"]:
             result["namespace"] = tool_info["namespace"]
-        return result
+        return _mark_plaintext_collaboration_call(result)
     if expected_type == "custom":
         custom_input = (
             envelope.get("input")
@@ -780,7 +883,7 @@ def extract_native_client_tool_call(
         )
         native_item_id = native.get("id")
         _remember_native_call(native)
-        return {
+        result = {
             "type": "custom_tool_call",
             "id": (
                 native_item_id
@@ -792,9 +895,12 @@ def extract_native_client_tool_call(
                 else f"ctc_{call_id}"
             ),
             "call_id": call_id,
-            "name": name,
+            "name": tool_info["name"],
             "input": custom_input,
         }
+        if tool_info["namespace"]:
+            result["namespace"] = tool_info["namespace"]
+        return result
     return None
 
 
@@ -804,7 +910,7 @@ def _client_tool_protocol_instructions(source: dict) -> str:
         return EXTERNAL_CLIENT_INSTRUCTIONS
 
     tool_catalog: list[str] = []
-    for key, _name, _namespace, tool_type, tool in _source_client_tools(source):
+    for key, name, namespace, tool_type, tool in _source_client_tools(source):
         # The qualified callable name already identifies both namespace and
         # leaf. Do not repeat all three names on every catalog entry.
         entry = {"name": key}
@@ -820,6 +926,7 @@ def _client_tool_protocol_instructions(source: dict) -> str:
                 or tool.get("inputSchema")
                 or tool.get("input_schema")
             )
+            parameters = _client_tool_prompt_parameters(namespace, name, parameters)
             details.append("parameters: " + compact_schema(parameters if isinstance(parameters, dict) else {}))
         else:
             custom_format = tool.get("format")
@@ -926,7 +1033,9 @@ def _client_tool_protocol_reminder(source: dict) -> str:
 def extract_client_tool_call(
     text: str,
     allowed_tools: dict[str, str],
-) -> dict[str, str] | None:
+    *,
+    source: dict | None = None,
+) -> dict[str, object] | None:
     if not isinstance(text, str) or not allowed_tools:
         return None
     match = _TOOL_CALL_PATTERN.search(text)
@@ -944,6 +1053,8 @@ def extract_client_tool_call(
     name = _original_client_tool_name(marker_name.strip(), allowed_tools)
     if name is None:
         return None
+    tool_specs = _client_tool_specs(source) if isinstance(source, dict) else None
+    call_name, namespace = _client_tool_identity(name, tool_specs)
     tool_type = allowed_tools.get(name)
     if tool_type == "function":
         arguments = marker.get("arguments")
@@ -955,35 +1066,41 @@ def extract_client_tool_call(
         if not isinstance(arguments, dict):
             return None
         call_id = f"{CLIENT_MARKER_CALL_ID_PREFIX}{uuid4().hex}"
-        return {
+        call = {
             "type": "function_call",
             "id": responses_replay_ids.function_item_id(call_id),
             "call_id": call_id,
-            "name": name,
+            "name": call_name,
             "arguments": json.dumps(
                 arguments,
                 separators=(",", ":"),
                 ensure_ascii=False,
             ),
         }
+        if namespace:
+            call["namespace"] = namespace
+        return _mark_plaintext_collaboration_call(call)
     if tool_type == "custom":
         custom_input = marker.get("input")
         if not isinstance(custom_input, str):
             return None
         call_id = f"{CLIENT_MARKER_CALL_ID_PREFIX}{uuid4().hex}"
-        return {
+        call = {
             "type": "custom_tool_call",
             "id": f"ctc_{call_id}",
             "call_id": call_id,
-            "name": name,
+            "name": call_name,
             "input": custom_input,
         }
+        if namespace:
+            call["namespace"] = namespace
+        return call
     return None
 
 
 def response_payload_with_tool_call(
     response: dict | None,
-    tool_call: dict[str, str],
+    tool_call: dict[str, object],
     *,
     model_id: str = MODEL_ID,
 ) -> dict[str, object]:
@@ -993,7 +1110,9 @@ def response_payload_with_tool_call(
     result.setdefault("created_at", int(time.time()))
     result["status"] = "completed"
     result["model"] = model_id
-    completed_tool_call = {**tool_call, "status": "completed"}
+    completed_tool_call = _mark_plaintext_collaboration_call(
+        {**tool_call, "status": "completed"}
+    )
     existing_output = result.get("output")
     replaced_native_call = False
     output: list[dict] = []
@@ -1387,6 +1506,9 @@ def _normalized_tool_output(
 def _fallback_transport_call(item: dict) -> dict:
     """Rebuild a transport call if the proxy restarted between call and result."""
     name = str(item.get("name") or "")
+    namespace = item.get("namespace")
+    if isinstance(namespace, str) and namespace and namespace != "functions":
+        name = _client_tool_key(name, namespace)
     if item.get("type") == "custom_tool_call":
         envelope: dict[str, object] = {
             "name": name,
@@ -1471,6 +1593,7 @@ def translate_input_items(
         return [_message_item("user", raw_input)]
     if not isinstance(raw_input, list):
         return []
+    validate_new_agent_message(raw_input)
 
     call_origins: dict[str, str] = {}
     result: list = []
@@ -1479,6 +1602,17 @@ def translate_input_items(
             continue
         item = _strip_client_only_item_metadata(item)
         item_type = str(item.get("type") or "").strip().lower()
+        if item_type == "agent_message":
+            # The Excel Responses backend does not implement Codex's private
+            # agent_message item. Plaintext assignment text is caller input;
+            # old encrypted assignments are unrecoverable and must not be
+            # forwarded as opaque, unsupported items.
+            if _agent_message_has_encrypted_payload(item):
+                continue
+            text = _item_text(item.get("content"))
+            if text:
+                result.append(_message_item("user", text))
+            continue
         if item_type in {"function_call", "custom_tool_call"}:
             name = item.get("name")
             call_id = item.get("call_id")
@@ -1493,10 +1627,20 @@ def translate_input_items(
                     call_origins[call_id] = native_name
                 result.append(remembered)
             elif isinstance(name, str) and name and marker_relay:
-                upstream_name = relay_tool_name(name)
+                namespace = item.get("namespace")
+                client_tool_name = _client_tool_key(
+                    name,
+                    namespace
+                    if isinstance(namespace, str) and namespace != "functions"
+                    else None,
+                )
+                upstream_name = relay_tool_name(client_tool_name)
                 if isinstance(call_id, str):
                     call_origins[call_id] = upstream_name
-                result.append({**item, "name": upstream_name})
+                upstream_call = {**item, "name": upstream_name}
+                upstream_call.pop("namespace", None)
+                upstream_call.pop("encrypted_function_args", None)
+                result.append(upstream_call)
             elif isinstance(name, str) and name:
                 if name == "update_plan":
                     if isinstance(call_id, str):
@@ -1532,7 +1676,7 @@ def translate_input_items(
                     }
                 )
             continue
-        if item_type in {"item_reference", "additional_tools"}:
+        if item_type == "item_reference" or item_type in _CATALOG_ITEM_TYPES:
             continue
         result.append(item)
     return result
