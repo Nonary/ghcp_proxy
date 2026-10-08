@@ -6617,6 +6617,7 @@ async def _handle_copilot_sdk_responses(
         sdk_body["input"] = format_translation.sanitize_input(
             raw_input,
             native_responses_passthrough=False,
+            preserve_tool_output_images=True,
         )
 
     upstream_path = "/v1/responses/compact" if is_compact else "/v1/responses"

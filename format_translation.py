@@ -2322,6 +2322,7 @@ def sanitize_input(
     preserve_encrypted_content: bool = True,
     drop_reasoning_items: bool = False,
     native_responses_passthrough: bool = False,
+    preserve_tool_output_images: bool = False,
 ):
     """
     Preserve encrypted_content in reasoning items for normal multi-turn correctness.
@@ -2333,6 +2334,7 @@ def sanitize_input(
     Expand locally synthesized compaction items into a readable summary message.
     Convert other compaction items into reasoning items for GHCP compatibility.
     Strip status=None which GHCP rejects.
+    SDK callers may preserve tool-output images for structured result delivery.
     Pass everything else through unchanged.
     """
     if not isinstance(input_items, list):
@@ -2385,7 +2387,11 @@ def sanitize_input(
             result.append(item)
             continue
 
-        if item_type == "function_call_output" and not native_responses_passthrough:
+        if (
+            item_type == "function_call_output"
+            and not native_responses_passthrough
+            and not preserve_tool_output_images
+        ):
             result.append(_sanitize_function_call_output_item(item))
             continue
 

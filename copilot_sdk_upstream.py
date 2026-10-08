@@ -38,6 +38,16 @@ import excel_upstream
 import excel_model_catalog
 import format_translation
 import sdk_reasoning_ledger
+from codex_sdk_adapter import (
+    AdapterValidationError,
+    CATALOG_ITEM_TYPES,
+    CodexSdkAdapter,
+    PendingToolResult,
+    ToolCall,
+    ToolMetadata,
+    decode_call_id as _decode_call_id,
+    encode_call_id as _encode_call_id,
+)
 import util
 from constants import TOKEN_DIR
 
@@ -85,8 +95,6 @@ else:
 RESPONSES_UPSTREAM_ENV = "GHCP_RESPONSES_UPSTREAM"
 SDK_UPSTREAM = "sdk"
 REST_UPSTREAM = "rest"
-_CALL_ID_PREFIX = "ghcpsdk_"
-_VALID_TOOL_NAME = re.compile(r"^[A-Za-z0-9_-]+$")
 _TURN_TIMEOUT_SECONDS = float(os.environ.get("GHCP_UPSTREAM_TIMEOUT_SECONDS", "1800") or 1800)
 _KEEPALIVE_INTERVAL_SECONDS = 15.0
 _PARALLEL_TOOL_SETTLE_SECONDS = 0.5
@@ -359,169 +367,24 @@ def _new_id(prefix: str) -> str:
     return f"{prefix}_{uuid4().hex}"
 
 
-def _encode_call_id(
-    session_id: str,
-    request_id: str,
-    *,
-    tool_name: str,
-    tool_type: str,
-) -> str:
-    raw = json.dumps(
-        {"s": session_id, "r": request_id, "n": tool_name, "t": tool_type},
-        separators=(",", ":"),
-    ).encode("utf-8")
-    encoded = base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
-    return _CALL_ID_PREFIX + encoded
-
-
-def _decode_call_id(call_id: Any) -> dict[str, str] | None:
-    if not isinstance(call_id, str) or not call_id.startswith(_CALL_ID_PREFIX):
-        return None
-    encoded = call_id[len(_CALL_ID_PREFIX) :]
-    try:
-        padded = encoded + "=" * (-len(encoded) % 4)
-        value = json.loads(base64.urlsafe_b64decode(padded).decode("utf-8"))
-    # urlsafe_b64decode raises binascii.Error (not ValueError) for malformed
-    # client-supplied call IDs.  A bad continuation is a 400, not an internal
-    # error from the proxy.
-    except (binascii.Error, ValueError, UnicodeDecodeError, json.JSONDecodeError):
-        return None
-    if not isinstance(value, dict):
-        return None
-    if not all(isinstance(value.get(key), str) and value[key] for key in ("s", "r", "n", "t")):
-        return None
-    if value["t"] not in {"function", "custom"}:
-        return None
-    return value
-
-
-def _sanitize_tool_name(name: str, used: set[str]) -> str:
-    candidate = name if _VALID_TOOL_NAME.fullmatch(name) else re.sub(r"[^A-Za-z0-9_-]", "_", name)
-    candidate = candidate or "tool"
-    base = candidate
-    suffix = 1
-    while candidate in used:
-        candidate = f"{base}_{suffix}"
-        suffix += 1
-    used.add(candidate)
-    return candidate
-
-
-@dataclass(frozen=True)
-class ToolMetadata:
-    original_name: str
-    tool_type: str
-    namespace: str | None = None
-
-
 @dataclass
 class ToolRegistration:
     tools: list[Any] = field(default_factory=list)
-    names: dict[str, ToolMetadata] = field(default_factory=dict)
+    adapter: CodexSdkAdapter = field(default_factory=CodexSdkAdapter)
 
-
-# Codex's namespace for top-level tools; calls in it need no namespace field.
-_DEFAULT_TOOL_NAMESPACE = "functions"
-
-
-def _flatten_tool_specs(
-    specs: Any, namespace: str | None = None, *, defer_loading: bool | None = None,
-):
-    for spec in specs if isinstance(specs, list) else []:
-        if not isinstance(spec, dict):
-            continue
-        if spec.get("type") == "namespace":
-            name = spec.get("name")
-            inherited = spec.get("defer_loading", defer_loading)
-            yield from _flatten_tool_specs(
-                spec.get("tools"), name if isinstance(name, str) and name else namespace,
-                defer_loading=inherited if isinstance(inherited, bool) else defer_loading,
-            )
-        else:
-            if defer_loading is not None and "defer_loading" not in spec:
-                spec = {**spec, "defer_loading": defer_loading}
-            yield (None if namespace == _DEFAULT_TOOL_NAMESPACE else namespace), spec
-
-
-def _declared_tool_specs(body: dict):
-    """Yield ``(namespace, spec)`` for every tool the caller declared.
-
-    Codex's Responses Lite requests carry no top-level ``tools``: the tool
-    list travels in an ``additional_tools`` input item, grouped into
-    ``namespace`` entries.
-    """
-    yield from _flatten_tool_specs(body.get("tools"))
-    items = body.get("input")
-    for item in items if isinstance(items, list) else []:
-        if isinstance(item, dict) and item.get("type") == "additional_tools":
-            yield from _flatten_tool_specs(item.get("tools"))
+    @property
+    def names(self) -> dict[str, ToolMetadata]:
+        return self.adapter.names
 
 
 def build_tool_registration(body: dict) -> ToolRegistration:
-    registration = ToolRegistration()
-    if body.get("tool_choice") == "none" or Tool is None:
-        return registration
-    used: set[str] = set()
-    declared: set[tuple[str | None, str]] = set()
-    for namespace, spec in _declared_tool_specs(body):
-        tool_type = spec.get("type")
-        if tool_type not in {"function", "custom"}:
-            continue
-        name = spec.get("name")
-        if not isinstance(name, str) or not name or (namespace, name) in declared:
-            continue
-        declared.add((namespace, name))
-        # Codex names a namespaced tool by prefixing its namespace, e.g.
-        # ``mcp__server__`` + ``read``.
-        safe_name = _sanitize_tool_name(f"{namespace or ''}{name}", used)
-        if tool_type == "custom":
-            # ``apply_patch`` (and potentially other names from the CLI's
-            # built-in catalog) is a free-form runtime tool.  Registering a
-            # client-owned custom tool under that name makes the SDK resume
-            # it as a built-in custom call.  Gemini then rejects the pending
-            # result because the SDK's continuation RPC has no tool-name
-            # field.  A private runtime name keeps the call on the ordinary
-            # external-function path; ``registration.names`` still maps it
-            # back to the OpenAI custom-tool name for the caller.
-            safe_name = _sanitize_tool_name(f"ghcp_custom_{safe_name}", used)
-        description = spec.get("description")
-        if not isinstance(description, str):
-            description = ""
-        if tool_type == "custom":
-            description = (
-                description.rstrip()
-                + "\nReturn this custom tool's complete raw input in the JSON `input` field."
-            ).strip()
-            parameters = {
-                "type": "object",
-                "properties": {"input": {"type": "string"}},
-                "required": ["input"],
-                "additionalProperties": False,
-            }
-        else:
-            parameters = spec.get("parameters")
-            if not isinstance(parameters, dict):
-                parameters = {"type": "object", "properties": {}}
-        registration.names[safe_name] = ToolMetadata(name, tool_type, namespace)
-        registration.tools.append(
-            Tool(
-                name=safe_name,
-                description=description,
-                parameters=parameters,
-                overrides_built_in_tool=tool_type == "function",
-                skip_permission=True,
-                # Let the hostless runtime expose plugin tools through native
-                # tool search instead of loading the full desktop catalog.
-                # Keep core tools eager and respect explicit caller preferences.
-                defer=(
-                    "auto" if spec.get("defer_loading") is True
-                    or (spec.get("defer_loading") is not False and (
-                        namespace is not None or name.startswith("mcp__")
-                    )) else "never"
-                ),
-            )
-        )
-    return registration
+    if Tool is None:
+        return ToolRegistration()
+    adapter = CodexSdkAdapter.from_request(body)
+    return ToolRegistration(
+        tools=[Tool(**options) for options in adapter.tool_options],
+        adapter=adapter,
+    )
 
 
 def _text_from_content(content: Any) -> str:
@@ -701,11 +564,7 @@ def _render_input_segments(value: Any) -> list[tuple[str, str]]:
                 ))
             continue
         if item_type in {"function_call", "custom_tool_call"}:
-            payload = item.get("arguments") if item_type == "function_call" else item.get("input")
-            rendered.append((
-                _SEGMENT_ECHO,
-                f"Assistant tool call {item.get('name', '')}: {_text_from_content(payload)}",
-            ))
+            rendered.append((_SEGMENT_ECHO, CodexSdkAdapter.render_tool_call(item)))
             continue
         if item_type in {"function_call_output", "custom_tool_call_output"}:
             rendered.append((_SEGMENT_ECHO, f"Tool result: {_text_from_content(item.get('output'))}"))
@@ -824,53 +683,12 @@ def _compaction_resume_delta(
     return new_text
 
 
-@dataclass(frozen=True)
-class PendingToolResult:
-    session_id: str
-    request_id: str
-    output: str
-    tool_name: str = ""
-
-
 def _is_caller_message(item: Any) -> bool:
-    return isinstance(item, str) or (
-        isinstance(item, dict)
-        and item.get("type") in {None, "message"}
-        and item.get("role") in {"user", "developer", "system"}
-    )
+    return CodexSdkAdapter.is_caller_message(item)
 
 
 def resolve_tool_continuation(value: Any) -> tuple[str, list[PendingToolResult]] | None:
-    """Resolve the trailing tool results, allowing accompanying caller messages."""
-    if not isinstance(value, list):
-        return None
-    trailing: list[PendingToolResult] = []
-    for item in reversed(value):
-        if _is_caller_message(item):
-            continue
-        if not isinstance(item, dict) or item.get("type") not in {
-            "function_call_output",
-            "custom_tool_call_output",
-        }:
-            break
-        decoded = _decode_call_id(item.get("call_id"))
-        if decoded is None:
-            return None
-        trailing.append(
-            PendingToolResult(
-                session_id=decoded["s"],
-                request_id=decoded["r"],
-                output=_text_from_content(item.get("output")),
-                tool_name=decoded.get("n", ""),
-            )
-        )
-    if not trailing:
-        return None
-    trailing.reverse()
-    session_id = trailing[0].session_id
-    if any(result.session_id != session_id for result in trailing):
-        return None
-    return session_id, trailing
+    return CodexSdkAdapter.continuation(value)
 
 
 async def _get_client():
@@ -1466,7 +1284,7 @@ def _continuation_prompt(
         if _is_caller_message(item):
             tail.append(item)
         elif isinstance(item, dict) and item.get("type") in {
-            "function_call_output", "custom_tool_call_output",
+            "function_call_output", "custom_tool_call_output", *CATALOG_ITEM_TYPES,
         }:
             continue
         else:
@@ -2155,8 +1973,9 @@ def _request_handler_options() -> dict[str, Any]:
 
 
 async def _open_session(body: dict, registration: ToolRegistration, *, diagnostics: dict | None = None):
-    client = await _get_client()
+    CodexSdkAdapter.validate_new_agent_message(body.get("input"))
     continuation = resolve_tool_continuation(body.get("input"))
+    client = await _get_client()
     reasoning_effort = await _reasoning_effort_for_client(body, client)
     options = _session_options(body, registration, reasoning_effort=reasoning_effort)
     segments = _render_input_segments(body.get("input"))
@@ -2267,6 +2086,9 @@ async def _open_session(body: dict, registration: ToolRegistration, *, diagnosti
         prompt_attachments = _attachments_for_prompt(
             body.get("input"), [text for _, text in segments]
         )
+        prompt_attachments.extend(
+            attachment for result in results for attachment in result.image_attachments()
+        )
         await _track_live_session(session, options=options, fingerprints=fingerprints)
         _remember_session(session.session_id)
         alias = _session_alias(body)
@@ -2317,10 +2139,7 @@ async def _open_session(body: dict, registration: ToolRegistration, *, diagnosti
                     HandlePendingToolCallRequest(
                         request_id=result.request_id,
                         result=(
-                            ExternalToolTextResultForLlm(
-                                text_result_for_llm=result.output,
-                                result_type="success",
-                            )
+                            ExternalToolTextResultForLlm.from_dict(result.sdk_payload())
                             if ExternalToolTextResultForLlm is not None
                             else result.output
                         ),
@@ -2341,25 +2160,23 @@ async def _open_session(body: dict, registration: ToolRegistration, *, diagnosti
             # stuck on "reconnecting".
             tool_texts = []
             for result in results:
-                name = getattr(result, "tool_name", "")
+                name = result.tool_name
+                if result.namespace:
+                    name = f"{result.namespace}.{name}"
                 prefix = f"Tool result for {name}: " if name else "Tool result: "
                 tool_texts.append(f"{prefix}{result.output}")
             fallback_prompt = "\n\n".join(tool_texts) or "Tool execution completed."
             if steering_prompt and not pending_work:
                 fallback_prompt = f"{steering_prompt}\n\n{fallback_prompt}"
-            await session.send(fallback_prompt)
+            attachments = [attachment for result in results for attachment in result.image_attachments()]
+            if steering_prompt and not pending_work:
+                attachments.extend(_attachments_for_prompt(body.get("input"), [steering_prompt]))
+            if attachments:
+                await session.send(fallback_prompt, attachments=attachments)
+            else:
+                await session.send(fallback_prompt)
 
     return session, dispatch
-
-
-@dataclass
-class ToolCall:
-    request_id: str
-    name: str
-    tool_type: str
-    arguments: Any
-    item_id: str = field(default_factory=lambda: _new_id("fc"))
-    namespace: str | None = None
 
 
 @dataclass
@@ -2692,17 +2509,7 @@ def _finalize_usage(outcome: "TurnOutcome") -> None:
 
 
 def _tool_call(data: Any, registration: ToolRegistration) -> ToolCall:
-    safe_name = str(getattr(data, "tool_name", "tool"))
-    metadata = registration.names.get(safe_name, ToolMetadata(safe_name, "function"))
-    prefix = "ctc" if metadata.tool_type == "custom" else "fc"
-    return ToolCall(
-        request_id=str(getattr(data, "request_id")),
-        name=metadata.original_name,
-        tool_type=metadata.tool_type,
-        arguments=getattr(data, "arguments", {}) or {},
-        item_id=_new_id(prefix),
-        namespace=metadata.namespace,
-    )
+    return registration.adapter.tool_call(data)
 
 
 def _event_queue(session: Any) -> tuple[asyncio.Queue, Callable[[], None]]:
@@ -2896,60 +2703,11 @@ async def _wait_for_outcome(
 
 
 def _arguments_json(call: ToolCall) -> str:
-    if call.tool_type == "custom":
-        arguments = call.arguments
-        # The SDK only exposes JSON-schema tools, so free-form Responses tools
-        # are registered behind an {"input": "..."} shim.  Some models return
-        # that shim as a JSON string rather than a decoded object.  Luna also
-        # uses the semantically natural {"patch": "..."} spelling for
-        # apply_patch.  Passing either wrapper through as the custom tool's raw
-        # input makes Codex reject a valid patch, after which the model retries
-        # the identical call indefinitely.
-        if isinstance(arguments, str):
-            try:
-                decoded = json.loads(arguments)
-            except json.JSONDecodeError:
-                return arguments
-            if isinstance(decoded, dict):
-                arguments = decoded
-            else:
-                return arguments
-        if isinstance(arguments, dict):
-            wrapped_input = arguments.get("input")
-            if isinstance(wrapped_input, str):
-                return wrapped_input
-            if call.name == "apply_patch":
-                wrapped_patch = arguments.get("patch")
-                if isinstance(wrapped_patch, str):
-                    return wrapped_patch
-        return _text_from_content(arguments)
-    if isinstance(call.arguments, str):
-        try:
-            json.loads(call.arguments)
-            return call.arguments
-        except json.JSONDecodeError:
-            return json.dumps({"input": call.arguments}, ensure_ascii=False)
-    return json.dumps(call.arguments or {}, ensure_ascii=False, separators=(",", ":"))
+    return CodexSdkAdapter.arguments_text(call)
 
 
 def _tool_item(session_id: str, call: ToolCall, *, completed: bool = True) -> dict:
-    call_id = _encode_call_id(
-        session_id,
-        call.request_id,
-        tool_name=call.name,
-        tool_type=call.tool_type,
-    )
-    item = {
-        "type": "custom_tool_call" if call.tool_type == "custom" else "function_call",
-        "id": call.item_id,
-        "call_id": call_id,
-        "name": call.name,
-        "status": "completed" if completed else "in_progress",
-    }
-    if call.namespace:
-        item["namespace"] = call.namespace
-    item["input" if call.tool_type == "custom" else "arguments"] = _arguments_json(call)
-    return item
+    return CodexSdkAdapter.tool_item(session_id, call, completed=completed)
 
 
 def _message_item(
@@ -3810,12 +3568,13 @@ async def handle_responses(
     try:
         session, dispatch = await _open_session(body, registration, diagnostics=session_diagnostics)
     except Exception as exc:
+        status_code = 400 if isinstance(exc, AdapterValidationError) else 502
         if finish_usage_callback is not None and plan is not None:
             try:
-                finish_usage_callback(plan, 502, response_text=str(exc))
+                finish_usage_callback(plan, status_code, response_text=str(exc))
             except Exception:
                 pass
-        return format_translation.openai_error_response(502, f"Copilot SDK: {exc}")
+        return format_translation.openai_error_response(status_code, f"Copilot SDK: {exc}")
 
     if plan is not None and getattr(plan, "usage_event", None) is not None:
         if not plan.usage_event.get("session_id"):
