@@ -62,6 +62,9 @@ def complete_disclosure(source, call, output=None):
 
 class ExcelToolDisclosureTests(unittest.TestCase):
     def setUp(self):
+        legacy = patch.object(excel, "LEAN_EXTERNAL_PROFILE", False)
+        legacy.start()
+        self.addCleanup(legacy.stop)
         self.flag = patch.object(excel, "LAZY_TOOL_CATALOG", True)
         self.flag.start()
         self.addCleanup(self.flag.stop)

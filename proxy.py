@@ -6612,6 +6612,7 @@ async def _handle_excel_responses(
     try:
         excel_headers = excel_upstream.excel_session_store.request_headers(
             stream=bool(body.get("stream")),
+            external_client=True,
         )
         # The Basispoints Excel Responses route requires the vision feature
         # header for input_image content. Codex sends images as standard

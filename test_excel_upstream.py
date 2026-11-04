@@ -6,6 +6,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 import excel_upstream
 
@@ -45,6 +46,11 @@ def _collaboration_source() -> dict:
 
 
 class ExcelUpstreamTests(unittest.TestCase):
+    def setUp(self):
+        legacy = patch.object(excel_upstream, "LEAN_EXTERNAL_PROFILE", False)
+        legacy.start()
+        self.addCleanup(legacy.stop)
+
     def _merge_models(self, payload):
         data = payload.get("data") if isinstance(payload, dict) else None
         records = {

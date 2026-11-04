@@ -5,6 +5,7 @@ import importlib.util
 import json
 from pathlib import Path
 import unittest
+from unittest.mock import patch
 
 import copilot_sdk_upstream as sdk
 import excel_upstream
@@ -12,6 +13,11 @@ from tool_catalog import compact_schema
 
 
 class ToolTokenBudgetTests(unittest.TestCase):
+    def setUp(self):
+        legacy = patch.object(excel_upstream, "LEAN_EXTERNAL_PROFILE", False)
+        legacy.start()
+        self.addCleanup(legacy.stop)
+
     def test_budget_counter_includes_tool_history_but_not_encrypted_reasoning(self):
         spec = importlib.util.spec_from_file_location("tool_budget_check", Path(__file__).parent / "tools/verify-tool-token-budget.py")
         check = importlib.util.module_from_spec(spec)
