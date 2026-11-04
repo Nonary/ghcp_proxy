@@ -14,7 +14,9 @@ SCHEMA_NOTATION = (
     "Parameter notation: {\"key\":type} requires key; {\"key\"?:type} makes it "
     "optional. [...] is an array. ... allows extra object keys; ...:schema "
     "constrains them. Without ... extra keys are forbidden. JSON annotations "
-    "after a type retain its constraints/descriptions. Other schemas use full JSON. "
+    "after a type retain its constraints/descriptions. In annotations, allOf, anyOf, "
+    "oneOf, $defs, and definitions contain schemas in the same notation; their "
+    "JSON Schema meanings and $ref paths are unchanged. Other schemas use full JSON. "
     "Only the notation is compacted: use the exact parameter names and obey every constraint."
 )
 
@@ -23,12 +25,28 @@ def _json(value: object) -> str:
     return json.dumps(value, separators=(",", ":"), ensure_ascii=False)
 
 
+def _annotations(values: dict) -> str:
+    fields = []
+    for key, value in values.items():
+        if key in {"allOf", "anyOf", "oneOf"} and isinstance(value, list):
+            rendered = "[" + ",".join(compact_schema(item) for item in value) + "]"
+        elif key in {"$defs", "definitions"} and isinstance(value, dict):
+            rendered = "{" + ",".join(
+                f"{_json(name)}:{compact_schema(item)}"
+                for name, item in value.items()
+            ) + "}"
+        else:
+            rendered = _json(value)
+        fields.append(f"{_json(key)}:{rendered}")
+    return "{" + ",".join(fields) + "}"
+
+
 def compact_schema(schema: object) -> str:
     """Render ordinary schema scaffolding without dropping its constraints."""
     if not isinstance(schema, dict):
         return _json(schema)
     if any(key in schema for key in {
-        "$ref", "$dynamicRef", "$defs", "definitions", "allOf", "anyOf", "oneOf",
+        "$dynamicRef",
         "not", "if", "then", "else", "patternProperties", "dependentSchemas",
         "prefixItems", "unevaluatedProperties", "unevaluatedItems",
     }):
@@ -60,10 +78,14 @@ def compact_schema(schema: object) -> str:
         rendered = "[" + compact_schema(remaining.pop("items")) + "]"
     elif isinstance(kind, str) and kind in {"string", "number", "integer", "boolean", "null"}:
         rendered = kind
+    elif "type" not in schema and any(key in remaining for key in {
+        "$ref", "$defs", "definitions", "allOf", "anyOf", "oneOf",
+    }):
+        return _annotations(remaining)
     else:
-        # Preserve unions, references, legacy tuple arrays, and unknown schema
+        # Preserve type unions, legacy tuple arrays, and unknown schema
         # dialects verbatim rather than guessing a lossy equivalent.
         return _json(schema)
     if remaining:
-        rendered += " " + _json(remaining)
+        rendered += " " + _annotations(remaining)
     return rendered

@@ -62,6 +62,16 @@ CLIENT_TOOL_RELAY_PREFIX = "codex_client__"
 CLIENT_MARKER_CALL_ID_PREFIX = "call_ghcp_excel_marker_"
 NATIVE_FALLBACK_CALL_ID_PREFIX = "call_ghcp_excel_native_"
 CLIENT_TOOL_TRANSPORT_NAME = "run_officejs"
+TOOL_SCHEMA_LOOKUP_NAME = "__ghcp_proxy_tool_schema"
+_TOOL_SCHEMA_CARRIER = "mcp__node_repl.js"
+_EAGER_CLIENT_TOOL_NAMES = frozenset({
+    "exec_command", "write_stdin", "apply_patch", "update_plan", _TOOL_SCHEMA_CARRIER,
+})
+_TOOL_SCHEMA_MARKER = "ghcp_proxy_tool_schema:"
+_TOOL_SCHEMA_BATCH_LIMIT = 4
+LAZY_TOOL_CATALOG = os.environ.get(
+    "GHCP_EXCEL_LAZY_TOOL_CATALOG", "1"
+).strip().lower() not in {"0", "false", "no", "off"}
 CLIENT_TOOL_TRANSPORT_ALIASES = frozenset(
     {CLIENT_TOOL_TRANSPORT_NAME, f"functions.{CLIENT_TOOL_TRANSPORT_NAME}"}
 )
@@ -322,13 +332,18 @@ def _client_tool_key(name: str, namespace: str | None = None) -> str:
     return f"{namespace}.{name}" if namespace else name
 
 
-def _iter_client_tools(tools: object, namespace: str | None = None):
+def _iter_client_tools(
+    tools: object, namespace: str | None = None, defer_loading: bool | None = None,
+):
     """Yield callable leaves from Codex dynamic tool namespaces."""
     if not isinstance(tools, list):
         return
     for tool in tools:
         if not isinstance(tool, dict):
             continue
+        loading = tool.get("defer_loading", defer_loading)
+        if "defer_loading" not in tool and isinstance(loading, bool):
+            tool = {**tool, "defer_loading": loading}
         tool_type = str(tool.get("type") or "").strip().lower()
         name = tool.get("name")
         if tool_type in {"function", "custom"} and isinstance(name, str):
@@ -343,7 +358,7 @@ def _iter_client_tools(tools: object, namespace: str | None = None):
                 )
         if tool_type == "namespace" and isinstance(name, str) and name.strip():
             nested_namespace = None if name.strip() == "functions" else name.strip()
-            yield from _iter_client_tools(tool.get("tools"), nested_namespace)
+            yield from _iter_client_tools(tool.get("tools"), nested_namespace, loading)
 
 
 def _source_client_tools(source: dict):
@@ -800,6 +815,11 @@ def extract_native_client_tool_call(
     envelope = _transport_envelope(native)
     if _is_transport_name(native.get("name")) and envelope is None:
         return None
+    if envelope is not None and envelope.get("name") == TOOL_SCHEMA_LOOKUP_NAME and TOOL_SCHEMA_LOOKUP_NAME not in specs:
+        arguments = envelope.get("arguments")
+        if not isinstance(arguments, dict) or set(arguments) != {"names"}:
+            return None
+        return _tool_schema_disclosure_call(native, source, arguments["names"])
     name = (
         _original_client_tool_name(envelope.get("name"), allowed_tools)
         if envelope is not None
@@ -807,6 +827,10 @@ def extract_native_client_tool_call(
     )
     if name is None or name not in specs:
         return None
+    if name in _deferred_tool_specs(source, specs) and name not in _disclosed_tool_names(source, specs):
+        # Never execute a tool whose policy/schema has not reached the model.
+        # A guessed call becomes metadata only; the model must call it again.
+        return _tool_schema_disclosure_call(native, source, [name])
     tool_info = specs[name]
     spec = tool_info["spec"]
     expected_type = tool_info["type"]
@@ -904,37 +928,203 @@ def extract_native_client_tool_call(
     return None
 
 
+def _render_client_tool_definition(info: dict) -> str:
+    tool = info["spec"]
+    details = [info["type"] + " " + json.dumps(
+        {"name": info["key"]}, separators=(",", ":"), ensure_ascii=False,
+    )]
+    description = tool.get("description")
+    if isinstance(description, str) and description:
+        details.append(description)
+    if info["type"] == "function":
+        parameters = tool.get("parameters") or tool.get("inputSchema") or tool.get("input_schema")
+        parameters = _client_tool_prompt_parameters(info["namespace"], info["name"], parameters)
+        details.append("parameters: " + compact_schema(parameters if isinstance(parameters, dict) else {}))
+    elif isinstance(tool.get("format"), dict):
+        details.append("format: " + json.dumps(tool["format"], separators=(",", ":"), ensure_ascii=False))
+    return "\n".join(details)
+
+
+def _deferred_tool_specs(source: dict, specs: dict | None = None) -> dict:
+    specs = _client_tool_specs(source) if specs is None else specs
+    carrier = specs.get(_TOOL_SCHEMA_CARRIER)
+    carrier_schema = carrier["spec"].get("parameters") if carrier else None
+    carrier_properties = carrier_schema.get("properties") if isinstance(carrier_schema, dict) else None
+    if (
+        not LAZY_TOOL_CATALOG or len(specs) <= 20
+        or isinstance(source.get("tool_choice"), dict) or source.get("tool_choice") == "none"
+        or _tool_schema_carrier_failed(source)
+        or TOOL_SCHEMA_LOOKUP_NAME in specs
+        or not carrier or carrier["type"] != "function"
+        or not isinstance(carrier_properties, dict)
+        or not isinstance(carrier_properties.get("code"), dict)
+        or carrier_properties["code"].get("type") != "string"
+        or not _value_matches_schema(
+            {"code": 'nodeRepl.write("tool metadata");'},
+            carrier_schema,
+        )
+    ):
+        # Small catalogs and clients without the read-only output carrier keep
+        # the original eager protocol; no tool is silently made unavailable.
+        return {}
+    return {
+        key: info for key, info in specs.items()
+        if key not in _EAGER_CLIENT_TOOL_NAMES
+        and info["spec"].get("defer_loading") is not False
+    }
+
+
+def _tool_schema_carrier_failed(source: dict) -> bool:
+    """A denied, failed, or truncated disclosure restores the eager protocol."""
+    items = source.get("input")
+    if not isinstance(items, list):
+        return False
+    outputs = {
+        item.get("call_id"): item.get("output") for item in items
+        if isinstance(item, dict) and item.get("type") == "function_call_output"
+        and isinstance(item.get("call_id"), str)
+    }
+    for item in items:
+        if not isinstance(item, dict) or item.get("type") != "function_call":
+            continue
+        name, namespace, call_id = item.get("name"), item.get("namespace"), item.get("call_id")
+        if not isinstance(name, str) or not isinstance(call_id, str):
+            continue
+        if namespace is not None and not isinstance(namespace, str):
+            continue
+        if _client_tool_key(name, namespace) != _TOOL_SCHEMA_CARRIER or call_id not in outputs:
+            continue
+        try:
+            code = json.loads(item.get("arguments", "")).get("code", "")
+            if not isinstance(code, str) or not code.startswith("nodeRepl.write(") or not code.endswith(");"):
+                continue
+            text = json.loads(code[len("nodeRepl.write("):-2])
+            if not isinstance(text, str) or _TOOL_SCHEMA_MARKER not in text:
+                continue
+            digest = json.loads(text.rsplit(_TOOL_SCHEMA_MARKER, 1)[1]).get("digest")
+            if isinstance(digest, str) and len(digest) == 24 and digest not in json.dumps(outputs[call_id], ensure_ascii=False):
+                return True
+        except (ValueError, TypeError, AttributeError):
+            continue
+    return False
+
+
+def _tool_schema_disclosure_text(specs: dict, names: list[str]) -> tuple[str, str]:
+    definitions = SCHEMA_NOTATION + "\n\n" + "\n\n".join(
+        _render_client_tool_definition(specs[name]) for name in names
+    )
+    digest = hashlib.sha256(definitions.encode("utf-8")).hexdigest()[:24]
+    marker = json.dumps({"names": names, "digest": digest}, separators=(",", ":"))
+    return (
+        "Read-only tool metadata. No requested action has executed. Read all "
+        "policies and constraints, then call the desired tool separately.\n\n"
+        + definitions + "\n" + _TOOL_SCHEMA_MARKER + marker, digest,
+    )
+
+
+def _disclosed_tool_names(source: dict, specs: dict) -> set[str]:
+    items = source.get("input")
+    if not isinstance(items, list):
+        return set()
+    outputs = {
+        item.get("call_id"): item.get("output") for item in items
+        if isinstance(item, dict) and item.get("type") == "function_call_output"
+        and isinstance(item.get("call_id"), str)
+    }
+    disclosed: set[str] = set()
+    for item in items:
+        if not isinstance(item, dict) or item.get("type") != "function_call":
+            continue
+        name, namespace, call_id = item.get("name"), item.get("namespace"), item.get("call_id")
+        if not isinstance(name, str) or not isinstance(call_id, str):
+            continue
+        if namespace is not None and not isinstance(namespace, str):
+            continue
+        key = _client_tool_key(name, namespace)
+        if key != _TOOL_SCHEMA_CARRIER or call_id not in outputs:
+            continue
+        try:
+            arguments = json.loads(item.get("arguments", ""))
+            code = arguments.get("code", "")
+            if not isinstance(code, str) or not code.startswith("nodeRepl.write(") or not code.endswith(");"):
+                continue
+            text = json.loads(code[len("nodeRepl.write("):-2])
+            if not isinstance(text, str) or _TOOL_SCHEMA_MARKER not in text:
+                continue
+            marker = json.loads(text.rsplit(_TOOL_SCHEMA_MARKER, 1)[1])
+            names = marker["names"]
+            if not isinstance(names, list) or not names or len(names) > _TOOL_SCHEMA_BATCH_LIMIT:
+                continue
+            if any(not isinstance(name, str) or name not in specs for name in names):
+                continue
+            expected, digest = _tool_schema_disclosure_text(specs, names)
+            # A call alone is not disclosure: require its completed output and
+            # the final digest, and invalidate it when any policy/schema changes.
+            if text == expected and digest in json.dumps(outputs[item["call_id"]], ensure_ascii=False):
+                disclosed.update(names)
+        except (ValueError, TypeError, KeyError, AttributeError):
+            continue
+    return disclosed
+
+
+def _tool_schema_disclosure_call(native: dict, source: dict, names: object) -> dict | None:
+    specs = _client_tool_specs(source)
+    deferred = _deferred_tool_specs(source, specs)
+    if (
+        not isinstance(names, list) or not names or len(names) > _TOOL_SCHEMA_BATCH_LIMIT
+        or any(not isinstance(name, str) or name not in deferred for name in names)
+    ):
+        return None
+    names = list(dict.fromkeys(names))
+    text, _digest = _tool_schema_disclosure_text(specs, names)
+    # The desktop's existing Node tool is only a read-only output carrier.
+    # JSON-quote the literal: tool descriptions never become executable code.
+    arguments = {"code": "nodeRepl.write(" + json.dumps(text, ensure_ascii=True) + ");"}
+    call_id = native.get("call_id")
+    if not isinstance(call_id, str) or not call_id:
+        return None
+    carrier = specs[_TOOL_SCHEMA_CARRIER]
+    schema = carrier["spec"].get("parameters") or {}
+    if "title" in schema.get("properties", {}):
+        arguments["title"] = "Load tool definitions (read-only metadata)"
+    if not _value_matches_schema(arguments, schema):
+        return None
+    _remember_native_call(native)
+    return {
+        "type": "function_call",
+        "id": responses_replay_ids.function_item_id(call_id),
+        "call_id": call_id,
+        "name": carrier["name"],
+        **({"namespace": carrier["namespace"]} if carrier["namespace"] else {}),
+        "arguments": json.dumps(arguments, separators=(",", ":"), ensure_ascii=False),
+    }
+
+
 def _client_tool_protocol_instructions(source: dict) -> str:
     allowed_tools = client_tool_types(source)
     if not allowed_tools:
         return EXTERNAL_CLIENT_INSTRUCTIONS
 
-    tool_catalog: list[str] = []
-    for key, name, namespace, tool_type, tool in _source_client_tools(source):
-        # The qualified callable name already identifies both namespace and
-        # leaf. Do not repeat all three names on every catalog entry.
-        entry = {"name": key}
-        # Descriptions contain tool policies. Keep them verbatim, outside JSON
-        # strings so quotes and newlines are not tokenized as escape sequences.
-        description = tool.get("description")
-        details = [tool_type + " " + json.dumps(entry, separators=(",", ":"), ensure_ascii=False)]
-        if isinstance(description, str) and description:
-            details.append(description)
-        if tool_type == "function":
-            parameters = (
-                tool.get("parameters")
-                or tool.get("inputSchema")
-                or tool.get("input_schema")
-            )
-            parameters = _client_tool_prompt_parameters(namespace, name, parameters)
-            details.append("parameters: " + compact_schema(parameters if isinstance(parameters, dict) else {}))
-        else:
-            custom_format = tool.get("format")
-            if isinstance(custom_format, dict):
-                details.append("format: " + json.dumps(custom_format, separators=(",", ":"), ensure_ascii=False))
-        tool_catalog.append("\n".join(details))
+    specs = _client_tool_specs(source)
+    deferred = _deferred_tool_specs(source, specs)
+    tool_catalog = [
+        _render_client_tool_definition(info)
+        for key, info in specs.items() if key not in deferred
+    ]
 
     catalog_text = SCHEMA_NOTATION + "\n\n" + "\n\n".join(tool_catalog)
+    if deferred:
+        catalog_text += (
+            "\n\nDeferred tools (names only; full policies and schemas load before use):\n"
+            + "\n".join(deferred)
+            + "\nTo load definitions, relay this proxy-local metadata request in code: "
+            + json.dumps({"name": TOOL_SCHEMA_LOOKUP_NAME, "arguments": {"names": [next(iter(deferred))]}}, separators=(",", ":"))
+            + ". names accepts 1-4 exact deferred names. The proxy turns this into "
+            "read-only mcp__node_repl.js output, not the requested action. Read all "
+            "returned policies before calling the tool. Calling a deferred tool "
+            "before its definition is disclosed also returns metadata only; retry "
+            "the action after reading it. All registered tools remain available."
+        )
     return (
         "This request is relayed by an external Codex Responses API client, not "
         "by the live Excel workbook. This proxy instruction supersedes any earlier "
@@ -1053,6 +1243,17 @@ def extract_client_tool_call(
     name = _original_client_tool_name(marker_name.strip(), allowed_tools)
     if name is None:
         return None
+    if isinstance(source, dict):
+        specs = _client_tool_specs(source)
+        if name in _deferred_tool_specs(source, specs) and name not in _disclosed_tool_names(source, specs):
+            native = {
+                "type": "function_call", "name": CLIENT_TOOL_TRANSPORT_NAME,
+                "call_id": f"{CLIENT_MARKER_CALL_ID_PREFIX}{uuid4().hex}",
+                "arguments": json.dumps({"code": json.dumps({
+                    "name": TOOL_SCHEMA_LOOKUP_NAME, "arguments": {"names": [name]},
+                })}),
+            }
+            return _tool_schema_disclosure_call(native, source, [name])
     tool_specs = _client_tool_specs(source) if isinstance(source, dict) else None
     call_name, namespace = _client_tool_identity(name, tool_specs)
     tool_type = allowed_tools.get(name)

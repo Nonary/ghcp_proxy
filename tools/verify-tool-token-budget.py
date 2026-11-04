@@ -116,24 +116,65 @@ async def verify(source: dict):
             await client.stop()
 
 
+def plaintext_input(body):
+    """Count message/tool plaintext, never ciphertext as if it were model text."""
+    def text(value):
+        if isinstance(value, str):
+            return value
+        if isinstance(value, list):
+            return "\n".join(text(item) for item in value)
+        if isinstance(value, dict):
+            if "text" in value or "content" in value:
+                return text(value.get("text", value.get("content")))
+            return json.dumps(value, separators=(",", ":"), ensure_ascii=False)
+        return "" if value is None else str(value)
+
+    parts = []
+    for item in body.get("input", []):
+        if not isinstance(item, dict):
+            continue
+        kind = item.get("type", "message")
+        if kind == "function_call":
+            parts.append(text(item.get("arguments")))
+        elif kind == "custom_tool_call":
+            parts.append(text(item.get("input")))
+        elif kind in {"function_call_output", "custom_tool_call_output"}:
+            parts.append(text(item.get("output")))
+        elif kind == "reasoning":
+            parts.append(text(item.get("summary", [])))
+        elif kind == "message":
+            parts.append(text(item.get("content", "")))
+    return "\n".join(parts)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--archive", type=Path, help="Local request-body archive (summaries only)")
+    parser.add_argument("--excel-only", action="store_true", help="Measure an archive without starting the synthetic SDK runtime")
     args = parser.parse_args()
+    if args.excel_only and not args.archive:
+        parser.error("--excel-only requires --archive")
     if args.archive:
         archive = json.loads(args.archive.read_text())
         source = archive["request_body"]
-        before = archive.get("upstream_body", {}).get("input", [])
-        before_text = "\n".join(
-            part.get("text", "") for item in before for part in item.get("content", [])
-            if isinstance(part, dict)
+        before = archive.get("upstream_body", {})
+        after = excel_upstream.prepare_responses_body(source)
+        before_text, after_text = plaintext_input(before), plaintext_input(after)
+        eager_catalog = "\n".join(
+            excel_upstream._render_client_tool_definition(info)
+            for info in excel_upstream._client_tool_specs(source).values()
         )
-        after = excel_upstream.prepare_responses_body(source)["input"]
-        after_text = "\n".join(
-            part.get("text", "") for item in after for part in item.get("content", [])
-            if isinstance(part, dict)
-        )
-        result = {"excel_visible_chars_before": len(before_text), "excel_visible_chars_after": len(after_text)}
+        compact_catalog = excel_upstream._client_tool_protocol_instructions(source)
+        archived_catalog = next((excel_upstream._item_text(item.get("content"))
+            for item in before.get("input", []) if isinstance(item, dict)
+            and "Available client tools:" in excel_upstream._item_text(item.get("content"))), eager_catalog)
+        specs = excel_upstream._client_tool_specs(source)
+        result = {
+            "excel_visible_chars_before": len(before_text), "excel_visible_chars_after": len(after_text),
+            "registered_tools": len(specs), "deferred_tools": len(excel_upstream._deferred_tool_specs(source, specs)),
+            "measurement": "Local plaintext estimate; excludes server context, ciphertext, and protocol framing.",
+            "model_calls": 0,
+        }
         try:
             import tiktoken
         except ImportError:
@@ -141,10 +182,14 @@ def main():
         else:
             encoder = tiktoken.get_encoding("o200k_base")
             result.update({
-                "estimated_visible_tokens_before": len(encoder.encode(before_text)),
-                "estimated_visible_tokens_after": len(encoder.encode(after_text)),
+                "estimated_visible_tokens_before": len(encoder.encode(before_text, disallowed_special=())),
+                "estimated_visible_tokens_after": len(encoder.encode(after_text, disallowed_special=())),
+                "estimated_catalog_tokens_before": len(encoder.encode(archived_catalog, disallowed_special=())),
+                "estimated_catalog_tokens_after": len(encoder.encode(compact_catalog, disallowed_special=())),
             })
         print(json.dumps(result))
+        if args.excel_only:
+            return
     else:
         source = {"tools": [
             {"type": "function", "name": "exec_command", "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}}},

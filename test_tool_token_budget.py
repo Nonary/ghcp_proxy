@@ -1,7 +1,9 @@
 """Focused checks for tool prompt size and unchanged execution contracts."""
 
 import copy
+import importlib.util
 import json
+from pathlib import Path
 import unittest
 
 import copilot_sdk_upstream as sdk
@@ -10,6 +12,22 @@ from tool_catalog import compact_schema
 
 
 class ToolTokenBudgetTests(unittest.TestCase):
+    def test_budget_counter_includes_tool_history_but_not_encrypted_reasoning(self):
+        spec = importlib.util.spec_from_file_location("tool_budget_check", Path(__file__).parent / "tools/verify-tool-token-budget.py")
+        check = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(check)
+        body = {"input": [
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "message text"}]},
+            {"type": "function_call", "arguments": '{"key":"argument text"}'},
+            {"type": "function_call_output", "output": "tool output text"},
+            {"type": "custom_tool_call", "input": "custom input text"},
+            {"type": "reasoning", "summary": [{"type": "summary_text", "text": "summary text"}], "encrypted_content": "opaque ciphertext"},
+        ]}
+        text = check.plaintext_input(body)
+        for value in ("message text", "argument text", "tool output text", "custom input text", "summary text"):
+            self.assertIn(value, text)
+        self.assertNotIn("opaque ciphertext", text)
+
     def test_sdk_keeps_core_tools_eager_and_defers_plugins(self):
         body = {"tools": [
             {"type": "function", "name": "exec_command"},
@@ -93,15 +111,32 @@ class ToolTokenBudgetTests(unittest.TestCase):
     def test_unusual_schemas_are_preserved_as_json(self):
         for schema in [
             {"type": ["string", "null"], "default": None},
-            {"$ref": "#/$defs/entry", "$defs": {"entry": {"type": "string"}}},
-            {"type": "object", "$ref": "#/definitions/entry"},
-            {"oneOf": [{"type": "string"}, {"type": "integer"}]},
+            {"$dynamicRef": "#entry"},
+            {"if": {"type": "string"}, "then": {"minLength": 2}},
+            {"type": None, "oneOf": [{"type": "string"}]},
             {"type": "array", "items": [{"type": "string"}]},
             {"type": "object", "required": ["not_in_properties"]},
             False,
         ]:
             with self.subTest(schema=schema):
                 self.assertEqual(json.loads(compact_schema(schema)), schema)
+
+    def test_definitions_and_compositions_retain_keywords_and_ref_scope(self):
+        schema = {
+            "type": "object", "properties": {}, "additionalProperties": False,
+            "oneOf": [{"$ref": "#/$defs/entry"}, {"type": "null"}],
+            "$defs": {"entry": {"type": "object", "properties": {
+                "mode": {"type": "string", "enum": ["read"], "description": "Never write."},
+            }, "required": ["mode"], "additionalProperties": False}},
+            "allOf": [{"anyOf": [{"type": "string"}, {"type": "integer", "minimum": 1}]}],
+        }
+        original = copy.deepcopy(schema)
+        rendered = compact_schema(schema)
+        for text in ('"oneOf":[{"$ref":"#/$defs/entry"},null]', '"$defs":{"entry":{"mode":string',
+                     '"allOf":[{"anyOf":[string,integer {"minimum":1}]}]', 'Never write.', '"enum":["read"]'):
+            self.assertIn(text, rendered)
+        self.assertEqual(schema, original)
+        self.assertLess(len(rendered), len(json.dumps(schema, separators=(",", ":"))))
 
     def test_ordinary_schema_scaffolding_is_substantially_smaller(self):
         schema = {"type": "object", "properties": {
