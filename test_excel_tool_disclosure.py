@@ -159,6 +159,34 @@ class ExcelToolDisclosureTests(unittest.TestCase):
             with self.subTest(names=names):
                 self.assertIsNone(self.lookup(names))
 
+    def test_flattened_namespace_aliases_resolve_lookup_and_execution(self):
+        call = self.lookup(["mcp__demo__tool_0", "mcp__demo.tool_0"])
+        self.assertIsNotNone(call)
+        marker = json.loads(disclosure_text(call).rsplit(excel._TOOL_SCHEMA_MARKER, 1)[1])
+        self.assertEqual(marker["names"], ["mcp__demo.tool_0"])
+        completed = complete_disclosure(self.source, call)
+        action = excel.extract_native_client_tool_call(
+            response_for("mcp__demo__tool_0", {"key": "abc"}), completed)
+        self.assertEqual((action["namespace"], action["name"]), ("mcp__demo", "tool_0"))
+        invalid = excel.extract_native_client_tool_call(
+            response_for("mcp__demo__tool_0", {"key": 1}), completed)
+        self.assertIsNone(invalid)
+        guessed = excel.extract_native_client_tool_call(
+            response_for("mcp__demo__tool_0", {"key": "abc"}), self.source)
+        self.assertEqual(guessed["namespace"], "mcp__node_repl")
+        self.assertIsNone(self.lookup(["mcp__demo__unknown"]))
+
+
+    def test_flattened_aliases_require_unique_registered_identity(self):
+        tools = {"mcp__demo.tool_0": "function", "mcp.demo__tool_0": "function"}
+        self.assertIsNone(excel._original_client_tool_name("mcp__demo__tool_0", tools))
+        self.assertEqual(excel._original_client_tool_name("mcp__demo.tool_0", tools),
+                         "mcp__demo.tool_0")
+        tools["mcp__demo__tool_0"] = "custom"
+        self.assertEqual(excel._original_client_tool_name("mcp__demo__tool_0", tools),
+                         "mcp__demo__tool_0")
+
+
     def test_reserved_name_collision_preserves_real_caller_tool(self):
         self.source["tools"].append({
             "type": "function", "name": excel.TOOL_SCHEMA_LOOKUP_NAME,

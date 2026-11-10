@@ -6,6 +6,11 @@ not the Copilot SDK. `proxy.py` selects `_handle_excel_responses`, and
 shape. The Excel adapter owns that wire conversion; it does not reuse the SDK
 session lifecycle or runtime tool registration.
 
+The Basispoints request schema does not accept `parallel_tool_calls`, even when
+false. Client tool-call preferences must not be forwarded as that field; doing
+so causes HTTP 422 (`Invalid request body`). The relay prompt specifies one
+client-tool envelope per transport call instead.
+
 ## Codex v2 compatibility
 
 - Top-level `tools`, Responses Lite `additional_tools`, and loaded
@@ -14,6 +19,14 @@ session lifecycle or runtime tool registration.
   items are omitted from conversation history.
 - Namespaced tool identities are restored as a leaf `name` plus a separate
   `namespace` on returned function and custom-tool calls.
+- Flattened MCP names such as `mcp__codex_app__list_threads` resolve to a unique
+  registered catalog identity (`mcp__codex_app.list_threads`) for schema lookups
+  and tool calls. Exact names take precedence; ambiguous aliases are rejected.
+  Deferred tools still require completed schema disclosure, and action
+  arguments are validated against the original tool schema.
+- The lean connector relay unwraps up to two redundant reserved transport
+  envelopes from model retries, retaining the native call identity for replay.
+  Real registered connector actions are not treated as reserved wrappers.
 - For `collaboration.spawn_agent`, `collaboration.send_message`, and
   `collaboration.followup_task`, the Excel prompt schema omits the Codex-only
   `encrypted: true` annotation on the `message` parameter. Synthesized Codex

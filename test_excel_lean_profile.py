@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import patch
 
 import excel_upstream as excel
-from test_excel_tool_disclosure import source_catalog, complete_disclosure
+from test_excel_tool_disclosure import source_catalog, complete_disclosure, disclosure_text
 
 
 def native_response(envelope, *, name=None, call_id="call_lean_test"):
@@ -17,6 +17,19 @@ def native_response(envelope, *, name=None, call_id="call_lean_test"):
         "name": name or excel.LEAN_CLIENT_TRANSPORT_NAME,
         "arguments": json.dumps(excel._lean_transport_arguments(envelope)),
     }]}
+
+
+def chat_source_catalog():
+    source = source_catalog()
+    source["tools"].append({"type": "namespace", "name": "mcp__codex_app", "tools": [
+        {"type": "function", "name": "list_threads", "parameters": {
+            "type": "object", "properties": {"limit": {"type": "integer"}},
+            "additionalProperties": False}},
+        {"type": "function", "name": "read_thread", "parameters": {
+            "type": "object", "properties": {"threadId": {"type": "string"}},
+            "required": ["threadId"], "additionalProperties": False}},
+    ]})
+    return source
 
 
 class ExcelLeanProfileTests(unittest.TestCase):
@@ -166,6 +179,104 @@ class ExcelLeanProfileTests(unittest.TestCase):
         self.assertEqual(action["namespace"], "mcp__demo")
         replay = excel.translate_input_items(completed["input"])
         self.assertEqual(replay[-2], response["output"][0])
+
+    def test_chat_search_flattened_lookup_and_nested_retries_roundtrip(self):
+        source = chat_source_catalog()
+        lookup = {"name": excel.TOOL_SCHEMA_LOOKUP_NAME, "arguments": {
+            "names": ["mcp__codex_app__list_threads", "mcp__codex_app__read_thread"]}}
+        for depth in range(3):
+            with self.subTest(depth=depth):
+                envelope = lookup
+                for _ in range(depth):
+                    envelope = {"name": excel.LEAN_CLIENT_TRANSPORT_NAME,
+                                "arguments": excel._lean_transport_arguments(envelope)}
+                response = native_response(envelope, call_id=f"call_chat_lookup_{depth}")
+                call = excel.extract_native_client_tool_call(response, source)
+                self.assertIsNotNone(call)
+                self.assertEqual((call["namespace"], call["name"]), ("mcp__node_repl", "js"))
+                marker = json.loads(disclosure_text(call).rsplit(excel._TOOL_SCHEMA_MARKER, 1)[1])
+                self.assertEqual(marker["names"], ["mcp__codex_app.list_threads", "mcp__codex_app.read_thread"])
+                completed = complete_disclosure(source, call)
+                replay = excel.translate_input_items(completed["input"])
+                self.assertEqual(replay[-2], response["output"][0])
+                action_envelope = {"name": "mcp__codex_app__list_threads", "arguments": {"limit": 10}}
+                if depth:
+                    action_envelope = {"name": excel.LEAN_CLIENT_TRANSPORT_NAME,
+                                       "arguments": json.dumps(excel._lean_transport_arguments(action_envelope))}
+                action = excel.extract_native_client_tool_call(native_response(
+                    action_envelope, call_id=f"call_chat_action_{depth}"), completed)
+                self.assertEqual((action["namespace"], action["name"]), ("mcp__codex_app", "list_threads"))
+                self.assertEqual(json.loads(action["arguments"]), {"limit": 10})
+                invalid = excel.extract_native_client_tool_call(native_response(
+                    {"name": "mcp__codex_app__read_thread", "arguments": {}}), completed)
+                self.assertIsNone(invalid)
+
+    def test_nested_reserved_relay_is_bounded_and_validated(self):
+        envelope = {"name": "exec_command", "arguments": {"cmd": "pwd"}}
+        for _ in range(3):
+            envelope = {"name": excel.LEAN_CLIENT_TRANSPORT_NAME,
+                        "arguments": excel._lean_transport_arguments(envelope)}
+        self.assertIsNone(excel.extract_native_client_tool_call(native_response(envelope), self.source))
+        for arguments in ("invalid JSON", [], {"action_ref": excel.LEAN_CLIENT_ACTION_REF, "params": []}):
+            nested = {"name": excel.LEAN_CLIENT_TRANSPORT_NAME, "arguments": arguments}
+            self.assertIsNone(excel.extract_native_client_tool_call(native_response(nested), self.source))
+
+    def test_chat_search_lookup_stream_does_not_leak_internal_connector(self):
+        import proxy
+        import format_translation
+        source = chat_source_catalog()
+        response = native_response({"name": excel.TOOL_SCHEMA_LOOKUP_NAME, "arguments": {
+            "names": ["mcp__codex_app__list_threads", "mcp__codex_app__read_thread"]}})
+        response.update({"id": "resp_chat_lookup", "status": "completed",
+                         "usage": {"input_tokens": 100, "output_tokens": 20}})
+
+        async def collect():
+            async def raw():
+                for event in ("response.output_item.added", "response.output_item.done"):
+                    yield format_translation.sse_encode(event, {
+                        "type": event, "output_index": 0, "item": response["output"][0]})
+                yield format_translation.sse_encode("response.completed", {
+                    "type": "response.completed", "response": response})
+            return b"".join([chunk async for chunk in proxy._excel_tool_stream_transform(source)(raw())])
+
+        wire = asyncio.run(collect()).decode()
+        events = [json.loads(line[6:]) for line in wire.splitlines() if line.startswith("data: ")]
+        items = [event["item"] for event in events if event["type"] == "response.output_item.done"]
+        self.assertEqual([(item["namespace"], item["name"]) for item in items], [("mcp__node_repl", "js")])
+        completed = next(event["response"] for event in events if event["type"] == "response.completed")
+        self.assertEqual(completed["output"], items)
+        self.assertEqual(completed["usage"], response["usage"])
+
+    def test_chat_search_non_streaming_route_translates_lookup_and_action(self):
+        import httpx
+        import proxy
+        source = chat_source_catalog()
+        lookup_response = native_response({"name": excel.TOOL_SCHEMA_LOOKUP_NAME, "arguments": {
+            "names": ["mcp__codex_app__list_threads", "mcp__codex_app__read_thread"]}},
+            call_id="call_chat_json_lookup")
+        lookup = excel.extract_native_client_tool_call(lookup_response, source)
+        completed = complete_disclosure(source, lookup)
+        action_response = native_response({"name": "mcp__codex_app__list_threads", "arguments": {}},
+                                          call_id="call_chat_json_action")
+
+        async def run(response, client_source):
+            response.update({"id": "resp_chat_json", "status": "completed"})
+            transport = httpx.MockTransport(lambda request: httpx.Response(200, json=response))
+            async with httpx.AsyncClient(transport=transport) as client:
+                plan = proxy.UpstreamRequestPlan(
+                    request_id="chat-json-test", upstream_url="https://example.invalid/responses",
+                    headers={}, body=excel.prepare_responses_body(client_source), usage_event=None,
+                    requested_model=source["model"], resolved_model=source["model"])
+                with patch.object(proxy, "_get_excel_upstream_client", return_value=client), \
+                     patch.object(proxy, "_finish_usage_and_trace"):
+                    result = await proxy._post_excel_non_streaming_request(plan, client_body=client_source)
+            self.assertEqual(result.status_code, 200)
+            return json.loads(result.body)["output"][0]
+
+        lookup_item = asyncio.run(run(lookup_response, source))
+        self.assertEqual((lookup_item["namespace"], lookup_item["name"]), ("mcp__node_repl", "js"))
+        action_item = asyncio.run(run(action_response, completed))
+        self.assertEqual((action_item["namespace"], action_item["name"]), ("mcp__codex_app", "list_threads"))
 
     def test_custom_tool_output_and_restart_fallback_are_native_function_items(self):
         self.source["tools"] = [{"type": "custom", "name": "apply_patch"}]

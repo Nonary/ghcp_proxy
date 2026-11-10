@@ -414,12 +414,16 @@ def _original_client_tool_name(
     if not isinstance(name, str):
         return None
     if name.startswith(CLIENT_TOOL_RELAY_PREFIX):
-        candidate = name[len(CLIENT_TOOL_RELAY_PREFIX) :]
-        return candidate if candidate in allowed_tools else None
+        name = name[len(CLIENT_TOOL_RELAY_PREFIX) :]
     # Accept the old, unprefixed marker format for in-flight responses. Native
     # Basispoints calls also arrive unprefixed; schema validation below decides
     # whether one can safely stand in for a same-named client tool.
-    return name if name in allowed_tools else None
+    if name in allowed_tools:
+        return name
+    # MCP names may arrive flattened instead of using the catalog's namespace
+    # separator. Only resolve a unique registered identity, never a guessed tool.
+    matches = [key for key in allowed_tools if key.replace(".", "__") == name]
+    return matches[0] if len(matches) == 1 else None
 
 
 def _remember_native_call(item: dict) -> None:
@@ -665,6 +669,22 @@ def _transport_envelope(native: dict) -> dict | None:
         if not isinstance(arguments, dict) or arguments.get("action_ref") != LEAN_CLIENT_ACTION_REF:
             return None
         envelope = arguments.get("params")
+        for depth in range(3):
+            if not isinstance(envelope, dict) or not _is_lean_transport_name(envelope.get("name")):
+                break
+            nested_arguments = envelope.get("arguments")
+            if isinstance(nested_arguments, str):
+                try:
+                    nested_arguments = json.loads(nested_arguments)
+                except json.JSONDecodeError:
+                    return None
+            if not isinstance(nested_arguments, dict):
+                return None
+            if nested_arguments.get("action_ref") != LEAN_CLIENT_ACTION_REF:
+                break
+            if depth == 2:
+                return None
+            envelope = nested_arguments.get("params")
         return envelope if isinstance(envelope, dict) else None
     if (
         native.get("type") != "function_call"
@@ -1134,12 +1154,16 @@ def _disclosed_tool_names(source: dict, specs: dict) -> set[str]:
 def _tool_schema_disclosure_call(native: dict, source: dict, names: object) -> dict | None:
     specs = _client_tool_specs(source)
     deferred = _deferred_tool_specs(source, specs)
-    if (
-        not isinstance(names, list) or not names or len(names) > _TOOL_SCHEMA_BATCH_LIMIT
-        or any(not isinstance(name, str) or name not in deferred for name in names)
-    ):
+    if not isinstance(names, list) or not names or len(names) > _TOOL_SCHEMA_BATCH_LIMIT:
         return None
-    names = list(dict.fromkeys(names))
+    allowed_tools = client_tool_types(source)
+    resolved_names: list[str] = []
+    for name in names:
+        resolved = _original_client_tool_name(name, allowed_tools)
+        if resolved is None or resolved not in deferred:
+            return None
+        resolved_names.append(resolved)
+    names = list(dict.fromkeys(resolved_names))
     text, _digest = _tool_schema_disclosure_text(specs, names)
     # The desktop's existing Node tool is only a read-only output carrier.
     # JSON-quote the literal: tool descriptions never become executable code.

@@ -136,12 +136,14 @@ class ExcelUpstreamTests(unittest.TestCase):
             "include": ["reasoning.encrypted_content"],
             "text": {"verbosity": "low"},
             "max_output_tokens": 1234,
+            "parallel_tool_calls": True,
             "tools": [{"type": "function", "name": "demo"}],
         }
         body = excel_upstream.prepare_responses_body(source)
 
         self.assertEqual(body["model"], "gpt-5.6-sol")
         self.assertEqual(body["model_selection"], "explicit")
+        self.assertNotIn("parallel_tool_calls", body)
         self.assertFalse(body["store"])
         self.assertEqual(body["reasoning_effort"], "xhigh")
         self.assertEqual(body["prompt_cache_key"], "conversation-1")
@@ -163,6 +165,17 @@ class ExcelUpstreamTests(unittest.TestCase):
         self.assertNotIn("text", body)
         self.assertNotIn("max_output_tokens", body)
         self.assertNotIn("reasoning", body)
+
+    def test_parallel_tool_calls_is_not_supported_by_excel_wire_schema(self):
+        for requested in (None, False, True):
+            with self.subTest(parallel_tool_calls=requested):
+                source = {"model": "gpt-6.1-sol-excel", "input": "Hello"}
+                if requested is not None:
+                    source["parallel_tool_calls"] = requested
+                body = excel_upstream.prepare_responses_body(source)
+                self.assertEqual(body["model"], "gpt-6.1-sol")
+                self.assertNotIn("parallel_tool_calls", body)
+
 
     def test_supported_reasoning_efforts_and_x_high_alias_are_forwarded(self):
         expected = {
