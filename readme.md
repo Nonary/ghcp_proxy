@@ -187,6 +187,7 @@ Set environment variables before starting the proxy.
 | Variable                        | Purpose                                     | Default or notes               |
 | ------------------------------- | ------------------------------------------- | ------------------------------ |
 | `GHCP_UPSTREAM_TIMEOUT_SECONDS` | Timeout for upstream non-streaming requests | `300` seconds                  |
+| `GHCP_SDK_STREAM_PROGRESS_TIMEOUT_SECONDS` | Maximum time without Copilot SDK stream events | `300` seconds; `0` disables this progress timeout |
 | `GHCP_UPSTREAM_PROXY`           | Proxy for HTTP and HTTPS upstream traffic   | Can be overridden per protocol |
 | `GHCP_HTTP_PROXY`               | HTTP upstream proxy                         | Optional                       |
 | `GHCP_HTTPS_PROXY`              | HTTPS upstream proxy                        | Optional                       |
@@ -205,6 +206,17 @@ automatically replay interrupted streams, since that could duplicate tool
 actions or token spend. A terminal Responses event ends the relay without
 waiting for a trailing HTTP EOF. Excel connections use a five-second idle
 keepalive expiry to limit stale connection reuse through network proxies.
+
+Copilot SDK Responses streams use `GHCP_SDK_STREAM_PROGRESS_TIMEOUT_SECONDS`
+to fail a stream that receives no SDK events, even while keepalive comments are
+being sent. The default is 300 seconds (five minutes) and is not a total generation limit;
+ongoing SDK events reset the timer. On a failure, the proxy aborts only that
+SDK turn. If the runtime confirms the session is idle, it keeps that conversation
+session available for reuse; otherwise it retires that SDK session, clears its
+alias, and attempts to delete it so a later request can rebuild from the
+conversation transcript. The proxy and SDK client stay running. It does not
+automatically replay a failed model request, which could duplicate tool actions
+or token spend; instead it emits `response.failed` to end the current stream.
 
 Request traces retain HTTP `499` for downstream cancellations (not confirmed
 delivery). Their stream lifecycle `failure_category` distinguishes

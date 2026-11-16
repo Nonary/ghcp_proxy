@@ -508,9 +508,12 @@ class _IsolatedSdkState:
         self._dir = tempfile.TemporaryDirectory()
         self._patch = patch.object(sdk, "_SDK_STATE_DIR", self._dir.name)
         self._patch.start()
+        self._retired_patch = patch.object(sdk, "_retired_session_ids", set())
+        self._retired_patch.start()
         return self._dir.name
 
     def __exit__(self, *exc):
+        self._retired_patch.stop()
         self._patch.stop()
         self._dir.cleanup()
         return False
@@ -856,6 +859,45 @@ class CopilotSdkEventTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resumed, ["sdk-session-1"])
         self.assertEqual(len(created), 1)
         self.assertEqual(sent[1], "User: next question")
+
+    async def test_open_session_refreshes_watermark_after_a_recovery_wait(self):
+        session = _FakeSession()
+        session.session_id = "sdk-recovered"
+        session.send = AsyncMock()
+        client = SimpleNamespace()
+        registration = sdk.ToolRegistration()
+        prior_input = [{"role": "user", "content": "prior request"}]
+        failed_input = [*prior_input, {"role": "user", "content": "failed request"}]
+        next_body = {
+            "model": "gpt-test",
+            "session_id": "thread-recovered",
+            "input": [*failed_input, {"role": "user", "content": "continue"}],
+        }
+        prior_fingerprints = sdk._segment_fingerprints(sdk._render_input_segments(prior_input))
+        failed_fingerprints = sdk._segment_fingerprints(sdk._render_input_segments(failed_input))
+        options = sdk._session_options(next_body, registration, reasoning_effort=None)
+        await sdk._track_live_session(session, options=options, fingerprints=prior_fingerprints)
+        sdk._remember_session(session.session_id)
+        sdk._remember_session_alias("thread-recovered", session.session_id, prior_fingerprints)
+        sdk._pending_alias_watermark[session.session_id] = (
+            "thread-recovered",
+            failed_fingerprints,
+        )
+
+        async def recover_session(*_args, **_kwargs):
+            sdk._commit_alias_watermark(session.session_id, success=True)
+            return session
+
+        with patch.object(sdk, "_get_client", AsyncMock(return_value=client)), \
+             patch.object(sdk, "_reuse_live_session", side_effect=recover_session):
+            resumed, dispatch = await sdk._open_session(next_body, registration)
+            await dispatch()
+
+        self.assertIs(resumed, session)
+        self.assertIn("continue", session.send.await_args.args[0])
+        self.assertNotIn("failed request", session.send.await_args.args[0])
+        sdk._commit_alias_watermark(session.session_id, success=True)
+        await sdk._evict_live_session(session.session_id)
 
     async def test_open_session_sends_input_image_as_sdk_attachment(self):
         sent = []
@@ -2228,6 +2270,239 @@ class CopilotSdkEventTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b": keep-alive\n\n", chunks)
         all_text = b"".join(chunks).decode()
         self.assertIn("delayed message", all_text)
+
+    async def test_stream_turn_surfaces_dispatch_errors_without_waiting_for_turn_timeout(self):
+        session = _FakeSession()
+        diagnostics = {}
+        finished = []
+
+        async def dispatch():
+            await asyncio.sleep(0.02)
+            raise RuntimeError("model request failed")
+
+        with patch.object(sdk, "_TURN_TIMEOUT_SECONDS", 0.5), \
+             patch.object(sdk, "_client", None), \
+             patch.object(sdk, "_interrupted_turns", set()) as recovery_tasks, \
+             patch.object(sdk, "_KEEPALIVE_INTERVAL_SECONDS", 0.005):
+            chunks = [
+                chunk
+                async for chunk in sdk._stream_turn(
+                    _ConnectedRequest(),
+                    {"model": "gpt-test"},
+                    session,
+                    dispatch,
+                    sdk.ToolRegistration(),
+                    plan=SimpleNamespace(),
+                    finish_usage_callback=lambda _plan, status, **_kwargs: finished.append(status),
+                    diagnostics=diagnostics,
+                )
+            ]
+            if recovery_tasks:
+                await asyncio.gather(*list(recovery_tasks), return_exceptions=True)
+
+        failed_event = next(chunk for chunk in chunks if b"event: response.failed" in chunk)
+        payload = json.loads(failed_event.split(b"data: ", 1)[1])
+        self.assertIn(b": keep-alive\n\n", chunks)
+        self.assertEqual(payload["response"]["error"]["message"], "model request failed")
+        self.assertEqual(diagnostics["error"], "model request failed")
+        self.assertEqual(finished, [500])
+
+    async def test_stream_turn_fails_and_releases_session_when_sdk_makes_no_progress(self):
+        disconnect_started = asyncio.Event()
+        disconnect_cancelled = asyncio.Event()
+        abort_started = asyncio.Event()
+        abort_cancelled = asyncio.Event()
+
+        class _HangingDisconnectSession(_FakeSession):
+            async def disconnect(self):
+                disconnect_started.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    disconnect_cancelled.set()
+                    raise
+
+            async def abort(self):
+                abort_started.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    abort_cancelled.set()
+                    raise
+
+        session = _HangingDisconnectSession()
+        diagnostics = {}
+        finished = []
+        replacement = _FakeSession()
+        replacement.session_id = "session-rebuilt"
+        replacement.send = AsyncMock()
+        client = SimpleNamespace(
+            delete_session=AsyncMock(),
+            create_session=AsyncMock(return_value=replacement),
+            resume_session=AsyncMock(return_value=_FakeSession()),
+        )
+
+        async def dispatch():
+            await asyncio.Event().wait()
+
+        with patch.object(sdk, "_live_sessions", {}), \
+             patch.object(sdk, "_client", client), \
+             patch.object(sdk, "_interrupted_turns", set()) as recovery_tasks:
+            await sdk._track_live_session(session)
+            sdk._remember_session(session.session_id)
+            prior_input = [{"role": "user", "content": "prior-input"}]
+            failed_input = [*prior_input, {"role": "user", "content": "failed-input"}]
+            sdk._remember_session_alias(
+                "thread-stalled",
+                session.session_id,
+                sdk._segment_fingerprints(sdk._render_input_segments(prior_input)),
+            )
+            sdk._pending_alias_watermark[session.session_id] = (
+                "thread-stalled",
+                sdk._segment_fingerprints(sdk._render_input_segments(failed_input)),
+            )
+            with patch.object(sdk, "_SDK_STREAM_PROGRESS_TIMEOUT_SECONDS", 0.02), \
+                 patch.object(sdk, "_KEEPALIVE_INTERVAL_SECONDS", 0.005), \
+                 patch.object(sdk, "_STREAM_FAILURE_CLEANUP_TIMEOUT_SECONDS", 0.02), \
+                 patch.object(sdk, "_ABORT_REQUEST_TIMEOUT_SECONDS", 0.02), \
+                 patch.object(sdk, "_FAILED_SESSION_DELETE_TIMEOUT_SECONDS", 0.02):
+                chunks = [
+                    chunk
+                    async for chunk in sdk._stream_turn(
+                        _ConnectedRequest(),
+                        {"model": "gpt-test"},
+                        session,
+                        dispatch,
+                        sdk.ToolRegistration(),
+                        plan=SimpleNamespace(),
+                        finish_usage_callback=lambda _plan, status, **_kwargs: finished.append(status),
+                        diagnostics=diagnostics,
+                    )
+                ]
+                if recovery_tasks:
+                    await asyncio.gather(*list(recovery_tasks), return_exceptions=True)
+
+            failed_event = next(chunk for chunk in chunks if b"event: response.failed" in chunk)
+            payload = json.loads(failed_event.split(b"data: ", 1)[1])
+            self.assertEqual(payload["response"]["error"]["code"], "upstream_timeout")
+            self.assertIn("Timed out waiting for Copilot SDK progress", diagnostics["error"])
+            self.assertEqual(finished, [500])
+            self.assertNotIn(session.session_id, sdk._live_sessions)
+            self.assertTrue(disconnect_started.is_set())
+            self.assertTrue(disconnect_cancelled.is_set())
+            self.assertTrue(abort_started.is_set())
+            self.assertTrue(abort_cancelled.is_set())
+            client.delete_session.assert_awaited_once_with(session.session_id)
+            self.assertFalse(sdk._owns_session(session.session_id))
+            self.assertIsNone(sdk._session_for_alias("thread-stalled"))
+            self.assertEqual(diagnostics["session_recovery"], "session_retired")
+
+            next_diagnostics = {}
+            next_body = {
+                "session_id": "thread-stalled",
+                "input": [*failed_input, {"role": "user", "content": "continue"}],
+            }
+            with patch.object(sdk, "_get_client", AsyncMock(return_value=client)):
+                next_session, next_dispatch = await sdk._open_session(
+                    next_body,
+                    sdk.ToolRegistration(),
+                    diagnostics=next_diagnostics,
+                )
+                await next_dispatch()
+            self.assertIs(next_session, replacement)
+            self.assertEqual(next_diagnostics["operation"], "create")
+            client.create_session.assert_awaited_once()
+            client.resume_session.assert_not_awaited()
+
+    async def test_stream_timeout_aborts_and_reuses_a_session_that_reaches_idle(self):
+        class _RecoverableSession(_FakeSession):
+            async def abort(self):
+                self.aborted = True
+                self.emit("session.idle", SessionIdleData())
+
+        session = _RecoverableSession()
+        session.session_id = "session-recovered"
+        diagnostics = {}
+        finished = []
+        client = SimpleNamespace(delete_session=AsyncMock())
+
+        async def dispatch():
+            return None
+
+        with patch.object(sdk, "_live_sessions", {}), \
+             patch.object(sdk, "_client", client), \
+             patch.object(sdk, "_interrupted_turns", set()) as recovery_tasks:
+            entry = await sdk._track_live_session(session, fingerprints=["prior-input"])
+            sdk._remember_session(session.session_id)
+            sdk._pending_alias_watermark[session.session_id] = (
+                "thread-recovered",
+                ["current-input"],
+            )
+            with patch.object(sdk, "_SDK_STREAM_PROGRESS_TIMEOUT_SECONDS", 0.02), \
+                 patch.object(sdk, "_KEEPALIVE_INTERVAL_SECONDS", 0.005), \
+                 patch.object(sdk, "_ABORT_SETTLE_SECONDS", 0.02), \
+                 patch.object(sdk, "_ABORT_REQUEST_TIMEOUT_SECONDS", 0.02):
+                chunks = [
+                    chunk
+                    async for chunk in sdk._stream_turn(
+                        _ConnectedRequest(),
+                        {"model": "gpt-test"},
+                        session,
+                        dispatch,
+                        sdk.ToolRegistration(),
+                        plan=SimpleNamespace(),
+                        finish_usage_callback=lambda _plan, status, **_kwargs: finished.append(status),
+                        diagnostics=diagnostics,
+                    )
+                ]
+                if recovery_tasks:
+                    await asyncio.gather(*list(recovery_tasks), return_exceptions=True)
+
+            self.assertTrue(any(b"event: response.failed" in chunk for chunk in chunks))
+            self.assertEqual(finished, [500])
+            self.assertTrue(session.aborted)
+            self.assertFalse(session.disconnected)
+            self.assertIs(sdk._live_sessions[session.session_id], entry)
+            self.assertFalse(entry.in_use)
+            self.assertEqual(
+                sdk._session_for_alias("thread-recovered"),
+                (session.session_id, ["current-input"]),
+            )
+            self.assertEqual(diagnostics["session_recovery"], "aborted_and_reused")
+            client.delete_session.assert_not_awaited()
+            if entry.reaper is not None:
+                entry.reaper.cancel()
+                await asyncio.gather(entry.reaper, return_exceptions=True)
+
+    async def test_stream_disconnect_is_traced_as_client_cancellation(self):
+        class _DisconnectedRequest:
+            async def is_disconnected(self):
+                return True
+
+        session = _FakeSession()
+        finished = []
+
+        async def dispatch():
+            await asyncio.Event().wait()
+
+        with patch.object(sdk, "_live_sessions", {}), patch.object(sdk, "_interrupted_turns", set()) as tasks:
+            chunks = [
+                chunk
+                async for chunk in sdk._stream_turn(
+                    _DisconnectedRequest(),
+                    {"model": "gpt-test"},
+                    session,
+                    dispatch,
+                    sdk.ToolRegistration(),
+                    plan=SimpleNamespace(),
+                    finish_usage_callback=lambda _plan, status, **_kwargs: finished.append(status),
+                )
+            ]
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+        self.assertTrue(any(b"event: response.in_progress" in chunk for chunk in chunks))
+        self.assertEqual(finished, [499])
 
     async def test_stream_turn_captures_usage_from_session_shutdown(self):
         session = _FakeSession()

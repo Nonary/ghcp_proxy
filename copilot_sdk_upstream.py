@@ -96,6 +96,10 @@ RESPONSES_UPSTREAM_ENV = "GHCP_RESPONSES_UPSTREAM"
 SDK_UPSTREAM = "sdk"
 REST_UPSTREAM = "rest"
 _TURN_TIMEOUT_SECONDS = float(os.environ.get("GHCP_UPSTREAM_TIMEOUT_SECONDS", "1800") or 1800)
+_SDK_STREAM_PROGRESS_TIMEOUT_SECONDS = float(
+    os.environ.get("GHCP_SDK_STREAM_PROGRESS_TIMEOUT_SECONDS", "300") or 300
+)
+_STREAM_FAILURE_CLEANUP_TIMEOUT_SECONDS = 1.0
 _KEEPALIVE_INTERVAL_SECONDS = 15.0
 _PARALLEL_TOOL_SETTLE_SECONDS = 0.5
 # A reasoning summary paragraph still open after this long without SDK
@@ -115,6 +119,7 @@ _RUNTIME_CA_ENV_VARS = ("SSL_CERT_FILE", "NODE_EXTRA_CA_CERTS", "CURL_CA_BUNDLE"
 _SESSION_LEDGER_NAME = "proxy-sessions.json"
 _SESSION_ALIASES_NAME = "proxy-session-aliases.json"
 _SESSION_USAGE_NAME = "proxy-session-usage.json"
+_retired_session_ids: set[str] = set()
 _SESSION_LEDGER_LOCK = threading.Lock()
 _ABANDONED_SESSION_SECONDS = 24 * 60 * 60
 
@@ -161,7 +166,10 @@ def _forget_session(session_id: str) -> None:
 
 def _owns_session(session_id: str) -> bool:
     with _SESSION_LEDGER_LOCK:
-        return session_id in _read_session_ledger_unlocked()
+        return (
+            session_id not in _retired_session_ids
+            and session_id in _read_session_ledger_unlocked()
+        )
 
 
 def _state_path(name: str) -> str:
@@ -266,7 +274,7 @@ def _session_for_alias(alias: str) -> tuple[str, list[str]] | None:
         if not entry:
             return None
         session_id = entry["session_id"]
-        if session_id not in _read_session_ledger_unlocked():
+        if session_id in _retired_session_ids or session_id not in _read_session_ledger_unlocked():
             return None
         return session_id, entry["segments"]
 
@@ -286,8 +294,8 @@ def _forget_session_aliases(session_ids: set[str]) -> None:
             _write_session_aliases_unlocked(remaining)
 
 
-# Alias watermarks are only durable once the turn they describe succeeded;
-# until then they sit here keyed by SDK session id.
+# Alias watermarks become durable once their input is settled by a successful
+# turn or a confirmed abort; until then they sit here keyed by SDK session id.
 _pending_alias_watermark: dict[str, tuple[str, list[str]]] = {}
 
 
@@ -300,6 +308,25 @@ def _commit_alias_watermark(session_id: str, *, success: bool) -> None:
         _remember_session_alias(alias, session_id, fingerprints)
     except OSError:
         pass
+
+
+def _forget_session_tracking(session_id: str) -> list[str]:
+    """Remove proxy metadata so a failed SDK session cannot be resumed."""
+    with _SESSION_LEDGER_LOCK:
+        _retired_session_ids.add(session_id)
+    _pending_alias_watermark.pop(session_id, None)
+    errors: list[str] = []
+    for label, forget in (
+        ("session ledger", lambda: _forget_session(session_id)),
+        ("session aliases", lambda: _forget_session_aliases({session_id})),
+        ("usage baselines", lambda: _forget_shutdown_baselines({session_id})),
+        ("reasoning ledger", lambda: _reasoning_ledger.forget({session_id})),
+    ):
+        try:
+            forget()
+        except OSError as exc:
+            errors.append(f"{label}: {exc}")
+    return errors
 
 
 async def _prune_abandoned_sessions(client: Any) -> None:
@@ -330,10 +357,13 @@ async def _delete_owned_session(session_id: str) -> None:
         await client.delete_session(session_id)
     except Exception:
         return
-    _forget_session(session_id)
-    _forget_session_aliases({session_id})
-    _forget_shutdown_baselines({session_id})
-    _reasoning_ledger.forget({session_id})
+    tracking_errors = _forget_session_tracking(session_id)
+    if tracking_errors:
+        print(
+            f"copilot_sdk_upstream: failed to clear deleted SDK session metadata: "
+            f"{'; '.join(tracking_errors)}",
+            flush=True,
+        )
 
 
 def responses_upstream() -> str:
@@ -1212,9 +1242,12 @@ async def _reuse_live_session(
     entry = _live_sessions.get(session_id)
     if entry is not None and entry.settling is not None and not entry.settling.done():
         # The previous request was interrupted and is still waiting for the
-        # runtime to go idle; it then parks or evicts this session.
+        # runtime to go idle; it then parks or retires this session.
         try:
-            await asyncio.wait_for(asyncio.shield(entry.settling), _ABORT_SETTLE_SECONDS + 1.0)
+            await asyncio.wait_for(
+                asyncio.shield(entry.settling),
+                _ABORT_REQUEST_TIMEOUT_SECONDS + _ABORT_SETTLE_SECONDS + 1.0,
+            )
         except Exception:
             pass
         entry = _live_sessions.get(session_id)
@@ -2008,7 +2041,7 @@ async def _open_session(body: dict, registration: ToolRegistration, *, diagnosti
                         known_session_id, allow_pending=False, options=options,
                         diagnostics=diagnostics,
                     )
-                    if session is None:
+                    if session is None and _owns_session(known_session_id):
                         try:
                             session = await client.resume_session(
                                 known_session_id,
@@ -2022,8 +2055,28 @@ async def _open_session(body: dict, registration: ToolRegistration, *, diagnosti
                             # fresh one carrying the full transcript.
                             session = None
                     if session is not None:
-                        prompt = "\n\n".join(new_text)
-                        prompt_attachments = _attachments_for_prompt(body.get("input"), new_text)
+                        latest = _session_for_alias(alias)
+                        if latest is None or latest[0] != known_session_id:
+                            new_text = []
+                        else:
+                            new_text = _resume_delta(segments, fingerprints, latest[1])
+                            if not new_text:
+                                new_text = _compaction_resume_delta(segments, fingerprints, latest[1])
+                        if not new_text:
+                            try:
+                                await asyncio.wait_for(
+                                    _release_session(session, None, completed=False, park=True),
+                                    timeout=_STREAM_FAILURE_CLEANUP_TIMEOUT_SECONDS,
+                                )
+                            except TimeoutError:
+                                print(
+                                    "copilot_sdk_upstream: timed out releasing an unused resumed session",
+                                    flush=True,
+                                )
+                            session = None
+                        else:
+                            prompt = "\n\n".join(new_text)
+                            prompt_attachments = _attachments_for_prompt(body.get("input"), new_text)
         if session is None:
             session = await client.create_session(**options)
             prompt = "\n\n".join(text for _, text in segments)
@@ -2532,6 +2585,8 @@ def _event_queue(session: Any) -> tuple[asyncio.Queue, Callable[[], None]]:
 
 
 _ABORT_SETTLE_SECONDS = 5.0
+_ABORT_REQUEST_TIMEOUT_SECONDS = 5.0
+_FAILED_SESSION_DELETE_TIMEOUT_SECONDS = 2.0
 
 
 async def _abort_and_settle(session: Any, queue: asyncio.Queue) -> bool:
@@ -2540,7 +2595,7 @@ async def _abort_and_settle(session: Any, queue: asyncio.Queue) -> bool:
     Only a settled session can be parked for the next request: a late
     ``session.idle`` from the aborted turn would end the next turn early.
     """
-    await session.abort()
+    await asyncio.wait_for(session.abort(), timeout=_ABORT_REQUEST_TIMEOUT_SECONDS)
     deadline = time.monotonic() + _ABORT_SETTLE_SECONDS
     while (remaining := deadline - time.monotonic()) > 0:
         try:
@@ -2553,7 +2608,7 @@ async def _abort_and_settle(session: Any, queue: asyncio.Queue) -> bool:
     return False
 
 
-# Interrupted turns still settling; referenced so they are not collected.
+# Interrupted or failed turns still settling; referenced so they are not collected.
 _interrupted_turns: set[asyncio.Task] = set()
 
 
@@ -2563,8 +2618,9 @@ def _settle_interrupted_turn(
     unsubscribe: Callable[[], None],
     *,
     parkable: bool,
+    diagnostics: dict | None = None,
 ) -> asyncio.Task:
-    """Abort an interrupted turn and park its session once the runtime is idle.
+    """Abort a turn, reusing its session only after the runtime confirms idle.
 
     Starlette cancels a streaming response through an anyio cancel scope,
     which cancels every later await in the generator too: a settle awaited
@@ -2575,16 +2631,121 @@ def _settle_interrupted_turn(
 
     async def settle() -> None:
         settled = False
+        recovery_error: Exception | None = None
         try:
             if parkable:
                 settled = await _abort_and_settle(session, queue)
             else:
-                await session.abort()
-        except Exception:
+                await asyncio.wait_for(
+                    session.abort(), timeout=_ABORT_REQUEST_TIMEOUT_SECONDS
+                )
+        except TimeoutError:
+            recovery_error = TimeoutError(
+                f"Timed out waiting for Copilot SDK session.abort after "
+                f"{_ABORT_REQUEST_TIMEOUT_SECONDS}s"
+            )
+            settled = False
+        except Exception as exc:
+            recovery_error = exc
             settled = False
         finally:
             unsubscribe()
-        await _release_session(session, None, completed=False, park=settled)
+
+        if settled:
+            try:
+                _remember_session(session.session_id)
+            except OSError as exc:
+                recovery_error = exc
+                settled = False
+
+        if parkable and not settled and recovery_error is None:
+            recovery_error = TimeoutError(
+                f"Copilot SDK session did not become idle within {_ABORT_SETTLE_SECONDS}s after abort"
+            )
+
+        if settled:
+            _commit_alias_watermark(session.session_id, success=True)
+            try:
+                await asyncio.wait_for(
+                    _release_session(session, None, completed=False, park=True),
+                    timeout=_STREAM_FAILURE_CLEANUP_TIMEOUT_SECONDS,
+                )
+            except TimeoutError:
+                entry = _live_sessions.get(session.session_id)
+                settled = bool(
+                    entry is not None
+                    and entry.session is session
+                    and not entry.in_use
+                )
+            except Exception as exc:
+                recovery_error = exc
+                settled = False
+
+        if settled:
+            if diagnostics is not None:
+                diagnostics["session_recovery"] = "aborted_and_reused"
+            return
+
+        _commit_alias_watermark(session.session_id, success=False)
+        tracking_errors = _forget_session_tracking(session.session_id)
+        if diagnostics is not None:
+            diagnostics["session_recovery"] = "session_retired"
+            if recovery_error is not None:
+                diagnostics["session_recovery_error"] = str(recovery_error)[:500]
+            if tracking_errors:
+                diagnostics["session_tracking_cleanup_errors"] = tracking_errors
+        if recovery_error is not None:
+            print(
+                f"copilot_sdk_upstream: retiring SDK session after failed abort/settle "
+                f"({type(recovery_error).__name__}: {recovery_error})",
+                flush=True,
+            )
+        if tracking_errors:
+            print(
+                "copilot_sdk_upstream: failed to clear retired SDK session metadata: "
+                + "; ".join(tracking_errors),
+                flush=True,
+            )
+
+        try:
+            await asyncio.wait_for(
+                _release_session(session, None, completed=False),
+                timeout=_STREAM_FAILURE_CLEANUP_TIMEOUT_SECONDS,
+            )
+        except TimeoutError:
+            print(
+                "copilot_sdk_upstream: timed out disconnecting a retired SDK session",
+                flush=True,
+            )
+        except Exception as exc:
+            if diagnostics is not None:
+                diagnostics["session_disconnect_error"] = str(exc)[:500]
+            print(
+                f"copilot_sdk_upstream: failed to disconnect retired SDK session: {exc}",
+                flush=True,
+            )
+
+        client = _client
+        if client is not None:
+            try:
+                await asyncio.wait_for(
+                    client.delete_session(session.session_id),
+                    timeout=_FAILED_SESSION_DELETE_TIMEOUT_SECONDS,
+                )
+            except TimeoutError as exc:
+                if diagnostics is not None:
+                    diagnostics["session_delete_error"] = str(exc)[:500]
+                print(
+                    "copilot_sdk_upstream: timed out deleting a retired SDK session",
+                    flush=True,
+                )
+            except Exception as exc:
+                if diagnostics is not None:
+                    diagnostics["session_delete_error"] = str(exc)[:500]
+                print(
+                    f"copilot_sdk_upstream: failed to delete retired SDK session: {exc}",
+                    flush=True,
+                )
 
     task = asyncio.get_running_loop().create_task(settle())
     _interrupted_turns.add(task)
@@ -2593,6 +2754,16 @@ def _settle_interrupted_turn(
     if entry is not None and entry.session is session:
         entry.settling = task
     return task
+
+
+def _raise_dispatch_error_if_done(dispatch_task: asyncio.Task) -> None:
+    if not dispatch_task.done():
+        return
+    if dispatch_task.cancelled():
+        raise RuntimeError("Copilot SDK request dispatch was cancelled")
+    error = dispatch_task.exception()
+    if error is not None:
+        raise error
 
 
 async def _wait_for_outcome(
@@ -2611,10 +2782,7 @@ async def _wait_for_outcome(
         # are surfaced immediately instead of waiting for the full turn
         # timeout.
         await asyncio.sleep(0)
-        if dispatch_task.done():
-            error = dispatch_task.exception()
-            if error is not None:
-                raise error
+        _raise_dispatch_error_if_done(dispatch_task)
         start_wait_time = time.time()
         while True:
             timeout = _PARALLEL_TOOL_SETTLE_SECONDS if outcome.calls else min(15.0, _TURN_TIMEOUT_SECONDS)
@@ -2622,6 +2790,7 @@ async def _wait_for_outcome(
                 event = await asyncio.wait_for(queue.get(), timeout=timeout)
                 start_wait_time = time.time()
             except TimeoutError:
+                _raise_dispatch_error_if_done(dispatch_task)
                 if outcome.calls:
                     _finalize_usage(outcome)
                     return outcome
@@ -2701,10 +2870,7 @@ async def _wait_for_outcome(
                 return outcome
             elif _event_name(event) == "session.error":
                 raise RuntimeError(str(getattr(data, "message", "Copilot session error")))
-            if dispatch_task.done():
-                error = dispatch_task.exception()
-                if error is not None:
-                    raise error
+            _raise_dispatch_error_if_done(dispatch_task)
     finally:
         unsubscribe()
         if not dispatch_task.done():
@@ -3004,11 +3170,16 @@ async def _stream_turn(
     outcome = TurnOutcome()
     output_index = 0
     final_payload: dict | None = None
-    # Set when an interrupted turn is handed to _settle_interrupted_turn.
+    # Set when a turn is handed to background abort/recovery cleanup.
     settling: asyncio.Task | None = None
     usage_finished = False
+    interrupted = False
+    failure_terminal_emitted = False
 
     def hand_off_interrupted_turn() -> asyncio.Task:
+        nonlocal interrupted
+        if final_payload is None and not failure_terminal_emitted:
+            interrupted = True
         if diagnostics is not None:
             diagnostics["interrupted"] = True
         return _settle_interrupted_turn(
@@ -3020,6 +3191,25 @@ async def _stream_turn(
                 and not dispatch_task.cancelled()
                 and dispatch_task.exception() is None
             ),
+            diagnostics=diagnostics,
+        )
+
+    def hand_off_failed_turn() -> asyncio.Task:
+        if diagnostics is not None:
+            diagnostics["session_recovery"] = "aborting"
+        parkable = (
+            dispatch_task.done()
+            and not dispatch_task.cancelled()
+            and dispatch_task.exception() is None
+        )
+        if not dispatch_task.done():
+            dispatch_task.cancel()
+        return _settle_interrupted_turn(
+            session,
+            queue,
+            unsubscribe,
+            parkable=parkable,
+            diagnostics=diagnostics,
         )
 
     reasoning_started = False
@@ -3048,7 +3238,12 @@ async def _stream_turn(
         if usage_finished or finish_usage_callback is None or plan is None:
             return
         usage_finished = True
-        status_code = 200 if final_payload is not None else 500
+        if final_payload is not None:
+            status_code = 200
+        elif interrupted:
+            status_code = 499
+        else:
+            status_code = 500
         try:
             finish_usage_callback(
                 plan,
@@ -3281,10 +3476,7 @@ async def _stream_turn(
 
     try:
         await asyncio.sleep(0)
-        if dispatch_task.done():
-            error = dispatch_task.exception()
-            if error is not None:
-                raise error
+        _raise_dispatch_error_if_done(dispatch_task)
         start_wait_time = time.time()
         while True:
             if await request.is_disconnected():
@@ -3303,6 +3495,7 @@ async def _stream_turn(
                 event = await asyncio.wait_for(queue.get(), timeout=timeout)
                 start_wait_time = time.time()
             except TimeoutError:
+                _raise_dispatch_error_if_done(dispatch_task)
                 if outcome.calls:
                     break
                 if reasoning_part_open:
@@ -3314,8 +3507,14 @@ async def _stream_turn(
                     for chunk in reasoning_parts.close():
                         yield chunk
                     continue
-                if (time.time() - start_wait_time) >= _TURN_TIMEOUT_SECONDS:
-                    raise TimeoutError(f"Timed out waiting for the Copilot SDK turn after {_TURN_TIMEOUT_SECONDS}s")
+                progress_timeout = min(
+                    _TURN_TIMEOUT_SECONDS,
+                    _SDK_STREAM_PROGRESS_TIMEOUT_SECONDS,
+                )
+                if progress_timeout > 0 and (time.time() - start_wait_time) >= progress_timeout:
+                    raise TimeoutError(
+                        f"Timed out waiting for Copilot SDK progress after {progress_timeout}s"
+                    )
                 yield b": keep-alive\n\n"
                 continue
             data = getattr(event, "data", None)
@@ -3455,10 +3654,7 @@ async def _stream_turn(
                 raise RuntimeError(data.message)
             elif isinstance(data, SessionIdleData):
                 break
-            if dispatch_task.done():
-                error = dispatch_task.exception()
-                if error is not None:
-                    raise error
+            _raise_dispatch_error_if_done(dispatch_task)
 
         if not is_compact:
             for chunk in emit_reasoning_done():
@@ -3525,12 +3721,15 @@ async def _stream_turn(
     except Exception as exc:
         if diagnostics is not None:
             diagnostics["error"] = str(exc)[:500]
+        failure_terminal_emitted = True
+        settling = hand_off_failed_turn()
+        error_code = "upstream_timeout" if isinstance(exc, TimeoutError) else "sdk_upstream_error"
         yield _sse(
             "response.failed",
             response={
                 **base,
                 "status": "failed",
-                "error": {"code": "sdk_upstream_error", "message": str(exc)},
+                "error": {"code": error_code, "message": str(exc)},
             },
         )
     finally:
@@ -3543,18 +3742,32 @@ async def _stream_turn(
         # after receiving a tool call); cancellation used to interrupt
         # ``disconnect`` and skip this entire lifecycle update.  Those turns
         # consequently appeared in neither Requests nor Sessions.
-        _remember_session(session.session_id)
-        _commit_alias_watermark(session.session_id, success=final_payload is not None)
+        if settling is None:
+            _remember_session(session.session_id)
+            _commit_alias_watermark(session.session_id, success=final_payload is not None)
         finish_usage()
         if settling is None:
             try:
-                await asyncio.shield(
-                    _release_session(session, outcome, completed=final_payload is not None)
+                release_session = _release_session(
+                    session,
+                    outcome,
+                    completed=final_payload is not None,
                 )
+                if failure_terminal_emitted:
+                    await asyncio.wait_for(
+                        release_session,
+                        timeout=_STREAM_FAILURE_CLEANUP_TIMEOUT_SECONDS,
+                    )
+                else:
+                    await asyncio.shield(release_session)
             except asyncio.CancelledError:
-                # The shielded release continues independently; lifecycle
-                # reporting above has already completed.
+                # Keep disconnect cancellation from masking the stream outcome.
                 pass
+            except TimeoutError:
+                print(
+                    "copilot_sdk_upstream: timed out disconnecting a failed stream session",
+                    flush=True,
+                )
             except Exception:
                 pass
 
