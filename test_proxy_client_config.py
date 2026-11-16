@@ -71,6 +71,24 @@ class ReasoningLevelTests(unittest.TestCase):
             self.service._config = SimpleNamespace(codex_model_catalog_file=path)
             self.assertTrue(self.service._codex_model_catalog_is_valid())
 
+    def test_transient_empty_discovery_preserves_populated_catalog(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "models.json")
+            with open(path, "w") as stream:
+                json.dump({"models": [{"slug": "gpt-6-sol-excel"}]}, stream)
+            self.service._config = SimpleNamespace(
+                codex_model_catalog_file=path,
+                codex_config_dir=directory,
+                codex_model_context_window=272_000,
+                codex_model_auto_compact_token_limit=180_000,
+            )
+            self.service._model_capabilities_provider = lambda: {}
+            self.service._model_routing_settings_provider = lambda: {}
+
+            self.assertFalse(self.service.refresh_codex_model_catalog())
+            with open(path) as stream:
+                self.assertEqual(json.load(stream)["models"], [{"slug": "gpt-6-sol-excel"}])
+
     def test_generated_catalog_uses_the_independent_backend_union(self):
         self.service._config = SimpleNamespace(codex_model_context_window=272_000, codex_model_auto_compact_token_limit=180_000)
         self.service._model_capabilities_provider = lambda: excel_upstream.merge_local_model_capabilities(

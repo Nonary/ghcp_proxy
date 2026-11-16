@@ -3,42 +3,33 @@
 from __future__ import annotations
 
 import json
-import re
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping
+from uuid import UUID
 
 
 _SPAWN_AGENT_COMPAT_MARKER = "ghcp_proxy multi-agent compatibility"
-_MODEL_SLUG_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,199}\Z")
 _SPAWN_AGENT_COMPAT_NOTE = (
     "\n\n[ghcp_proxy multi-agent compatibility]\n"
-    "For `model`, use any model id offered in the active GHCP Proxy/Codex model "
-    "catalog; do not limit overrides to a hard-coded example list. "
-    "When `agent_type`, `model`, "
-    "`reasoning_effort`, or `service_tier` is overridden, `fork_context` must "
-    "be false or omitted. A full-history fork inherits those settings from "
-    "the parent. Use only the agent id returned by a successful spawn when "
+    "Omit `model` to inherit the parent's model. To override it, use the exact "
+    "id of any model in the active GHCP Proxy/Codex catalog; never substitute "
+    "a different version, family, or Excel route. Set `reasoning_effort` "
+    "separately when a particular effort is requested. A full-history fork "
+    "inherits model and reasoning effort from the parent. "
+    "Use only the agent id returned by a successful spawn when "
     "calling `wait_agent`."
 )
 
 
-def _catalog_model_slugs_sentence(model_slugs) -> str:
-    if not isinstance(model_slugs, (list, tuple)):
-        return ""
-    slugs = []
-    seen = set()
-    for value in model_slugs:
-        if (
-            isinstance(value, str)
-            and _MODEL_SLUG_PATTERN.fullmatch(value)
-            and value not in seen
-        ):
-            slugs.append(value)
-            seen.add(value)
-    if not slugs:
-        return ""
-    return " Available model slugs in the active catalog: " + ", ".join(
-        f"`{slug}`" for slug in slugs
-    ) + "."
+def _without_model_override_inventory(description: str) -> str:
+    """Remove the client-generated example list, not its argument contract."""
+    lines = description.splitlines(keepends=True)
+    for index, line in enumerate(lines):
+        if line.strip().startswith("Available model overrides ("):
+            end = index + 1
+            while end < len(lines) and lines[end].strip():
+                end += 1
+            return ("".join(lines[:index] + lines[end:])).strip()
+    return description
 
 
 def _non_empty_string(value) -> str | None:
@@ -276,13 +267,34 @@ def codex_turn_id(body: dict | None) -> str | None:
     return _codex_metadata_value(body, "turn_id", "turnId")
 
 
+def codex_turn_started_at_ms(body: dict | None) -> int | None:
+    """Return the authoritative lifecycle start time when supplied by Codex."""
+    for mapping in reversed(_metadata_mappings(body)):
+        value = mapping.get("turn_started_at_unix_ms")
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            return value
+    return None
+
+
+def codex_item_created_at_ms(item: dict) -> int | None:
+    """Read creation time only from recognized UUIDv7 replay item identities."""
+    item_id = item.get("id")
+    if not isinstance(item_id, str) or not item_id.startswith(("msg_", "amsg_", "fco_")):
+        return None
+    try:
+        identifier = UUID(item_id.rsplit("_", 1)[-1])
+    except ValueError:
+        return None
+    return identifier.int >> 80 if identifier.version == 7 else None
+
+
 def codex_thread_source(body: dict | None) -> str | None:
     """Return the normalized Codex lifecycle source (for example ``user``)."""
     value = _codex_metadata_value(body, "thread_source", "threadSource")
     return value.lower() if value else None
 
 
-def _patched_spawn_agent_tool(tool: dict, model_slugs=None) -> tuple[dict, bool]:
+def _patched_spawn_agent_tool(tool: dict) -> tuple[dict, bool]:
     if tool.get("name") != "spawn_agent":
         return tool, False
     description = tool.get("description")
@@ -291,31 +303,39 @@ def _patched_spawn_agent_tool(tool: dict, model_slugs=None) -> tuple[dict, bool]
 
     parameters = tool.get("parameters")
     properties = parameters.get("properties") if isinstance(parameters, Mapping) else None
-    # This is the Codex multi_agent_v1 contract that produced the captured
-    # failure. Newer collaboration tools use a different fork shape and do not
-    # accept model overrides, so leave those schemas untouched.
-    if not isinstance(properties, Mapping) or not {
-        "fork_context",
-        "model",
-    }.issubset(properties):
+    # Both the legacy v1 and current collaboration/v2 schemas allow overrides.
+    if not isinstance(properties, Mapping) or not (
+        {"fork_context", "model"}.issubset(properties)
+        or {"fork_turns", "model"}.issubset(properties)
+    ):
         return tool, False
 
     patched = dict(tool)
-    patched["description"] = description.rstrip() + _SPAWN_AGENT_COMPAT_NOTE
+    patched["description"] = (
+        _without_model_override_inventory(description).rstrip()
+        + _SPAWN_AGENT_COMPAT_NOTE
+    )
 
     patched_parameters = dict(parameters)
     patched_properties = dict(properties)
 
-    fork_context = properties.get("fork_context")
+    fork_key = "fork_turns" if "fork_turns" in properties else "fork_context"
+    fork_context = properties.get(fork_key)
     if isinstance(fork_context, Mapping):
         patched_fork_context = dict(fork_context)
         existing = _non_empty_string(fork_context.get("description")) or ""
-        patched_fork_context["description"] = (
-            existing.rstrip()
-            + " Full-history forks inherit agent type, model, reasoning effort, and "
-            "service tier; set this false or omit it when overriding any of them."
-        ).strip()
-        patched_properties["fork_context"] = patched_fork_context
+        if fork_key == "fork_turns":
+            guidance = (
+                " Full-history forks inherit model and reasoning effort; "
+                "use `none` when overriding either one."
+            )
+        else:
+            guidance = (
+                " Full-history forks inherit agent type, model, reasoning effort, and "
+                "service tier; set this false or omit it when overriding any of them."
+            )
+        patched_fork_context["description"] = (existing.rstrip() + guidance).strip()
+        patched_properties[fork_key] = patched_fork_context
 
     model = properties.get("model")
     if isinstance(model, Mapping):
@@ -323,8 +343,8 @@ def _patched_spawn_agent_tool(tool: dict, model_slugs=None) -> tuple[dict, bool]
         existing = _non_empty_string(model.get("description")) or ""
         patched_model["description"] = (
             existing.rstrip()
-            + " Any model id offered in the active GHCP Proxy/Codex model catalog is a valid override."
-            + _catalog_model_slugs_sentence(model_slugs)
+            + " Optional; omit to inherit the parent model. Any model id in the active "
+            "GHCP Proxy/Codex model catalog is a valid override."
         ).strip()
         patched_properties["model"] = patched_model
 
@@ -333,11 +353,11 @@ def _patched_spawn_agent_tool(tool: dict, model_slugs=None) -> tuple[dict, bool]
     return patched, True
 
 
-def _patched_tool_node(node, model_slugs=None):
+def _patched_tool_node(node):
     if not isinstance(node, dict):
         return node, False
 
-    patched, changed = _patched_spawn_agent_tool(node, model_slugs)
+    patched, changed = _patched_spawn_agent_tool(node)
     nested_tools = patched.get("tools")
     if not isinstance(nested_tools, list):
         return patched, changed
@@ -345,7 +365,7 @@ def _patched_tool_node(node, model_slugs=None):
     patched_nested = []
     nested_changed = False
     for nested in nested_tools:
-        patched_child, child_changed = _patched_tool_node(nested, model_slugs)
+        patched_child, child_changed = _patched_tool_node(nested)
         patched_nested.append(patched_child)
         nested_changed = nested_changed or child_changed
     if not nested_changed:
@@ -356,42 +376,19 @@ def _patched_tool_node(node, model_slugs=None):
     return patched, True
 
 
-def _contains_spawn_agent_tool(node) -> bool:
-    if not isinstance(node, dict):
-        return False
-    if node.get("name") == "spawn_agent":
-        return True
-    nested_tools = node.get("tools")
-    return isinstance(nested_tools, list) and any(
-        _contains_spawn_agent_tool(nested) for nested in nested_tools
-    )
-
-
 def normalize_codex_agent_tools(
     body: dict,
     *,
-    model_slugs=None,
-    model_slugs_provider: Callable[[], Sequence[str]] | None = None,
     diagnostics: list[dict] | None = None,
 ) -> dict:
     """Clarify current multi-agent constraints without mutating the input."""
     if not isinstance(body, dict) or not isinstance(body.get("tools"), list):
         return body
 
-    if model_slugs is None and model_slugs_provider is not None and any(
-        _contains_spawn_agent_tool(tool) for tool in body["tools"]
-    ):
-        try:
-            model_slugs = model_slugs_provider()
-        except Exception:
-            # Tool compatibility guidance is best-effort; don't fail Responses
-            # requests if the optional model catalog cannot be loaded.
-            model_slugs = None
-
     patched_tools = []
     changed = False
     for tool in body["tools"]:
-        patched_tool, tool_changed = _patched_tool_node(tool, model_slugs)
+        patched_tool, tool_changed = _patched_tool_node(tool)
         patched_tools.append(patched_tool)
         changed = changed or tool_changed
     if not changed:

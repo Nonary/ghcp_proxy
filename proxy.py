@@ -6773,7 +6773,6 @@ async def responses(request: Request):
     agent_compat_diagnostics: list[dict] = []
     body = codex_agent_compat.normalize_codex_agent_tools(
         body,
-        model_slugs_provider=client_proxy_config_service.codex_model_catalog_model_names,
         diagnostics=agent_compat_diagnostics,
     )
     if excel_upstream.is_excel_model(body.get("model")):

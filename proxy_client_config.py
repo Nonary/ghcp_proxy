@@ -417,6 +417,16 @@ class ProxyClientConfigService:
             return False
         os.makedirs(self._config.codex_config_dir, exist_ok=True)
         catalog = self._build_codex_model_catalog_payload()
+        if not catalog.get("models"):
+            # Discovery can be temporarily empty during startup. Keep the last
+            # usable picker catalog rather than making Codex refuse to launch.
+            try:
+                with open(self._config.codex_model_catalog_file, encoding="utf-8") as f:
+                    previous = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                previous = None
+            if isinstance(previous, dict) and previous.get("models"):
+                return False
         self._write_json_atomic(
             self._config.codex_model_catalog_file,
             catalog,

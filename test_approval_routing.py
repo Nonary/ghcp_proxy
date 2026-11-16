@@ -10,7 +10,7 @@ from initiator_policy import is_approval_agent_request
 
 
 class ApprovalRoutingTests(unittest.TestCase):
-    def test_spawn_agent_compat_uses_active_model_catalog_for_overrides(self):
+    def test_spawn_agent_compat_accepts_any_catalog_model_or_inheritance(self):
         body = {
             "tools": [
                 {
@@ -26,36 +26,55 @@ class ApprovalRoutingTests(unittest.TestCase):
             ]
         }
 
-        normalized = normalize_codex_agent_tools(
-            body,
-            model_slugs=["gpt-6-luna", "gpt-5.6-sol", "invalid\nmodel", "gpt-6-luna"],
-        )
+        normalized = normalize_codex_agent_tools(body)
         tool = normalized["tools"][0]
 
-        self.assertIn("active GHCP Proxy/Codex model catalog", tool["description"])
+        self.assertIn("active GHCP Proxy/Codex catalog", tool["description"])
         model_description = tool["parameters"]["properties"]["model"]["description"]
         self.assertIn("active GHCP Proxy/Codex model catalog", model_description)
-        self.assertIn("Available model slugs in the active catalog", model_description)
-        self.assertIn("`gpt-6-luna`", model_description)
-        self.assertIn("`gpt-5.6-sol`", model_description)
-        self.assertEqual(model_description.count("`gpt-6-luna`"), 1)
-        self.assertNotIn("invalid", model_description)
+        self.assertIn("Any model id in the active", model_description)
+        self.assertIn("omit to inherit", model_description)
+        self.assertNotIn("gpt-6-luna", str(tool))
+        self.assertIn("set this false or omit it", tool["parameters"]["properties"]["fork_context"]["description"])
 
-        normalized_again = normalize_codex_agent_tools(
-            normalized,
-            model_slugs=["gpt-6-astra"],
-        )
+        normalized_again = normalize_codex_agent_tools(normalized)
         self.assertEqual(normalized_again, normalized)
 
-    def test_model_catalog_provider_is_not_called_without_spawn_agent(self):
+    def test_collaboration_spawn_preserves_any_model_and_fork_none(self):
+        body = {
+            "tools": [{
+                "namespace": "collaboration",
+                "tools": [{
+                    "name": "spawn_agent",
+                    "description": (
+                        "Spawn a child with a model override.\n\n"
+                        "Available model overrides (optional; inherited parent model is preferred):\n"
+                        "- `gpt-5.6-luna-excel`: An example.\n\n"
+                        "Child agents inherit settings by default."
+                    ),
+                    "parameters": {"properties": {
+                        "fork_turns": {"type": "string", "enum": ["all", "none"]},
+                        "model": {"type": "string", "description": "Optional override."},
+                        "reasoning_effort": {"type": "string"},
+                    }},
+                }],
+            }],
+        }
+        normalized = normalize_codex_agent_tools(body)
+        tool = normalized["tools"][0]["tools"][0]
+        self.assertIn("exact id of any model", tool["description"])
+        self.assertIn("Set `reasoning_effort` separately", tool["description"])
+        self.assertIn("Child agents inherit settings by default.", tool["description"])
+        self.assertNotIn("Available model overrides", tool["description"])
+        self.assertNotIn("An example", tool["description"])
+        self.assertIn("omit to inherit", tool["parameters"]["properties"]["model"]["description"])
+        self.assertIn("use `none`", tool["parameters"]["properties"]["fork_turns"]["description"])
+        self.assertNotIn("Available model slugs", str(tool))
+        self.assertIn("Available model overrides", body["tools"][0]["tools"][0]["description"])
+
+    def test_unrelated_tool_is_not_changed(self):
         body = {"tools": [{"name": "lookup", "parameters": {}}]}
-
-        normalized = normalize_codex_agent_tools(
-            body,
-            model_slugs_provider=lambda: self.fail("catalog should not be loaded"),
-        )
-
-        self.assertIs(normalized, body)
+        self.assertIs(normalize_codex_agent_tools(body), body)
 
     def test_current_codex_guardian_metadata_is_detected(self):
         body = {
