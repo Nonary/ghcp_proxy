@@ -23,6 +23,7 @@ from collections import OrderedDict
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from app_paths import user_state_dir
+import codex_agent_compat
 import responses_replay_ids
 from tool_catalog import SCHEMA_NOTATION, compact_schema
 
@@ -1101,7 +1102,10 @@ def _tool_schema_disclosure_text(specs: dict, names: list[str]) -> tuple[str, st
     marker = json.dumps({"names": names, "digest": digest}, separators=(",", ":"))
     return (
         "Read-only tool metadata. No requested action has executed. Read all "
-        "policies and constraints, then call the desired tool separately.\n\n"
+        "policies and constraints, then call the desired tool separately. "
+        f"Each lookup returns at most {_TOOL_SCHEMA_BATCH_LIMIT} definitions; "
+        "if requested definitions are missing, repeat the lookup to load "
+        "the remaining undisclosed definitions.\n\n"
         + definitions + "\n" + _TOOL_SCHEMA_MARKER + marker, digest,
     )
 
@@ -1154,7 +1158,7 @@ def _disclosed_tool_names(source: dict, specs: dict) -> set[str]:
 def _tool_schema_disclosure_call(native: dict, source: dict, names: object) -> dict | None:
     specs = _client_tool_specs(source)
     deferred = _deferred_tool_specs(source, specs)
-    if not isinstance(names, list) or not names or len(names) > _TOOL_SCHEMA_BATCH_LIMIT:
+    if not isinstance(names, list) or not names:
         return None
     allowed_tools = client_tool_types(source)
     resolved_names: list[str] = []
@@ -1164,6 +1168,9 @@ def _tool_schema_disclosure_call(native: dict, source: dict, names: object) -> d
             return None
         resolved_names.append(resolved)
     names = list(dict.fromkeys(resolved_names))
+    disclosed = _disclosed_tool_names(source, specs)
+    pending = [name for name in names if name not in disclosed]
+    names = (pending or names)[:_TOOL_SCHEMA_BATCH_LIMIT]
     text, _digest = _tool_schema_disclosure_text(specs, names)
     # The desktop's existing Node tool is only a read-only output carrier.
     # JSON-quote the literal: tool descriptions never become executable code.
@@ -1208,7 +1215,8 @@ def _client_tool_protocol_instructions(source: dict) -> str:
             + ("\nTo load definitions, relay this proxy-local metadata request in params: "
                if LEAN_EXTERNAL_PROFILE else "\nTo load definitions, relay this proxy-local metadata request in code: ")
             + json.dumps({"name": TOOL_SCHEMA_LOOKUP_NAME, "arguments": {"names": [next(iter(deferred))]}}, separators=(",", ":"))
-            + ". names accepts 1-4 exact deferred names. The proxy turns this into "
+            + f". names accepts exact deferred names; each lookup returns at most {_TOOL_SCHEMA_BATCH_LIMIT} "
+            "definitions. Repeat larger lookups to load remaining definitions. The proxy turns this into "
             "read-only mcp__node_repl.js output, not the requested action. Read all "
             "returned policies before calling the tool. Calling a deferred tool "
             "before its definition is disclosed also returns metadata only; retry "
@@ -2061,47 +2069,79 @@ def _cache_key(source: dict) -> str | None:
     return None
 
 
-def _agent_turn_state(raw_input: object) -> tuple[str, str]:
-    """Return a stable user-turn fingerprint and Excel agent iteration.
+def _agent_turn_state(
+    raw_input: object, *, turn_id: str | None = None,
+    turn_started_at_ms: int | None = None,
+) -> tuple[str, str]:
+    """Return a stable caller-turn fingerprint and Excel agent iteration.
 
     The Excel add-in holds ``turn_id`` constant while it executes any number of
     tools for one user message. Only ``agent_iteration`` advances. Treating
     every tool output as a new turn makes Basispoints discard the prior plan
-    state and start planning again.
+    state and start planning again. Codex v2's lifecycle turn is authoritative:
+    queued agent messages and compaction do not start a new turn.
     """
     if isinstance(raw_input, str):
         rendered = json.dumps(raw_input, ensure_ascii=False)
-        return hashlib.sha256(rendered.encode("utf-8")).hexdigest(), "1"
+        return turn_id or hashlib.sha256(rendered.encode("utf-8")).hexdigest(), "1"
     if not isinstance(raw_input, list):
-        return "anonymous", "1"
+        return turn_id or "anonymous", "1"
 
-    last_user_index = -1
+    last_caller_index = -1
+    current_turn_start = None
+    timestamp_turn_start = None
     for index, item in enumerate(raw_input):
         if not isinstance(item, dict):
             continue
         role = str(item.get("role") or "").strip().lower()
-        if role == "user":
-            last_user_index = index
+        if role == "user" or item.get("type") == "agent_message":
+            last_caller_index = index
+        metadata = item.get("internal_chat_message_metadata_passthrough")
+        if (
+            turn_id and current_turn_start is None
+            and isinstance(metadata, dict) and metadata.get("turn_id") == turn_id
+        ):
+            current_turn_start = index
+        if turn_id and turn_started_at_ms is not None and timestamp_turn_start is None:
+            created_at = codex_agent_compat.codex_item_created_at_ms(item)
+            if created_at is not None and created_at >= turn_started_at_ms:
+                timestamp_turn_start = index
 
-    turn_prefix = (
-        raw_input[: last_user_index + 1]
-        if last_user_index >= 0
-        else raw_input[:1]
+    if turn_id:
+        fingerprint = turn_id
+    else:
+        turn_prefix = (
+            raw_input[: last_caller_index + 1]
+            if last_caller_index >= 0
+            else raw_input[:1]
+        )
+        rendered = json.dumps(
+            turn_prefix,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        )
+        fingerprint = hashlib.sha256(rendered.encode("utf-8")).hexdigest()
+    # Current Codex omits item turn tags but uses timestamped UUIDv7 IDs.
+    # Anchor to the lifecycle start, not a queued assignment or child reply.
+    if current_turn_start is None:
+        current_turn_start = timestamp_turn_start
+    iteration_start = (
+        current_turn_start if current_turn_start is not None else last_caller_index + 1
     )
-    rendered = json.dumps(
-        turn_prefix,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-    )
-    fingerprint = hashlib.sha256(rendered.encode("utf-8")).hexdigest()
-    iteration_outputs = sum(
-        1
-        for item in raw_input[last_user_index + 1 :]
-        if isinstance(item, dict)
-        and item.get("type")
-        in {"function_call_output", "custom_tool_call_output"}
-    )
+    iteration_outputs = 0
+    for item in raw_input[iteration_start:]:
+        if not isinstance(item, dict) or item.get("type") not in {
+            "function_call_output", "custom_tool_call_output",
+        }:
+            continue
+        metadata = item.get("internal_chat_message_metadata_passthrough")
+        if (
+            turn_id and isinstance(metadata, dict)
+            and metadata.get("turn_id") not in (None, turn_id)
+        ):
+            continue
+        iteration_outputs += 1
     return fingerprint, str(iteration_outputs + 1)
 
 
@@ -2204,13 +2244,17 @@ def prepare_responses_body(
         for key, value in raw_metadata.items():
             if isinstance(key, str) and isinstance(value, (str, int, float, bool)):
                 metadata[key[:64]] = str(value)[:512]
-    turn_fingerprint, iteration = _agent_turn_state(raw_input)
+    turn_fingerprint, iteration = _agent_turn_state(
+        raw_input, turn_id=codex_agent_compat.codex_turn_id(source),
+        turn_started_at_ms=codex_agent_compat.codex_turn_started_at_ms(source),
+    )
     metadata.setdefault("agent_iteration", iteration)
     # Identifiers are derived, never random: the same client request must
     # serialize to the same bytes every time. A conversation keeps one task
     # identity across turns, and a retried turn keeps its turn identity, so a
     # retry is recognisable as the same turn rather than as new work.
-    conversation = cache_key or history_root
+    # Forks share the root prompt-cache key, but not Basispoints task state.
+    conversation = codex_agent_compat.codex_thread_id(source) or cache_key or history_root
     metadata.setdefault(
         "task_id",
         str(uuid5(NAMESPACE_URL, f"ghcp-proxy/gpt-excel/{conversation}")),

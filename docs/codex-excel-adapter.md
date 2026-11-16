@@ -27,6 +27,9 @@ client-tool envelope per transport call instead.
 - The lean connector relay unwraps up to two redundant reserved transport
   envelopes from model retries, retaining the native call identity for replay.
   Real registered connector actions are not treated as reserved wrappers.
+- Deferred tool-definition lookups return at most four definitions at a time.
+  Larger lookups page through still-undisclosed definitions when repeated,
+  rather than leaking the native relay to Codex as an unsupported tool call.
 - For `collaboration.spawn_agent`, `collaboration.send_message`, and
   `collaboration.followup_task`, the Excel prompt schema omits the Codex-only
   `encrypted: true` annotation on the `message` parameter. Synthesized Codex
@@ -36,6 +39,17 @@ client-tool envelope per transport call instead.
   A new trailing opaque encrypted assignment is rejected with HTTP 400 rather
   than forwarding an incomplete readable header. Historical encrypted
   assignments are skipped because their payload cannot be recovered.
+- Basispoints task identities use the current Codex thread, not the shared root
+  session's prompt-cache key. Parents, children, and nested children keep
+  separate task state while retaining the shared prompt cache.
+- Codex lifecycle turn IDs keep tool continuations, queued agent messages, and
+  compaction within the same Excel turn. Iterations count only that turn's tool
+  outputs. A follow-up assignment starts a new turn without replacing the
+  thread's task; clients without lifecycle metadata use user or agent messages
+  as turn boundaries.
+  When Codex omits per-item turn tags, its lifecycle start time and recognized
+  UUIDv7 replay item timestamps delimit the current turn instead, so queued
+  assignments and child replies do not reset its iteration count.
 
 The proxy still treats client tools as declarations: it converts the Excel
 model's `run_officejs` transport call into a Codex client-tool call, but it does
@@ -49,4 +63,5 @@ not execute the client tool or modify the workbook.
 
 The tests cover catalog loading and precedence, namespace restoration,
 collaboration plaintext markers across JSON/SSE tool calls, plaintext agent
-message translation, and explicit rejection of opaque new assignments.
+message translation, explicit rejection of opaque new assignments, isolated
+parent/child task identities, and follow-up/queued-message turn continuity.

@@ -176,7 +176,6 @@ class ExcelUpstreamTests(unittest.TestCase):
                 self.assertEqual(body["model"], "gpt-6.1-sol")
                 self.assertNotIn("parallel_tool_calls", body)
 
-
     def test_supported_reasoning_efforts_and_x_high_alias_are_forwarded(self):
         expected = {
             "low": "low",
@@ -372,6 +371,199 @@ class ExcelUpstreamTests(unittest.TestCase):
         self.assertEqual(items[0]["type"], "reasoning")
         self.assertEqual(items[0]["encrypted_content"], "gAAA==")
         self.assertEqual(items[1]["type"], "message")
+
+    def test_v2_threads_isolate_tasks_without_splitting_the_prompt_cache(self):
+        for lean in (False, True):
+            for explicit_cache_key in (False, True):
+                with self.subTest(lean=lean, explicit_cache_key=explicit_cache_key):
+                    tasks = []
+                    for thread_id in ("root-thread", "child-thread", "grandchild-thread"):
+                        source = {
+                            "model": "gpt-5.6-sol-excel",
+                            "input": "Shared fork history.",
+                            "client_metadata": {
+                                "session_id": "root-session",
+                                "x-codex-turn-metadata": json.dumps({
+                                    "thread_id": thread_id,
+                                    "turn_id": "current-turn",
+                                }),
+                            },
+                        }
+                        if explicit_cache_key:
+                            source["prompt_cache_key"] = "root-session"
+                        with patch.object(excel_upstream, "LEAN_EXTERNAL_PROFILE", lean):
+                            body = excel_upstream.prepare_responses_body(source)
+                            self.assertEqual(body, excel_upstream.prepare_responses_body(source))
+                        self.assertEqual(body["prompt_cache_key"], "root-session")
+                        tasks.append(body["metadata"]["task_id"])
+                    self.assertEqual(len(set(tasks)), 3)
+
+    def test_v2_turn_survives_queued_messages_and_compaction(self):
+        def tagged(item, turn_id="current-turn"):
+            return {**item, "internal_chat_message_metadata_passthrough": {"turn_id": turn_id}}
+
+        source = {
+            "model": "gpt-5.6-sol-excel",
+            "client_metadata": {"thread_id": "child-thread", "turn_id": "current-turn"},
+            "input": [
+                tagged({"role": "user", "content": "Inherited user request."}, "old-turn"),
+                tagged({"type": "function_call_output", "call_id": "call_old", "output": "old"}, "old-turn"),
+                tagged({"type": "agent_message", "content": "Current assignment."}),
+            ],
+        }
+        first = excel_upstream.prepare_responses_body(source)
+        continuation = {
+            **source,
+            "input": source["input"] + [
+                tagged({"type": "function_call_output", "call_id": "call_current", "output": "done"}),
+                tagged({"type": "agent_message", "content": "Queued steering from parent."}),
+            ],
+        }
+        later = excel_upstream.prepare_responses_body(continuation)
+        self.assertEqual(first["metadata"]["task_id"], later["metadata"]["task_id"])
+        self.assertEqual(first["metadata"]["turn_id"], later["metadata"]["turn_id"])
+        self.assertEqual(first["metadata"]["agent_iteration"], "1")
+        self.assertEqual(later["metadata"]["agent_iteration"], "2")
+
+        compacted = excel_upstream.prepare_responses_body({
+            **continuation,
+            "input": [
+                {"type": "compaction", "encrypted_content": "opaque-compaction"},
+                *continuation["input"][2:],
+            ],
+        })
+        self.assertEqual(later["metadata"], compacted["metadata"])
+
+    def test_v2_followup_only_turn_resets_iteration_without_changing_task(self):
+        source = {
+            "model": "gpt-5.6-sol-excel",
+            "client_metadata": {"thread_id": "child-thread", "turn_id": "first-turn"},
+            "input": [
+                {"role": "user", "content": "Inherited environment."},
+                {"type": "agent_message", "content": "First assignment."},
+                {"type": "function_call_output", "call_id": "call_first", "output": "done"},
+            ],
+        }
+        first = excel_upstream.prepare_responses_body(source)
+        followup = {
+            **source,
+            "client_metadata": {"thread_id": "child-thread", "turn_id": "followup-turn"},
+            "input": source["input"] + [{"type": "agent_message", "content": "New assignment."}],
+        }
+        later = excel_upstream.prepare_responses_body(followup)
+        self.assertEqual(first["metadata"]["task_id"], later["metadata"]["task_id"])
+        self.assertNotEqual(first["metadata"]["turn_id"], later["metadata"]["turn_id"])
+        self.assertEqual(later["metadata"]["agent_iteration"], "1")
+        self.assertEqual(later, excel_upstream.prepare_responses_body(followup))
+
+    def test_untagged_lifecycle_items_keep_iterations_across_agent_messages(self):
+        source = {
+            "model": "gpt-6-luna-excel",
+            "client_metadata": {
+                "thread_id": "current-thread", "turn_id": "current-turn",
+                "turn_started_at_unix_ms": 1,
+                "x-codex-turn-metadata": json.dumps({
+                    "turn_id": "current-turn",
+                    "turn_started_at_unix_ms": 1793899711330,
+                }),
+            },
+            "input": [
+                {"role": "user", "id": "msg_01a1acb5-c323-75e0-8dd9-533b49b771b7", "content": "Old request."},
+                {"type": "function_call_output", "call_id": "old", "output": "old"},
+                {"role": "user", "id": "msg_01a1acc1-4d37-79a3-9f9b-7cf5953865bb", "content": "Current request."},
+                {"type": "function_call_output", "call_id": "current", "output": "done"},
+            ],
+        }
+        first = excel_upstream.prepare_responses_body(source)
+        self.assertEqual(first["metadata"]["agent_iteration"], "2")
+        for author, recipient in (("/root/child", "/root"), ("/root", "/root/child")):
+            with self.subTest(author=author):
+                continuation = {
+                    **source,
+                    "input": source["input"] + [{
+                        "type": "agent_message", "author": author, "recipient": recipient,
+                        "id": "amsg_01a1acc1-fadf-7d81-b882-5646a727f483",
+                        "content": "Queued message during the same lifecycle turn.",
+                    }],
+                }
+                later = excel_upstream.prepare_responses_body(continuation)
+                self.assertEqual(first["metadata"], later["metadata"])
+                self.assertEqual(later, excel_upstream.prepare_responses_body(continuation))
+                followup = {
+                    **continuation,
+                    "client_metadata": {
+                        "thread_id": "current-thread", "turn_id": "next-turn",
+                        "turn_started_at_unix_ms": 1793899763006,
+                    },
+                    "input": continuation["input"] + [{
+                        "type": "agent_message", "content": "Next assignment.",
+                        "id": "amsg_01a1acc2-1553-7df0-88dd-7c8d8a79ed35",
+                    }],
+                }
+                resumed = excel_upstream.prepare_responses_body(followup)
+                self.assertEqual(resumed["metadata"]["agent_iteration"], "1")
+                self.assertEqual(first["metadata"]["task_id"], resumed["metadata"]["task_id"])
+                self.assertNotEqual(first["metadata"]["turn_id"], resumed["metadata"]["turn_id"])
+
+    def test_explicit_turn_tags_take_precedence_over_uuid_timestamps(self):
+        fingerprint, iteration = excel_upstream._agent_turn_state([
+            {"role": "user", "id": "msg_01a1acc1-4d37-79a3-9f9b-7cf5953865bb", "content": "Old request."},
+            {"type": "function_call_output", "call_id": "old", "output": "old"},
+            {"type": "agent_message", "content": "Current assignment.",
+             "internal_chat_message_metadata_passthrough": {"turn_id": "current"}},
+        ], turn_id="current", turn_started_at_ms=1793899711330)
+        self.assertEqual((fingerprint, iteration), ("current", "1"))
+        for item_id in (None, [], "msg_unknown", "msg_550e8400-e29b-41d4-a716-446655440000",
+                        "unknown_01a1acc1-4d37-79a3-9f9b-7cf5953865bb"):
+            with self.subTest(item_id=item_id):
+                self.assertIsNone(excel_upstream.codex_agent_compat.codex_item_created_at_ms({"id": item_id}))
+
+    def test_v2_lifecycle_turn_is_authoritative_over_rewritten_history(self):
+        source = {
+            "model": "gpt-5.6-sol-excel",
+            "client_metadata": {
+                "thread_id": "child-thread",
+                "turn_id": "stale-outer-turn",
+                "x-codex-turn-metadata": json.dumps({
+                    "thread_id": "child-thread", "turn_id": "current-turn",
+                }),
+            },
+            "input": [{"type": "agent_message", "content": "Original assignment."}],
+        }
+        first = excel_upstream.prepare_responses_body(source)
+        rewritten = excel_upstream.prepare_responses_body({
+            **source, "input": [{"type": "agent_message", "content": "Compacted assignment."}],
+        })
+        self.assertEqual(first["metadata"], rewritten["metadata"])
+        next_turn = excel_upstream.prepare_responses_body({
+            **source,
+            "client_metadata": {"thread_id": "child-thread", "turn_id": "next-turn"},
+        })
+        self.assertEqual(first["metadata"]["task_id"], next_turn["metadata"]["task_id"])
+        self.assertNotEqual(first["metadata"]["turn_id"], next_turn["metadata"]["turn_id"])
+
+    def test_plaintext_agent_assignments_define_turns_without_lifecycle_metadata(self):
+        source = {
+            "model": "gpt-5.6-sol-excel",
+            "prompt_cache_key": "conversation-1",
+            "input": [
+                {"role": "developer", "content": "Stable instructions."},
+                {"type": "agent_message", "content": "First assignment."},
+            ],
+        }
+        first = excel_upstream.prepare_responses_body(source)
+        history = source["input"] + [
+            {"type": "function_call_output", "call_id": "call_first", "output": "done"},
+        ]
+        continuation = excel_upstream.prepare_responses_body({**source, "input": history})
+        self.assertEqual(first["metadata"]["turn_id"], continuation["metadata"]["turn_id"])
+        self.assertEqual(continuation["metadata"]["agent_iteration"], "2")
+        followup = excel_upstream.prepare_responses_body({
+            **source, "input": history + [{"type": "agent_message", "content": "New assignment."}],
+        })
+        self.assertEqual(first["metadata"]["task_id"], followup["metadata"]["task_id"])
+        self.assertNotEqual(first["metadata"]["turn_id"], followup["metadata"]["turn_id"])
+        self.assertEqual(followup["metadata"]["agent_iteration"], "1")
 
     def test_plaintext_agent_messages_become_excel_user_messages(self):
         old_encrypted_assignment = {

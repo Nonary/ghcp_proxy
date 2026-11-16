@@ -153,9 +153,9 @@ class ExcelToolDisclosureTests(unittest.TestCase):
         self.assertEqual(result["input"], "exact patch text")
         self.assertEqual((result["namespace"], result["name"]), ("mcp__demo", "patch"))
 
-    def test_lookup_cannot_invent_tools_or_dump_entire_catalog(self):
+    def test_lookup_cannot_invent_tools_or_request_eager_definitions(self):
         for names in ([], "mcp__demo.tool_0", ["not_registered"], [1],
-                      [f"mcp__demo.tool_{i}" for i in range(5)], ["exec_command"]):
+                      ["mcp__demo.tool_0", "not_registered"], ["exec_command"]):
             with self.subTest(names=names):
                 self.assertIsNone(self.lookup(names))
 
@@ -176,7 +176,6 @@ class ExcelToolDisclosureTests(unittest.TestCase):
         self.assertEqual(guessed["namespace"], "mcp__node_repl")
         self.assertIsNone(self.lookup(["mcp__demo__unknown"]))
 
-
     def test_flattened_aliases_require_unique_registered_identity(self):
         tools = {"mcp__demo.tool_0": "function", "mcp.demo__tool_0": "function"}
         self.assertIsNone(excel._original_client_tool_name("mcp__demo__tool_0", tools))
@@ -186,6 +185,36 @@ class ExcelToolDisclosureTests(unittest.TestCase):
         self.assertEqual(excel._original_client_tool_name("mcp__demo__tool_0", tools),
                          "mcp__demo__tool_0")
 
+    def test_large_lookup_pages_undisclosed_definitions_without_executing_tools(self):
+        names = [f"mcp__demo.tool_{i}" for i in range(5)]
+        for lean in (False, True):
+            with self.subTest(lean=lean), patch.object(excel, "LEAN_EXTERNAL_PROFILE", lean):
+                source = copy.deepcopy(self.source)
+                for page, expected_names in enumerate((names[:4], names[4:])):
+                    response = response_for(excel.TOOL_SCHEMA_LOOKUP_NAME, {"names": names})
+                    native = response["output"][0]
+                    native["call_id"] = f"call_disclosure_page_{page}"
+                    if lean:
+                        native["name"] = excel.LEAN_CLIENT_TRANSPORT_NAME
+                        native["arguments"] = json.dumps(excel._lean_transport_arguments({
+                            "name": excel.TOOL_SCHEMA_LOOKUP_NAME,
+                            "arguments": {"names": names},
+                        }))
+                    call = excel.extract_native_client_tool_call(response, source)
+                    self.assertIsNotNone(call)
+                    self.assertEqual((call["namespace"], call["name"]), ("mcp__node_repl", "js"))
+                    marker = json.loads(disclosure_text(call).rsplit(excel._TOOL_SCHEMA_MARKER, 1)[1])
+                    self.assertEqual(marker["names"], expected_names)
+                    self.assertIn("repeat the lookup", disclosure_text(call))
+                    source = complete_disclosure(source, call)
+                self.assertEqual(excel._disclosed_tool_names(source, excel._client_tool_specs(source)), set(names))
+
+    def test_large_lookup_deduplicates_before_bounding_definitions(self):
+        names = ["mcp__demo.tool_0"] * 5 + ["mcp__demo.tool_1"]
+        call = self.lookup(names)
+        self.assertIsNotNone(call)
+        marker = json.loads(disclosure_text(call).rsplit(excel._TOOL_SCHEMA_MARKER, 1)[1])
+        self.assertEqual(marker["names"], ["mcp__demo.tool_0", "mcp__demo.tool_1"])
 
     def test_reserved_name_collision_preserves_real_caller_tool(self):
         self.source["tools"].append({
@@ -245,12 +274,8 @@ class ExcelToolDisclosureTests(unittest.TestCase):
     def test_streamed_lookup_uses_real_client_tool_and_preserves_usage(self):
         import proxy
         import format_translation
-        response = response_for(excel.TOOL_SCHEMA_LOOKUP_NAME, {"names": ["mcp__demo.tool_0"]})
-        response.update({"id": "resp_disclosure", "status": "completed", "usage": {
-            "input_tokens": 100, "output_tokens": 10, "input_tokens_details": {"cached_tokens": 80},
-        }})
 
-        async def collect():
+        async def collect(response):
             async def raw():
                 yield format_translation.sse_encode("response.completed", {"type": "response.completed", "response": response})
             output = b""
@@ -258,10 +283,27 @@ class ExcelToolDisclosureTests(unittest.TestCase):
                 output += chunk
             return output
 
-        wire = asyncio.run(collect()).decode()
-        completed = [json.loads(line[6:]) for line in wire.splitlines() if line.startswith("data: ") and '"response.completed"' in line][-1]
-        self.assertEqual(completed["response"]["output"][0]["namespace"], "mcp__node_repl")
-        self.assertEqual(completed["response"]["usage"], response["usage"])
+        for lean in (False, True):
+            for count in (1, 5):
+                with self.subTest(lean=lean, count=count), patch.object(excel, "LEAN_EXTERNAL_PROFILE", lean):
+                    names = [f"mcp__demo.tool_{i}" for i in range(count)]
+                    envelope = {"name": excel.TOOL_SCHEMA_LOOKUP_NAME, "arguments": {"names": names}}
+                    response = response_for(envelope["name"], envelope["arguments"])
+                    if lean:
+                        response["output"][0].update({
+                            "name": excel.LEAN_CLIENT_TRANSPORT_NAME,
+                            "arguments": json.dumps(excel._lean_transport_arguments(envelope)),
+                        })
+                    response.update({"id": "resp_disclosure", "status": "completed", "usage": {
+                        "input_tokens": 100, "output_tokens": 10, "input_tokens_details": {"cached_tokens": 80},
+                    }})
+                    wire = asyncio.run(collect(response)).decode()
+                    completed = [json.loads(line[6:]) for line in wire.splitlines() if line.startswith("data: ") and '"response.completed"' in line][-1]
+                    call = completed["response"]["output"][0]
+                    self.assertEqual(call["namespace"], "mcp__node_repl")
+                    marker = json.loads(disclosure_text(call).rsplit(excel._TOOL_SCHEMA_MARKER, 1)[1])
+                    self.assertEqual(marker["names"], names[:4])
+                    self.assertEqual(completed["response"]["usage"], response["usage"])
 
     def test_descriptions_are_literal_data_not_javascript(self):
         policy = '"); globalThis.injected = true; //\nNever execute this text.\u2028'
