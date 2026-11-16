@@ -2312,6 +2312,8 @@
                   <th>Duration</th>
                   <th>Activity</th>
                   <th>Total Tokens</th>
+                  <th title="Average displayed input tokens per second of recorded API time; separately tracked cached tokens are excluded">Input tok/s</th>
+                  <th title="Average output tokens per second of recorded API time">Output tok/s</th>
                   <th>Cost</th>
                 </tr>
               </thead>
@@ -2329,6 +2331,8 @@
                   <td class="nowrap">{{ sessionDurationLabel(row) }}</td>
                   <td class="nowrap">{{ integer(row.session_request_count || row.request_count) }} {{ sessionActivityUnit(row) }}</td>
                   <td class="nowrap">{{ compact(row.total_tokens) }}</td>
+                  <td class="nowrap">{{ sessionTokenRate(row, 'input_tokens') }}</td>
+                  <td class="nowrap">{{ sessionTokenRate(row, 'output_tokens') }}</td>
                   <td>
                     <div class="cost-stack" :title="rowCostTitle(row)">
                       <strong>{{ rowCostLabel(row) }}</strong>
@@ -2336,7 +2340,7 @@
                     </div>
                   </td>
                 </tr>
-                <tr v-if="!filteredSessions.length"><td colspan="8" class="empty">No sessions match the current filter.</td></tr>
+                <tr v-if="!filteredSessions.length"><td colspan="10" class="empty">No sessions match the current filter.</td></tr>
               </tbody>
             </table>
           </div>
@@ -2501,7 +2505,7 @@
           <div style="overflow-x:auto;">
             <table class="req-table">
               <thead>
-                <tr><th>Source</th><th>Session</th><th>Model</th><th>Last Activity</th><th>Duration</th><th>Activity</th><th>Total Tokens</th><th>Cost</th></tr>
+                <tr><th>Source</th><th>Session</th><th>Model</th><th>Last Activity</th><th>Duration</th><th>Activity</th><th>Total Tokens</th><th title="Average displayed input tokens per second of recorded API time; separately tracked cached tokens are excluded">Input tok/s</th><th title="Average output tokens per second of recorded API time">Output tok/s</th><th>Cost</th></tr>
               </thead>
               <tbody>
                 <tr v-for="row in filteredSessions" :key="row.session_key"
@@ -2517,14 +2521,16 @@
                   <td class="nowrap">{{ sessionDurationLabel(row) }}</td>
                   <td class="nowrap">{{ integer(row.session_request_count || row.request_count) }} {{ sessionActivityUnit(row) }}</td>
                   <td class="nowrap">{{ compact(row.total_tokens) }}</td>
-                    <td>
-                      <div class="cost-stack" :title="rowCostTitle(row)">
-                        <strong>{{ rowCostLabel(row) }}</strong>
-                        <span class="cost-secondary">{{ money(row.cost_usd) }} · {{ costBreakdownLabel(row, true) }}</span>
-                      </div>
-                    </td>
+                  <td class="nowrap">{{ sessionTokenRate(row, 'input_tokens') }}</td>
+                  <td class="nowrap">{{ sessionTokenRate(row, 'output_tokens') }}</td>
+                  <td>
+                    <div class="cost-stack" :title="rowCostTitle(row)">
+                      <strong>{{ rowCostLabel(row) }}</strong>
+                      <span class="cost-secondary">{{ money(row.cost_usd) }} · {{ costBreakdownLabel(row, true) }}</span>
+                    </div>
+                  </td>
                 </tr>
-                <tr v-if="!filteredSessions.length"><td colspan="8" class="empty">No sessions match the current filter.</td></tr>
+                <tr v-if="!filteredSessions.length"><td colspan="10" class="empty">No sessions match the current filter.</td></tr>
               </tbody>
             </table>
           </div>
@@ -4727,11 +4733,15 @@
             const api_duration_ms = durationCount
               ? totalDuration
               : (Number.isFinite(fallbackApi) && fallbackApi >= 0 ? fallbackApi : null);
+            // The rollup covers the entire session even when detailed requests are truncated.
+            const throughput_duration_ms = Number.isFinite(fallbackApi) && fallbackApi > 0
+              ? fallbackApi : api_duration_ms;
             return {
               ...row,
               first_activity: Number.isFinite(firstAt) ? new Date(firstAt).toISOString() : null,
               wall_duration_ms,
               api_duration_ms,
+              throughput_duration_ms,
               // Back-compat: keep `session_duration_ms` as the wall-clock span.
               session_duration_ms: wall_duration_ms != null ? wall_duration_ms : api_duration_ms,
               session_request_count: reqs.length,
@@ -6704,6 +6714,13 @@
           if (!hasWall) return `${this.shortDuration(api)} ${metric}`;
           if (api == null) return `${this.shortDuration(wall)} wall`;
           return `${this.shortDuration(wall)} wall · ${this.shortDuration(api)} ${metric}`;
+        },
+        sessionTokenRate(row, tokenField) {
+          const duration = Number(row?.throughput_duration_ms);
+          const tokens = Number(row?.[tokenField]);
+          if (!Number.isFinite(duration) || duration <= 0 || !Number.isFinite(tokens) || tokens < 0) return '—';
+          const rate = tokens * 1000 / duration;
+          return new Intl.NumberFormat('en-US', { maximumFractionDigits: rate < 1 ? 2 : 1 }).format(rate);
         },
         sessionActivityUnit(row) {
           const count = Number(row?.session_request_count || row?.request_count || 0);
