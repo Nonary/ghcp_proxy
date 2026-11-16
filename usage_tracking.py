@@ -21,7 +21,7 @@ from fastapi import Request
 import codex_agent_compat
 from constants import (
     TOKEN_DIR, USAGE_LOG_FILE, REQUEST_ERROR_LOG_FILE,
-    DETAILED_REQUEST_HISTORY_LIMIT,
+    DETAILED_REQUEST_HISTORY_LIMIT, DETAILED_REQUEST_HISTORY_COMPACTION_BATCH_SIZE,
     RESPONSE_REASONING_PREVIEW_MAX_CHARS,
 )
 from util import (
@@ -44,6 +44,8 @@ from event_bus import EventBus
 REQUEST_FINISHED_EVENT = "request_finished"
 USAGE_EVENT_RECORDED_EVENT = "usage_event_recorded"
 _NATIVE_USAGE_EVENT_DEDUPE_KEY_LIMIT = 100_000
+# Completed-session affinity is a cache; active requests are tracked separately.
+_SESSION_REQUEST_CONTEXT_LIMIT = 5000
 
 
 # ---------------------------------------------------------------------------
@@ -72,9 +74,9 @@ class UsageTrackingState:
     native_lifecycle_revision: int = 0
     native_usage_event_dedupe_keys: OrderedDict[str, None] = field(default_factory=OrderedDict)
     session_request_id_lock: object = field(default_factory=Lock)
-    latest_server_request_ids_by_chain: dict[tuple[str, str], str] = field(default_factory=dict)
+    latest_server_request_ids_by_chain: OrderedDict[tuple[str, str], str] = field(default_factory=OrderedDict)
     active_server_request_ids_by_request: dict[str, dict[str, str | None]] = field(default_factory=dict)
-    latest_claude_user_session_contexts: dict[tuple[str, str], dict[str, str | None]] = field(default_factory=dict)
+    latest_claude_user_session_contexts: OrderedDict[tuple[str, str], dict[str, str | None]] = field(default_factory=OrderedDict)
 
 
 # ---------------------------------------------------------------------------
@@ -812,7 +814,11 @@ class UsageTracker:
             return
         chain_key = _server_request_chain_key(session_id, client_request_id, subagent)
         with self.state.session_request_id_lock:
-            self.state.latest_server_request_ids_by_chain[chain_key] = server_request_id
+            contexts = self.state.latest_server_request_ids_by_chain
+            contexts[chain_key] = server_request_id
+            contexts.move_to_end(chain_key)
+            while len(contexts) > _SESSION_REQUEST_CONTEXT_LIMIT:
+                contexts.popitem(last=False)
 
     # ------------------------------------------------------------------
     # Session / request context tracking (private methods)
@@ -833,13 +839,17 @@ class UsageTracker:
             event.get("subagent"),
         )
         with self.state.session_request_id_lock:
-            self.state.latest_claude_user_session_contexts[scope_key] = {
+            contexts = self.state.latest_claude_user_session_contexts
+            contexts[scope_key] = {
                 "session_id": session_id,
                 "session_id_origin": event.get("session_id_origin"),
                 "client_request_id": event.get("client_request_id"),
                 "subagent": event.get("subagent"),
                 "server_request_id": event.get("server_request_id"),
             }
+            contexts.move_to_end(scope_key)
+            while len(contexts) > _SESSION_REQUEST_CONTEXT_LIMIT:
+                contexts.popitem(last=False)
 
     def _get_latest_claude_user_session_context(
         self,
@@ -849,21 +859,19 @@ class UsageTracker:
         scope_key = _claude_session_scope_key(client_request_id, subagent)
         with self.state.session_request_id_lock:
             context = self.state.latest_claude_user_session_contexts.get(scope_key)
+            if context is not None:
+                self.state.latest_claude_user_session_contexts.move_to_end(scope_key)
             return dict(context) if isinstance(context, dict) else None
 
     def _remember_server_request_id(self, event: dict | None):
         if not isinstance(event, dict):
             return
-        chain_key = _server_request_chain_key(
+        self.remember_latest_server_request_id(
             event.get("session_id"),
             event.get("client_request_id"),
             event.get("subagent"),
+            event.get("server_request_id"),
         )
-        server_request_id = event.get("server_request_id")
-        if not isinstance(server_request_id, str) or not server_request_id:
-            return
-        with self.state.session_request_id_lock:
-            self.state.latest_server_request_ids_by_chain[chain_key] = server_request_id
 
     def _remember_active_server_request_id(self, event: dict | None):
         if not isinstance(event, dict):
@@ -962,7 +970,11 @@ class UsageTracker:
     ) -> str | None:
         chain_key = _server_request_chain_key(session_id, client_request_id, subagent)
         with self.state.session_request_id_lock:
-            return self.state.latest_server_request_ids_by_chain.get(chain_key)
+            contexts = self.state.latest_server_request_ids_by_chain
+            server_request_id = contexts.get(chain_key)
+            if server_request_id is not None:
+                contexts.move_to_end(chain_key)
+            return server_request_id
 
     def _resolve_server_request_id(
         self,
@@ -1139,8 +1151,14 @@ class UsageTracker:
                 return
 
             detailed_events = list(self.state.recent_usage_events)
-            events_to_archive = detailed_events[:overflow]
-            remaining_events = detailed_events[overflow:]
+            # Leave room for the next batch without exceeding the history cap
+            # or dropping the newest request when using a small retention limit.
+            archive_count = max(
+                overflow,
+                min(DETAILED_REQUEST_HISTORY_COMPACTION_BATCH_SIZE, len(detailed_events) - 1),
+            )
+            events_to_archive = detailed_events[:archive_count]
+            remaining_events = detailed_events[archive_count:]
             archive_rows = []
             archived_summaries = []
             archive_keys = []

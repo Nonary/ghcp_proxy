@@ -95,8 +95,11 @@ CLAUDE_PROXY_SETTINGS = {
     "effortLevel": "medium",
 }
 DETAILED_REQUEST_HISTORY_LIMIT = 5000
+# Archive this many old rows when the limit is exceeded so the detailed log
+# is not rewritten on every completion. The retained history stays <= the limit.
+DETAILED_REQUEST_HISTORY_COMPACTION_BATCH_SIZE = 64
 # Cap on the number of detailed request rows serialized into the dashboard
-# bulk payload. The in-memory deque still holds DETAILED_REQUEST_HISTORY_LIMIT
+# bulk payload. The in-memory deque holds up to DETAILED_REQUEST_HISTORY_LIMIT
 # events for aggregations (cost summary, daily history, sessions) and for
 # lazy /api/request-prompt lookups, but the dashboard table only paginates
 # 100 per page; shipping all 5000 events on every refresh sent megabytes of
