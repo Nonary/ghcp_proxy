@@ -658,6 +658,114 @@ class CopilotSdkEventTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outcome.usage["fresh_input_tokens"], 400)
         self.assertEqual(outcome.event_usage["input_tokens"], 100)
 
+    async def test_multi_call_context_usage_is_separate_from_billing(self):
+        for stream in (False, True):
+            for compact in (False, True):
+                for shutdown in (False, True):
+                    with self.subTest(stream=stream, compact=compact, shutdown=shutdown):
+                        session = _FakeSession()
+                        session.session_id = f"usage-{stream}-{compact}-{shutdown}"
+
+                        async def dispatch():
+                            session.emit("assistant.usage", AssistantUsageData(
+                                model="gpt-test", input_tokens=100, output_tokens=10,
+                                cache_read_tokens=80, cache_write_tokens=5, reasoning_tokens=4,
+                            ))
+                            session.emit("assistant.usage", AssistantUsageData(
+                                model="gpt-test", input_tokens=40, output_tokens=20,
+                                cache_read_tokens=30, cache_write_tokens=2, reasoning_tokens=5,
+                            ))
+                            if shutdown:
+                                session.emit("session.shutdown", {
+                                    "modelMetrics": {"gpt-test": {"usage": {
+                                        "inputTokens": 200, "outputTokens": 50,
+                                        "cacheReadTokens": 150, "cacheWriteTokens": 10,
+                                        "reasoningTokens": 12,
+                                    }}},
+                                })
+                            session.emit("session.idle", SessionIdleData())
+
+                        finished = []
+                        with patch.object(sdk, "_open_session", AsyncMock(return_value=(session, dispatch))), \
+                             patch.object(sdk, "_release_session", AsyncMock()):
+                            response = await sdk.handle_responses(
+                                _ConnectedRequest(),
+                                {"model": "gpt-test", "input": "test", "stream": stream},
+                                is_compact=compact,
+                                plan=SimpleNamespace(usage_event={}),
+                                finish_usage_callback=lambda _plan, status, **kwargs: finished.append((status, kwargs)),
+                            )
+                            if stream:
+                                events = [
+                                    json.loads(line[6:])
+                                    async for chunk in response.body_iterator
+                                    for line in chunk.decode().splitlines()
+                                    if line.startswith("data: ")
+                                ]
+                                payload = next(e["response"] for e in events if e["type"] == "response.completed")
+                            else:
+                                payload = json.loads(response.body)
+
+                        usage = payload["usage"]
+                        self.assertEqual(usage["input_tokens"], 40)
+                        self.assertEqual(usage["output_tokens"], 20)
+                        self.assertEqual(usage["total_tokens"], 60)
+                        self.assertEqual(usage["cached_input_tokens"], 30)
+                        self.assertEqual(usage["fresh_input_tokens"], 10)
+                        self.assertEqual(usage["input_tokens_details"], {
+                            "cached_tokens": 30, "cache_creation_input_tokens": 2,
+                        })
+                        self.assertEqual(usage["output_tokens_details"]["reasoning_tokens"], 5)
+                        self.assertEqual(len(finished), 1)
+                        self.assertEqual(finished[0][0], 200)
+                        tracked = finished[0][1]["usage"]
+                        self.assertEqual(tracked["input_tokens"], 200 if shutdown else 140)
+                        self.assertEqual(tracked["output_tokens"], 50 if shutdown else 30)
+                        self.assertEqual(tracked["total_tokens"], 250 if shutdown else 170)
+                        self.assertEqual(tracked["pricing_fresh_input_tokens"], 50 if shutdown else 30)
+                        self.assertEqual(tracked["pricing_cached_input_tokens"], 150 if shutdown else 110)
+                        self.assertEqual(tracked["pricing_cache_creation_input_tokens"], 10 if shutdown else 7)
+
+    async def test_subagent_usage_does_not_replace_main_context_usage(self):
+        for markers in ({"agent_id": "child"}, {"parent_tool_call_id": "child-call"}):
+            with self.subTest(markers=markers):
+                session = _FakeSession()
+
+                async def dispatch():
+                    session.emit("assistant.usage", AssistantUsageData(
+                        model="gpt-test", input_tokens=100, output_tokens=10,
+                    ))
+                    session.emit("assistant.usage", AssistantUsageData(
+                        model="gpt-test", input_tokens=40, output_tokens=20,
+                        parent_tool_call_id=markers.get("parent_tool_call_id"),
+                    ), agent_id=markers.get("agent_id"))
+                    session.emit("session.idle", SessionIdleData())
+
+                outcome = await sdk._wait_for_outcome(session, dispatch, sdk.ToolRegistration())
+                payload = sdk._response_payload({"model": "gpt-test"}, session.session_id, outcome, "resp-1")
+                self.assertEqual(payload["usage"]["input_tokens"], 100)
+                self.assertEqual(payload["usage"]["total_tokens"], 110)
+                self.assertEqual(outcome.usage["input_tokens"], 140)
+                self.assertEqual(outcome.usage["output_tokens"], 30)
+
+    async def test_context_usage_tracks_last_call_without_clamping(self):
+        for inputs in ((168486, 172118), (280000,)):
+            with self.subTest(inputs=inputs):
+                session = _FakeSession()
+
+                async def dispatch():
+                    for input_tokens in inputs:
+                        session.emit("assistant.usage", AssistantUsageData(
+                            model="gpt-test", input_tokens=input_tokens, output_tokens=100,
+                        ))
+                    session.emit("session.idle", SessionIdleData())
+
+                outcome = await sdk._wait_for_outcome(session, dispatch, sdk.ToolRegistration())
+                payload = sdk._response_payload({"model": "gpt-test"}, session.session_id, outcome, "resp-1")
+                self.assertEqual(payload["usage"]["input_tokens"], inputs[-1])
+                self.assertEqual(payload["usage"]["total_tokens"], inputs[-1] + 100)
+                self.assertEqual(outcome.usage["input_tokens"], sum(inputs))
+
     async def test_shutdown_baseline_survives_a_proxy_restart(self):
         """A resumed session must not bill its whole history to one request."""
         def shutdown(total_input, output):

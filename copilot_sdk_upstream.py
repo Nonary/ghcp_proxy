@@ -2199,6 +2199,8 @@ class TurnOutcome:
     # Two independent usage sources; ``_finalize_usage`` picks between them.
     shutdown_usage: dict[str, int] = field(default_factory=dict)
     event_usage: dict[str, int] = field(default_factory=dict)
+    # Context occupancy is one main-agent call, not the turn's billable sum.
+    last_call_usage: dict[str, int] = field(default_factory=dict)
 
 
 def _event_name(event: Any) -> str:
@@ -2359,6 +2361,13 @@ def _add_usage(total: dict[str, int], usage: dict[str, int]) -> None:
     total["total_tokens"] = total.get("fresh_input_tokens", 0) + total.get("output_tokens", 0)
 
 
+def _record_event_usage(outcome: "TurnOutcome", event: Any) -> None:
+    usage = _usage_from_event(event.data)
+    _add_usage(outcome.event_usage, usage)
+    if not _is_subagent_message_event(event, event.data):
+        outcome.last_call_usage = usage
+
+
 _USAGE_KEYS = (
     "input_tokens",
     "output_tokens",
@@ -2495,7 +2504,7 @@ def _format_client_usage(usage: dict[str, int] | None) -> dict[str, Any]:
 
 
 def _finalize_usage(outcome: "TurnOutcome") -> None:
-    """Pick the authoritative usage record for the turn.
+    """Pick the authoritative billable totals, separate from client context usage.
 
     ``session.shutdown`` carries session-cumulative totals and lands at the
     end of a turn, while ``assistant.usage`` fires per model API call during
@@ -2661,7 +2670,7 @@ async def _wait_for_outcome(
                     _finalize_usage(outcome)
                     return outcome
             elif isinstance(data, AssistantUsageData):
-                _add_usage(outcome.event_usage, _usage_from_event(data))
+                _record_event_usage(outcome, event)
             elif isinstance(data, ExternalToolRequestedData):
                 outcome.calls.append(_tool_call(data, registration))
             elif (SubagentStartedData is not None and isinstance(data, SubagentStartedData)) or _event_name(event) == "subagent.started":
@@ -2804,7 +2813,7 @@ def _response_payload(body: dict, session_id: str, outcome: TurnOutcome, respons
         "model": body.get("model"),
         "output": output,
         "parallel_tool_calls": len(outcome.calls) > 1,
-        "usage": _format_client_usage(outcome.usage),
+        "usage": _format_client_usage(outcome.last_call_usage or outcome.usage),
     }
 
 
@@ -2831,7 +2840,7 @@ def to_compaction_payload(
         ],
         "output_text": summary_text,
         "parallel_tool_calls": False,
-        "usage": _format_client_usage(outcome.usage),
+        "usage": _format_client_usage(outcome.last_call_usage or outcome.usage),
     }
 
 
@@ -3439,7 +3448,7 @@ async def _stream_turn(
                 if outcome.calls:
                     break
             elif isinstance(data, AssistantUsageData):
-                _add_usage(outcome.event_usage, _usage_from_event(data))
+                _record_event_usage(outcome, event)
             elif isinstance(data, ExternalToolRequestedData):
                 outcome.calls.append(_tool_call(data, registration))
             elif isinstance(data, SessionErrorData):

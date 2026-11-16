@@ -64,6 +64,19 @@ supplies inline result images as native SDK blob attachments.
 The SDK route explicitly preserves tool-output images during input sanitization.
 Other routes retain their existing image-sanitization behavior.
 
+## Context and billable usage
+
+One SDK turn can make several model calls before returning to Codex. JSON,
+streaming, and compaction responses report the last main-agent call's usage,
+including its cached-input and reasoning breakdowns. Summing those calls would
+count the same context repeatedly and can falsely show a full context window.
+Sub-agent usage does not replace the main agent's context measurement.
+
+Internal usage and cost tracking still include every model call, preferring the
+per-turn delta of session shutdown totals when available. If no main-agent usage
+event is available, responses retain the existing shutdown-usage fallback.
+Actual large contexts are not clamped to the configured window.
+
 ## Limits
 
 - The SDK accepts JSON-schema tools, not native Responses custom-tool grammars.
