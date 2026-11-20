@@ -113,6 +113,37 @@ class Gpt6PricingTests(unittest.TestCase):
         self.assertEqual(breakdown["cache_creation"], 0.25)
         self.assertEqual(breakdown["output"], 1.0)
 
+    def test_gpt_6_1_terra_uses_official_standard_and_long_context_rates(self):
+        pricing = MODEL_PRICING["gpt-6.1-terra"]
+        self.assertEqual(pricing["input_per_million"], 1.00)
+        self.assertEqual(pricing["cached_input_per_million"], 0.05)
+        self.assertEqual(pricing["cache_write_per_million"], 1.25)
+        self.assertEqual(pricing["output_per_million"], 5.00)
+        self.assertEqual(pricing["long_context_threshold"], 272_000)
+        self.assertEqual(pricing["long_context_input_per_million"], 2.00)
+        self.assertEqual(pricing["long_context_cached_input_per_million"], 0.10)
+        self.assertEqual(pricing["long_context_cache_write_per_million"], 2.50)
+        self.assertEqual(pricing["long_context_output_per_million"], 7.50)
+
+        standard_usage = {
+            "fresh_input_tokens": 100_000,
+            "cached_input_tokens": 100_000,
+            "cache_creation_input_tokens": 50_000,
+            "output_tokens": 100_000,
+        }
+        standard_breakdown = _usage_event_cost_breakdown("gpt-6.1-terra", standard_usage)
+        self.assertEqual(standard_breakdown["input_fresh"], 0.05)
+        self.assertEqual(standard_breakdown["cached_input"], 0.005)
+        self.assertEqual(standard_breakdown["cache_creation"], 0.0625)
+        self.assertEqual(standard_breakdown["output"], 0.5)
+
+        long_context_usage = {**standard_usage, "cached_input_tokens": 200_000}
+        long_context_breakdown = _usage_event_cost_breakdown("gpt-6.1-terra", long_context_usage)
+        self.assertEqual(long_context_breakdown["input_fresh"], 0.10)
+        self.assertEqual(long_context_breakdown["cached_input"], 0.02)
+        self.assertEqual(long_context_breakdown["cache_creation"], 0.125)
+        self.assertEqual(long_context_breakdown["output"], 0.75)
+
     def test_gpt_6_luna_pricing_is_already_configured(self):
         pricing = MODEL_PRICING["gpt-6-luna"]
         self.assertEqual(pricing["input_per_million"], 0.10)
