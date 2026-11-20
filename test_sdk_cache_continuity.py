@@ -429,9 +429,11 @@ class CopilotSdkCacheContinuityTests(unittest.IsolatedAsyncioTestCase):
         await socket.send_response_message(json.dumps({
             "type": "response.completed",
             "headers": {"X-Copilot-Service-Request-Id": "svc-1", "X-Copilot-WebSocket-Session-Id": "0123456789abcdef"},
-            "response": {"id": "r1", "output": [answer("y")], "usage": {}},
+            "response": {"id": "r1", "model": "gpt-5.6-sol", "output": [answer("y")], "usage": {}},
         }))
         record = self.entry.diagnostics["model_calls"][-1]
+        self.assertEqual(record["requested_model"], MODEL)
+        self.assertEqual(record["response_model"], "gpt-5.6-sol")
         self.assertEqual(record["service_request_id"], "svc-1")
         self.assertEqual(record["copilot_websocket_session"], "01234567")
 

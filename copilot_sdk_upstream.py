@@ -928,6 +928,32 @@ def _model_supports_reasoning_effort(
     return None
 
 
+async def _validate_requested_model(body: dict, client: Any) -> None:
+    """Do not let the SDK silently replace an unknown explicit model."""
+    requested_id = _model_id_for_lookup(body.get("model"))
+    if requested_id is None or requested_id == "auto":
+        return
+    try:
+        models = await client.list_models()
+    except Exception:
+        # Discovery can fail independently of inference. Retain compatibility
+        # with older SDKs, but report the actual model from response events.
+        return
+    if not isinstance(models, (list, tuple)):
+        return
+    available_ids = {
+        model_id
+        for info in models
+        if (model_id := _model_id_for_lookup(getattr(info, "id", None)))
+    }
+    if available_ids and requested_id not in available_ids:
+        raise AdapterValidationError(
+            f"Model {body.get('model')!r} is not available in the current Copilot "
+            "catalog. Choose a model from /v1/models; refusing to silently "
+            "substitute the SDK's default model."
+        )
+
+
 async def _reasoning_effort_for_client(body: dict, client: Any) -> str | None:
     """Filter the requested effort using the SDK's cached ``models.list``."""
     requested = _reasoning_effort(body)
@@ -1514,6 +1540,8 @@ class _SseUsageTap(httpx.AsyncByteStream):
             event = _parse_event(line[5:].decode("utf-8", "replace"))
             response = event.get("response") if event else None
             if isinstance(response, dict):
+                if isinstance(response.get("model"), str):
+                    self._record["response_model"] = response["model"]
                 _note_usage(self._record, response.get("usage"))
                 _reasoning_ledger.record_output(
                     self._session_id, self._model, self._before, response.get("output"),
@@ -1588,6 +1616,7 @@ class _UpstreamRequestHandler(CopilotRequestHandler):
         items = body.get("input")
         record: dict[str, Any] = {
             "transport": transport,
+            "requested_model": model,
             "continuation": continued,
             "input_items": len(items) if isinstance(items, list) else None,
         }
@@ -1988,6 +2017,8 @@ class _UpstreamWebSocket(CopilotWebSocketForwarder):
             self.context.session_id, self._chain.model, self._last_input_key, response.get("output"),
         )
         if self._record is not None:
+            if isinstance(response.get("model"), str):
+                self._record["response_model"] = response["model"]
             _note_usage(self._record, response.get("usage"))
             _note_copilot_ids(self._record, event.get("headers"))
         self._record = None
@@ -2009,6 +2040,7 @@ async def _open_session(body: dict, registration: ToolRegistration, *, diagnosti
     CodexSdkAdapter.validate_new_agent_message(body.get("input"))
     continuation = resolve_tool_continuation(body.get("input"))
     client = await _get_client()
+    await _validate_requested_model(body, client)
     reasoning_effort = await _reasoning_effort_for_client(body, client)
     options = _session_options(body, registration, reasoning_effort=reasoning_effort)
     segments = _render_input_segments(body.get("input"))
@@ -2254,6 +2286,9 @@ class TurnOutcome:
     event_usage: dict[str, int] = field(default_factory=dict)
     # Context occupancy is one main-agent call, not the turn's billable sum.
     last_call_usage: dict[str, int] = field(default_factory=dict)
+    # The SDK may choose a different model from the requested session model.
+    # Use main-agent response metadata, never the request label, for billing.
+    model: str | None = None
 
 
 def _event_name(event: Any) -> str:
@@ -2418,6 +2453,7 @@ def _record_event_usage(outcome: "TurnOutcome", event: Any) -> None:
     usage = _usage_from_event(event.data)
     _add_usage(outcome.event_usage, usage)
     if not _is_subagent_message_event(event, event.data):
+        _record_response_model(outcome, event.data)
         outcome.last_call_usage = usage
 
 
@@ -2821,7 +2857,7 @@ async def _wait_for_outcome(
             elif isinstance(data, AssistantMessageData):
                 message_reasoning = _assistant_message_reasoning_text(data)
                 if not _is_subagent_message_event(event, data):
-                    _record_message_phase(outcome, data)
+                    _record_message_metadata(outcome, data)
                 if _is_subagent_message_event(event, data):
                     if not saw_reasoning_delta and (message_reasoning or data.content):
                         outcome.reasoning = message_reasoning or data.content
@@ -2910,7 +2946,14 @@ def _message_phase(outcome: TurnOutcome) -> str | None:
     return "commentary" if outcome.calls else None
 
 
-def _record_message_phase(outcome: TurnOutcome, data: Any) -> None:
+def _record_response_model(outcome: TurnOutcome, data: Any) -> None:
+    model = getattr(data, "model", None)
+    if isinstance(model, str) and model.strip():
+        outcome.model = model.strip()
+
+
+def _record_message_metadata(outcome: TurnOutcome, data: Any) -> None:
+    _record_response_model(outcome, data)
     phase = getattr(data, "phase", None)
     phase = getattr(phase, "value", phase)
     if phase in {"commentary", "final_answer"}:
@@ -2976,7 +3019,7 @@ def _response_payload(body: dict, session_id: str, outcome: TurnOutcome, respons
         "object": "response",
         "created_at": int(time.time()),
         "status": "completed",
-        "model": body.get("model"),
+        "model": outcome.model or body.get("model"),
         "output": output,
         "parallel_tool_calls": len(outcome.calls) > 1,
         "usage": _format_client_usage(outcome.last_call_usage or outcome.usage),
@@ -2997,7 +3040,7 @@ def to_compaction_payload(
         "object": "response",
         "created_at": int(time.time()),
         "status": "completed",
-        "model": fallback_model or body.get("model"),
+        "model": outcome.model or fallback_model or body.get("model"),
         "output": [
             {
                 "type": "compaction",
@@ -3520,7 +3563,7 @@ async def _stream_turn(
             data = getattr(event, "data", None)
             if _event_name(event) == "assistant.message_start" and not _is_subagent_message_event(event, data):
                 # Known before the first text delta, so the added item carries it.
-                _record_message_phase(outcome, data)
+                _record_message_metadata(outcome, data)
             # A compact response is a different Responses item type.  Do not
             # leak the SDK's ordinary assistant/tool items into that stream:
             # remote compaction v2 validates the streamed output and requires
@@ -3614,7 +3657,7 @@ async def _stream_turn(
             elif isinstance(data, AssistantMessageData):
                 message_reasoning = _assistant_message_reasoning_text(data)
                 if not _is_subagent_message_event(event, data):
-                    _record_message_phase(outcome, data)
+                    _record_message_metadata(outcome, data)
                 if _is_subagent_message_event(event, data):
                     if not saw_reasoning_delta and (message_reasoning or data.content):
                         for chunk in emit_reasoning_start():

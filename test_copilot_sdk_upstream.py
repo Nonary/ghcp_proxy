@@ -525,6 +525,104 @@ class CopilotSdkEventTests(unittest.IsolatedAsyncioTestCase):
         self._sdk_state.__enter__()
         self.addCleanup(self._sdk_state.__exit__, None, None, None)
 
+    async def test_unknown_explicit_model_is_rejected_before_creating_session(self):
+        client = SimpleNamespace(
+            list_models=AsyncMock(return_value=[SimpleNamespace(id="gpt-5.6-sol")]),
+            create_session=AsyncMock(),
+        )
+        body = {"model": "gpt-6.1-terra", "input": "hello"}
+        with patch.object(sdk, "_get_client", AsyncMock(return_value=client)):
+            response = await sdk.handle_responses(_ConnectedRequest(), body)
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("refusing to silently substitute", json.loads(response.body)["error"]["message"])
+        client.create_session.assert_not_awaited()
+
+    async def test_model_validation_accepts_available_qualified_and_default_models(self):
+        client = SimpleNamespace(
+            list_models=AsyncMock(return_value=[SimpleNamespace(id="gpt-5.6-sol")]),
+        )
+        for model in ("gpt-5.6-sol", "openai/gpt-5.6-sol", "auto", None):
+            with self.subTest(model=model):
+                await sdk._validate_requested_model({"model": model}, client)
+
+    async def test_model_validation_tolerates_unavailable_discovery(self):
+        for result in (None, [], [SimpleNamespace(id=None)]):
+            with self.subTest(result=result):
+                client = SimpleNamespace(list_models=AsyncMock(return_value=result))
+                await sdk._validate_requested_model({"model": "gpt-test"}, client)
+        client = SimpleNamespace(list_models=AsyncMock(side_effect=RuntimeError("offline")))
+        await sdk._validate_requested_model({"model": "gpt-test"}, client)
+
+    async def test_actual_model_is_reported_for_streaming_and_non_streaming_responses(self):
+        for stream in (False, True):
+            for source in ("message", "usage"):
+                with self.subTest(stream=stream, source=source):
+                    session = _FakeSession()
+
+                    async def dispatch():
+                        session.emit("assistant.message", AssistantMessageData(
+                            content="hello", message_id="main",
+                            model="gpt-5.6-sol" if source == "message" else None,
+                        ))
+                        if source == "usage":
+                            session.emit("assistant.usage", AssistantUsageData(
+                                model="gpt-5.6-sol", input_tokens=100, output_tokens=10,
+                            ))
+                        session.emit("assistant.message", AssistantMessageData(
+                            content="child result", message_id="child", model="gpt-6-luna",
+                        ), agent_id="child")
+                        session.emit("assistant.usage", AssistantUsageData(
+                            model="gpt-6-luna", input_tokens=10, output_tokens=1,
+                        ), agent_id="child")
+                        session.emit("session.idle", SessionIdleData())
+
+                    body = {"model": "gpt-6.1-terra", "input": "hello", "stream": stream}
+                    finish = unittest.mock.Mock()
+                    plan = SimpleNamespace(trace_context={}, usage_event={})
+                    with patch.object(sdk, "_open_session", AsyncMock(return_value=(session, dispatch))):
+                        response = await sdk.handle_responses(
+                            _ConnectedRequest(), body, plan=plan, finish_usage_callback=finish,
+                        )
+                        if stream:
+                            chunks = [chunk.decode() async for chunk in response.body_iterator]
+                            completed = next(c for c in chunks if c.startswith("event: response.completed"))
+                            payload = json.loads(completed.split("data: ", 1)[1])["response"]
+                        else:
+                            payload = json.loads(response.body)
+                    self.assertEqual(payload["model"], "gpt-5.6-sol")
+                    finish.assert_called_once()
+                    self.assertEqual(finish.call_args.kwargs["response_payload"]["model"], "gpt-5.6-sol")
+
+    def test_compaction_reports_actual_model_and_preserves_legacy_fallback(self):
+        body = {"model": "gpt-6.1-terra"}
+        outcome = sdk.TurnOutcome(text="summary", model="gpt-5.6-sol")
+        payload = sdk.to_compaction_payload(body, "session-1", outcome, "response-1")
+        self.assertEqual(payload["model"], "gpt-5.6-sol")
+        outcome.model = None
+        payload = sdk.to_compaction_payload(body, "session-1", outcome, "response-1", fallback_model="gpt-test")
+        self.assertEqual(payload["model"], "gpt-test")
+        self.assertEqual(sdk._response_payload(body, "session-1", outcome, "response-1")["model"], "gpt-6.1-terra")
+
+    def test_billing_uses_actual_model_instead_of_requested_terra_rates(self):
+        event = {
+            "requested_model": "gpt-6.1-terra",
+            "resolved_model": "gpt-6.1-terra",
+            "response_model": "gpt-5.6-sol",
+            "usage": {"fresh_input_tokens": 31_554, "output_tokens": 824},
+        }
+        self.assertEqual(sdk.util._usage_event_model_name(event), "gpt-5.6-sol")
+        self.assertAlmostEqual(sdk.util._usage_event_estimated_cost(event), 0.142696)
+
+    def test_trace_retains_raw_upstream_response_model(self):
+        record = {}
+        tap = sdk._SseUsageTap(None, record)
+        payload = {"type": "response.completed", "response": {
+            "model": "gpt-5.6-sol", "usage": {"input_tokens": 100},
+        }}
+        tap._observe(("data: " + json.dumps(payload) + "\n\n").encode())
+        self.assertEqual(record["response_model"], "gpt-5.6-sol")
+        self.assertEqual(record["input_tokens"], 100)
+
     async def test_non_streaming_event_translation_collects_text_and_usage(self):
         session = _FakeSession()
 
@@ -3047,7 +3145,7 @@ class CopilotSdkRequestContinuityTests(unittest.IsolatedAsyncioTestCase):
             resume_session=AsyncMock(side_effect=lambda session_id, **options: self.new_session()),
             list_models=AsyncMock(return_value=[SimpleNamespace(
                 id="gpt-5.6-luna", supported_reasoning_efforts=["low", "high", "xhigh", "max"],
-            )]),
+            ), SimpleNamespace(id="gpt-other")]),
         )
         patcher = patch.object(sdk, "_get_client", AsyncMock(return_value=self.client))
         patcher.start()
@@ -3331,6 +3429,10 @@ class CopilotSdkRequestContinuityTests(unittest.IsolatedAsyncioTestCase):
 
 class CopilotSdkModelCatalogTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
+        # Discovery is mocked; do not load real or expired test CA bundles.
+        tls_patcher = patch.object(sdk, "_runtime_ssl_context", return_value=True)
+        tls_patcher.start()
+        self.addCleanup(tls_patcher.stop)
         patcher = patch.object(sdk.excel_model_catalog, "fetch_model_capabilities", return_value={})
         self.excel_catalog = patcher.start()
         self.addCleanup(patcher.stop)
