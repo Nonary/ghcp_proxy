@@ -122,6 +122,21 @@ Models without an `-excel` alias continue to use GitHub Copilot.
 
 No Excel-specific prompt prefix or additional prompting syntax is required.
 
+### Copilot Fusion
+
+Copilot SDK mode supports the native `fusion` model with `github-copilot-sdk>=1.0.35,<2`.
+The proxy discovers account-eligible Fusion tiers through the SDK's `models.list`
+Auto metadata; Fusion is not an ordinary Copilot HTTP `/models` entry. It appears
+as **Copilot Fusion** only when Standard or High is enabled and picker-visible.
+Disabled tiers and failed discovery do not create selectable options.
+
+Codex's **Medium** option selects Fusion **Standard**, and **High** selects Fusion
+**High**. Direct API callers may also send `reasoning.effort: "standard"` (or the
+top-level `reasoning_effort` equivalent). The proxy sends the native
+`capi.fusion_tier` SDK option, not `reasoning_effort`; unsupported efforts and
+unavailable tiers are rejected rather than silently downgraded. Plain `auto`
+routing is unchanged. Fusion Max is not exposed by this integration.
+
 ## Excel Setup
 
 The Excel backend uses the authenticated session created by the official ChatGPT add-in.

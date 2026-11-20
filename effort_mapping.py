@@ -32,6 +32,8 @@ def _canonicalize(model: str | None, effort: str | None) -> str | None:
     if not normalized:
         return None
     normalized_model = _normalize_model(model)
+    if normalized_model == "fusion" and normalized == "standard":
+        return "medium"
     if normalized_model.startswith("claude-"):
         mapped = _CLAUDE_ALIASES.get(normalized)
         if mapped is not None:

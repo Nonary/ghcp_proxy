@@ -34,6 +34,7 @@ import certifi
 import httpx
 
 import auth
+import copilot_fusion
 import excel_upstream
 import excel_model_catalog
 import format_translation
@@ -53,6 +54,7 @@ from constants import TOKEN_DIR
 
 try:
     from copilot import CopilotClient, Tool
+    from copilot.generated.rpc import ModelsListRequest
     from copilot.copilot_request_handler import CopilotRequestHandler, CopilotWebSocketForwarder
     from copilot.rpc import ExternalToolTextResultForLlm, HandlePendingToolCallRequest
     from copilot.session import PermissionHandler
@@ -114,6 +116,7 @@ _ENVIRONMENT_CONTEXT_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 _SDK_STATE_DIR = os.path.join(TOKEN_DIR, "copilot-sdk")
+_fusion_model_caps: dict[str, dict] = {}
 _RUNTIME_CA_BUNDLE_NAME = "runtime-ca-bundle.pem"
 _RUNTIME_CA_ENV_VARS = ("SSL_CERT_FILE", "NODE_EXTRA_CA_CERTS", "CURL_CA_BUNDLE")
 _SESSION_LEDGER_NAME = "proxy-sessions.json"
@@ -722,7 +725,7 @@ def resolve_tool_continuation(value: Any) -> tuple[str, list[PendingToolResult]]
 
 
 async def _get_client():
-    global _client, _client_lock, _client_pruned, _client_token
+    global _client, _client_lock, _client_pruned, _client_token, _fusion_model_caps
     if _SDK_IMPORT_ERROR is not None or CopilotClient is None:
         raise RuntimeError(
             "The official Copilot SDK is not installed. Run: pip install github-copilot-sdk"
@@ -740,6 +743,7 @@ async def _get_client():
             await _close_websocket_pool()
             await _client.stop()
         _configure_runtime_ca_bundle()
+        _fusion_model_caps = {}
         os.makedirs(_SDK_STATE_DIR, exist_ok=True)
         _client = CopilotClient(
             github_token=token,
@@ -756,6 +760,32 @@ async def _get_client():
             await _prune_abandoned_sessions(_client)
             _client_pruned = True
         return _client
+
+
+async def refresh_fusion_model_capabilities(client: Any = None) -> dict[str, dict]:
+    """Discover native Fusion tiers, which list_models() does not preserve."""
+    global _fusion_model_caps
+    try:
+        if client is None:
+            client = await _get_client()
+        catalog = await asyncio.wait_for(
+            client.rpc.models.list(ModelsListRequest(), timeout=10), timeout=10,
+        )
+        payload = catalog.to_dict()
+        discovered = (
+            copilot_fusion.model_capabilities(payload) if isinstance(payload, dict) else {}
+        )
+    except Exception:
+        # Missing metadata or failed discovery must not advertise a selectable
+        # tier or reuse stale account-specific eligibility.
+        discovered = {}
+    _fusion_model_caps = discovered
+    return get_fusion_model_capabilities()
+
+
+def get_fusion_model_capabilities() -> dict[str, dict]:
+    """Snapshot for the synchronous client-picker capability provider."""
+    return copy.deepcopy(_fusion_model_caps)
 
 
 def _write_runtime_ca_bundle(parts: list[str]) -> str | None:
@@ -930,6 +960,19 @@ def _model_supports_reasoning_effort(
 
 async def _validate_requested_model(body: dict, client: Any) -> None:
     """Do not let the SDK silently replace an unknown explicit model."""
+    if copilot_fusion.is_fusion_model(body.get("model")):
+        try:
+            tier = copilot_fusion.tier_for_request(body)
+        except ValueError as exc:
+            raise AdapterValidationError(str(exc)) from exc
+        capabilities = await refresh_fusion_model_capabilities(client)
+        available = capabilities.get(copilot_fusion.MODEL_ID, {}).get("fusion_tiers", [])
+        if tier not in available:
+            raise AdapterValidationError(
+                f"Copilot Fusion {tier!r} tier is not available in the current "
+                "SDK catalog for this account. Choose a model from /v1/models."
+            )
+        return
     requested_id = _model_id_for_lookup(body.get("model"))
     if requested_id is None or requested_id == "auto":
         return
@@ -956,6 +999,10 @@ async def _validate_requested_model(body: dict, client: Any) -> None:
 
 async def _reasoning_effort_for_client(body: dict, client: Any) -> str | None:
     """Filter the requested effort using the SDK's cached ``models.list``."""
+    if copilot_fusion.is_fusion_model(body.get("model")):
+        # Fusion selects an ensemble/routing tier, not the chosen model's
+        # token-level reasoning effort. Sending both changes the semantics.
+        return None
     requested = _reasoning_effort(body)
     if requested is None:
         return None
@@ -1069,7 +1116,10 @@ def _session_options(
 ) -> dict[str, Any]:
     instructions = body.get("instructions")
     if reasoning_effort is ...:
-        reasoning_effort = _reasoning_effort(body)
+        reasoning_effort = (
+            None if copilot_fusion.is_fusion_model(body.get("model"))
+            else _reasoning_effort(body)
+        )
     working_directory = _workspace_from_request(body)
     if registration.tools:
         available_tools: list[str] | None = [
@@ -1125,6 +1175,13 @@ def _session_options(
         # into an unrelated desktop workspace.
         "enable_host_git_operations": working_directory is not None,
     }
+    if copilot_fusion.is_fusion_model(body.get("model")):
+        try:
+            options["capi"]["fusion_tier"] = copilot_fusion.tier_for_request(body)
+        except ValueError as exc:
+            raise AdapterValidationError(str(exc)) from exc
+        options["model"] = copilot_fusion.MODEL_ID
+        options.pop("reasoning_effort", None)
     if working_directory is not None:
         options["working_directory"] = working_directory
     if isinstance(instructions, str) and instructions:
@@ -3949,6 +4006,16 @@ async def models_response() -> Response:
         if isinstance(policy_state, str):
             entry["policy"] = {"state": policy_state}
         data.append(entry)
+    fusion_caps = await refresh_fusion_model_capabilities(client)
+    if fusion_caps and not any(entry["id"] == copilot_fusion.MODEL_ID for entry in data):
+        data.append({
+            "id": copilot_fusion.MODEL_ID,
+            "object": "model",
+            "created": 0,
+            "owned_by": "github-copilot",
+            "name": "Copilot Fusion",
+            "model_picker_enabled": True,
+        })
     return JSONResponse(
         excel_upstream.merge_local_models_payload({"object": "list", "data": data}, excel_models=excel_models)
     )
@@ -3956,11 +4023,12 @@ async def models_response() -> Response:
 
 async def shutdown() -> None:
     """Stop the managed Copilot runtime during application shutdown."""
-    global _client, _client_pruned, _client_token
+    global _client, _client_pruned, _client_token, _fusion_model_caps
     client = _client
     _client = None
     _client_token = None
     _client_pruned = False
+    _fusion_model_caps = {}
     await _evict_all_live_sessions()
     await _close_websocket_pool()
     if client is not None:

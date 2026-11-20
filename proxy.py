@@ -983,10 +983,14 @@ async def _app_startup_restore_client_proxy_configs():
     restore_client_proxy_configs_on_startup()
     # Refresh any persisted picker catalog as well as request-time discovery.
     # Run in the background so two independent backends cannot stall startup.
-    asyncio.create_task(asyncio.to_thread(
-        client_proxy_config_service.refresh_codex_model_catalog,
-    ))
+    asyncio.create_task(_refresh_sdk_client_model_catalog())
     auto_update_runtime_controller.start_periodic_checks()
+
+
+async def _refresh_sdk_client_model_catalog():
+    if copilot_sdk_upstream.enabled():
+        await copilot_sdk_upstream.refresh_fusion_model_capabilities()
+    await asyncio.to_thread(client_proxy_config_service.refresh_codex_model_catalog)
 
 
 @app.on_event("shutdown")
@@ -5360,8 +5364,11 @@ def fetch_excel_model_capabilities() -> dict[str, dict]:
 def fetch_available_model_capabilities() -> dict[str, dict]:
     """Union of independently discovered Copilot models and Excel aliases."""
     excel_models = fetch_excel_model_capabilities()
+    copilot_models = dict(fetch_copilot_model_capabilities())
+    if copilot_sdk_upstream.enabled():
+        copilot_models.update(copilot_sdk_upstream.get_fusion_model_capabilities())
     return excel_upstream.merge_local_model_capabilities(
-        fetch_copilot_model_capabilities(), excel_models=excel_models,
+        copilot_models, excel_models=excel_models,
     )
 
 

@@ -16,6 +16,7 @@ from typing import Callable, Mapping
 from fastapi import HTTPException
 
 from constants import CODEX_PROXY_BASE_URL, DASHBOARD_BASE_URL, MODEL_PRICING
+import copilot_fusion
 
 LEGACY_CODEX_PROXY_BASE_URL = "http://localhost:8000/v1"
 LEGACY_DASHBOARD_BASE_URL = "http://localhost:8000"
@@ -1258,6 +1259,13 @@ class ProxyClientConfigService:
             }
             for effort in efforts
         ]
+        if copilot_fusion.is_fusion_model(model_name):
+            for level in levels:
+                level["description"] = (
+                    "Standard Fusion routing for everyday coding"
+                    if level["effort"] == "medium"
+                    else "High Fusion routing for challenging tasks and deeper reasoning"
+                )
         default_level = next((effort for effort in _DEFAULT_PREFERRED_REASONING if effort in efforts), efforts[0])
         return (levels, default_level)
 
