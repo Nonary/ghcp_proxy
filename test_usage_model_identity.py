@@ -1,7 +1,7 @@
 import unittest
 
 from dashboard import _prepare_usage_event
-from util import _usage_event_model_name
+from util import _usage_event_estimated_cost, _usage_event_model_name
 
 
 class UsageModelIdentityTests(unittest.TestCase):
@@ -35,6 +35,23 @@ class UsageModelIdentityTests(unittest.TestCase):
         }
 
         self.assertEqual(_usage_event_model_name(event), "gpt-5.5")
+
+    def test_fusion_usage_is_estimated_against_sdk_selected_model(self):
+        event = {
+            "requested_model": "fusion",
+            "resolved_model": "fusion",
+            "response_model": "gpt-5.6-sol",
+            "finished_at": "2026-11-20T12:00:00Z",
+            "usage": {
+                "fresh_input_tokens": 31_554,
+                "output_tokens": 824,
+            },
+        }
+
+        prepared = _prepare_usage_event(event)
+        self.assertEqual(prepared["model_name"], "gpt-5.6-sol")
+        self.assertGreater(prepared["event_cost"], 0)
+        self.assertAlmostEqual(prepared["event_cost"], _usage_event_estimated_cost(event))
 
 
 if __name__ == "__main__":

@@ -2374,8 +2374,9 @@
                     </span>
                   </td>
                   <td>
-                    <div>{{ row.resolved_model || row.requested_model || '—' }}</div>
-                    <span v-if="requestEffortLabel(row)" :class="['badge', requestEffortBadgeClass(row)]">{{ requestEffortLabel(row) }}</span>
+                    <div>{{ requestDisplayModel(row) }}</div>
+                    <span v-if="fusionTierLabel(row)" class="badge badge-effort-other">{{ fusionTierLabel(row) }}</span>
+                    <span v-else-if="requestEffortLabel(row)" :class="['badge', requestEffortBadgeClass(row)]">{{ requestEffortLabel(row) }}</span>
                   </td>
                   <td><code>{{ row.path || '—' }}</code></td>
                   <td>{{ requestDurationLabel(row) }}</td>
@@ -2383,7 +2384,7 @@
                   <td>
                     <div class="cost-stack" :title="rowCostTitle(row)">
                       <strong>{{ rowCostLabel(row) }}</strong>
-                      <span class="cost-secondary">{{ money(row.cost_usd) }} · {{ costBreakdownLabel(row, true) }}</span>
+                      <span class="cost-secondary">Estimated · {{ money(row.cost_usd) }} · {{ costBreakdownLabel(row, true) }}</span>
                     </div>
                   </td>
                   <td>
@@ -2567,8 +2568,9 @@
                     <span class="pill" :class="row.success === false ? 'pill-error' : 'pill-success'">{{ row.success === false ? 'ERROR' : 'SUCCESS' }}</span>
                   </td>
                   <td>
-                    <div>{{ row.resolved_model || row.requested_model || '—' }}</div>
-                    <span v-if="requestEffortLabel(row)" :class="['badge', requestEffortBadgeClass(row)]">{{ requestEffortLabel(row) }}</span>
+                    <div>{{ requestDisplayModel(row) }}</div>
+                    <span v-if="fusionTierLabel(row)" class="badge badge-effort-other">{{ fusionTierLabel(row) }}</span>
+                    <span v-else-if="requestEffortLabel(row)" :class="['badge', requestEffortBadgeClass(row)]">{{ requestEffortLabel(row) }}</span>
                   </td>
                   <td><code>{{ row.path || '—' }}</code></td>
                   <td>{{ requestDurationLabel(row) }}</td>
@@ -2576,7 +2578,7 @@
                   <td>
                     <div class="cost-stack" :title="rowCostTitle(row)">
                       <strong>{{ rowCostLabel(row) }}</strong>
-                      <span class="cost-secondary">{{ money(row.cost_usd) }} · {{ costBreakdownLabel(row, true) }}</span>
+                      <span class="cost-secondary">Estimated · {{ money(row.cost_usd) }} · {{ costBreakdownLabel(row, true) }}</span>
                     </div>
                   </td>
                   <td>
@@ -2627,9 +2629,10 @@
                   <div class="request-row-head">
                     <div style="display:flex; gap:6px; flex-wrap:wrap; align-items:center">
                       <span v-if="requestFastModeLabel(row)" :class="['badge', requestServiceTierBadgeClass(row)]">{{ requestFastModeLabel(row) }}</span>
-                      <span v-if="requestEffortLabel(row)" :class="['badge', requestEffortBadgeClass(row)]">{{ requestEffortLabel(row) }}</span>
+                      <span v-if="fusionTierLabel(row)" class="badge badge-effort-other">{{ fusionTierLabel(row) }}</span>
+                      <span v-else-if="requestEffortLabel(row)" :class="['badge', requestEffortBadgeClass(row)]">{{ requestEffortLabel(row) }}</span>
                     </div>
-                    <div class="request-title">{{ row.resolved_model || row.requested_model || '-' }}</div>
+                    <div class="request-title">{{ requestDisplayModel(row) }}</div>
                     <div class="subtle">{{ stamp(row.finished_at || row.started_at) }}</div>
                   </div>
                   <div class="request-meta subtle">
@@ -2639,7 +2642,7 @@
                     <div>{{ tokenSummary(row) }}</div>
                     <div class="cost-stack">
                       <strong>{{ rowCostLabel(row) }}</strong>
-                      <span class="cost-secondary">{{ money(row.cost_usd) }} · {{ costBreakdownLabel(row, true) }}</span>
+                      <span class="cost-secondary">Estimated · {{ money(row.cost_usd) }} · {{ costBreakdownLabel(row, true) }}</span>
                     </div>
                   </div>
                 </button>
@@ -2661,10 +2664,11 @@
                   <div><div class="detail-label">Path</div><div class="detail-value mono">{{ selectedRequest.path || '-' }}</div></div>
                   <div><div class="detail-label">Upstream Path</div><div class="detail-value mono">{{ selectedRequest.upstream_path || '-' }}</div></div>
                   <div><div class="detail-label">Requested Model</div><div class="detail-value">{{ selectedRequest.requested_model || '-' }}</div></div>
-                  <div><div class="detail-label">Resolved Model</div><div class="detail-value">{{ selectedRequest.response_model || selectedRequest.resolved_model || '-' }}</div></div>
+                  <div><div class="detail-label">{{ fusionTierLabel(selectedRequest) ? 'Fusion-selected model' : 'Resolved Model' }}</div><div class="detail-value">{{ selectedRequest.response_model || selectedRequest.resolved_model || '-' }}</div></div>
                   <div><div class="detail-label">Estimated {{ rowCostUnitName(selectedRequest) }}</div><div class="detail-value"><strong>{{ rowCostLabel(selectedRequest) }}</strong><span class="cost-inline"> · {{ money(selectedRequest.cost_usd) }}</span></div></div>
                   <div><div class="detail-label">{{ requestTimingName(selectedRequest) }}</div><div class="detail-value">{{ requestDurationDetail(selectedRequest) }}</div></div>
-                  <div v-if="requestEffortLabel(selectedRequest)"><div class="detail-label">Reasoning level</div><div class="detail-value"><span :class="['badge', requestEffortBadgeClass(selectedRequest)]">{{ requestEffortLabel(selectedRequest) }}</span></div></div>
+                  <div v-if="fusionTierLabel(selectedRequest)"><div class="detail-label">Copilot Fusion tier</div><div class="detail-value"><span class="badge badge-effort-other">{{ fusionTierLabel(selectedRequest) }}</span></div></div>
+                  <div v-else-if="requestEffortLabel(selectedRequest)"><div class="detail-label">Reasoning level</div><div class="detail-value"><span :class="['badge', requestEffortBadgeClass(selectedRequest)]">{{ requestEffortLabel(selectedRequest) }}</span></div></div>
                   <div><div class="detail-label">Cost breakdown</div><div class="detail-value">{{ costBreakdownLabel(selectedRequest) }}</div></div>
                   <div><div class="detail-label">Session ID</div><div class="detail-value mono">{{ selectedRequest.session_id || '-' }}</div></div>
                   <div><div class="detail-label">Request ID</div><div class="detail-value mono">{{ selectedRequest.request_id || '-' }}</div></div>
@@ -5613,6 +5617,15 @@
         },
         requestEffortLabel(row) {
           return this._lowerField(row, 'native_reasoning_effort') || this._lowerField(row, 'reasoning_effort');
+        },
+        requestDisplayModel(row) {
+          return row?.response_model || row?.resolved_model || row?.requested_model || '-';
+        },
+        fusionTierLabel(row) {
+          const requestedModel = this._lowerField(row, 'requested_model').split('/').pop();
+          if (requestedModel !== 'fusion') return '';
+          const effort = this.requestEffortLabel(row);
+          return `Copilot Fusion · ${effort === 'high' ? 'high' : 'standard'}`;
         },
         requestEffortBadgeClass(row) {
           return this.requestEffortLabel(row) === 'fast' ? 'badge-effort-fast' : 'badge-effort-other';
