@@ -55,6 +55,32 @@ The proxy still treats client tools as declarations: it converts the Excel
 model's `run_officejs` transport call into a Codex client-tool call, but it does
 not execute the client tool or modify the workbook.
 
+## Context compaction
+
+The Codex model catalog and the default Basispoints `context_management`
+threshold use the same per-model compaction limit. Excel models with a
+272,000-token context use the shared Copilot default of 240,000 tokens, rather
+than an earlier Excel-only limit. Luna's existing 200,000-token context retains
+its 180,000-token limit. Newly discovered aliases inherit the default Excel
+model's limits unless discovery supplies more specific capabilities.
+
+Explicit client `context_management` lists, including an empty list, are
+preserved. These defaults apply to both the lean external-client profile and
+the legacy Office profile. Copilot's route is unchanged.
+
+Successful Excel JSON and SSE responses declare `x-reasoning-included: true`.
+Basispoints already counts replayed encrypted reasoning in `usage.input_tokens`,
+but does not supply this header. Without it, Codex adds a separate estimate for
+old reasoning on top of the reported usage. For example, 129k reported tokens
+plus 111k estimated reasoning can trigger the 240k limit while the context
+meter still shows roughly 50%. The marker prevents that double count without
+changing token totals, billing, encrypted reasoning replay, or compaction limits.
+The proxy adds this marker only to 2xx HTTP responses.
+
+Restart the proxy to load the change. Existing chats receive the corrected
+usage signal on their next successful model response; a new chat or Codex app
+restart is not required for this fix.
+
 ## Focused verification
 
 ```sh

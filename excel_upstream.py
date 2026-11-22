@@ -23,6 +23,7 @@ from collections import OrderedDict
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from app_paths import user_state_dir
+from constants import CODEX_PROXY_MODEL_AUTO_COMPACT_TOKEN_LIMIT, CODEX_PROXY_MODEL_CONTEXT_WINDOW
 import codex_agent_compat
 import responses_replay_ids
 from tool_catalog import SCHEMA_NOTATION, compact_schema
@@ -196,8 +197,10 @@ _DEFAULT_CLIENT_HEADERS = {
 
 LOCAL_MODEL_CAPABILITIES = {
     model_id: {
-        "auto_compact_token_limit": 180_000,
-        "context_window": 200_000 if "luna" in model_id else 272_000,
+        "auto_compact_token_limit": (
+            180_000 if "luna" in model_id else CODEX_PROXY_MODEL_AUTO_COMPACT_TOKEN_LIMIT
+        ),
+        "context_window": 200_000 if "luna" in model_id else CODEX_PROXY_MODEL_CONTEXT_WINDOW,
         "display_name": {
             "gpt-6-astra-excel": "6-Astra Excel",
             "gpt-6-sol-excel": "6-Sol Excel",
@@ -207,7 +210,7 @@ LOCAL_MODEL_CAPABILITIES = {
             "gpt-5.6-sol-excel": "5.6-Sol Excel",
         }.get(model_id, model_id.removesuffix("-excel").upper().replace("GPT-", "GPT ")),
         "input_modalities": ["text", "image"],
-        "max_context_window": 200_000 if "luna" in model_id else 272_000,
+        "max_context_window": 200_000 if "luna" in model_id else CODEX_PROXY_MODEL_CONTEXT_WINDOW,
         "messages_endpoint_supported": False,
         "model_picker_enabled": True,
         "parallel_tool_calls": False,
@@ -2232,10 +2235,13 @@ def prepare_responses_body(
     )
 
     context_management = source.get("context_management")
+    model_caps = LOCAL_MODEL_CAPABILITIES.get(
+        excel_model_id(source.get("model")), LOCAL_MODEL_CAPABILITIES[MODEL_ID],
+    )
     output["context_management"] = (
         context_management
         if isinstance(context_management, list)
-        else [{"type": "compaction", "compact_threshold": 200_000}]
+        else [{"type": "compaction", "compact_threshold": model_caps["auto_compact_token_limit"]}]
     )
 
     metadata: dict[str, str] = {}

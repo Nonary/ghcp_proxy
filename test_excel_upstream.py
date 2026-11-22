@@ -72,6 +72,48 @@ class ExcelUpstreamTests(unittest.TestCase):
                     ["text", "image"],
                 )
 
+    def test_default_compaction_matches_model_window_in_both_profiles(self):
+        for lean in (False, True):
+            for model_id, expected_limit in (
+                ("gpt-6-astra-excel", 240_000),
+                ("gpt-6-sol-excel", 240_000),
+                ("gpt-5.6-sol-excel", 240_000),
+                ("gpt-5.6-terra-excel", 240_000),
+                ("gpt-6-luna-excel", 180_000),
+                ("gpt-5.6-luna-excel", 180_000),
+                ("gpt-7-new-model-excel", 240_000),
+            ):
+                with self.subTest(lean=lean, model=model_id):
+                    with patch.object(excel_upstream, "LEAN_EXTERNAL_PROFILE", lean):
+                        body = excel_upstream.prepare_responses_body({
+                            "model": model_id,
+                            "input": [{"type": "compaction_trigger"}],
+                        })
+                    capabilities = excel_upstream.merge_local_model_capabilities(
+                        {}, excel_models={model_id.removesuffix("-excel"): {}},
+                    )[model_id]
+                    self.assertEqual(capabilities["auto_compact_token_limit"], expected_limit)
+                    self.assertLess(expected_limit, capabilities["context_window"])
+                    self.assertEqual(body["context_management"], [
+                        {"type": "compaction", "compact_threshold": expected_limit},
+                    ])
+                    self.assertEqual(body["input"][-1], {"type": "compaction_trigger"})
+
+    def test_client_compaction_overrides_are_preserved_in_both_profiles(self):
+        for lean in (False, True):
+            for context_management in (
+                [], [{"type": "compaction", "compact_threshold": 150_000}],
+            ):
+                with self.subTest(lean=lean, context_management=context_management):
+                    source = {
+                        "model": "gpt-6-sol-excel", "input": "Hello",
+                        "context_management": context_management,
+                    }
+                    with patch.object(excel_upstream, "LEAN_EXTERNAL_PROFILE", lean):
+                        body = excel_upstream.prepare_responses_body(source)
+                    self.assertEqual(body["context_management"], context_management)
+                    self.assertEqual(source["context_management"], context_management)
+
     def test_session_store_keeps_only_allowlisted_headers(self):
         store = excel_upstream.ExcelSessionStore()
         status = store.configure(
@@ -2781,6 +2823,85 @@ class ExcelStreamTransformTests(unittest.TestCase):
         self.assertEqual("".join(deltas), marker)
         completed = dict(events)["response.completed"]["response"]
         self.assertEqual(completed["output"][0]["type"], "message")
+
+
+class ExcelResponseUsageTests(unittest.IsolatedAsyncioTestCase):
+    async def _response(self, *, stream, status_code=200):
+        from unittest import mock
+        import httpx
+        import proxy
+        from starlette.requests import Request
+
+        reasoning = {"type": "reasoning", "summary": [], "encrypted_content": "gAAA-context"}
+        payload = {
+            "id": "resp_context_usage", "status": "completed", "model": "gpt-6.1-sol",
+            "output": [reasoning],
+            "usage": {
+                "input_tokens": 129_000, "output_tokens": 197, "total_tokens": 129_197,
+                "input_tokens_details": {"cached_tokens": 126_000},
+                "output_tokens_details": {"reasoning_tokens": 100},
+            },
+        }
+        source = {
+            "model": "gpt-6.1-sol-excel", "stream": stream,
+            "input": [reasoning, {"type": "message", "role": "user", "content": "Continue."}],
+        }
+        content = (
+            proxy.format_translation.sse_encode("response.completed", {
+                "type": "response.completed", "response": payload,
+            }) if stream and status_code == 200 else json.dumps(
+                payload if status_code == 200 else {"error": {"message": "Synthetic failure"}},
+            ).encode()
+        )
+        transport = httpx.MockTransport(lambda request: httpx.Response(
+            status_code, content=content,
+            headers={"content-type": "text/event-stream" if stream and status_code == 200 else "application/json"},
+        ))
+        request = Request(
+            {"type": "http", "method": "POST", "path": "/v1/responses", "headers": []},
+            receive=asyncio.Queue().get,
+        )
+        plan = proxy.UpstreamRequestPlan(
+            request_id="excel-context-test", upstream_url="https://example.invalid/responses",
+            headers={}, body=excel_upstream.prepare_responses_body(source), usage_event=None,
+            requested_model=source["model"], resolved_model=source["model"],
+        )
+        async with httpx.AsyncClient(transport=transport) as client:
+            with mock.patch.object(proxy.excel_session_capture, "refresh_macos_excel_session"), \
+                 mock.patch.object(proxy.excel_session_capture, "refresh_windows_excel_session"), \
+                 mock.patch.object(excel_upstream.excel_session_store, "request_headers", return_value={}), \
+                 mock.patch.object(excel_upstream.excel_session_store, "tools_version_id", return_value=None), \
+                 mock.patch.object(proxy, "_prepare_upstream_request", return_value=(plan, None)), \
+                 mock.patch.object(proxy, "_get_excel_upstream_client", return_value=client), \
+                 mock.patch.object(proxy, "_finish_usage_and_trace"), \
+                 mock.patch.object(request, "is_disconnected", mock.AsyncMock(return_value=False)):
+                response = await proxy._handle_excel_responses(request, source)
+                if stream and status_code == 200:
+                    wire = b"".join([chunk async for chunk in response.body_iterator])
+                    result = next(
+                        json.loads(line[6:])["response"] for line in wire.splitlines()
+                        if line.startswith(b"data: ") and b'"response.completed"' in line
+                    )
+                else:
+                    result = json.loads(response.body)
+        return response, result, payload
+
+    async def test_excel_declares_reasoning_inclusive_usage_without_changing_usage_or_replay(self):
+        for lean in (False, True):
+            for stream in (False, True):
+                with self.subTest(lean=lean, stream=stream), \
+                     patch.object(excel_upstream, "LEAN_EXTERNAL_PROFILE", lean):
+                    response, result, upstream = await self._response(stream=stream)
+                    self.assertEqual(response.headers.get("x-reasoning-included"), "true")
+                    self.assertEqual(result["usage"], upstream["usage"])
+                    self.assertEqual(result["output"], upstream["output"])
+
+    async def test_excel_error_responses_are_not_declared_as_context_measurements(self):
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                response, _, _ = await self._response(stream=stream, status_code=401)
+                self.assertEqual(response.status_code, 401)
+                self.assertNotIn("x-reasoning-included", response.headers)
 
 
 class ExcelStreamRecoveryTests(unittest.IsolatedAsyncioTestCase):

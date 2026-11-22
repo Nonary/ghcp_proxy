@@ -6664,7 +6664,7 @@ async def _handle_excel_responses(
     if error_response is not None:
         return error_response
     if bool(upstream_body.get("stream")):
-        return await proxy_streaming_response(
+        response = await proxy_streaming_response(
             plan.upstream_url,
             plan.headers,
             plan.body,
@@ -6680,7 +6680,13 @@ async def _handle_excel_responses(
             upstream_client=_get_excel_upstream_client(),
             emit_response_stream_errors=True,
         )
-    return await _post_excel_non_streaming_request(plan, client_body=body)
+    else:
+        response = await _post_excel_non_streaming_request(plan, client_body=body)
+    if 200 <= response.status_code < 300:
+        # Basispoints includes replayed reasoning in input_tokens but omits this
+        # signal. Without it, Codex adds an estimate for that same reasoning again.
+        response.headers["x-reasoning-included"] = "true"
+    return response
 
 
 async def _handle_copilot_sdk_responses(

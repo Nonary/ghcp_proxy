@@ -99,6 +99,29 @@ class ReasoningLevelTests(unittest.TestCase):
         self.assertEqual(slugs, {"gpt-6.1-sol", "gpt-6-sol-excel"})
         self.assertEqual(slugs, set(self.service.codex_model_catalog_model_names()))
 
+    def test_generated_catalog_aligns_excel_compaction_with_copilot(self):
+        self.service._config = SimpleNamespace(
+            codex_model_context_window=272_000,
+            codex_model_auto_compact_token_limit=240_000,
+        )
+        self.service._model_capabilities_provider = lambda: excel_upstream.merge_local_model_capabilities(
+            {"gpt-6.1-sol": {"context_window": 272_000}},
+            excel_models={"gpt-6-sol": {}, "gpt-6-luna": {}, "gpt-7-new-model": {}},
+        )
+        self.service._model_routing_settings_provider = lambda: {
+            "enabled": True,
+            "mappings": [{"source_model": "gpt-5.3-codex", "target_model": "gpt-6-sol-excel"}],
+        }
+        models = {
+            row["slug"]: row for row in self.service._build_codex_model_catalog_payload()["models"]
+        }
+        for model_id in ("gpt-6.1-sol", "gpt-6-sol-excel", "gpt-7-new-model-excel", "gpt-5.3-codex"):
+            with self.subTest(model=model_id):
+                self.assertEqual(models[model_id]["context_window"], 272_000)
+                self.assertEqual(models[model_id]["auto_compact_token_limit"], 240_000)
+        self.assertEqual(models["gpt-6-luna-excel"]["context_window"], 200_000)
+        self.assertEqual(models["gpt-6-luna-excel"]["auto_compact_token_limit"], 180_000)
+
     def test_generated_catalog_selects_v2_for_fresh_threads_and_children(self):
         self.service._config = SimpleNamespace(
             codex_model_context_window=272_000,
