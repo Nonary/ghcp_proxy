@@ -1,8 +1,14 @@
+import asyncio
+import gzip
 import json
 import os
+import time
 import unittest
+from collections import OrderedDict
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
+
+import httpx
 
 import copilot_fusion as fusion
 import copilot_sdk_upstream as sdk
@@ -112,6 +118,165 @@ class CopilotFusionMappingTests(unittest.TestCase):
         standard = sdk._session_options({"model": "fusion"}, sdk.ToolRegistration())
         high = sdk._session_options({"model": "fusion", "reasoning_effort": "high"}, sdk.ToolRegistration())
         self.assertNotEqual(standard, high)
+
+
+class CopilotFusionContinuityTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.entry = sdk._LiveSession(
+            session=SimpleNamespace(session_id="conversation-1"),
+            options={"model": "fusion"}, diagnostics={},
+        )
+        self.sessions = {"conversation-1": self.entry}
+        for name, value in (("_live_sessions", self.sessions), ("_fusion_routes", OrderedDict())):
+            patcher = patch.object(sdk, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.handler = sdk._UpstreamRequestHandler()
+        self.upstream = AsyncMock(side_effect=self.route_response)
+        patcher = patch.object(self.handler, "_send_upstream", self.upstream)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def route_response(self, request):
+        if request.url.path == "/model/fusion":
+            payload = {"steps": [{"role": "primary", "model_id": "gpt-6-luna"}],
+                       "session": {"token": "synthetic-fusion-token", "expires_at": time.time() + 3600}}
+        else:
+            payload = {"selected_model": {"id": "gpt-6-luna"},
+                       "session_token": "synthetic-fusion-token", "expires_at": time.time() + 3600}
+        return httpx.Response(200, json=payload, request=request)
+
+    async def route(self, path="/auto", *, session_id="conversation-1", parent_agent_id=None, **changes):
+        body = {"prompt": "First question", **(
+            {"fusion_mode": "hydrafusion", "plan_version": "v1"} if path == "/model/fusion"
+            else {"tier": "balance", "has_image": False, "fusion": True}
+        ), **changes}
+        request = httpx.Request("POST", "https://example.invalid" + path, json=body)
+        return await self.handler.send_request(
+            request, SimpleNamespace(session_id=session_id, parent_agent_id=parent_agent_id),
+        )
+
+    async def test_followups_reuse_native_routes_and_billing_tokens_for_both_tiers(self):
+        for path in ("/auto", "/model/fusion"):
+            first = await self.route(path)
+            followup = await self.route(path, prompt="Different, more complex question",
+                                        multi_turn={"turns_since_anchor": 1},
+                                        hydra_rl_multi_turn={"state_token": "new-state"})
+            self.assertEqual(followup.json(), first.json())
+        self.assertEqual(self.upstream.await_count, 2)
+        self.assertEqual([x["cache"] for x in self.entry.diagnostics["fusion_routes"]],
+                         ["miss", "hit", "miss", "hit"])
+        self.assertNotIn("synthetic-fusion-token", json.dumps(self.entry.diagnostics))
+
+    async def test_conversations_subagents_and_plain_auto_do_not_share_routes(self):
+        await self.route()
+        self.sessions["conversation-2"] = sdk._LiveSession(
+            session=SimpleNamespace(session_id="conversation-2"), options={"model": "fusion"},
+        )
+        await self.route(session_id="conversation-2")
+        await self.route(parent_agent_id="parent")
+        self.entry.options = {"model": "auto"}
+        await self.route()
+        self.assertEqual(self.upstream.await_count, 4)
+
+    async def test_changed_tier_or_vision_requirements_reroute(self):
+        await self.route()
+        await self.route(tier="hydrafusion")
+        await self.route(has_image=True)
+        await self.route()
+        self.assertEqual(self.upstream.await_count, 4)
+
+    async def test_token_is_refreshed_before_expiry(self):
+        now = time.time()
+        with patch.object(sdk.time, "time", return_value=now):
+            await self.route()
+        with patch.object(sdk.time, "time", return_value=now + 3300):
+            await self.route()
+        self.assertEqual(self.upstream.await_count, 2)
+
+    async def test_compaction_and_model_errors_invalidate_routes(self):
+        await self.route()
+        sdk._set_compaction_state(self.entry, True)
+        sdk._set_compaction_state(self.entry, False)
+        await self.route()
+        await sdk._observe_http_response(httpx.Response(403, content=b"model unavailable"), {},
+                                         session_id="conversation-1")
+        await self.route()
+        self.assertEqual(self.upstream.await_count, 3)
+
+    async def test_ordinary_disk_resume_retains_the_decision(self):
+        first = await self.route()
+        self.sessions["conversation-1"] = sdk._LiveSession(
+            session=SimpleNamespace(session_id="conversation-1"), options={"model": "fusion"},
+        )
+        self.assertEqual((await self.route()).json(), first.json())
+        self.assertEqual(self.upstream.await_count, 1)
+
+    async def test_explicit_compaction_release_invalidates_the_decision(self):
+        await self.route()
+        self.entry.tool_choice = "none"
+        await sdk._release_session(self.entry.session, sdk.TurnOutcome(), completed=True)
+        self.entry.reaper.cancel()
+        await self.route()
+        self.assertEqual(self.upstream.await_count, 2)
+
+    async def test_settled_interrupt_retains_the_decision(self):
+        await self.route()
+        await sdk._release_session(self.entry.session, None, completed=False, park=True)
+        self.entry.reaper.cancel()
+        await self.route(prompt="Continue after interrupt")
+        self.assertEqual(self.upstream.await_count, 1)
+
+    async def test_model_selection_changes_discard_the_old_route(self):
+        await self.route()
+        self.entry.in_use = False
+        with patch.object(sdk, "_evict_live_session", AsyncMock()):
+            await sdk._reuse_live_session(
+                "conversation-1", allow_pending=False,
+                options={"model": "fusion", "capi": {"fusion_tier": "high"}},
+            )
+        await self.route()
+        self.assertEqual(self.upstream.await_count, 2)
+
+    async def test_failed_or_invalid_router_responses_are_not_cached(self):
+        for response in (
+            httpx.Response(503, json={"error": "unavailable"}),
+            httpx.Response(200, content=b"not json"),
+            httpx.Response(200, json={"session_token": "invalid", "expires_at": time.time() + 3600}),
+            httpx.Response(200, json={"selected_model": {"id": "gpt-6-luna"},
+                                     "session_token": "invalid", "expires_at": True}),
+        ):
+            with self.subTest(status=response.status_code, content=response.content):
+                sdk._invalidate_fusion_routes("conversation-1")
+                self.upstream.side_effect = [response, self.route_response(httpx.Request("POST", "https://example.invalid/auto"))]
+                self.upstream.reset_mock()
+                await self.route()
+                await self.route()
+                self.assertEqual(self.upstream.await_count, 2)
+
+    async def test_compressed_routing_responses_remain_readable_on_reuse(self):
+        request = httpx.Request("POST", "https://example.invalid/auto")
+        payload = self.route_response(request).content
+        self.upstream.return_value = httpx.Response(
+            200, headers={"content-type": "application/json", "content-encoding": "gzip"},
+            content=gzip.compress(payload),
+        )
+        self.upstream.side_effect = None
+        for _ in range(2):
+            response = await self.route()
+            forwarded = httpx.Response(200, headers=response.headers, content=await response.aread())
+            self.assertEqual(forwarded.json()["session_token"], "synthetic-fusion-token")
+        self.assertEqual(self.upstream.await_count, 1)
+
+    async def test_invalidation_during_routing_does_not_restore_stale_decision(self):
+        async def send(request):
+            sdk._invalidate_fusion_routes("conversation-1")
+            await asyncio.sleep(0)
+            return self.route_response(request)
+        self.upstream.side_effect = send
+        await self.route()
+        await self.route()
+        self.assertEqual(self.upstream.await_count, 2)
 
 
 class CopilotFusionDiscoveryTests(unittest.IsolatedAsyncioTestCase):

@@ -137,6 +137,20 @@ top-level `reasoning_effort` equivalent). The proxy sends the native
 unavailable tiers are rejected rather than silently downgraded. Plain `auto`
 routing is unchanged. Fusion Max is not exposed by this integration.
 
+Fusion routing decisions are retained per SDK conversation, matching VS Code's
+conversation-scoped routing cache. Follow-up turns reuse the native decision and
+Fusion billing token rather than rerouting just because a new user message
+arrived. Standard selections and High execution plans remain native Fusion;
+the proxy does not convert them to ordinary fixed-model requests.
+
+Cached decisions are invalidated after compaction, model/tier or routing-input
+changes, before the routing token expires, and after model errors, allowing
+native routing to select a new backend. Decisions are isolated between
+conversations and kept only in memory, so a proxy restart also permits
+rerouting. A newly selected backend may still have a cold prompt cache.
+Request traces record routing cache hits and misses under
+`copilot_sdk_session.fusion_routes`, without recording routing tokens.
+
 ## Excel Setup
 
 The Excel backend uses the authenticated session created by the official ChatGPT add-in.

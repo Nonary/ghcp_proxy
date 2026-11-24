@@ -15,6 +15,7 @@ import copy
 import hashlib
 import importlib.util
 import json
+import math
 import os
 import re
 import ssl
@@ -315,6 +316,7 @@ def _commit_alias_watermark(session_id: str, *, success: bool) -> None:
 
 def _forget_session_tracking(session_id: str) -> list[str]:
     """Remove proxy metadata so a failed SDK session cannot be resumed."""
+    _invalidate_fusion_routes(session_id)
     with _SESSION_LEDGER_LOCK:
         _retired_session_ids.add(session_id)
     _pending_alias_watermark.pop(session_id, None)
@@ -744,6 +746,7 @@ async def _get_client():
             await _client.stop()
         _configure_runtime_ca_bundle()
         _fusion_model_caps = {}
+        _fusion_routes.clear()
         os.makedirs(_SDK_STATE_DIR, exist_ok=True)
         _client = CopilotClient(
             github_token=token,
@@ -1239,9 +1242,31 @@ class _LiveSession:
     background_calls: list = field(default_factory=list)
     # Aborts an interrupted turn and releases the session (_stream_turn).
     settling: asyncio.Task | None = None
+    fusion_route_generation: int = 0
 
 
 _live_sessions: dict[str, _LiveSession] = {}
+
+
+@dataclass(frozen=True)
+class _FusionRoute:
+    expires_at: float
+    config: str
+    content: bytes = field(repr=False)
+    headers: list[tuple[str, str]] = field(repr=False)
+
+
+_FUSION_ROUTE_REFRESH_SECONDS = 300.0
+_MAX_FUSION_ROUTES = 128
+_fusion_routes: OrderedDict[tuple[str, str], _FusionRoute] = OrderedDict()
+
+
+def _invalidate_fusion_routes(session_id: str) -> None:
+    entry = _live_sessions.get(session_id)
+    if entry is not None:
+        entry.fusion_route_generation += 1
+    for key in [key for key in _fusion_routes if key[0] == session_id]:
+        del _fusion_routes[key]
 
 
 def _set_compaction_state(entry: _LiveSession, in_flight: bool) -> None:
@@ -1250,6 +1275,7 @@ def _set_compaction_state(entry: _LiveSession, in_flight: bool) -> None:
         entry.compaction_settled.clear()
     else:
         entry.compaction_settled.set()
+        _invalidate_fusion_routes(entry.session.session_id)
 
 
 def _is_compaction_event(event: Any, *, started: bool) -> bool:
@@ -1300,6 +1326,8 @@ async def _track_live_session(
             loop.call_soon_threadsafe(_set_compaction_state, entry, True)
         elif _is_compaction_event(event, started=False):
             loop.call_soon_threadsafe(_set_compaction_state, entry, False)
+        elif _event_name(event) == "session.model_change":
+            loop.call_soon_threadsafe(_invalidate_fusion_routes, session.session_id)
 
     try:
         entry.unsubscribe = session.on(handler)
@@ -1339,6 +1367,12 @@ async def _reuse_live_session(
     if entry is None or entry.in_use:
         return None
     if entry.options != options:
+        previous = entry.options or {}
+        if (
+            previous.get("model") != options.get("model")
+            or previous.get("capi") != options.get("capi")
+        ):
+            _invalidate_fusion_routes(session_id)
         if diagnostics is not None:
             diagnostics["reuse_miss"] = "configuration_changed"
             diagnostics["changed_options"] = sorted(
@@ -1463,6 +1497,8 @@ async def _release_session(
             pass
         return
     pending = bool(completed and outcome is not None and outcome.calls)
+    if (completed and entry.tool_choice == "none") or (not completed and not park):
+        _invalidate_fusion_routes(session.session_id)
     if not completed and not park:
         await _evict_live_session(session.session_id)
         return
@@ -1747,6 +1783,87 @@ class _UpstreamRequestHandler(CopilotRequestHandler):
     async def _send_upstream(self, request: httpx.Request) -> httpx.Response:
         return await _get_sdk_http_client().send(request, stream=True)
 
+    async def _route_fusion_request(
+        self, request: httpx.Request, ctx: Any, body: dict | None,
+    ) -> httpx.Response:
+        session_id = ctx.session_id
+        entry = _live_sessions.get(session_id) if session_id else None
+        path = request.url.path
+        if (
+            path not in {"/auto", "/model/fusion"}
+            or body is None
+            or entry is None
+            or not copilot_fusion.is_fusion_model((entry.options or {}).get("model"))
+            or getattr(ctx, "parent_agent_id", None)
+        ):
+            return await self._send_upstream(request)
+
+        # VS Code retains its routing decision until compaction, expiry, or a
+        # configuration change. Keep the native decision and billing token,
+        # rather than changing the SDK session to a concrete, non-Fusion model.
+        config = {k: v for k, v in body.items() if k not in {
+            "prompt", "multi_turn", "hydra_rl_multi_turn",
+        }}
+        key = (session_id, str(request.url))
+        signature = json.dumps(config, sort_keys=True)
+        record = {"path": path, "cache": "miss"}
+        if entry.diagnostics is not None:
+            routes = entry.diagnostics.setdefault("fusion_routes", [])
+            if len(routes) < _MAX_TRACED_MODEL_CALLS:
+                routes.append(record)
+        cached = _fusion_routes.pop(key, None)
+        if (
+            cached is not None and cached.config == signature
+            and cached.expires_at > time.time() + _FUSION_ROUTE_REFRESH_SECONDS
+        ):
+            _fusion_routes[key] = cached
+            record["cache"] = "hit"
+            return httpx.Response(200, headers=cached.headers, content=cached.content, request=request)
+
+        generation = entry.fusion_route_generation
+        response = await self._send_upstream(request)
+        if response.status_code != 200:
+            return response
+        content = await response.aread()
+        for header in ("content-encoding", "content-length", "transfer-encoding"):
+            response.headers.pop(header, None)
+        try:
+            payload = response.json()
+        except ValueError:
+            record["cache"] = "invalid_json"
+            return response
+        if not isinstance(payload, dict):
+            record["cache"] = "invalid_response"
+            return response
+        selected = payload.get("selected_model")
+        if (
+            path == "/auto"
+            and (not isinstance(selected, dict) or not isinstance(selected.get("id"), str) or not selected["id"])
+        ) or (path == "/model/fusion" and not (
+            isinstance(payload.get("steps"), list) and payload["steps"]
+        )):
+            record["cache"] = "invalid_response"
+            return response
+        metadata = payload.get("session") if path == "/model/fusion" else payload
+        token_key = "token" if path == "/model/fusion" else "session_token"
+        expires_at = metadata.get("expires_at") if isinstance(metadata, dict) else None
+        token = metadata.get(token_key) if isinstance(metadata, dict) else None
+        if (
+            not isinstance(token, str) or not token
+            or isinstance(expires_at, bool)
+            or not isinstance(expires_at, (int, float)) or not math.isfinite(expires_at)
+            or expires_at <= time.time() + _FUSION_ROUTE_REFRESH_SECONDS
+        ):
+            record["cache"] = "uncacheable"
+            return response
+        if _live_sessions.get(session_id) is entry and entry.fusion_route_generation == generation:
+            _fusion_routes[key] = _FusionRoute(
+                expires_at, signature, content, list(response.headers.multi_items()),
+            )
+            while len(_fusion_routes) > _MAX_FUSION_ROUTES:
+                _fusion_routes.popitem(last=False)
+        return response
+
     async def send_request(self, request: httpx.Request, ctx: Any) -> httpx.Response:
         if request.method != "POST":
             return await self._send_upstream(request)
@@ -1756,7 +1873,9 @@ class _UpstreamRequestHandler(CopilotRequestHandler):
         except ValueError:
             body = None
         if not isinstance(body, dict) or "input" not in body:
-            return await self._send_upstream(request)
+            return await self._route_fusion_request(
+                request, ctx, body if isinstance(body, dict) else None,
+            )
         changed, record = self._prepare(ctx.session_id, body, "http", getattr(ctx, "interaction_type", None))
         _note_model_call(ctx.session_id, record)
         items = body.get("input")
@@ -4030,6 +4149,7 @@ async def shutdown() -> None:
     _client_pruned = False
     _fusion_model_caps = {}
     await _evict_all_live_sessions()
+    _fusion_routes.clear()
     await _close_websocket_pool()
     if client is not None:
         await client.stop()
